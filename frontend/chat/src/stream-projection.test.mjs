@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { StreamProjectionStore } from "./stream-projection.ts";
-import { publishWebStreamChanges } from "./web-stream-projection.ts";
+import { canProjectWebStreamWithoutRoot, publishWebStreamChanges } from "./web-stream-projection.ts";
 
 function assistant(id, content, streaming = true) {
   return { id, role: "assistant", content, blocks: [], streaming };
@@ -85,4 +85,14 @@ test("publishWebStreamChanges skips unchanged and non-streaming rows", () => {
 
   assert.equal(store.read("assistant:turn", previous[1]), terminal);
   assert.equal(store.read("assistant:done", previous[0]), previous[0]);
+});
+
+test("only an active last-row stream mutation can bypass the app root", () => {
+  const history = assistant("assistant:history", "历史", false);
+  const active = assistant("assistant:turn", "流式");
+  const delta = assistant("assistant:turn", "流式继续");
+
+  assert.equal(canProjectWebStreamWithoutRoot([history, active], [history, delta]), true);
+  assert.equal(canProjectWebStreamWithoutRoot([history, active], [history, assistant("assistant:turn", "完成", false)]), false);
+  assert.equal(canProjectWebStreamWithoutRoot([history, active], [assistant("assistant:history", "变化", false), delta]), false);
 });

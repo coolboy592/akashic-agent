@@ -115,7 +115,7 @@ import {
   type MobileComposerDraft,
   type MobileComposerDraftWrite,
 } from "./mobile-message-state";
-import type { AgentBlock, ChatMessage } from "./main";
+import type { AgentBlock, ChatMessage } from "./chat-message";
 import { messageNeedsMarkdown } from "./message-rendering-policy";
 import { StreamProjectionStore } from "./stream-projection";
 import {
@@ -2687,11 +2687,11 @@ function MobileDrawer({
                 {session.unreadCount > 99 ? "99+" : session.unreadCount}
               </strong>
             ) : session.id === snapshot.selectedSessionId ? <Check size={18} /> : null,
-          onActivate: () => {
-            window.AkashicNative?.selectSession(session.id);
-            onClose();
-          },
         }))}
+        onSessionActivate={(sessionId) => {
+          window.AkashicNative?.selectSession(sessionId);
+          onClose();
+        }}
         sessionAfterContent={<MobilePluginSlot name="drawer.panel" sessionId={snapshot.selectedSessionId} />}
         actions={[
           { id: "settings", icon: <Settings size={18} />, label: "设置", onActivate: onOpenSettings },

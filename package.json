@@ -16,9 +16,16 @@
     "lint": "eslint \"frontend/dashboard/src/**/*.{ts,tsx}\" \"frontend/chat/src/**/*.{ts,tsx}\" \"plugins/**/*.ts\" \"types/**/*.d.ts\"",
     "package:mobile-web": "bash scripts/package-mobile-web.sh",
     "test:shared-chat-showcase": "node --test frontend/chat/src/shared-chat-showcase.test.mjs frontend/chat/src/trace-motion-showcase.test.mjs frontend/chat/src/drawer-island-showcase.test.mjs",
+    "test:desktop-navigation": "node --experimental-strip-types --test frontend/chat/src/desktop-navigation.test.mjs frontend/chat/src/desktop-composer.test.mjs frontend/chat/src/model-capsule-data.test.mjs frontend/chat/src/mobile-pairing.test.mjs frontend/chat/src/settings-interactions.test.mjs frontend/chat/src/memory-settings.test.mjs frontend/chat/src/web-chat-data.test.mjs frontend/chat/src/web-chat-transport.test.mjs frontend/chat/src/webui-error-boundary.test.mjs frontend/chat/src/module-boundaries.test.mjs",
     "test:theme": "node --test frontend/theme/src/theme-catalog.test.mjs",
     "test:dashboard-api": "node --experimental-strip-types --test frontend/dashboard/src/api.test.mjs",
-    "test:mobile-web-state": "node --experimental-strip-types --test frontend/chat/src/message-rendering-policy.test.mjs frontend/chat/src/mobile-message-state.test.mjs frontend/chat/src/stream-projection.test.mjs frontend/chat/src/web-chat-status.test.mjs frontend/chat/src/mobile-plugin-layout.test.mjs frontend/chat/src/mobile-plugin-query-queue.test.mjs frontend/chat/src/mobile-plugin-result-cache.test.mjs frontend/chat/src/mobile-surface-history.test.mjs frontend/chat/src/mobile-turn-trace.test.mjs",
+    "test:mobile-web-state": "node --experimental-strip-types --test frontend/chat/src/desktop-conversation.test.mjs frontend/chat/src/static-message-response.test.mjs frontend/chat/src/runtime-dashboard-data.test.mjs frontend/chat/src/message-rendering-policy.test.mjs frontend/chat/src/mobile-message-state.test.mjs frontend/chat/src/stream-projection.test.mjs frontend/chat/src/web-chat-status.test.mjs frontend/chat/src/mobile-plugin-layout.test.mjs frontend/chat/src/mobile-plugin-query-queue.test.mjs frontend/chat/src/mobile-plugin-result-cache.test.mjs frontend/chat/src/mobile-surface-history.test.mjs frontend/chat/src/mobile-turn-trace.test.mjs frontend/chat/src/web-turn-trace.test.mjs",
+    "test:webui-performance": "node --test scripts/webui-performance/*.test.mjs && node scripts/webui-performance/run-build-baseline.mjs",
+    "measure:webui-performance:browser": "node scripts/webui-performance/run-browser-scenarios.mjs",
+    "serve:webui-performance:fixture": "node scripts/webui-performance/serve-desktop-fixture.mjs",
+    "serve:webui-performance:runtime": "npm run build:chat && PYTHONPATH=. python scripts/webui-performance/serve_isolated_runtime.py",
+    "baseline:webui-performance:build": "node scripts/webui-performance/run-build-baseline.mjs --update-baseline",
+    "baseline:webui-performance:browser": "node scripts/webui-performance/run-browser-scenarios.mjs --update-baseline",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
@@ -30,16 +37,19 @@
     "@vitejs/plugin-react": "^4.3.4",
     "ai-elements": "^1.9.0",
     "autoprefixer": "^10.4.20",
+    "axe-core": "^4.13.0",
     "esbuild": "^0.25.0",
     "eslint": "^10.2.1",
     "eslint-plugin-react-hooks": "^7.1.1",
     "eslint-plugin-react-refresh": "^0.5.2",
     "globals": "^17.5.0",
+    "playwright-core": "^1.62.1",
     "postcss": "^8.4.49",
     "tailwindcss": "^3.4.17",
     "typescript": "5.8.3",
     "typescript-eslint": "^8.59.1",
-    "vite": "^6.0.7"
+    "vite": "^6.0.7",
+    "ws": "^8.18.3"
   },
   "dependencies": {
     "@ai-sdk/react": "^4.0.16",

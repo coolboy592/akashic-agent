@@ -9,9 +9,9 @@
   --pairing-surface-container-low: var(--ak-color-bg-surface-low);
   --pairing-surface-container: var(--ak-color-bg-surface);
   --pairing-surface-container-high: var(--ak-color-bg-surface-high);
-  --pairing-on-surface: var(--ak-color-text-primary);
-  --pairing-on-surface-variant: var(--ak-color-text-secondary);
-  --pairing-on-surface-muted: var(--ak-color-border-strong);
+  --pairing-on-surface: var(--md-sys-color-on-surface);
+  --pairing-on-surface-variant: var(--md-sys-color-on-surface-variant);
+  --pairing-on-surface-muted: var(--md-sys-color-on-surface-variant);
   --pairing-primary: var(--ak-color-action-primary);
   --pairing-primary-hover: var(--ak-color-action-hover);
   --pairing-primary-container: var(--ak-color-action-container);
@@ -61,6 +61,39 @@ input {
   font-size: 0.875rem;
 }
 
+.webui-fatal-error {
+  display: grid;
+  min-height: 100vh;
+  place-items: center;
+  padding: 24px;
+  color: var(--md-sys-color-on-surface);
+  background: var(--md-sys-color-surface);
+}
+
+.webui-fatal-error > div {
+  width: min(100%, 32rem);
+  border-radius: var(--md-sys-shape-corner-large);
+  padding: 24px;
+  background: var(--md-sys-color-error-container);
+}
+
+.webui-fatal-error h1 { margin: 0; font-size: 1.5rem; }
+.webui-fatal-error p { line-height: 1.6; }
+.webui-fatal-error button,
+.message-renderer-error button {
+  min-height: 44px;
+  border: 0;
+  border-radius: var(--md-sys-shape-corner-full);
+  padding-inline: 18px;
+  color: var(--md-sys-color-on-primary);
+  background: var(--md-sys-color-primary);
+  font: inherit;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.message-renderer-error { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+
 .chat-shell {
   display: grid;
   grid-template-columns: 292px minmax(0, 1fr);
@@ -78,6 +111,11 @@ input {
   overflow: hidden;
   border-right: 0;
   background: var(--md-sys-color-surface-container-low);
+}
+
+.desktop-mobile-navigation-trigger,
+.desktop-mobile-navigation-dialog {
+  display: none;
 }
 
 .chat-sidebar-brand {
@@ -133,6 +171,38 @@ input {
 
 .web-message-anchor {
   width: 100%;
+}
+
+.web-message-anchor.history-isolated {
+  content-visibility: auto;
+  contain-intrinsic-block-size: auto 160px;
+}
+
+.static-code-block {
+  position: relative;
+}
+
+.static-code-copy {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  min-height: 32px;
+  border: 1px solid var(--md-sys-color-outline-variant);
+  border-radius: 8px;
+  padding: 0 10px;
+  color: var(--md-sys-color-on-surface-variant);
+  background: var(--md-sys-color-surface-container-high);
+  font: inherit;
+  cursor: pointer;
+}
+
+.static-code-copy:hover {
+  background: var(--md-sys-color-surface-container-highest);
+}
+
+.static-code-copy:focus-visible {
+  outline: 2px solid var(--md-sys-color-primary);
+  outline-offset: 2px;
 }
 
 .web-message-anchor.user {
@@ -327,6 +397,11 @@ input {
   width: 100%;
   height: 100%;
   padding: 0;
+}
+
+.desktop-scroll-return {
+  bottom: 112px;
+  z-index: 6;
 }
 
 .home-state {
@@ -666,6 +741,7 @@ form.composer:focus-within [data-slot="input-group"] {
 .mobile-pairing-centered p {
   max-width: 42ch;
   margin: 0;
+  color: var(--pairing-on-surface);
   line-height: 1.55;
 }
 
@@ -727,7 +803,7 @@ form.composer:focus-within [data-slot="input-group"] {
 }
 
 .mobile-pairing-step.active {
-  color: var(--pairing-primary);
+  color: var(--pairing-on-surface-variant);
 }
 
 .mobile-pairing-step-node {
@@ -934,6 +1010,42 @@ form.composer:focus-within [data-slot="input-group"] {
 
   .chat-sidebar {
     display: none;
+  }
+
+  .desktop-mobile-navigation-trigger {
+    position: fixed;
+    z-index: 35;
+    inset: 12px auto auto 12px;
+    display: grid;
+    width: 44px;
+    height: 44px;
+    place-items: center;
+    border: 0;
+    border-radius: 50%;
+    color: var(--md-sys-color-on-surface);
+    background: var(--md-sys-color-surface-container-high);
+    box-shadow: 0 2px 8px rgb(var(--md-sys-color-shadow-rgb) / 0.18);
+  }
+
+  .desktop-mobile-navigation-dialog {
+    inset: 0 auto 0 0;
+    display: block;
+    width: min(292px, calc(100vw - 32px));
+    max-width: none;
+    height: 100vh;
+    transform: none;
+    gap: 0;
+    overflow: hidden;
+    border: 0;
+    border-radius: 0 20px 20px 0;
+    padding: 0;
+    background: var(--md-sys-color-surface-container-low);
+  }
+
+  .desktop-mobile-navigation-dialog .chat-sidebar {
+    display: flex;
+    width: 100%;
+    height: 100%;
   }
 
   .conversation-content {
