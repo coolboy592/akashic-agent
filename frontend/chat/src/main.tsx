@@ -1,4 +1,4 @@
-import React, { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
+import React, { lazy, Suspense, useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { createRoot } from "react-dom/client";
 import type { FileUIPart } from "ai";
 import { useStickToBottomContext } from "use-stick-to-bottom";
@@ -53,10 +53,15 @@ import { MobilePairingDialog } from "./mobile-pairing-dialog";
 import { ModelCapsulePicker, type ChatModelRuntime } from "./model-capsule-picker";
 import { loadWebPluginCatalog, MobilePluginSlot } from "./mobile-plugin-runtime";
 import { RuntimeDashboard } from "./runtime-dashboard";
+import { StreamProjectionStore, attachReducedMotionFlush } from "./stream-projection";
+import {
+  advanceWebStreamPresentation,
+  publishWebStreamChanges,
+} from "./web-stream-projection";
+import { isGeneratingChatStatus, type ChatStatus } from "./web-chat-status";
 import "./styles.css";
 import "./message-view.css";
 
-type ChatStatus = "idle" | "submitted" | "streaming" | "error";
 type Role = "user" | "assistant";
 
 interface SessionRow {
@@ -171,6 +176,28 @@ const LazyModelExperienceShowcase = lazy(() =>
 const LazySettingsApp = lazy(() =>
   import("./settings-app").then(({ SettingsApp }) => ({ default: SettingsApp })),
 );
+
+type ProjectedChatMessageViewProps = React.ComponentProps<typeof LazyChatMessageView> & {
+  streamStore: StreamProjectionStore<ChatMessage>;
+};
+
+/** Subscribe the desktop renderer to the same per-message display clock as mobile. */
+function ProjectedChatMessageView({
+  message: baselineMessage,
+  streamStore,
+  ...props
+}: ProjectedChatMessageViewProps) {
+  const subscribe = useCallback(
+    (listener: () => void) => streamStore.subscribe(baselineMessage.id, listener),
+    [baselineMessage.id, streamStore],
+  );
+  const getSnapshot = useCallback(
+    () => streamStore.read(baselineMessage.id, baselineMessage),
+    [baselineMessage, streamStore],
+  );
+  const message = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
+  return <LazyChatMessageView {...props} message={message} />;
+}
 
 type ChatFrame =
   | { type: "session.created"; request_id: string; session_id: string }
@@ -327,7 +354,45 @@ function App() {
   );
   const [sessions, setSessions] = useState<SessionRow[]>([]);
   const [activeSessionId, setActiveSessionId] = useState("");
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [streamStore] = useState(() => new StreamProjectionStore<ChatMessage>(
+    {
+      request: (callback) => window.requestAnimationFrame(callback),
+      cancel: (handle) => window.cancelAnimationFrame(handle),
+    },
+    advanceWebStreamPresentation,
+  ));
+  const [messages, setMessagesState] = useState<ChatMessage[]>([]);
+  const messagesRef = useRef<ChatMessage[]>([]);
+  const commitMessages = useCallback((
+    action: React.SetStateAction<ChatMessage[]>,
+    revealImmediately: boolean,
+  ) => {
+    // 1. Resolve every WebSocket mutation against a synchronous immutable baseline.
+    const previous = messagesRef.current;
+    const next = typeof action === "function" ? action(previous) : action;
+    messagesRef.current = next;
+
+    // 2. Seed the row projection before React receives the authoritative chunk.
+    if (next.length === 0) {
+      streamStore.clear();
+    } else {
+      publishWebStreamChanges(
+        previous,
+        next,
+        streamStore,
+        revealImmediately || window.matchMedia("(prefers-reduced-motion: reduce)").matches,
+      );
+    }
+    setMessagesState(next);
+  }, [streamStore]);
+  const setMessages = useCallback<React.Dispatch<React.SetStateAction<ChatMessage[]>>>(
+    (action) => commitMessages(action, false),
+    [commitMessages],
+  );
+  const setMessagesImmediate = useCallback<React.Dispatch<React.SetStateAction<ChatMessage[]>>>(
+    (action) => commitMessages(action, true),
+    [commitMessages],
+  );
   const [input, setInput] = useState("");
   const [status, setStatus] = useState<ChatStatus>("idle");
   const [error, setError] = useState("");
@@ -383,11 +448,22 @@ function App() {
     const endpoint = `/api/chat/sessions/${encodeURIComponent(sessionId)}/messages`;
     try {
       const payload = await fetchChatJson<unknown>(`${endpoint}?page=1&page_size=100&sort_by=seq&sort_order=asc`, { signal: controller.signal });
+      streamStore.clear();
       setMessages(messageRows(payload, endpoint).filter(isVisibleChatRow).map(rowToMessage));
     } finally {
       if (messagesRequestRef.current === controller) messagesRequestRef.current = null;
     }
-  }, []);
+  }, [setMessages, streamStore]);
+
+  useEffect(() => {
+    streamStore.reconcileBaseline(messages);
+  }, [messages, streamStore]);
+
+  useEffect(() => () => streamStore.clear(), [streamStore]);
+
+  // 切入 prefers-reduced-motion: reduce 时立即补齐积压，即使没有新 delta；
+  // 卸载时移除 listener。初始化已 reduce 的行为由 publish 处的 matchMedia 判断保持即时。
+  useEffect(() => attachReducedMotionFlush(streamStore), [streamStore]);
 
   const loadSessionsSafely = useCallback(() => loadSessions().catch((error: unknown) => reportError(error)), [loadSessions, reportError]);
   const loadMessagesSafely = useCallback((sessionId: string) => loadMessages(sessionId).catch((error: unknown) => reportError(error)), [loadMessages, reportError]);
@@ -435,6 +511,7 @@ function App() {
           setActiveSessionId,
           setError,
           setMessages,
+          setMessagesImmediate,
           setStatus,
           loadSessions: loadSessionsSafely,
           loadMessages: loadMessagesSafely,
@@ -454,7 +531,7 @@ function App() {
       }
     };
     return socket;
-  }, [loadMessagesSafely, loadSessionsSafely, reportError]);
+  }, [loadMessagesSafely, loadSessionsSafely, reportError, setMessages, setMessagesImmediate]);
 
   useEffect(() => {
     let active = true;
@@ -561,7 +638,7 @@ function App() {
     } finally {
       if (sendRequestRef.current === controller) sendRequestRef.current = null;
     }
-  }, [connect, ensureSession, modelSelectionDirty, replyTarget, reportError, selectedReasoningEffort, selectedRuntimeId]);
+  }, [connect, ensureSession, modelSelectionDirty, replyTarget, reportError, selectedReasoningEffort, selectedRuntimeId, setMessages]);
 
   const stopTurn = useCallback(() => {
     if (!activeSessionId) return;
@@ -586,7 +663,7 @@ function App() {
     setSelectedReasoningEffort("");
     setModelSelectionDirty(false);
     void loadModels("").catch((error: unknown) => reportError(error));
-  }, [loadModels, reportError]);
+  }, [loadModels, reportError, setMessages]);
 
   const dashboardHref = chatReady ? "/" : undefined;
 
@@ -726,8 +803,9 @@ function App() {
                           else messageElementsRef.current.delete(message.id);
                         }}
                       >
-                        <LazyChatMessageView
+                        <ProjectedChatMessageView
                           message={message}
+                          streamStore={streamStore}
                           leadingContent={message.reply ? (
                             <MessageReplyReference
                               role={message.reply.role}
@@ -942,14 +1020,14 @@ function ComposerSubmit({
   disabled?: boolean;
 }) {
   const attachments = usePromptInputAttachments();
-  const isGenerating = status === "submitted" || status === "streaming";
+  const isGenerating = isGeneratingChatStatus(status);
   return (
     <ComposerActionButton
-      mode={status === "idle" ? "send" : "stop"}
+      mode={isGenerating ? "stop" : "send"}
       label={isGenerating ? "中止回答" : "发送消息"}
       type={isGenerating ? "button" : "submit"}
       onClick={isGenerating ? onStop : undefined}
-      disabled={disabled || (status === "idle" && !input.trim() && attachments.files.length === 0)}
+      disabled={disabled || (!isGenerating && !input.trim() && attachments.files.length === 0)}
     />
   );
 }
@@ -1074,6 +1152,7 @@ function handleFrame(
     setActiveSessionId: React.Dispatch<React.SetStateAction<string>>;
     setError: React.Dispatch<React.SetStateAction<string>>;
     setMessages: React.Dispatch<React.SetStateAction<ChatMessage[]>>;
+    setMessagesImmediate: React.Dispatch<React.SetStateAction<ChatMessage[]>>;
     setStatus: React.Dispatch<React.SetStateAction<ChatStatus>>;
     loadSessions: () => Promise<void>;
     loadMessages: (sessionId: string) => Promise<void>;
@@ -1165,7 +1244,7 @@ function handleFrame(
   }
   if (frame.type === "message.final") {
     if (frame.metadata?.source === "message_push") {
-      ctx.setMessages((messages) => updateLastAssistant(messages, (message) => ({
+      ctx.setMessagesImmediate((messages) => updateLastAssistant(messages, (message) => ({
         ...message,
         content: message.content || frame.content,
         attachments: mergeAttachments(message.attachments, mediaToAttachments(frame.media)),

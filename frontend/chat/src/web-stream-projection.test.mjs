@@ -7,14 +7,13 @@ import {
   flushStreamingTexts,
   graphemeCount,
   prepareStreamingTexts,
-  streamRate,
   streamStateOf,
 } from "./stream-projection.ts";
+import { StreamProjectionStore } from "./stream-projection.ts";
 import {
-  advanceMobileStreamPresentation,
-  MobileStreamProjectionStore,
-  mobileStreamFrameBudget,
-} from "./mobile-stream-projection.ts";
+  advanceWebStreamPresentation,
+  publishWebStreamChanges,
+} from "./web-stream-projection.ts";
 
 class TestFrameScheduler {
   callback = null;
@@ -39,11 +38,13 @@ class TestFrameScheduler {
   }
 }
 
-function message(id, content, detail = "") {
+function assistant(content, streaming = true, blocks = []) {
   return {
-    id,
+    id: "assistant:turn",
+    role: "assistant",
     content,
-    blocks: detail ? [{ id: "thinking", kind: "thinking", detail }] : [],
+    blocks,
+    streaming,
   };
 }
 
@@ -93,11 +94,11 @@ function assertQueuedExact(projection, targetText, label) {
  */
 function runStreamSimulation(hz, sourceCps, { chunkGraphemes = 10, unit = "流", durationMs = 10_000, exactDrain = true } = {}) {
   const scheduler = new TestFrameScheduler();
-  const store = new MobileStreamProjectionStore(scheduler, advanceMobileStreamPresentation);
+  const store = new StreamProjectionStore(scheduler, advanceWebStreamPresentation);
   const frameMs = 1000 / hz;
   const id = "assistant:turn";
   const contentFor = (graphemes) => unit.repeat(graphemes);
-  const fallback = message(id, "");
+  const fallback = assistant("");
   let published = 0;
   let authoritative = fallback;
   const samples = [];
@@ -107,15 +108,15 @@ function runStreamSimulation(hz, sourceCps, { chunkGraphemes = 10, unit = "流",
     const sourceGraphemes = Math.floor((sourceCps * t) / 1000);
     while (published < sourceGraphemes) {
       const next = Math.min(sourceGraphemes, published + chunkGraphemes);
-      const target = message(id, contentFor(next));
-      store.publish(id, authoritative, target, false);
+      const target = assistant(contentFor(next));
+      publishWebStreamChanges([authoritative], [target], store, false);
       authoritative = target;
       published = next;
     }
     if (scheduler.callback !== null) {
       scheduler.advance(frameMs);
     }
-    const visible = store.read(id, fallback).content;
+    const visible = store.read(authoritative.id, fallback).content;
     assert.ok(
       authoritative.content.startsWith(visible),
       `visible must stay an exact prefix of the authoritative source at t=${t.toFixed(1)}ms`,
@@ -163,9 +164,9 @@ function rollingWindowMax(trace) {
  */
 function continuous800Rolling(hz, chunkGraphemes, unit = "字") {
   const scheduler = new TestFrameScheduler();
-  const store = new MobileStreamProjectionStore(scheduler, advanceMobileStreamPresentation);
+  const store = new StreamProjectionStore(scheduler, advanceWebStreamPresentation);
   const id = "assistant:turn";
-  const fallback = message(id, "");
+  const fallback = assistant("");
   const frameMs = 1000 / hz;
   let published = 0;
   let authoritative = fallback;
@@ -175,8 +176,8 @@ function continuous800Rolling(hz, chunkGraphemes, unit = "字") {
     const sourceGraphemes = Math.floor((800 * t) / 1000);
     while (published < sourceGraphemes) {
       const next = Math.min(sourceGraphemes, published + chunkGraphemes);
-      const target = message(id, unit.repeat(next));
-      store.publish(id, authoritative, target, false);
+      const target = assistant(unit.repeat(next));
+      publishWebStreamChanges([authoritative], [target], store, false);
       authoritative = target;
       published = next;
     }
@@ -195,9 +196,9 @@ function continuous800Rolling(hz, chunkGraphemes, unit = "字") {
  */
 function hiddenGapMaxWindow(hz, chunkGraphemes, unit = "字") {
   const scheduler = new TestFrameScheduler();
-  const store = new MobileStreamProjectionStore(scheduler, advanceMobileStreamPresentation);
+  const store = new StreamProjectionStore(scheduler, advanceWebStreamPresentation);
   const id = "assistant:turn";
-  const fallback = message(id, "");
+  const fallback = assistant("");
   const frameMs = 1000 / hz;
   let published = 0;
   let authoritative = fallback;
@@ -205,8 +206,8 @@ function hiddenGapMaxWindow(hz, chunkGraphemes, unit = "字") {
     const sourceGraphemes = Math.floor((800 * t) / 1000);
     while (published < sourceGraphemes) {
       const next = Math.min(sourceGraphemes, published + chunkGraphemes);
-      const target = message(id, unit.repeat(next));
-      store.publish(id, authoritative, target, false);
+      const target = assistant(unit.repeat(next));
+      publishWebStreamChanges([authoritative], [target], store, false);
       authoritative = target;
       published = next;
     }
@@ -227,8 +228,124 @@ function hiddenGapMaxWindow(hz, chunkGraphemes, unit = "字") {
   return { max: rollingWindowMax(trace), recoveryCount: trace[0].count };
 }
 
+test("desktop stream reveals by grapheme and applies tool structure immediately", () => {
+  const before = assistant("", true, []);
+  const target = assistant("回答", true, [
+    { kind: "thinking", content: "思考" },
+    {
+      kind: "tool",
+      callId: "call:1",
+      name: "read",
+      status: "input-available",
+      input: {},
+      output: undefined,
+      errorText: undefined,
+    },
+  ]);
+
+  const next = advanceWebStreamPresentation(before, target, 0);
+
+  assert.equal(next.blocks[0].content, "");
+  assert.equal(next.blocks[1], target.blocks[1]);
+  assert.equal(next.content, "回");
+});
+
+test("desktop projection starts next frame and terminal content appears immediately", () => {
+  const scheduler = new TestFrameScheduler();
+  const store = new StreamProjectionStore(scheduler, advanceWebStreamPresentation);
+  const before = assistant("正");
+  const chunk = assistant("正在检查流式链路");
+
+  publishWebStreamChanges([before], [chunk], store, false);
+  assert.equal(store.read(before.id, before).content, "正");
+  scheduler.advance();
+  assert.equal(store.read(before.id, before).content, "正在检查");
+
+  const terminal = assistant("正在检查流式链路完成", false);
+  publishWebStreamChanges([chunk], [terminal], store, false);
+  assert.equal(store.read(before.id, before), terminal);
+  assert.equal(scheduler.callback, null);
+});
+
+test("a completed push bypasses smoothing even while the target stays marked streaming", () => {
+  const scheduler = new TestFrameScheduler();
+  const store = new StreamProjectionStore(scheduler, advanceWebStreamPresentation);
+  const before = assistant("正");
+  const chunk = assistant("正在检查流式链路");
+  publishWebStreamChanges([before], [chunk], store, false);
+  scheduler.advance();
+
+  const pushed = assistant("主动推送已完成", true);
+  publishWebStreamChanges([chunk], [pushed], store, true);
+
+  assert.equal(store.read(before.id, before), pushed);
+  assert.equal(scheduler.callback, null);
+});
+
+test("a ZWJ emoji sequence is never split across reveals", () => {
+  const before = assistant("");
+  const target = assistant("👨‍👩‍👧好");
+
+  const next = advanceWebStreamPresentation(before, target, 0);
+
+  assert.equal(next.content, "👨‍👩‍👧");
+  assert.equal(Array.from(next.content).length, 5);
+});
+
+test("a non-prefix correction replaces text instead of fabricating an append", () => {
+  const before = assistant("旧前缀");
+  const corrected = assistant("权威纠正");
+
+  const next = advanceWebStreamPresentation(before, corrected, 16.67);
+
+  assert.equal(next, corrected);
+});
+
+test("a 300 grapheme burst drains in under 800ms without batch jumps", () => {
+  const scheduler = new TestFrameScheduler();
+  const store = new StreamProjectionStore(scheduler, advanceWebStreamPresentation);
+  const content = "流式输出".repeat(75);
+  const authoritative = assistant("");
+  let lastLength = 0;
+  let largestFrame = 0;
+  store.subscribe(authoritative.id, () => {
+    const visible = store.read(authoritative.id, authoritative);
+    const length = graphemeCount(visible.content);
+    largestFrame = Math.max(largestFrame, length - lastLength);
+    lastLength = length;
+  });
+
+  store.publish(authoritative.id, authoritative, assistant(content), false);
+  let frames = 0;
+  for (; frames < 600 && scheduler.callback !== null; frames += 1) {
+    scheduler.advance(16.67);
+  }
+
+  assert.equal(store.read(authoritative.id, authoritative).content, content);
+  const drainMs = frames * 16.67;
+  assert.ok(drainMs >= 450 && drainMs < 800, `drain time ${drainMs}ms`);
+  assert.ok(largestFrame <= 12, `largest frame revealed ${largestFrame}`);
+});
+
+test("resuming after a hidden gap reveals only a bounded frame", () => {
+  const scheduler = new TestFrameScheduler();
+  const store = new StreamProjectionStore(scheduler, advanceWebStreamPresentation);
+  const authoritative = assistant("");
+  publishWebStreamChanges([authoritative], [assistant("长文".repeat(100))], store, false);
+  scheduler.advance(16.67);
+  const afterFirst = store.read(authoritative.id, authoritative).content;
+  scheduler.advance(30_000);
+  const afterResume = store.read(authoritative.id, authoritative).content;
+
+  const firstRevealed = graphemeCount(afterFirst);
+  const resumeRevealed = graphemeCount(afterResume) - firstRevealed;
+  assert.ok(firstRevealed <= 12, `first frame revealed ${firstRevealed}`);
+  assert.ok(resumeRevealed > 0 && resumeRevealed <= 12, `resume frame revealed ${resumeRevealed}`);
+});
+
 test("after a 30s hidden gap every sliding one-second window including the recovery frame stays under the 600 g/s cap", () => {
-  // 轨迹从恢复那一帧开始记录：恢复帧必须计入，且枚举所有窗口起点。
+  // 轨迹从恢复那一帧开始记录：旧版测试在 advance(30000) 之后才设置 previous，
+  // 恢复帧的揭示被漏掉，属于假绿。这里恢复帧必须计入，且枚举所有窗口起点。
   for (const hz of [60, 90, 120, 144]) {
     for (const chunkGraphemes of [1, 10, 50]) {
       const { max, recoveryCount } = hiddenGapMaxWindow(hz, chunkGraphemes);
@@ -252,316 +369,74 @@ test("continuous 800 g/s keeps every rolling one-second window under 600 and ave
   }
 });
 
-test("stream projection wakes only the subscribed message row", () => {
-  const scheduler = new TestFrameScheduler();
-  const store = new MobileStreamProjectionStore(scheduler, advanceMobileStreamPresentation);
-  const before = message("assistant:turn", "正");
-  const target = message("assistant:turn", "正在检查流式链路");
-  let activeUpdates = 0;
-  let historyUpdates = 0;
-  store.subscribe("assistant:turn", () => { activeUpdates += 1; });
-  store.subscribe("history", () => { historyUpdates += 1; });
-
-  store.publish(before.id, before, target, false);
-  assert.equal(store.read(before.id, before).content, "正");
-  scheduler.advance();
-
-  assert.equal(store.read(before.id, before).content, "正在检查");
-  assert.equal(activeUpdates, 2);
-  assert.equal(historyUpdates, 0);
-});
-
-test("the first target starts revealing on the very next frame", () => {
-  const scheduler = new TestFrameScheduler();
-  const store = new MobileStreamProjectionStore(scheduler, advanceMobileStreamPresentation);
-  const target = message("assistant:turn", "立即启动");
-
-  store.publish("assistant:turn", message("assistant:turn", ""), target, false);
-  scheduler.advance(0.1);
-
-  assert.ok(store.read("assistant:turn", target).content.length > 0);
-});
-
-test("terminal projection bypasses smoothing and preserves an id migration alias", () => {
-  const scheduler = new TestFrameScheduler();
-  const store = new MobileStreamProjectionStore(scheduler, advanceMobileStreamPresentation);
-  const before = message("assistant:turn", "正在");
-  const terminal = message("message:canonical", "正在分析完成");
-
-  store.publish(before.id, before, terminal, true);
-
-  assert.equal(store.read(before.id, before), terminal);
-  assert.equal(store.read(terminal.id, before), terminal);
-  assert.equal(scheduler.callback, null);
-});
-
-test("presentation applies tool structure immediately and smooths thinking text", () => {
-  const before = message("assistant:turn", "", "先");
-  const target = {
-    ...message("assistant:turn", "", "先检查调用链"),
-    blocks: [
-      { id: "thinking", kind: "thinking", detail: "先检查调用链" },
-      { id: "tool", kind: "tool", detail: "读取配置", state: "running" },
-    ],
-  };
-
-  const next = advanceMobileStreamPresentation(before, target, 16.67);
-
-  assert.equal(next.blocks[0].detail, "先检查");
-  assert.equal(next.blocks[1], target.blocks[1]);
-});
-
-test("answer-only frames preserve the shared process block list", () => {
-  const blocks = [{ id: "tool", kind: "tool", detail: "完成", state: "completed" }];
-  const before = { id: "assistant:turn", content: "回", blocks };
-  const target = { id: "assistant:turn", content: "回答继续", blocks };
-
-  const next = advanceMobileStreamPresentation(before, target, 16.67);
-
-  assert.equal(next.blocks, blocks);
-  assert.equal(next.content, "回答继");
-});
-
-test("a non-prefix correction replaces the visible text immediately", () => {
-  const corrected = message("assistant:turn", "权威纠正");
-
-  const next = advanceMobileStreamPresentation(message("assistant:turn", "旧前缀"), corrected, 16.67);
-
-  assert.equal(next, corrected);
-});
-
-test("resetting for a coarse snapshot does not wake streaming rows twice", () => {
-  const scheduler = new TestFrameScheduler();
-  const store = new MobileStreamProjectionStore(scheduler, advanceMobileStreamPresentation);
-  const before = message("assistant:turn", "正");
-  const target = message("assistant:turn", "正在检查");
-  let updates = 0;
-  store.subscribe(before.id, () => { updates += 1; });
-  store.publish(before.id, before, target, false);
-  scheduler.advance();
-
-  store.clear();
-
-  assert.equal(updates, 2);
-  assert.equal(store.read(before.id, before), before);
-});
-
-test("a 300 grapheme burst drains in under 800ms without batch jumps", () => {
-  const scheduler = new TestFrameScheduler();
-  const store = new MobileStreamProjectionStore(scheduler, advanceMobileStreamPresentation);
-  const content = "流式输出".repeat(75);
-  const authoritative = message("assistant:turn", "");
-  let lastLength = 0;
-  let largestFrame = 0;
-  store.subscribe(authoritative.id, () => {
-    const visible = store.read(authoritative.id, authoritative);
-    const length = graphemeCount(visible.content);
-    largestFrame = Math.max(largestFrame, length - lastLength);
-    lastLength = length;
-  });
-
-  store.publish(authoritative.id, authoritative, message(authoritative.id, content), false);
-  let frames = 0;
-  for (; frames < 600 && scheduler.callback !== null; frames += 1) {
-    scheduler.advance(16.67);
-  }
-
-  assert.equal(store.read(authoritative.id, authoritative).content, content);
-  const drainMs = frames * 16.67;
-  assert.ok(drainMs >= 450 && drainMs < 800, `drain time ${drainMs}ms`);
-  assert.ok(largestFrame <= 12, `largest frame revealed ${largestFrame}`);
-});
-
-test("drain time is refresh-rate independent at 60/90/120/144Hz", () => {
-  const content = "流式输出".repeat(75);
-  const drainWallMs = (frameMs) => {
-    const scheduler = new TestFrameScheduler();
-    const store = new MobileStreamProjectionStore(scheduler, advanceMobileStreamPresentation);
-    const authoritative = message("assistant:turn", "");
-    store.publish(authoritative.id, authoritative, message(authoritative.id, content), false);
-    let frames = 0;
-    for (; frames < 3000 && scheduler.callback !== null; frames += 1) {
-      scheduler.advance(frameMs);
-    }
-    assert.equal(store.read(authoritative.id, authoritative).content, content);
-    return frames * frameMs;
-  };
-
-  const t60 = drainWallMs(16.67);
-  const t90 = drainWallMs(11.11);
-  const t120 = drainWallMs(8.33);
-  const t144 = drainWallMs(6.94);
-  assert.ok(t60 >= 450 && t60 < 800, `60Hz drain ${t60}ms`);
-  for (const [label, t] of [["90", t90], ["120", t120], ["144", t144]]) {
-    assert.ok(Math.abs(t - t60) / t60 < 0.2, `${label}Hz ${t}ms vs 60Hz ${t60}ms`);
-  }
-});
-
-test("resuming after a hidden gap reveals only a bounded frame", () => {
-  const scheduler = new TestFrameScheduler();
-  const store = new MobileStreamProjectionStore(scheduler, advanceMobileStreamPresentation);
-  const authoritative = message("assistant:turn", "");
-  store.publish(authoritative.id, authoritative, message(authoritative.id, "长文".repeat(100)), false);
-  scheduler.advance(16.67);
-  const afterFirst = store.read(authoritative.id, authoritative).content;
-  scheduler.advance(30_000);
-  const afterResume = store.read(authoritative.id, authoritative).content;
-
-  const firstRevealed = graphemeCount(afterFirst);
-  const resumeRevealed = graphemeCount(afterResume) - firstRevealed;
-  assert.ok(firstRevealed <= 12, `first frame revealed ${firstRevealed}`);
-  assert.ok(resumeRevealed > 0 && resumeRevealed <= 12, `resume frame revealed ${resumeRevealed}`);
-});
-
 test("the answer's first grapheme appears within two frames after a large thinking backlog", () => {
   const scheduler = new TestFrameScheduler();
-  const store = new MobileStreamProjectionStore(scheduler, advanceMobileStreamPresentation);
-  const id = "assistant:turn";
-  const thinking = "先".repeat(1000);
-  const thinkingOnly = message(id, "", thinking);
-  const full = message(id, "答", thinking);
-  store.publish(id, message(id, "", ""), thinkingOnly, false);
+  const store = new StreamProjectionStore(scheduler, advanceWebStreamPresentation);
+  const thinking = "思".repeat(1000);
+  const thinkingOnly = assistant("", true, [{ kind: "thinking", content: thinking }]);
+  const full = assistant("答", true, [{ kind: "thinking", content: thinking }]);
+  store.publish("assistant:turn", assistant(""), thinkingOnly, false);
 
   let frames = 0;
-  while (store.read(id, thinkingOnly).blocks[0].detail.length === 0 && frames < 100) {
+  while (store.read("assistant:turn", thinkingOnly).blocks[0].content.length === 0 && frames < 100) {
     scheduler.advance(16.67);
     frames += 1;
   }
   assert.ok(frames > 0 && frames < 100, `thinking started after ${frames} frames`);
 
-  store.publish(id, thinkingOnly, full, false);
+  store.publish("assistant:turn", thinkingOnly, full, false);
   let answerFrames = 0;
-  let content = store.read(id, full).content;
+  let content = store.read("assistant:turn", full).content;
   while (content === "" && answerFrames < 10) {
     scheduler.advance(16.67);
-    content = store.read(id, full).content;
+    content = store.read("assistant:turn", full).content;
     answerFrames += 1;
   }
 
   assert.equal(content, "答");
   assert.ok(answerFrames <= 2, `answer visible after ${answerFrames} frames`);
   // 主 lane（thinking）未被清空：answer 首字出现时 thinking 仍有积压未揭示。
-  const mid = store.read(id, full);
-  assert.ok(mid.blocks[0].detail.length < thinking.length, "thinking must not drain while the answer still streams");
+  const mid = store.read("assistant:turn", full);
+  assert.ok(mid.blocks[0].content.length < thinking.length, "thinking must not drain while the answer still streams");
   while (scheduler.callback !== null) scheduler.advance(16.67);
-  const final = store.read(id, full);
+  const final = store.read("assistant:turn", full);
   assert.equal(final.content, "答");
-  assert.equal(final.blocks[0].detail, thinking);
+  assert.equal(final.blocks[0].content, thinking);
 });
 
 test("thinking's first grapheme appears within two frames after a large answer backlog", () => {
   const scheduler = new TestFrameScheduler();
-  const store = new MobileStreamProjectionStore(scheduler, advanceMobileStreamPresentation);
-  const id = "assistant:turn";
+  const store = new StreamProjectionStore(scheduler, advanceWebStreamPresentation);
   const answer = "答".repeat(1000);
-  const emptyThinking = [{ id: "thinking", kind: "thinking", detail: "" }];
-  const answerOnly = { ...message(id, answer), blocks: emptyThinking };
-  const full = { ...message(id, answer), blocks: [{ id: "thinking", kind: "thinking", detail: "思" }] };
-  store.publish(id, message(id, "", ""), answerOnly, false);
+  const answerOnly = assistant(answer, true, [{ kind: "thinking", content: "" }]);
+  const full = assistant(answer, true, [{ kind: "thinking", content: "思" }]);
+  store.publish("assistant:turn", assistant(""), answerOnly, false);
 
   let frames = 0;
-  while (store.read(id, answerOnly).content.length === 0 && frames < 100) {
+  while (store.read("assistant:turn", answerOnly).content.length === 0 && frames < 100) {
     scheduler.advance(16.67);
     frames += 1;
   }
   assert.ok(frames > 0 && frames < 100, `answer started after ${frames} frames`);
 
-  store.publish(id, answerOnly, full, false);
+  store.publish("assistant:turn", answerOnly, full, false);
   let thinkingFrames = 0;
-  let thinking = store.read(id, full).blocks[0].detail;
+  let thinking = store.read("assistant:turn", full).blocks[0].content;
   while (thinking === "" && thinkingFrames < 10) {
     scheduler.advance(16.67);
-    thinking = store.read(id, full).blocks[0].detail;
+    thinking = store.read("assistant:turn", full).blocks[0].content;
     thinkingFrames += 1;
   }
 
   assert.equal(thinking, "思");
   assert.ok(thinkingFrames <= 2, `thinking visible after ${thinkingFrames} frames`);
   // 主 lane（answer）未被清空：thinking 首字出现时 answer 仍有积压未揭示。
-  const mid = store.read(id, full);
+  const mid = store.read("assistant:turn", full);
   assert.ok(mid.content.length > 0 && mid.content.length < answer.length, "answer must keep streaming, not drain early");
   while (scheduler.callback !== null) scheduler.advance(16.67);
-  const final = store.read(id, full);
+  const final = store.read("assistant:turn", full);
   assert.equal(final.content, answer);
-  assert.equal(final.blocks[0].detail, "思");
-});
-
-test("a ZWJ emoji sequence is never split across reveals", () => {
-  const target = message("assistant:turn", "👨‍👩‍👧好");
-  const next = advanceMobileStreamPresentation(message("assistant:turn", ""), target, 0);
-
-  assert.equal(next.content, "👨‍👩‍👧");
-  assert.equal(Array.from(next.content).length, 5);
-});
-
-test("cross-delta ZWJ sequences never show a dangling joiner", () => {
-  const scheduler = new TestFrameScheduler();
-  const store = new MobileStreamProjectionStore(scheduler, advanceMobileStreamPresentation);
-  const id = "assistant:turn";
-  const fallback = message(id, "");
-  const firstTarget = message(id, "👨");
-  store.publish(id, fallback, firstTarget, false);
-  scheduler.advance(16.67);
-  assert.equal(store.read(id, fallback).content, "👨");
-
-  // 后续 delta 从 ZWJ 续接开始：已揭示尾簇被扩展，同一次 publish 原子替换
-  // 为完整新簇，任何时刻可见文本都是最新 target 的 EGC 序列前缀。
-  const fullTarget = message(id, "👨‍👩‍👧好");
-  store.publish(id, firstTarget, fullTarget, false);
-  const afterPublish = store.read(id, fallback);
-  assert.equal(afterPublish.content, "👨‍👩‍👧", "atomic replace right at publish");
-  assertEgcPrefix(fullTarget.content, afterPublish.content, "after atomic publish");
-  assert.equal(streamStateOf(afterPublish).queued, 1, "only 好 stays queued");
-  let frames = 0;
-  let visible = afterPublish;
-  while (visible.content !== "👨‍👩‍👧好" && frames < 600) {
-    scheduler.advance(16.67);
-    frames += 1;
-    visible = store.read(id, fallback);
-    assertEgcPrefix(fullTarget.content, visible.content, `frame ${frames}`);
-  }
-  assert.equal(visible.content, "👨‍👩‍👧好");
-});
-
-test("a 50k grapheme backlog is never scanned on a single frame", () => {
-  const content = "字".repeat(50_000);
-  const target = message("assistant:turn", content);
-  const first = advanceMobileStreamPresentation(message("assistant:turn", ""), target, 0);
-  const state = streamStateOf(first);
-  assert.ok(state.queued >= 49_999, `queued ${state.queued}`);
-
-  const queue = state.content;
-  let reads = 0;
-  queue.bounds = new Proxy(queue.bounds, {
-    get(bounds, property) {
-      reads += 1;
-      const value = Reflect.get(bounds, property);
-      return typeof value === "function" ? value.bind(bounds) : value;
-    },
-  });
-
-  let worst = 0;
-  let current = first;
-  const readsBefore = reads;
-  for (let frame = 0; frame < 200; frame += 1) {
-    const before = reads;
-    current = advanceMobileStreamPresentation(current, target, 16.67);
-    worst = Math.max(worst, reads - before);
-
-    // 必须持续消费同一个队列对象：任何重分割都会把 5 万积压重新全量入队。
-    assert.equal(streamStateOf(current)?.content, queue, `re-segmented at frame ${frame}`);
-    // 可见文本始终是权威 source 的精确前缀（只按可见长度核对，不扫描积压）。
-    assert.equal(current.content, content.slice(0, current.content.length), `prefix violated at frame ${frame}`);
-  }
-
-  // 每帧只能接触 O(budget) 个边界，绝不遍历 5 万积压。
-  assert.ok(worst <= 60, `worst frame touched ${worst} bounds entries`);
-  const consumed = reads - readsBefore;
-  assert.ok(consumed <= 4000, `consumed ${consumed} reads across 200 frames`);
-
-  // 按 600 g/s 上限以 ~10 grapheme/帧 有界推进。
-  const visible = graphemeCount(current.content);
-  assert.ok(visible >= 1500 && visible <= 2500, `visible ${visible} after 200 frames`);
+  assert.equal(final.blocks[0].content, "思");
 });
 
 test("continuous 400 g/s keeps P95 visible lag under 100ms at 60/90/120/144Hz", () => {
@@ -569,8 +444,6 @@ test("continuous 400 g/s keeps P95 visible lag under 100ms at 60/90/120/144Hz", 
     const { samples } = runStreamSimulation(hz, 400);
     const p95 = percentile(samples, 0.95);
     assert.ok(p95 <= 100, `${hz}Hz P95 lag ${p95.toFixed(1)}ms`);
-
-    // 滞后不无界增长：后段均值不超过前段的 1.3 倍。
     const early = samples.slice(hz * 2, hz * 5);
     const late = samples.slice(hz * 7, hz * 10);
     const bound = mean(early) * 1.3 + 10;
@@ -583,7 +456,7 @@ test("a 100 g/s source is never artificially slowed down", () => {
     const { samples, store, id, fallback, published, authoritative } = runStreamSimulation(hz, 100);
     const p95 = percentile(samples, 0.95);
     assert.ok(p95 <= 150, `${hz}Hz 100g/s P95 lag ${p95.toFixed(1)}ms`);
-    assert.ok(Math.max(...samples) <= 250, `${hz}Hz 100g/s max lag ${Math.max(...samples).toFixed(1)}ms`);
+    assert.ok(Math.max(...samples) <= 250, `${hz}Hz max lag ${Math.max(...samples).toFixed(1)}ms`);
     assert.ok(published >= 990, `${hz}Hz published ${published}`);
     // 连续发布后完整字符串必须与权威 source 逐字符相等（无重复、无错序）。
     assert.equal(store.read(id, fallback).content, authoritative.content);
@@ -591,18 +464,17 @@ test("a 100 g/s source is never artificially slowed down", () => {
 });
 
 test("cross-delta cluster extensions replace the visible tail atomically without spending tokens", () => {
-  const id = "assistant:turn";
-  const target = message(id, "先👨‍好");
-  const empty = message(id, "");
+  const target = assistant("先👨‍好");
+  const empty = assistant("");
 
   // 帧 1（elapsed 0）：fresh 保底揭示 1 个 EGC"先"，形成负债务。
-  let current = advanceMobileStreamPresentation(empty, target, 0);
+  let current = advanceWebStreamPresentation(empty, target, 0);
   assert.equal(current.content, "先");
   let state = streamStateOf(current);
   assert.ok(state.token < 0, `fresh floor borrowed: token ${state.token}`);
 
   // 帧 2（1ms）：收益不足以偿还债务，本帧不揭示 —— 债务偿还的节奏。
-  current = advanceMobileStreamPresentation(current, target, 1);
+  current = advanceWebStreamPresentation(current, target, 1);
   assert.equal(current.content, "先");
 
   // 逐帧推进直到排空：任何帧都是 EGC 序列前缀，完整簇"👨\u200D"、"好"逐项揭示。
@@ -610,17 +482,17 @@ test("cross-delta cluster extensions replace the visible tail atomically without
   for (; frame < 200; frame += 1) {
     assertEgcPrefix(target.content, current.content, `frame ${frame}`);
     if (streamStateOf(current).queued === 0) break;
-    current = advanceMobileStreamPresentation(current, target, 16.67);
+    current = advanceWebStreamPresentation(current, target, 16.67);
   }
   assert.ok(frame < 200, "target must drain");
-  assert.equal(current.content, "先👨‍好");
+  assert.equal(current.content, "先👨\u200D好");
   assert.equal(streamStateOf(current).queued, 0);
 
   // 扩展 delta：已揭示尾"好"被组合音标扩展 → 同一次提交原子替换为完整新簇，
   // 不新增 grapheme、不消耗 pacing 配额（token 原样保留）。
-  const extended = message(id, "先👨‍好\u0301");
+  const extended = assistant("先👨‍好\u0301");
   const tokenBefore = streamStateOf(current).token;
-  const next = advanceMobileStreamPresentation(current, extended, 0);
+  const next = advanceWebStreamPresentation(current, extended, 0);
   assert.equal(next.content, "先👨‍好\u0301");
   state = streamStateOf(next);
   assert.equal(state.queued, 0);
@@ -630,14 +502,14 @@ test("cross-delta cluster extensions replace the visible tail atomically without
 
 test("a complete trailing cluster displays and a later extension merges atomically", () => {
   const scheduler = new TestFrameScheduler();
-  const store = new MobileStreamProjectionStore(scheduler, advanceMobileStreamPresentation);
+  const store = new StreamProjectionStore(scheduler, advanceWebStreamPresentation);
   const id = "assistant:turn";
-  const fallback = message(id, "");
+  const fallback = assistant("");
   const tail = "先".repeat(10) + "👨‍";
-  store.publish(id, fallback, message(id, tail), false);
+  publishWebStreamChanges([fallback], [assistant(tail)], store, false);
 
   // 逐帧推进：每一帧可见文本都是 target 的 EGC 序列前缀；
-  // "👨\u200D" 是当时 target 下的完整簇，正常显示（不为未来未知 delta 按住）。
+  // "👨‍" 是当时 target 下的完整簇，正常显示（不为未来未知 delta 按住）。
   let frames = 0;
   let visible = store.read(id, fallback);
   while (frames < 200 && graphemeCount(visible.content) < 11) {
@@ -649,9 +521,9 @@ test("a complete trailing cluster displays and a later extension merges atomical
   assert.ok(frames < 200, "a complete trailing cluster must reveal, not be held forever");
   assert.equal(visible.content, tail);
 
-  // 后续 delta"好"不与"👨\u200D"合并：正常揭示，最终精确。
-  const full = message(id, tail + "好");
-  store.publish(id, message(id, tail), full, false);
+  // 后续 delta"好"不与"👨‍"合并：正常揭示，最终精确。
+  const full = assistant(tail + "好");
+  publishWebStreamChanges([assistant(tail)], [full], store, false);
   let releaseFrames = 0;
   while (scheduler.callback !== null && releaseFrames < 100) {
     scheduler.advance(16.67);
@@ -664,16 +536,21 @@ test("a complete trailing cluster displays and a later extension merges atomical
 
 test("structure-only publishes keep the queued content and thinking text intact", () => {
   const scheduler = new TestFrameScheduler();
-  const store = new MobileStreamProjectionStore(scheduler, advanceMobileStreamPresentation);
+  const store = new StreamProjectionStore(scheduler, advanceWebStreamPresentation);
   const id = "assistant:turn";
-  const t1 = {
-    ...message(id, "回答内容", "思考过程"),
-    blocks: [
-      { id: "think", kind: "thinking", detail: "思考过程" },
-      { id: "tool", kind: "tool", detail: "工具A", state: "running" },
-    ],
-  };
-  store.publish(id, message(id, ""), t1, false);
+  const t1 = assistant("回答内容", true, [
+    { kind: "thinking", content: "思考过程" },
+    {
+      kind: "tool",
+      callId: "call:1",
+      name: "read",
+      status: "input-available",
+      input: {},
+      output: undefined,
+      errorText: undefined,
+    },
+  ]);
+  publishWebStreamChanges([assistant("")], [t1], store, false);
   scheduler.advance(16.67);
   const mid = store.read(id, t1);
   assert.ok(mid.content.length < "回答内容".length, "streaming in progress before structure-only publish");
@@ -682,29 +559,37 @@ test("structure-only publishes keep the queued content and thinking text intact"
     ...t1,
     blocks: [
       ...t1.blocks,
-      { id: "tool2", kind: "tool", detail: "工具B", state: "queued" },
+      {
+        kind: "tool",
+        callId: "call:2",
+        name: "write",
+        status: "input-available",
+        input: {},
+        output: undefined,
+        errorText: undefined,
+      },
     ],
   };
-  store.publish(id, t1, t2, false);
+  publishWebStreamChanges([t1], [t2], store, false);
   while (scheduler.callback !== null) scheduler.advance(16.67);
 
   const visible = store.read(id, t2);
   assert.equal(visible.content, "回答内容");
-  assert.equal(visible.blocks[0].detail, "思考过程");
+  assert.equal(visible.blocks[0].content, "思考过程");
   assert.equal(visible.blocks[1], t2.blocks[1]);
   assert.equal(visible.blocks[2], t2.blocks[2]);
 });
 
 test("a non-prefix correction through the store replaces the projection immediately", () => {
   const scheduler = new TestFrameScheduler();
-  const store = new MobileStreamProjectionStore(scheduler, advanceMobileStreamPresentation);
-  const before = message("assistant:turn", "正在流式输出");
-  const streaming = message("assistant:turn", "正在流式输出更多");
-  store.publish(before.id, before, streaming, false);
+  const store = new StreamProjectionStore(scheduler, advanceWebStreamPresentation);
+  const before = assistant("正在流式输出");
+  const streaming = assistant("正在流式输出更多");
+  publishWebStreamChanges([before], [streaming], store, false);
   scheduler.advance();
 
-  const corrected = message("assistant:turn", "权威纠正");
-  store.publish(streaming.id, streaming, corrected, false);
+  const corrected = assistant("权威纠正");
+  publishWebStreamChanges([streaming], [corrected], store, false);
 
   assert.equal(store.read(before.id, before), corrected);
   assert.equal(scheduler.callback, null);
@@ -712,22 +597,19 @@ test("a non-prefix correction through the store replaces the projection immediat
 
 test("multiple thinking queues share the frame budget fairly", () => {
   const scheduler = new TestFrameScheduler();
-  const store = new MobileStreamProjectionStore(scheduler, advanceMobileStreamPresentation);
+  const store = new StreamProjectionStore(scheduler, advanceWebStreamPresentation);
   const id = "assistant:turn";
   const thinking = "思".repeat(200);
-  const target = {
-    ...message(id, "", thinking),
-    blocks: [
-      { id: "a", kind: "thinking", detail: thinking },
-      { id: "b", kind: "thinking", detail: thinking },
-    ],
-  };
-  store.publish(id, message(id, ""), target, false);
+  const target = assistant("", true, [
+    { kind: "thinking", content: thinking },
+    { kind: "thinking", content: thinking },
+  ]);
+  publishWebStreamChanges([assistant("")], [target], store, false);
   for (let frame = 0; frame < 12; frame += 1) scheduler.advance(16.67);
 
   const visible = store.read(id, target);
-  const a = graphemeCount(visible.blocks[0].detail);
-  const b = graphemeCount(visible.blocks[1].detail);
+  const a = graphemeCount(visible.blocks[0].content);
+  const b = graphemeCount(visible.blocks[1].content);
   assert.ok(a > 0 && b > 0, `both queues revealed: a=${a} b=${b}`);
   assert.ok(Math.abs(a - b) <= 4, `fair shares: a=${a} b=${b}`);
 });
@@ -762,91 +644,113 @@ test("an 800 g/s source never lets the consumer exceed the 600 g/s cap", () => {
 });
 
 test("trailing ZWJ-ending clusters reveal as complete EGCs and stay exact EGC prefixes", () => {
-  const id = "assistant:turn";
-  const target = message(id, "字\u200D字\u200D");
-  const empty = message(id, "");
+  const target = assistant("字\u200D字\u200D");
+  const empty = assistant("");
 
   // "字\u200D" 是当时 target 下的完整 EGC：正常揭示，任何时刻都是 EGC 序列前缀
   // （不再为未来未知 delta 按住，也不允许展示半簇"字"）。
-  let current = advanceMobileStreamPresentation(empty, target, 0);
+  let current = advanceWebStreamPresentation(empty, target, 0);
   for (let frame = 0; frame < 120; frame += 1) {
     assertEgcPrefix(target.content, current.content, `frame ${frame}`);
     if (current.content === "字\u200D字\u200D") break;
-    current = advanceMobileStreamPresentation(current, target, 16.67);
+    current = advanceWebStreamPresentation(current, target, 16.67);
   }
   assert.equal(current.content, "字\u200D字\u200D");
 
   // 追加安全 grapheme 后按权威 EGC 序列继续揭示，最终精确。
-  const full = message(id, "字\u200D字\u200D好");
+  const full = assistant("字\u200D字\u200D好");
   for (let frame = 0; frame < 200; frame += 1) {
-    current = advanceMobileStreamPresentation(current, full, 16.67);
+    current = advanceWebStreamPresentation(current, full, 16.67);
     assertEgcPrefix(full.content, current.content, `release frame ${frame}`);
   }
   assert.equal(current.content, "字\u200D字\u200D好");
 });
 
-test("reconcile drops converged projections so read falls back to the baseline", () => {
-  const scheduler = new TestFrameScheduler();
-  const store = new MobileStreamProjectionStore(scheduler, advanceMobileStreamPresentation);
-  const id = "assistant:turn";
-  const fallback = message(id, "");
-  const target = message(id, "短句");
-  store.publish(id, fallback, target, false);
-  let frames = 0;
-  while (scheduler.callback !== null && frames < 100) {
-    scheduler.advance(16.67);
-    frames += 1;
+test("a 50k grapheme backlog is never scanned on a single frame", () => {
+  const content = "字".repeat(50_000);
+  const target = assistant(content, true, []);
+  const first = advanceWebStreamPresentation(assistant(""), target, 0);
+  const state = streamStateOf(first);
+  assert.ok(state.queued >= 49_999, `queued ${state.queued}`);
+
+  const queue = state.content;
+  let reads = 0;
+  queue.bounds = new Proxy(queue.bounds, {
+    get(bounds, property) {
+      reads += 1;
+      const value = Reflect.get(bounds, property);
+      return typeof value === "function" ? value.bind(bounds) : value;
+    },
+  });
+
+  let worst = 0;
+  let current = first;
+  const readsBefore = reads;
+  for (let frame = 0; frame < 200; frame += 1) {
+    const before = reads;
+    current = advanceWebStreamPresentation(current, target, 16.67);
+    worst = Math.max(worst, reads - before);
+
+    // 必须持续消费同一个队列对象：任何重分割都会把 5 万积压重新全量入队。
+    assert.equal(streamStateOf(current)?.content, queue, `re-segmented at frame ${frame}`);
+    // 可见文本始终是权威 source 的精确前缀（只按可见长度核对，不扫描积压）。
+    assert.equal(current.content, content.slice(0, current.content.length), `prefix violated at frame ${frame}`);
   }
-  assert.equal(store.read(id, fallback).content, "短句");
 
-  store.reconcileBaseline([target]);
-  assert.equal(store.read(id, fallback), fallback);
-});
+  // 每帧只能接触 O(budget) 个边界，绝不遍历 5 万积压。
+  assert.ok(worst <= 60, `worst frame touched ${worst} bounds entries`);
+  const consumed = reads - readsBefore;
+  assert.ok(consumed <= 4000, `consumed ${consumed} reads across 200 frames`);
 
-test("frame budget is time-based with a rate that adapts to backlog", () => {
-  assert.equal(mobileStreamFrameBudget(16.67, 0), 0);
-  assert.equal(mobileStreamFrameBudget(0, 5), 0);
-  assert.equal(mobileStreamFrameBudget(16.67, 5), 2);
-  assert.equal(mobileStreamFrameBudget(16.67, 48), 10);
-  assert.equal(mobileStreamFrameBudget(16.67, 1000), 10);
-  assert.equal(mobileStreamFrameBudget(250, 100000), 12);
-  assert.equal(streamRate(0), 120);
-  assert.equal(streamRate(48), 600);
-  assert.equal(streamRate(1000), 600);
+  // 按 600 g/s 上限以 ~10 grapheme/帧 有界推进。
+  const visible = graphemeCount(current.content);
+  assert.ok(visible >= 1500 && visible <= 2500, `visible ${visible} after 200 frames`);
 });
 
 test("flushStreamingTexts reveals every queued grapheme exactly and cleans the projection state", () => {
-  const target = {
-    ...message("assistant:turn", "回答内容", "思考过程"),
-    blocks: [
-      { id: "thinking", kind: "thinking", detail: "思考过程" },
-      { id: "tool", kind: "tool", detail: "工具", state: "running" },
-    ],
-  };
+  const target = assistant("回答内容", true, [
+    { kind: "thinking", content: "思考过程" },
+    {
+      kind: "tool",
+      callId: "call:1",
+      name: "read",
+      status: "input-available",
+      input: {},
+      output: undefined,
+      errorText: undefined,
+    },
+  ]);
 
-  const flushed = flushStreamingTexts(message("assistant:turn", "回", "思"), target);
+  const flushed = flushStreamingTexts(assistant("回"), target);
 
   assert.equal(flushed.content, "回答内容");
-  assert.equal(flushed.blocks[0].detail, "思考过程");
+  assert.equal(flushed.blocks[0].content, "思考过程");
   assert.equal(flushed.blocks[1], target.blocks[1]);
+  assert.equal(flushed.streaming, true, "authoritative fields are never fabricated");
   const state = streamStateOf(flushed);
   assert.equal(state.queued, 0);
   assert.equal(state.token, 0);
   assert.equal(state.content, null);
 });
 
+test("flushStreamingTexts on a non-prefix correction reveals the authoritative text verbatim", () => {
+  const corrected = assistant("权威纠正");
+
+  const flushed = flushStreamingTexts(assistant("旧前缀"), corrected);
+
+  assert.equal(flushed.content, "权威纠正");
+  assert.equal(streamStateOf(flushed).queued, 0);
+});
+
 test("flushAll reveals a standing backlog without further publishes and notifies each row once", () => {
   const scheduler = new TestFrameScheduler();
-  const store = new MobileStreamProjectionStore(scheduler, advanceMobileStreamPresentation);
+  const store = new StreamProjectionStore(scheduler, advanceWebStreamPresentation);
   const id = "assistant:turn";
-  const fallback = message(id, "");
+  const fallback = assistant("");
   const thinking = "思".repeat(300);
   const content = "答".repeat(300);
-  const target = {
-    ...message(id, content, thinking),
-    blocks: [{ id: "thinking", kind: "thinking", detail: thinking }],
-  };
-  store.publish(id, fallback, target, false);
+  const target = assistant(content, true, [{ kind: "thinking", content: thinking }]);
+  publishWebStreamChanges([fallback], [target], store, false);
   scheduler.advance(16.67);
   const before = store.read(id, fallback);
   assert.ok(before.content.length < content.length, "backlog must be pending before flushAll");
@@ -859,7 +763,8 @@ test("flushAll reveals a standing backlog without further publishes and notifies
 
   const after = store.read(id, fallback);
   assert.equal(after.content, content, "flushAll reveals the full answer without a new delta");
-  assert.equal(after.blocks[0].detail, thinking, "flushAll reveals the full thinking text");
+  assert.equal(after.blocks[0].content, thinking, "flushAll reveals the full thinking text");
+  assert.equal(after.streaming, true, "flushAll must not fabricate a terminal state");
   assert.equal(notifications, 1, "affected row notified exactly once");
   assert.equal(idleNotifications, 0, "unaffected rows stay quiet");
   assert.equal(scheduler.callback, null, "no residual frame after flushAll");
@@ -868,11 +773,8 @@ test("flushAll reveals a standing backlog without further publishes and notifies
   assert.equal(state.token, 0);
 
   // 清理后再次 publish 的增量照常入队推进，不残留旧队列状态。
-  const more = {
-    ...message(id, content + "答".repeat(50), thinking),
-    blocks: [{ id: "thinking", kind: "thinking", detail: thinking }],
-  };
-  store.publish(id, message(id, content), more, false);
+  const more = assistant(content + "答".repeat(50), true, [{ kind: "thinking", content: thinking }]);
+  publishWebStreamChanges([assistant(content)], [more], store, false);
   scheduler.advance(16.67);
   const resumed = store.read(id, fallback);
   assert.ok(resumed.content.length > content.length && resumed.content.length < more.content.length, "pacing resumes from the flushed baseline");
@@ -882,11 +784,11 @@ test("flushAll reveals a standing backlog without further publishes and notifies
 
 test("flushAll with no pending backlog cancels nothing and stays silent", () => {
   const scheduler = new TestFrameScheduler();
-  const store = new MobileStreamProjectionStore(scheduler, advanceMobileStreamPresentation);
-  const id = "assistant:turn";
-  store.publish(id, message(id, ""), message(id, "终态"), true);
+  const store = new StreamProjectionStore(scheduler, advanceWebStreamPresentation);
+  const fallback = assistant("");
+  store.publish("assistant:turn", fallback, assistant("终态", false), true);
   let notifications = 0;
-  store.subscribe(id, () => { notifications += 1; });
+  store.subscribe("assistant:turn", () => { notifications += 1; });
 
   store.flushAll();
 
@@ -914,11 +816,11 @@ function fakeMediaQueryList() {
 
 test("the reduced-motion listener flushes the backlog on switch to reduce and detaches on cleanup", () => {
   const scheduler = new TestFrameScheduler();
-  const store = new MobileStreamProjectionStore(scheduler, advanceMobileStreamPresentation);
+  const store = new StreamProjectionStore(scheduler, advanceWebStreamPresentation);
   const id = "assistant:turn";
-  const fallback = message(id, "");
+  const fallback = assistant("");
   const content = "长文".repeat(50);
-  store.publish(id, fallback, message(id, content), false);
+  publishWebStreamChanges([fallback], [assistant(content)], store, false);
 
   const media = fakeMediaQueryList();
   const detach = attachReducedMotionFlush(store, media);
@@ -934,20 +836,20 @@ test("the reduced-motion listener flushes the backlog on switch to reduce and de
   detach();
   assert.equal(media.listeners.size, 0, "cleanup must remove the change listener");
 
-  const more = message(id, content + "更多");
-  store.publish(id, message(id, content), more, false);
+  const more = assistant(content + "更多");
+  publishWebStreamChanges([assistant(content)], [more], store, false);
   media.fire(true);
   assert.ok(store.read(id, fallback).content.length < more.content.length, "a detached listener must not flush");
 });
 
 test("compactQueue rebases a 13k double-UTF-16 backlog exactly and appends 1k more without loss", () => {
   const scheduler = new TestFrameScheduler();
-  const store = new MobileStreamProjectionStore(scheduler, advanceMobileStreamPresentation);
+  const store = new StreamProjectionStore(scheduler, advanceWebStreamPresentation);
   const id = "assistant:turn";
-  const fallback = message(id, "");
+  const fallback = assistant("");
   const unit = "👨";
   const first = unit.repeat(13_000);
-  store.publish(id, fallback, message(id, first), false);
+  publishWebStreamChanges([fallback], [assistant(first)], store, false);
 
   const queueBefore = streamStateOf(store.read(id, fallback)).content;
   let frames = 0;
@@ -963,8 +865,8 @@ test("compactQueue rebases a 13k double-UTF-16 backlog exactly and appends 1k mo
   assert.equal(mid.content.length % unit.length, 0, "reveals must never split a surrogate pair");
   assert.ok(streamStateOf(mid).content.text.length < first.length, "compaction must have rebased the queued text");
 
-  const full = message(id, first + unit.repeat(1000));
-  store.publish(id, message(id, first), full, false);
+  const full = assistant(first + unit.repeat(1000));
+  publishWebStreamChanges([assistant(first)], [full], store, false);
   let guard = 0;
   while (scheduler.callback !== null && guard < 3000) {
     scheduler.advance(16.67);
@@ -992,13 +894,13 @@ test("cross-delta EGC extensions in an unrevealed backlog never split clusters",
     "a\u0301👍🏽🇺🇸👩\u200D💻",
   ];
   const scheduler = new TestFrameScheduler();
-  const store = new MobileStreamProjectionStore(scheduler, advanceMobileStreamPresentation);
+  const store = new StreamProjectionStore(scheduler, advanceWebStreamPresentation);
   const id = "assistant:turn";
-  const fallback = message(id, "");
+  const fallback = assistant("");
   let authoritative = fallback;
   for (const text of steps) {
-    const target = message(id, text);
-    store.publish(id, authoritative, target, false);
+    const target = assistant(text);
+    publishWebStreamChanges([authoritative], [target], store, false);
     authoritative = target;
     const projection = store.read(id, fallback);
     assertEgcPrefix(authoritative.content, projection.content, `publish ${JSON.stringify(text)}`);
@@ -1025,16 +927,16 @@ test("an already-revealed base EGC is atomically replaced when the extension del
     ["👩", "👩\u200D💻"],
   ]) {
     const scheduler = new TestFrameScheduler();
-    const store = new MobileStreamProjectionStore(scheduler, advanceMobileStreamPresentation);
+    const store = new StreamProjectionStore(scheduler, advanceWebStreamPresentation);
     const id = "assistant:turn";
-    const fallback = message(id, "");
-    store.publish(id, fallback, message(id, base), false);
+    const fallback = assistant("");
+    publishWebStreamChanges([fallback], [assistant(base)], store, false);
     while (scheduler.callback !== null) scheduler.advance(16.67);
     assert.equal(store.read(id, fallback).content, base, `base ${base} must drain`);
 
     // 基础 EGC 已可见后才收到扩展 delta：下一次 publish 立即原子替换。
     const visibleBefore = graphemeCount(store.read(id, fallback).content);
-    store.publish(id, message(id, base), message(id, extended), false);
+    publishWebStreamChanges([assistant(base)], [assistant(extended)], store, false);
     const projection = store.read(id, fallback);
     assert.equal(projection.content, extended, `atomic replace ${base} -> ${extended}`);
     assertEgcPrefix(extended, projection.content, `atomic replace ${base}`);
@@ -1044,7 +946,7 @@ test("an already-revealed base EGC is atomically replaced when the extension del
 
     // 原子替换不消耗 pacing/rolling 配额：随后 delta 的揭示照常精确。
     const more = extended + "b";
-    store.publish(id, message(id, extended), message(id, more), false);
+    publishWebStreamChanges([assistant(extended)], [assistant(more)], store, false);
     while (scheduler.callback !== null) scheduler.advance(16.67);
     assert.equal(store.read(id, fallback).content, more);
   }
@@ -1056,13 +958,13 @@ test("three-segment family emoji and consecutive combining marks stay exact acro
     [["e", "e\u0301", "e\u0301\u0302", "e\u0301\u0302\u0303"], "e\u0301\u0302\u0303"],
   ]) {
     const scheduler = new TestFrameScheduler();
-    const store = new MobileStreamProjectionStore(scheduler, advanceMobileStreamPresentation);
+    const store = new StreamProjectionStore(scheduler, advanceWebStreamPresentation);
     const id = "assistant:turn";
-    const fallback = message(id, "");
+    const fallback = assistant("");
     let authoritative = fallback;
     for (const text of steps) {
-      const target = message(id, text);
-      store.publish(id, authoritative, target, false);
+      const target = assistant(text);
+      publishWebStreamChanges([authoritative], [target], store, false);
       authoritative = target;
       const projection = store.read(id, fallback);
       assertEgcPrefix(authoritative.content, projection.content, `step ${JSON.stringify(text)}`);
@@ -1080,53 +982,47 @@ test("three-segment family emoji and consecutive combining marks stay exact acro
 
 test("thinking and answer lanes repair cross-delta clusters independently without bleeding", () => {
   const scheduler = new TestFrameScheduler();
-  const store = new MobileStreamProjectionStore(scheduler, advanceMobileStreamPresentation);
+  const store = new StreamProjectionStore(scheduler, advanceWebStreamPresentation);
   const id = "assistant:turn";
-  const fallback = message(id, "");
-  const t1 = message(id, "a", "e");
-  store.publish(id, fallback, t1, false);
+  const fallback = assistant("");
+  const t1 = assistant("a", true, [{ kind: "thinking", content: "e" }]);
+  publishWebStreamChanges([fallback], [t1], store, false);
   scheduler.advance(16.67);
-  const t2 = message(id, "a\u0301", "e\u0301");
-  store.publish(id, t1, t2, false);
+  const t2 = assistant("a\u0301", true, [{ kind: "thinking", content: "e\u0301" }]);
+  publishWebStreamChanges([t1], [t2], store, false);
   const projection = store.read(id, fallback);
   assert.equal(projection.content, "a\u0301");
-  assert.equal(projection.blocks[0].detail, "e\u0301");
+  assert.equal(projection.blocks[0].content, "e\u0301");
   assertEgcPrefix(t2.content, projection.content, "answer lane");
-  assertEgcPrefix(t2.blocks[0].detail, projection.blocks[0].detail, "thinking lane");
+  assertEgcPrefix(t2.blocks[0].content, projection.blocks[0].content, "thinking lane");
   assert.equal(streamStateOf(projection).queued, 0, "both lanes fully replaced");
 
   // 两个 thinking 块各自隔离：一个块的尾簇扩展不会与另一个块拼接。
   const scheduler2 = new TestFrameScheduler();
-  const store2 = new MobileStreamProjectionStore(scheduler2, advanceMobileStreamPresentation);
-  const multi = {
-    ...message(id, "", "e"),
-    blocks: [
-      { id: "think1", kind: "thinking", detail: "e" },
-      { id: "think2", kind: "thinking", detail: "f" },
-    ],
-  };
-  store2.publish(id, message(id, ""), multi, false);
+  const store2 = new StreamProjectionStore(scheduler2, advanceWebStreamPresentation);
+  const multi = assistant("", true, [
+    { kind: "thinking", content: "e" },
+    { kind: "thinking", content: "f" },
+  ]);
+  publishWebStreamChanges([assistant("")], [multi], store2, false);
   while (scheduler2.callback !== null) scheduler2.advance(16.67);
-  const multiExt = {
-    ...message(id, "", "e\u0301"),
-    blocks: [
-      { id: "think1", kind: "thinking", detail: "e\u0301" },
-      { id: "think2", kind: "thinking", detail: "f" },
-    ],
-  };
-  store2.publish(id, multi, multiExt, false);
+  const multiExt = assistant("", true, [
+    { kind: "thinking", content: "e\u0301" },
+    { kind: "thinking", content: "f" },
+  ]);
+  publishWebStreamChanges([multi], [multiExt], store2, false);
   const seen = store2.read(id, fallback);
-  assert.equal(seen.blocks[0].detail, "e\u0301", "block 0 tail replaced atomically");
-  assert.equal(seen.blocks[1].detail, "f", "unrelated block must not absorb another block's tail");
+  assert.equal(seen.blocks[0].content, "e\u0301", "block 0 tail replaced atomically");
+  assert.equal(seen.blocks[1].content, "f", "unrelated block must not absorb another block's tail");
 });
 
 test("after compactQueue rebase a later extension tail repairs exactly without duplication or loss", () => {
   const scheduler = new TestFrameScheduler();
-  const store = new MobileStreamProjectionStore(scheduler, advanceMobileStreamPresentation);
+  const store = new StreamProjectionStore(scheduler, advanceWebStreamPresentation);
   const id = "assistant:turn";
-  const fallback = message(id, "");
+  const fallback = assistant("");
   const base = "字".repeat(6000) + "a";
-  store.publish(id, fallback, message(id, base), false);
+  publishWebStreamChanges([fallback], [assistant(base)], store, false);
 
   // 排空越过 compaction 阈值（4096）后仍留积压，随后发布扩展组合音标。
   let frames = 0;
@@ -1139,8 +1035,8 @@ test("after compactQueue rebase a later extension tail repairs exactly without d
   assert.ok(streamStateOf(mid).content.text.length < base.length, "compaction must have rebased the queued text");
   assert.ok(graphemeCount(mid.content) < graphemeCount(base), "must still be streaming before the extension");
 
-  const extended = message(id, base + "\u0301");
-  store.publish(id, message(id, base), extended, false);
+  const extended = assistant(base + "\u0301");
+  publishWebStreamChanges([assistant(base)], [extended], store, false);
   let guard = 0;
   while (scheduler.callback !== null && guard < 3000) {
     scheduler.advance(16.67);
@@ -1153,8 +1049,8 @@ test("after compactQueue rebase a later extension tail repairs exactly without d
   assert.equal(graphemeCount(extended.content), 6001);
 
   // 完全排空后再次扩展：可见尾原子替换，同样不重复不丢失。
-  const extended2 = message(id, base + "\u0301\u0302");
-  store.publish(id, message(id, extended.content), extended2, false);
+  const extended2 = assistant(base + "\u0301\u0302");
+  publishWebStreamChanges([assistant(extended.content)], [extended2], store, false);
   const replaced = store.read(id, fallback);
   assert.equal(replaced.content, base + "\u0301\u0302", "fully-drained tail replaced atomically after compaction");
   assert.equal(streamStateOf(replaced).queued, 0);
@@ -1169,10 +1065,10 @@ test("after compactQueue rebase a later extension tail repairs exactly without d
 function runClusterStream(hz, sourceCps, unit, chunkUnits, durationMs = 10_000) {
   const unitCount = graphemeCount(unit);
   const scheduler = new TestFrameScheduler();
-  const store = new MobileStreamProjectionStore(scheduler, advanceMobileStreamPresentation);
+  const store = new StreamProjectionStore(scheduler, advanceWebStreamPresentation);
   const frameMs = 1000 / hz;
   const id = "assistant:turn";
-  const fallback = message(id, "");
+  const fallback = assistant("");
   let published = 0;
   let authoritative = fallback;
   const samples = [];
@@ -1180,8 +1076,8 @@ function runClusterStream(hz, sourceCps, unit, chunkUnits, durationMs = 10_000) 
     const sourceUnits = Math.floor((sourceCps * t) / 1000 / unitCount);
     while (published < sourceUnits) {
       const next = Math.min(sourceUnits, published + chunkUnits);
-      const target = message(id, unit.repeat(next));
-      store.publish(id, authoritative, target, false);
+      const target = assistant(unit.repeat(next));
+      publishWebStreamChanges([authoritative], [target], store, false);
       authoritative = target;
       published = next;
     }
@@ -1208,9 +1104,9 @@ function runClusterStream(hz, sourceCps, unit, chunkUnits, durationMs = 10_000) 
 function continuous800RollingCluster(hz, unit, chunkUnits) {
   const unitCount = graphemeCount(unit);
   const scheduler = new TestFrameScheduler();
-  const store = new MobileStreamProjectionStore(scheduler, advanceMobileStreamPresentation);
+  const store = new StreamProjectionStore(scheduler, advanceWebStreamPresentation);
   const id = "assistant:turn";
-  const fallback = message(id, "");
+  const fallback = assistant("");
   const frameMs = 1000 / hz;
   let published = 0;
   let authoritative = fallback;
@@ -1221,8 +1117,8 @@ function continuous800RollingCluster(hz, unit, chunkUnits) {
     while (published + unitCount <= sourceGraphemes) {
       const units = Math.min(chunkUnits, Math.floor((sourceGraphemes - published) / unitCount));
       const next = published + units * unitCount;
-      const target = message(id, unit.repeat(next / unitCount));
-      store.publish(id, authoritative, target, false);
+      const target = assistant(unit.repeat(next / unitCount));
+      publishWebStreamChanges([authoritative], [target], store, false);
       authoritative = target;
       published = next;
     }
@@ -1241,9 +1137,9 @@ function continuous800RollingCluster(hz, unit, chunkUnits) {
 function hiddenGapMaxWindowCluster(hz, unit, chunkUnits) {
   const unitCount = graphemeCount(unit);
   const scheduler = new TestFrameScheduler();
-  const store = new MobileStreamProjectionStore(scheduler, advanceMobileStreamPresentation);
+  const store = new StreamProjectionStore(scheduler, advanceWebStreamPresentation);
   const id = "assistant:turn";
-  const fallback = message(id, "");
+  const fallback = assistant("");
   const frameMs = 1000 / hz;
   let published = 0;
   let authoritative = fallback;
@@ -1252,8 +1148,8 @@ function hiddenGapMaxWindowCluster(hz, unit, chunkUnits) {
     while (published + unitCount <= sourceGraphemes) {
       const units = Math.min(chunkUnits, Math.floor((sourceGraphemes - published) / unitCount));
       const next = published + units * unitCount;
-      const target = message(id, unit.repeat(next / unitCount));
-      store.publish(id, authoritative, target, false);
+      const target = assistant(unit.repeat(next / unitCount));
+      publishWebStreamChanges([authoritative], [target], store, false);
       authoritative = target;
       published = next;
     }
@@ -1306,26 +1202,26 @@ test("stream pacing metrics report: 400 g/s lag, 800 g/s rolling, hidden-gap rol
       `${hz}Hz | ${p95.toFixed(1)}ms / ${maxLag.toFixed(1)}ms | ${cont.max} / ${(cont.total / 10).toFixed(1)}g/s | ${hidden.max}`,
     );
   }
-  console.log(`\n[mobile-stream-projection metrics]\n${lines.join("\n")}`);
+  console.log(`\n[web-stream-projection metrics]\n${lines.join("\n")}`);
 });
 
 /** 计数 adapter：每次批量 block 文本更新都记一次调用（一帧的 map/copy 次数）。 */
-function countingMobileIO() {
+function countingWebIO() {
   const counters = { batch: 0 };
   return {
     counters,
     io: {
       blockCount: (message) => message.blocks.length,
       content: (message) => message.content,
-      blockText: (message, index) => (message.blocks[index]?.kind === "thinking" ? message.blocks[index].detail : null),
+      blockText: (message, index) => (message.blocks[index]?.kind === "thinking" ? message.blocks[index].content : null),
       withContent: (message, content) => ({ ...message, content }),
       withBlockTexts: (message, texts) => {
         counters.batch += 1;
         return {
           ...message,
           blocks: message.blocks.map((block, blockIndex) => {
-            const detail = texts.get(blockIndex);
-            return detail === undefined ? block : { ...block, detail };
+            const text = texts.get(blockIndex);
+            return text === undefined ? block : { ...block, content: text };
           }),
         };
       },
@@ -1333,14 +1229,16 @@ function countingMobileIO() {
   };
 }
 
-function mobileThinkingMessage(blockCount, contentGraphemes, blockGraphemes) {
+function webThinkingMessage(blockCount, contentGraphemes, blockGraphemes) {
   return {
     id: "assistant:turn",
+    role: "assistant",
+    streaming: true,
     content: "回".repeat(contentGraphemes),
     blocks: Array.from({ length: blockCount }, (_, index) => ({
       id: `b${index}`,
       kind: "thinking",
-      detail: "思".repeat(blockGraphemes),
+      content: "思".repeat(blockGraphemes),
     })),
   };
 }
@@ -1349,9 +1247,9 @@ test("prepare and each advance frame touch the adapter with at most one batch bl
   // O(B) 而非 O(B²)：B 个 thinking 块无论多大，prepare 与每一帧都只做一次
   // 批量 adapter map/copy（调用次数不随 B 增长）。
   for (const blockCount of [4, 64]) {
-    const { io, counters } = countingMobileIO();
-    const target = mobileThinkingMessage(blockCount, 240, 240);
-    const empty = { id: "assistant:turn", content: "", blocks: [] };
+    const { io, counters } = countingWebIO();
+    const target = webThinkingMessage(blockCount, 240, 240);
+    const empty = { id: "assistant:turn", role: "assistant", streaming: true, content: "", blocks: [] };
     let current = prepareStreamingTexts(empty, target, io);
     assert.equal(counters.batch, 1, `B=${blockCount}: prepare must batch all block text into one adapter call`);
     for (let frame = 0; frame < 20; frame += 1) {
@@ -1364,9 +1262,9 @@ test("prepare and each advance frame touch the adapter with at most one batch bl
 });
 
 test("no block list is copied once thinking reached its authoritative text or the queue drained", () => {
-  const { io, counters } = countingMobileIO();
-  const target = mobileThinkingMessage(4, 2000, 20);
-  const empty = { id: "assistant:turn", content: "", blocks: [] };
+  const { io, counters } = countingWebIO();
+  const target = webThinkingMessage(4, 2000, 20);
+  const empty = { id: "assistant:turn", role: "assistant", streaming: true, content: "", blocks: [] };
   let current = prepareStreamingTexts(empty, target, io);
   let blocklessContentFrames = 0;
   let guard = 0;
@@ -1379,7 +1277,7 @@ test("no block list is copied once thinking reached its authoritative text or th
   assert.ok(blocklessContentFrames > 0, "content-only frames after thinking drained must skip block copies");
   assert.equal(current.content, target.content, "drain must reveal the authoritative content exactly");
   for (let index = 0; index < target.blocks.length; index += 1) {
-    assert.equal(current.blocks[index].detail, target.blocks[index].detail);
+    assert.equal(current.blocks[index].content, target.blocks[index].content);
   }
   counters.batch = 0;
   advanceStreamingTexts(current, target, 16.67, io);
