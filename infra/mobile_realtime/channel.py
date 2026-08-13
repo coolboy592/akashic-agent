@@ -28,6 +28,7 @@ from bus.events_lifecycle import (
     StreamDeltaReady,
     ToolCallCompleted,
     ToolCallStarted,
+    TurnOutputCompleted,
     TurnStarted,
 )
 from agent.plugins.mobile_ui import (
@@ -63,6 +64,7 @@ from infra.mobile_realtime.protocol import (
     MessageReplyReference,
     MessageSendCommand,
     MAX_JSON_FRAME_BYTES,
+    TURN_OUTPUT_COMPLETED_CAPABILITY,
 )
 from infra.mobile_realtime.plugin_ui import PluginUiQuery, PluginUiQueryScheduler
 from infra.mobile_realtime.remote_media import (
@@ -136,6 +138,8 @@ class _ProcessTurnState:
 _DELTA_FLUSH_BYTES = 4 * 1024
 _DELTA_FLUSH_INTERVAL_SECONDS = 1.0 / 60.0
 _MAX_DELTA_BATCHES = 256
+_MAX_DEVICE_CAPABILITIES = 128
+_MAX_DEVICE_CAPABILITY_LENGTH = 512
 _BOT_COMMAND_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
 _PLUGIN_SEGMENT = r"[A-Za-z0-9][A-Za-z0-9._-]*"
 _PLUGIN_ID_PATTERN = re.compile(rf"^{_PLUGIN_SEGMENT}(?:@{_PLUGIN_SEGMENT})?$")
@@ -290,6 +294,7 @@ class MobileRealtimeChannel:
         _ = ctx.event_bus.on(StreamDeltaReady, self._on_stream_delta)
         _ = ctx.event_bus.on(ToolCallStarted, self._on_tool_call_started)
         _ = ctx.event_bus.on(ToolCallCompleted, self._on_tool_call_completed)
+        _ = ctx.event_bus.on(TurnOutputCompleted, self._on_output_completed)
         _ = ctx.push_tool.register_channel(
             self.name,
             deliver=self._deliver_message,
@@ -868,6 +873,8 @@ class MobileRealtimeChannel:
         device_id: str,
         frame: ClientCommand,
     ) -> CommandReply:
+        if frame.type == "device.update":
+            return await self._update_device_capabilities(device_id, frame)
         if frame.type == "session.list":
             return await self._list_sessions(device_id, frame)
         if frame.type == "session.create":
@@ -943,6 +950,52 @@ class MobileRealtimeChannel:
         if frame.type == "attachment.download":
             return self._download_attachment(frame)
         raise MobileCommandError("unsupported_command", f"尚不支持命令: {frame.type}")
+
+    async def _update_device_capabilities(
+        self,
+        device_id: str,
+        frame: GenericCommand,
+    ) -> CommandReply:
+        """设备升级后刷新持久化能力声明，无需重新配对。
+
+        复用配对协议的边界约束：最多 128 项、每项 1..512 字符，杜绝通过
+        命令帧把超长 capability 集合写入 mobile_devices。
+        """
+
+        _expect_keys(frame.payload, {"capabilities"})
+        raw_capabilities = frame.payload["capabilities"]
+        if not isinstance(raw_capabilities, list):
+            raise MobileCommandError(
+                "invalid_payload",
+                "device.update capabilities 必须是字符串数组",
+            )
+        if len(raw_capabilities) > _MAX_DEVICE_CAPABILITIES:
+            raise MobileCommandError(
+                "invalid_payload",
+                f"device.update capabilities 最多 {_MAX_DEVICE_CAPABILITIES} 项",
+            )
+        capabilities: list[str] = []
+        for item in raw_capabilities:
+            if (
+                not isinstance(item, str)
+                or not item
+                or len(item) > _MAX_DEVICE_CAPABILITY_LENGTH
+            ):
+                raise MobileCommandError(
+                    "invalid_payload",
+                    f"device.update capability 必须是 1..{_MAX_DEVICE_CAPABILITY_LENGTH} 字符的非空字符串",
+                )
+            capabilities.append(item)
+        if len(set(capabilities)) != len(capabilities):
+            raise MobileCommandError(
+                "invalid_payload",
+                "device.update capabilities 不能包含重复项",
+            )
+        await self._runtime.refresh_device_capabilities(
+            device_id=device_id,
+            capabilities=tuple(capabilities),
+        )
+        return CommandReply(type="device.update.ok", payload={})
 
     async def _model_catalog(self, frame: GenericCommand) -> CommandReply:
         """返回当前模型 generation 和指定会话已经提交的选择。"""
@@ -2036,6 +2089,33 @@ class MobileRealtimeChannel:
                     "duration_ms": max(0, round((monotonic() - started_at) * 1_000)),
                     "control_turn_id": state.control_turn_id,
                 },
+            )
+
+    async def _on_output_completed(self, event: TurnOutputCompleted) -> None:
+        self._raise_delta_failure()
+        if event.channel != self.name:
+            return
+        session_id = event.session_key
+        turn_id = event.turn_id or self._current_turn_id(session_id)
+        # 终态已收口则丢弃迟到信号，绝不重建 per-turn 结构。
+        if (session_id, turn_id) in self._turn_terminals:
+            self._log_late_event_dropped(session_id, turn_id, "turn.output.completed")
+            return
+        # 与 terminal 同一 owner 锁内 flush + durable publish，保证 output.completed
+        # 要么先于 terminal 发布，要么在 terminal 已收口后被丢弃，绝不排在 terminal 之后。
+        async with self._delta_locked(session_id, turn_id, require_state=True) as lock:
+            if lock is None:
+                self._log_late_event_dropped(
+                    session_id, turn_id, "turn.output.completed"
+                )
+                return
+            _ = await self._flush_batch_locked(session_id, turn_id)
+            await self._runtime.publish_event(
+                event_type="turn.output.completed",
+                session_id=session_id,
+                turn_id=turn_id,
+                payload={"client_message_id": event.client_message_id},
+                required_capability=TURN_OUTPUT_COMPLETED_CAPABILITY,
             )
 
     async def _on_response(self, message: OutboundMessage) -> None:

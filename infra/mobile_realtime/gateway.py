@@ -78,6 +78,7 @@ from infra.mobile_realtime.protocol import (
     MobileFrame,
     ProtocolDecodeError,
     ResumeControl,
+    TURN_OUTPUT_COMPLETED_CAPABILITY,
     frame_to_json,
     parse_frame,
 )
@@ -968,8 +969,13 @@ class MobileGatewayRuntime:
         turn_id: str | None = None,
         device_id: str | None = None,
         connection_epoch: int | None = None,
+        required_capability: str | None = None,
     ) -> None:
-        """把 P0 事件写入每个设备 inbox，并向在线连接即时投递。"""
+        """把 P0 事件写入每个设备 inbox，并向在线连接即时投递。
+
+        指定 required_capability 时只向声明了该能力的设备入箱；旧客户端
+        不声明即不收到该事件，避免未知事件触发协议拒绝。
+        """
 
         # 1. 先在协议边界验证事件，拒绝把坏 envelope 写入 SQLite
         event_id = _new_ulid()
@@ -991,13 +997,22 @@ class MobileGatewayRuntime:
                         or connection.connection_epoch != connection_epoch
                     ):
                         return
+                if required_capability is not None:
+                    device = self.storage.read_device(device_id)
+                    if device is None or required_capability not in device.capabilities:
+                        return
                 target_device_ids = (device_id,)
             else:
                 if connection_epoch is not None:
                     raise ValueError("广播事件不能指定 connection_epoch")
-                target_device_ids = tuple(
-                    device.device_id for device in self.storage.list_active_devices()
-                )
+                devices = self.storage.list_active_devices()
+                if required_capability is not None:
+                    devices = tuple(
+                        device
+                        for device in devices
+                        if required_capability in device.capabilities
+                    )
+                target_device_ids = tuple(device.device_id for device in devices)
             events = self.inbox.enqueue_many(
                 device_ids=target_device_ids,
                 event_id=event_id,
@@ -1038,6 +1053,20 @@ class MobileGatewayRuntime:
                     continue
                 connection.pending_events.append(event)
                 self._schedule_delivery_locked(target_device_id, connection)
+
+    async def refresh_device_capabilities(
+        self,
+        *,
+        device_id: str,
+        capabilities: tuple[str, ...],
+    ) -> None:
+        """更新设备持久化能力，并同步当前连接的运行时能力。"""
+
+        self.storage.update_device_capabilities(device_id, capabilities)
+        async with self._delivery_lock:
+            connection = self._connections.get(device_id)
+            if connection is not None:
+                connection.capabilities = capabilities
 
     async def publish_event_with_outbound_attachments(
         self,

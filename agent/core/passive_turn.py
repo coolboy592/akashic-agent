@@ -68,7 +68,11 @@ from bus.events import (
     OutboundMessage,
     TurnDisposition,
 )
-from bus.events_lifecycle import ToolCallCompleted, ToolCallStarted
+from bus.events_lifecycle import (
+    ToolCallCompleted,
+    ToolCallStarted,
+    TurnOutputCompleted,
+)
 from agent.lifecycle.phase import Phase
 from agent.lifecycle.phases.after_reasoning import (
     AfterReasoningFrame,
@@ -1522,6 +1526,11 @@ class DefaultReasoner(Reasoner):
             )
         except ContentSafetyError:
             logger.warning("安全拦截：当前消息本身可能违规")
+            await self._observe_output_completed(
+                session_key=session.key,
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+            )
             return TurnRunResult(
                 reply="你的消息触发了安全审查，无法处理。",
                 context_retry=retry_trace,
@@ -1530,12 +1539,22 @@ class DefaultReasoner(Reasoner):
             if self._llm.provider.context_window <= 0:
                 raise
             logger.warning("上下文超长：当前完整 payload 超过模型输入边界")
+            await self._observe_output_completed(
+                session_key=session.key,
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+            )
             return TurnRunResult(
                 reply="上下文过长无法处理，请尝试新建对话。",
                 context_retry=retry_trace,
             )
         except asyncio.TimeoutError:
             logger.warning("LLM 流响应超时，远端连接中断")
+            await self._observe_output_completed(
+                session_key=session.key,
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+            )
             return TurnRunResult(
                 reply="模型流响应中断，请刷新对话重试。",
                 context_retry=retry_trace,
@@ -1636,6 +1655,11 @@ class DefaultReasoner(Reasoner):
                     mobile_attention=mobile_attention,
                 )
                 await self._lock_turn_input_source(turn_input_source)
+                await self._observe_output_completed(
+                    session_key=tool_event_session_key,
+                    channel=tool_event_channel,
+                    chat_id=tool_event_chat_id,
+                )
                 return result
             batch_start = (
                 pending_start_override
@@ -1681,6 +1705,11 @@ class DefaultReasoner(Reasoner):
                     mobile_attention=mobile_attention,
                 )
                 await self._lock_turn_input_source(turn_input_source)
+                await self._observe_output_completed(
+                    session_key=tool_event_session_key,
+                    channel=tool_event_channel,
+                    chat_id=tool_event_chat_id,
+                )
                 return result
             # 4. 构造本轮工具 schema，并按完整 provider input 判断压缩水位。
             schema_names: list[str] | set[str] | None = (
@@ -1963,6 +1992,11 @@ class DefaultReasoner(Reasoner):
                                 mobile_attention=mobile_attention,
                             )
                             await self._lock_turn_input_source(turn_input_source)
+                            await self._observe_output_completed(
+                                session_key=tool_event_session_key,
+                                channel=tool_event_channel,
+                                chat_id=tool_event_chat_id,
+                            )
                             return result
                         logger.warning(
                             "[工具未解锁] LLM 尝试调用 '%s'，但该工具 schema 不可见，引导模型先 tool_search",
@@ -2227,6 +2261,11 @@ class DefaultReasoner(Reasoner):
                             mobile_attention=mobile_attention,
                         )
                         await self._lock_turn_input_source(turn_input_source)
+                        await self._observe_output_completed(
+                            session_key=tool_event_session_key,
+                            channel=tool_event_channel,
+                            chat_id=tool_event_chat_id,
+                        )
                         return result
 
                 # 7. 本轮工具执行完后，记录 tool_chain。
@@ -2294,6 +2333,11 @@ class DefaultReasoner(Reasoner):
                         mobile_attention=mobile_attention,
                     )
                     await self._lock_turn_input_source(turn_input_source)
+                    await self._observe_output_completed(
+                        session_key=tool_event_session_key,
+                        channel=tool_event_channel,
+                        chat_id=tool_event_chat_id,
+                    )
                     return result
                 continue
 
@@ -2327,6 +2371,13 @@ class DefaultReasoner(Reasoner):
                 ),
             )
             await self._lock_turn_input_source(turn_input_source)
+            # 输出完成信号：最终回复的最后一个 delta 已交付、input source 已锁，
+            # 在 AfterStep 收尾之前立即发出，慢插件不得推迟 composer 解锁。
+            await self._observe_output_completed(
+                session_key=tool_event_session_key,
+                channel=tool_event_channel,
+                chat_id=tool_event_chat_id,
+            )
             messages.append({"role": "assistant", "content": response.content})
             # 8b. AfterStep 模块链（最终回复分支）：通知观察者本轮推理结束。
             _ = await after_step_phase.run(
@@ -2433,6 +2484,27 @@ class DefaultReasoner(Reasoner):
                 result_preview=result_preview,
                 runtime_provenance=dict(runtime_provenance or {}),
                 turn_id=running_turn_id.get(),
+            )
+        )
+
+    async def _observe_output_completed(
+        self,
+        *,
+        session_key: str,
+        channel: str,
+        chat_id: str,
+    ) -> None:
+        """在最后可见输出交付后、AfterStep 收尾前发出展示层 output.completed。"""
+
+        if self._event_bus is None or not session_key:
+            return
+        await self._event_bus.observe(
+            TurnOutputCompleted(
+                session_key=session_key,
+                channel=channel,
+                chat_id=chat_id,
+                turn_id=running_turn_id.get(),
+                client_message_id=current_client_message_id.get(),
             )
         )
 

@@ -12,6 +12,7 @@ export type ChatFrame =
   | { type: "react.tool.completed"; session_id: string; turn_id: string; call_id: string; tool_name: string; status: string; result_preview: string }
   | { type: "answer.delta"; session_id: string; turn_id: string; delta: string }
   | { type: "message.final"; session_id: string; turn_id: string; content: string; thinking?: string; media?: string[]; duration_ms?: number; metadata?: Record<string, unknown> }
+  | { type: "turn.output.completed"; session_id: string; turn_id: string; client_message_id?: string }
   | { type: "turn.interrupted"; request_id: string; session_id: string; status: string; message: string }
   | { type: "error"; request_id: string; message: string }
   | { type: "pong"; request_id: string };
@@ -21,7 +22,10 @@ export interface WebChatFrameContext {
   activateSession: (sessionId: string) => void;
   setError: (message: string) => void;
   setMessages: (updater: (messages: ChatMessage[]) => ChatMessage[]) => void;
+  getStatus: () => ChatStatus;
   setStatus: (status: ChatStatus) => void;
+  getActiveTurnId: () => string | null;
+  setActiveTurnId: (turnId: string | null) => void;
   loadSessions: () => Promise<void>;
   loadMessages: (sessionId: string) => Promise<void>;
 }
@@ -58,6 +62,12 @@ export function parseChatFrame(value: unknown): ChatFrame {
         throw new Error("message.final.duration_ms 格式无效");
       }
       if (frame.metadata !== undefined && !recordValue(frame.metadata)) throw new Error("message.final.metadata 格式无效");
+      break;
+    case "turn.output.completed":
+      requireStrings(frame, ["session_id", "turn_id"]);
+      if (frame.client_message_id !== undefined && typeof frame.client_message_id !== "string") {
+        throw new Error("turn.output.completed.client_message_id 格式无效");
+      }
       break;
     case "turn.interrupted":
       requireStrings(frame, ["request_id", "session_id", "status", "message"]);
@@ -97,10 +107,12 @@ export function applyChatFrame(frame: ChatFrame, context: WebChatFrameContext): 
   if (frame.type === "turn.interrupted") {
     context.setError(frame.status === "idle" ? frame.message : "");
     context.setStatus("idle");
+    context.setActiveTurnId(null);
     return;
   }
   if (frame.type === "turn.started") {
     context.setStatus("streaming");
+    context.setActiveTurnId(frame.turn_id);
     context.setMessages((messages) => [...messages, {
       id: frame.turn_id,
       role: "assistant",
@@ -155,6 +167,18 @@ export function applyChatFrame(frame: ChatFrame, context: WebChatFrameContext): 
     })));
     return;
   }
+  if (frame.type === "turn.output.completed") {
+    // 只有属于当前 active turn 且仍处于生成中才进入 finalizing；
+    // 迟到/跨 turn 的 completion 直接忽略，避免污染下一轮或把 idle 改回 finalizing。
+    const current = context.getStatus();
+    if (
+      frame.turn_id === context.getActiveTurnId() &&
+      (current === "streaming" || current === "submitted")
+    ) {
+      context.setStatus("finalizing");
+    }
+    return;
+  }
   if (frame.type !== "message.final") return;
 
   if (frame.metadata?.source === "message_push") {
@@ -168,8 +192,12 @@ export function applyChatFrame(frame: ChatFrame, context: WebChatFrameContext): 
     void context.loadSessions();
     return;
   }
-  context.setStatus("idle");
-  context.setMessages((messages) => updateLastAssistant(messages, (message) => ({
+  const isActiveTerminal = frame.turn_id === context.getActiveTurnId();
+  if (isActiveTerminal) {
+    context.setStatus("idle");
+    context.setActiveTurnId(null);
+  }
+  context.setMessages((messages) => updateAssistantById(messages, frame.turn_id, (message) => ({
     ...message,
     content: frame.content || message.content,
     attachments: frame.media?.length
@@ -264,6 +292,20 @@ function updateLastAssistant(messages: ChatMessage[], updater: (message: ChatMes
     }
   }
   return [...messages, updater({ id: createUuid(), role: "assistant", content: "", blocks: [] })];
+}
+
+function updateAssistantById(
+  messages: ChatMessage[],
+  messageId: string,
+  updater: (message: ChatMessage) => ChatMessage,
+): ChatMessage[] {
+  const index = messages.findIndex((message) => message.role === "assistant" && message.id === messageId);
+  if (index < 0) {
+    return [...messages, updater({ id: messageId, role: "assistant", content: "", blocks: [] })];
+  }
+  const next = [...messages];
+  next[index] = updater(next[index]);
+  return next;
 }
 
 function updateTool(
