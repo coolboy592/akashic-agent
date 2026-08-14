@@ -6,6 +6,17 @@ from agent.plugin_composition.access import (
     ScopedPluginData,
 )
 from agent.plugin_composition.effect import Effect
+from agent.plugin_composition.events import (
+    Bail,
+    EmitEventKey,
+    ParallelEventKey,
+    SerialEventKey,
+)
+from agent.plugin_composition.executor import (
+    EXECUTOR_SERVICE,
+    ExecutorService,
+    SyncTask,
+)
 from agent.plugin_composition.model import (
     CompositionError,
     CompositionReceipt,
@@ -22,15 +33,22 @@ __all__ = [
     "CompositionRoot",
     "CompositionAudit",
     "Context",
+    "Bail",
+    "EmitEventKey",
     "Effect",
     "ExternalEffectGate",
     "ExternalEffectObservation",
+    "EXECUTOR_SERVICE",
+    "ExecutorService",
     "Fiber",
     "FiberState",
     "FiberView",
     "Plugin",
     "PluginDataAccess",
+    "ParallelEventKey",
     "ScopedPluginData",
     "ServiceKey",
+    "SerialEventKey",
+    "SyncTask",
     "WriteObservation",
 ]

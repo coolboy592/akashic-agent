@@ -158,7 +158,7 @@ Skill 等价既包括目录和 frontmatter，也包括正文、脚本、资源�
 ### 4.1 已确认事实
 
 - Cordis 的插件通过 service key 获取能力，通过 typed event 通信，通过 effect/fiber 回收注册和后台工作。
-- 配置行顺序不承担依赖语义；service dependency 由 inject/coeffect 表达。需要确定执行先后的拦截链使用拥有明确 dispatch contract 的 waterfall、serial 或领域 service。
+- 配置行顺序不承担 service 依赖语义；硬依赖由 inject 表达，可选能力由使用点查询。需要确定执行先后的处理使用拥有明确合同的 serial event 或领域 service；当前迁移不引入通用 waterfall。
 - Akashic 的 phase slot/requires/produces、event priority、tool hook 顺序和 package 展开共同决定当前行为，不能只翻译插件基类方法名。
 - 当前 tool hook 依 plugin ID 排序后顺序执行，后一个 hook 看到前一个 hook 改写后的参数。`shell_restore` 与 `shell_safety` 必须作为组合场景验证。
 - 当前 citation/meme 的关键顺序由显式 slot 依赖和 after-reasoning event placement 共同形成，必须作为一个组合迁移。
@@ -362,7 +362,7 @@ parity-run/<run-id>/
 |---|---|
 | Tool registry 与 schema | `ctx.tools` service + scoped registration |
 | Prompt module | system-prompt section/provider；排序由领域 owner 明确拥有 |
-| before/after interception | typed event；waterfall/serial mode 写入公开 contract |
+| before/after interception | typed event；serial/parallel/emit mode 写入公开 contract |
 | Skill/Drift skill | `ctx.skills` provider/catalog/invalidation + disposer |
 | MCP/managed service | Service Definition / Provider / Consumer + readiness |
 | job/background task | `ctx.jobs` 或 plugin fiber-owned task |
@@ -376,10 +376,11 @@ DeepSeek Harness 的 `tools/pre-execute` 当前只表达 allow/deny/ask，不拥
 依赖不能使用任意数字 priority 作为主要公共协议：
 
 - service existence 使用 inject/coeffect。
-- around middleware 使用 waterfall，监听者必须调用 `next()` 才继续。
-- 需要有序且全部执行的领域流程使用 serial 或拥有显式 step graph 的 service。
+- 需要有序的领域流程使用 serial 或拥有显式 step graph 的 service；只有 `Bail` 能提前终止 serial。
 - 可以同时执行且没有顺序依赖的观察者使用 parallel。
-- 纯广播使用 emit；消费者不能依赖未声明的注册先后。
+- 纯同步广播使用 emit；异步 listener 注册到 emit 时 fail-loud。
+- listener 只使用 generation 内稳定注册顺序；不引入 priority 或 listener dependency DAG。
+- 同步并发通过受限 ExecutorService 执行纯任务，不在线程中暴露 Context/Fiber。
 - 相互排斥的 provider 使用唯一 service key、显式 config selection 和 load-time conflict check。Akasha 与 default memory 由同一个 memory service 选择，不让两个 provider 同时偷偷生效。
 
 ## 10. 模型行为验证

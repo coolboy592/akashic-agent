@@ -4,12 +4,22 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-from collections.abc import Awaitable, Callable, Iterable, Mapping
+from collections.abc import Awaitable, Callable, Coroutine, Iterable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import AsyncGenerator, Protocol, TypeVar, cast
+from typing import Any, AsyncGenerator, Protocol, TypeVar, cast
 
 from agent.plugin_composition.effect import Effect, EffectSetup
+from agent.plugin_composition.events import (
+    Bail,
+    EmitEventKey,
+    EventKey,
+    EventListener,
+    EventRegistry,
+    ParallelEventKey,
+    SerialEventKey,
+)
+from agent.plugin_composition.executor import reject_executor_context_access
 from agent.plugin_composition.access import CompositionAudit
 from agent.plugin_composition.model import (
     CompositionError,
@@ -20,6 +30,7 @@ from agent.plugin_composition.model import (
 )
 
 T = TypeVar("T")
+R = TypeVar("R")
 PluginApply = Callable[["Context"], object]
 FiberObserver = Callable[["Fiber"], object]
 
@@ -45,10 +56,12 @@ class Context:
 
     @property
     def fiber(self) -> Fiber:
+        reject_executor_context_access()
         return self._fiber
 
     @property
     def generation_id(self) -> str:
+        reject_executor_context_access()
         return self._root.generation_id
 
     async def mount(
@@ -59,6 +72,7 @@ class Context:
         inject: Iterable[ServiceKey[object]] | None = None,
         required_for_readiness: bool = True,
     ) -> Fiber:
+        reject_executor_context_access()
         return await self._root._mount(
             parent=self._fiber,
             plugin=plugin,
@@ -76,6 +90,7 @@ class Context:
     ) -> Fiber:
         """Mount an optional child that activates only while deps exist."""
 
+        reject_executor_context_access()
         return await self.mount(
             apply,
             name=name or getattr(apply, "__name__", "inject"),
@@ -84,6 +99,8 @@ class Context:
         )
 
     async def provide(self, key: ServiceKey[T], value: T) -> Effect:
+        reject_executor_context_access()
+
         async def setup() -> Callable[[], Awaitable[None]]:
             self._root._register_provider(
                 cast(ServiceKey[object], key),
@@ -102,12 +119,14 @@ class Context:
         return await self.effect(setup, label=f"service:{key.name}")
 
     def get(self, key: ServiceKey[T]) -> T | None:
+        reject_executor_context_access()
         provider = self._fiber.dependency_store.get(cast(ServiceKey[object], key))
         if provider is None:
             provider = self._root._active_provider(cast(ServiceKey[object], key))
         return cast(T | None, None if provider is None else provider.value)
 
     def require(self, key: ServiceKey[T]) -> T:
+        reject_executor_context_access()
         value = self.get(key)
         if value is None:
             raise CompositionError(
@@ -117,7 +136,79 @@ class Context:
         return value
 
     async def effect(self, setup: EffectSetup, *, label: str = "effect") -> Effect:
+        reject_executor_context_access()
         return await self._fiber.add_effect(setup, label=label)
+
+    async def on(
+        self,
+        key: EmitEventKey[T] | SerialEventKey[T, object] | ParallelEventKey[T],
+        listener: Callable[[T], object],
+    ) -> Effect:
+        """Register one typed listener as an Effect of the current Fiber."""
+
+        reject_executor_context_access()
+        raw_key = cast(EventKey, key)
+        raw_listener = cast(EventListener, listener)
+        return await self.effect(
+            lambda: self._root._events.register(
+                self._fiber,
+                raw_key,
+                raw_listener,
+            ),
+            label=f"event:{type(key).__name__}:{key.name}",
+        )
+
+    def emit(self, key: EmitEventKey[T], payload: T) -> None:
+        reject_executor_context_access()
+        self._root._events.emit(key, payload)
+
+    async def serial(
+        self,
+        key: SerialEventKey[T, R],
+        payload: T,
+    ) -> Bail[R] | None:
+        reject_executor_context_access()
+        return await self._root._events.serial(key, payload)
+
+    async def parallel(self, key: ParallelEventKey[T], payload: T) -> None:
+        reject_executor_context_access()
+        await self._root._events.parallel(key, payload)
+
+    async def spawn(
+        self,
+        coroutine: Coroutine[Any, Any, T],
+        *,
+        name: str,
+    ) -> asyncio.Task[T]:
+        """Start one Fiber-owned task and expose failures to Core readiness."""
+
+        reject_executor_context_access()
+        if not name or name.strip() != name:
+            coroutine.close()
+            raise ValueError("任务名称必须是非空且无首尾空白的字符串")
+        task: asyncio.Task[T] | None = None
+
+        def setup() -> Callable[[], Awaitable[None]]:
+            nonlocal task
+            task = asyncio.create_task(coroutine, name=f"plugin-task:{name}")
+            task.add_done_callback(
+                lambda completed: self._root._record_task_result(
+                    self._fiber,
+                    cast(asyncio.Task[object], completed),
+                )
+            )
+
+            async def cleanup() -> None:
+                assert task is not None
+                if not task.done():
+                    _ = task.cancel()
+                _ = await asyncio.gather(task, return_exceptions=True)
+
+            return cleanup
+
+        _ = await self.effect(setup, label=f"task:{name}")
+        assert task is not None
+        return task
 
 
 class Fiber:
@@ -364,6 +455,7 @@ class CompositionRoot:
         self._dispose_observers: list[FiberObserver] = []
         self._errors: list[str] = []
         self._audit = audit or CompositionAudit()
+        self._events = EventRegistry()
         self._dispose_task: asyncio.Task[None] | None = None
         self.root_fiber = Fiber(
             root=self,
@@ -469,7 +561,8 @@ class CompositionRoot:
         )
         return (
             f"{receipt.generation_id}:{','.join(receipt.services)}:{fibers}:"
-            f"{','.join(sorted(receipt.effects))}"
+            f"{','.join(sorted(receipt.effects))}:"
+            f"{','.join(self._events.registrations())}"
         )
 
     def validation_identity(self) -> str:
@@ -712,7 +805,23 @@ class CompositionRoot:
                 self._record_error(fiber, error)
 
     def _record_error(self, fiber: Fiber, error: BaseException) -> None:
+        if isinstance(error, CompositionError):
+            self._errors.append(
+                f"{fiber.name}:{type(error).__name__}:{error.code}:{error}"
+            )
+            return
         self._errors.append(f"{fiber.name}:{type(error).__name__}:{error}")
+
+    def _record_task_result(
+        self,
+        fiber: Fiber,
+        task: asyncio.Task[object],
+    ) -> None:
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            self._record_error(fiber, error)
 
     def _remove_fiber(self, fiber: Fiber) -> None:
         _ = self._fibers.pop(fiber.fiber_id, None)

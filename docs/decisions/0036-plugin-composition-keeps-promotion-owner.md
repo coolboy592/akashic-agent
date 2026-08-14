@@ -1,8 +1,8 @@
 # 0036 · 插件组合内核保留现有晋升 owner
 
-- 状态：accepted / implemented phase 1
+- 状态：accepted / implemented phases 1–2
 - 日期：2026-08-14
-- 关联条款：PLG-001～PLG-013、WSP-001～WSP-005、ERR-001、TST-001～TST-007
+- 关联条款：PLG-001～PLG-014、WSP-001～WSP-005、ERR-001、TST-001～TST-007
 - supersedes：无
 - superseded by：无
 
@@ -14,7 +14,9 @@ Akashic 已经拥有 Cordis 不提供的候选隔离、stable/latest、父 Turn 
 
 ## 决定
 
-Akashic 新插件采用 Python 实现的最小组合内核：Root Context 持有一代完整拓扑，Service 表达能力，Inject 表达必需或可选依赖，Fiber 管理依赖波动下的状态，Effect 在所属 Root/Fiber scope 内逆序回收资源。插件公开入口是 `apply(ctx)`；Job、Channel、Prompt、输出处理、UI、MCP、存储和外部效果都是领域 Service，不进入组合内核的固定枚举。第一阶段不另造一个只转发 Fiber 所有权的 `Scope` 类；Cordis 的独立 service isolation scope 留到真实迁移插件提出需求时再实现。
+Akashic 新插件采用 Python 实现的最小组合内核：Root Context 持有一代完整拓扑，Service 表达能力，Inject 表达 Fiber 的硬依赖；可选能力不进入 inject，由使用点查询或不阻塞 Root readiness 的嵌套 Fiber 承载。Fiber 管理依赖波动下的状态，Effect 在所属 Root/Fiber scope 内逆序回收资源。插件公开入口是 `apply(ctx)`；Job、Channel、Prompt、输出处理、UI、MCP、存储和外部效果都是领域 Service，不进入组合内核的固定枚举。第一阶段不另造一个只转发 Fiber 所有权的 `Scope` 类；Cordis 的独立 service isolation scope 留到真实迁移插件提出需求时再实现。
+
+事件能力只提供三种公开 dispatch：同步串行 `emit`、支持显式 `Bail` 的异步串行 `serial`、等待全部 settle 并聚合失败的异步并发 `parallel`。同步并发由受限 `ExecutorService` 提供，不允许工作线程取得 Context/Fiber。listener 只使用 generation 内稳定注册顺序；真实能力依赖使用 inject，不引入 priority、listener DAG 或通用 waterfall。
 
 现有 publication plane 保持唯一 owner：安装 artifact、候选隔离、generation identity、行为验证回执、stable/latest、父 Turn 终点授权、snapshot lease、晋升、丢弃和恢复日志继续由 Core 管理。候选发布单位是完整 Root Context 拓扑，不是单个回调或单个 Service。
 

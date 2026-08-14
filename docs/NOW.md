@@ -15,7 +15,7 @@
 
 ## P0 · 插件组合内核
 
-- 第一阶段已按[0036](decisions/0036-plugin-composition-keeps-promotion-owner.md)和[任务合同](design/plugin-composition-kernel-task-contract.md)完成。下一步按差分回放选择 Citation/Meme 或 GitHub Watch 迁移试点；不得在证据出现前改写现有插件或删除 legacy host。
+- 组合内核第一阶段与[事件/同步执行能力阶段](design/plugin-event-executor-task-contract.md)已完成。下一步先实现 TopologyView revision/lifecycle seam，再以 Citation/Meme 做首组差分迁移。不得在证据出现前改写现有插件或删除 legacy host。
 
 ## P0 · 独立语义验收
 
