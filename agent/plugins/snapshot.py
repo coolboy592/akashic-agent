@@ -16,7 +16,7 @@ from agent.plugins.specs import RegisteredProactiveSource, proactive_source_key
 from agent.tools.registry import ToolRegistry
 from agent.tool_hooks import ToolHook
 from agent.skills import SkillIndex
-from agent.plugin_composition import CompositionRoot
+from agent.plugin_composition import CompositionRoot, TopologyView
 from bus.event_bus import Handler
 from infra.channels.contract import Channel
 
@@ -61,7 +61,7 @@ class RuntimeSnapshot:
         default_factory=lambda: MappingProxyType({})
     )
     composition_root: CompositionRoot | None = None
-    composition_topology_identity: str | None = None
+    composition_topology: TopologyView | None = None
     composition_validation_identity: str | None = None
     state: SnapshotState = "compiled"
     lease_count: int = 0
@@ -202,7 +202,7 @@ class RuntimeSnapshotCompiler:
             else ""
         )
         identity += f"|snapshot:{snapshot_revision}"
-        composition_identity: str | None = None
+        composition_topology: TopologyView | None = None
         if composition_root is not None:
             receipt = composition_root.receipt()
             if not receipt.ready:
@@ -212,8 +212,8 @@ class RuntimeSnapshotCompiler:
                     f"errors={receipt.errors}, "
                     f"external_effects={receipt.external_effects}"
                 )
-            composition_identity = composition_root.topology_identity()
-            identity += f"|composition:{composition_identity}"
+            composition_topology = composition_root.topology_view()
+            identity += f"|composition:{composition_topology.identity}"
         snapshot_id = hashlib.sha256(identity.encode()).hexdigest()[:16]
         return RuntimeSnapshot(
             snapshot_id=snapshot_id,
@@ -247,7 +247,7 @@ class RuntimeSnapshotCompiler:
             after_reasoning_modules=phases["after_reasoning_modules"],
             after_turn_modules=phases["after_turn_modules"],
             composition_root=composition_root,
-            composition_topology_identity=composition_identity,
+            composition_topology=composition_topology,
         )
 
     @staticmethod
@@ -904,11 +904,14 @@ class RuntimeSnapshotStore:
     ) -> None:
         root = snapshot.composition_root
         if root is None:
-            if snapshot.composition_topology_identity is not None:
+            if snapshot.composition_topology is not None:
                 raise RuntimeError(
                     "RuntimeSnapshot composition identity 缺少 Root Context"
                 )
             return
+        topology = snapshot.composition_topology
+        if topology is None:
+            raise RuntimeError("RuntimeSnapshot composition Root 缺少 TopologyView")
         receipt = root.receipt()
         if not receipt.ready:
             raise RuntimeError(
@@ -917,7 +920,7 @@ class RuntimeSnapshotStore:
                 f"errors={receipt.errors}, "
                 f"external_effects={receipt.external_effects}"
             )
-        if root.topology_identity() != snapshot.composition_topology_identity:
+        if root.topology_identity() != topology.identity:
             raise RuntimeError("RuntimeSnapshot 插件组合拓扑在编译后发生变化")
         if require_validation:
             if snapshot.composition_validation_identity is None:

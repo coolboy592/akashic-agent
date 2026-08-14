@@ -1,6 +1,6 @@
 # 0036 · 插件组合内核保留现有晋升 owner
 
-- 状态：accepted / implemented phases 1–2
+- 状态：accepted / implemented phases 1–3
 - 日期：2026-08-14
 - 关联条款：PLG-001～PLG-014、WSP-001～WSP-005、ERR-001、TST-001～TST-007
 - supersedes：无
@@ -55,6 +55,7 @@ Akashic 新插件采用 Python 实现的最小组合内核：Root Context 持有
 - [x] Cordis 生命周期关键行为在 Python 内核测试中通过，包括依赖波动、重入卸载、epoch 防陈旧激活和逆序清理。
 - [x] 实验插件在隔离 workspace 中完成候选装载、自验证、晋升、依赖撤除和资源归零，且正式 workspace 与插件清单零写入。
 - [x] 旧插件回归保持通过，现有 publication plane 的 stable/latest 与 parent-Turn owner 不变。
+- [x] Root 拓扑以不可变 `TopologyView` 进入 RuntimeSnapshot；内容 identity 覆盖 Fiber 依赖、Service、Effect 与 listener 顺序，晋升仍由 Core 复核。
 
 ## 未决问题
 

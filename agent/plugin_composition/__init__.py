@@ -24,6 +24,8 @@ from agent.plugin_composition.model import (
     FiberState,
     FiberView,
     ServiceKey,
+    TopologyFiberView,
+    TopologyView,
     WriteObservation,
 )
 
@@ -50,5 +52,7 @@ __all__ = [
     "ServiceKey",
     "SerialEventKey",
     "SyncTask",
+    "TopologyFiberView",
+    "TopologyView",
     "WriteObservation",
 ]

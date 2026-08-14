@@ -59,6 +59,28 @@ async def test_topology_identity_preserves_listener_registration_order() -> None
 
 
 @pytest.mark.asyncio
+async def test_topology_view_exposes_ordered_listener_revision() -> None:
+    root = CompositionRoot("event-view")
+
+    async def first(ctx) -> None:
+        await ctx.on(NOTICE, lambda _: None)
+
+    async def second(ctx) -> None:
+        await ctx.on(NOTICE, lambda _: None)
+
+    await root.mount(first, name="first")
+    await root.mount(second, name="second")
+    view = root.topology_view()
+
+    assert view.identity == root.topology_identity()
+    assert view.listeners == (
+        "emit:notice:first",
+        "emit:notice:second",
+    )
+    assert len(view.identity) == 64
+
+
+@pytest.mark.asyncio
 async def test_emit_rejects_async_listener_during_registration() -> None:
     root = CompositionRoot("emit-async-listener")
 

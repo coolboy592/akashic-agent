@@ -42,6 +42,24 @@ class FiberView:
 
 
 @dataclass(frozen=True, slots=True)
+class TopologyFiberView:
+    name: str
+    state: FiberState
+    required_for_readiness: bool
+    dependencies: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class TopologyView:
+    generation_id: str
+    identity: str
+    fibers: tuple[TopologyFiberView, ...]
+    services: tuple[str, ...]
+    effects: tuple[str, ...]
+    listeners: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class WriteObservation:
     plugin_id: str
     operation: str

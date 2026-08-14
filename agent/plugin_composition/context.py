@@ -3,7 +3,9 @@ from __future__ import annotations
 # pyright: reportPrivateUsage=false
 
 import asyncio
+import hashlib
 import inspect
+import json
 from collections.abc import Awaitable, Callable, Coroutine, Iterable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -27,6 +29,8 @@ from agent.plugin_composition.model import (
     FiberState,
     FiberView,
     ServiceKey,
+    TopologyFiberView,
+    TopologyView,
 )
 
 T = TypeVar("T")
@@ -548,22 +552,64 @@ class CompositionRoot:
             external_effects=external_effects,
         )
 
-    def topology_identity(self) -> str:
-        """Return the logical topology identity, excluding transient Fiber ids."""
+    def topology_view(self) -> TopologyView:
+        """Freeze the current logical topology as a content-addressed value."""
 
+        # 1. Exclude transient Fiber ids and error receipts from topology identity.
         receipt = self.receipt()
-        fibers = ",".join(
+        fibers = tuple(
             sorted(
-                f"{fiber.name}:{fiber.state.value}:"
-                f"{'required' if fiber.required_for_readiness else 'optional'}"
-                for fiber in receipt.fibers
+                (
+                    TopologyFiberView(
+                        name=fiber.name,
+                        state=fiber.state,
+                        required_for_readiness=fiber.required_for_readiness,
+                        dependencies=tuple(
+                            sorted(key.name for key in fiber.dependencies)
+                        ),
+                    )
+                    for fiber in self._fibers.values()
+                ),
+                key=lambda item: item.name,
             )
         )
-        return (
-            f"{receipt.generation_id}:{','.join(receipt.services)}:{fibers}:"
-            f"{','.join(sorted(receipt.effects))}:"
-            f"{','.join(self._events.registrations())}"
+        effects = tuple(sorted(receipt.effects))
+        listeners = self._events.registrations()
+
+        # 2. The hash is the revision identity; no durable counter is introduced.
+        identity_payload = {
+            "generation": self.generation_id,
+            "fibers": [
+                {
+                    "name": fiber.name,
+                    "state": fiber.state.value,
+                    "required": fiber.required_for_readiness,
+                    "dependencies": fiber.dependencies,
+                }
+                for fiber in fibers
+            ],
+            "services": receipt.services,
+            "effects": effects,
+            "listeners": listeners,
+        }
+        encoded = json.dumps(
+            identity_payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+        identity = hashlib.sha256(encoded).hexdigest()
+        return TopologyView(
+            generation_id=self.generation_id,
+            identity=identity,
+            fibers=fibers,
+            services=receipt.services,
+            effects=effects,
+            listeners=listeners,
         )
+
+    def topology_identity(self) -> str:
+        return self.topology_view().identity
 
     def validation_identity(self) -> str:
         """Bind the Core-observed topology and audit receipt at validation close."""

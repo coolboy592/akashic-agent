@@ -555,6 +555,7 @@ async def test_snapshot_store_publishes_complete_composition_root() -> None:
 
     lease = store.lease(selector="latest")
     assert lease.snapshot.composition_root is root
+    assert lease.snapshot.composition_topology == root.topology_view()
     assert lease.snapshot.composition_root.context.require(GREETING) == "hello"
     await lease.release()
 
@@ -578,12 +579,44 @@ async def test_snapshot_store_rejects_topology_drift_after_compile() -> None:
         inject=(GREETING,),
     )
     candidate = RuntimeSnapshotCompiler().compile({}, composition_root=root)
+    compiled_view = candidate.composition_topology
     await provider.dispose()
+
+    assert compiled_view is not None
+    assert candidate.composition_topology is compiled_view
+    assert compiled_view.identity != root.topology_identity()
 
     store = RuntimeSnapshotStore()
     store.install(RuntimeSnapshotCompiler().compile({}))
     with pytest.raises(RuntimeError, match="组合拓扑未就绪"):
         store.begin_publish(candidate)
+
+
+@pytest.mark.asyncio
+async def test_topology_view_identity_includes_declared_dependencies() -> None:
+    async def build(dependency: ServiceKey[object]) -> str:
+        root = CompositionRoot("dependency-view")
+        await root.mount(GreetingProvider())
+
+        class FormatterProvider:
+            name = "formatter-provider"
+            inject = ()
+
+            async def apply(self, ctx) -> None:
+                await ctx.provide(FORMATTER, lambda value: value)
+
+        await root.mount(FormatterProvider())
+        await root.mount(
+            lambda _: None,
+            name="consumer",
+            inject=(dependency,),
+        )
+        return root.topology_identity()
+
+    greeting = await build(GREETING)
+    formatter = await build(FORMATTER)
+
+    assert greeting != formatter
 
 
 @pytest.mark.asyncio
