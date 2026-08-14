@@ -1,0 +1,755 @@
+from __future__ import annotations
+
+# pyright: reportPrivateUsage=false
+
+import asyncio
+import inspect
+from collections.abc import Awaitable, Callable, Iterable, Mapping
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from typing import AsyncGenerator, Protocol, TypeVar, cast
+
+from agent.plugin_composition.effect import Effect, EffectSetup
+from agent.plugin_composition.access import CompositionAudit
+from agent.plugin_composition.model import (
+    CompositionError,
+    CompositionReceipt,
+    FiberState,
+    FiberView,
+    ServiceKey,
+)
+
+T = TypeVar("T")
+PluginApply = Callable[["Context"], object]
+FiberObserver = Callable[["Fiber"], object]
+
+
+class Plugin(Protocol):
+    def apply(self, ctx: Context) -> object: ...
+
+
+@dataclass(slots=True)
+class _Provider:
+    key: ServiceKey[object]
+    value: object
+    owner: Fiber
+    revision: int
+
+
+class Context:
+    """Expose composition operations bound to one owning Fiber."""
+
+    def __init__(self, root: CompositionRoot, fiber: Fiber) -> None:
+        self._root = root
+        self._fiber = fiber
+
+    @property
+    def fiber(self) -> Fiber:
+        return self._fiber
+
+    @property
+    def generation_id(self) -> str:
+        return self._root.generation_id
+
+    async def mount(
+        self,
+        plugin: Plugin | PluginApply,
+        *,
+        name: str | None = None,
+        inject: Iterable[ServiceKey[object]] | None = None,
+        required_for_readiness: bool = True,
+    ) -> Fiber:
+        return await self._root._mount(
+            parent=self._fiber,
+            plugin=plugin,
+            name=name,
+            inject=inject,
+            required_for_readiness=required_for_readiness,
+        )
+
+    async def inject(
+        self,
+        dependencies: Iterable[ServiceKey[object]],
+        apply: PluginApply,
+        *,
+        name: str | None = None,
+    ) -> Fiber:
+        """Mount an optional child that activates only while deps exist."""
+
+        return await self.mount(
+            apply,
+            name=name or getattr(apply, "__name__", "inject"),
+            inject=dependencies,
+            required_for_readiness=False,
+        )
+
+    async def provide(self, key: ServiceKey[T], value: T) -> Effect:
+        async def setup() -> Callable[[], Awaitable[None]]:
+            self._root._register_provider(
+                cast(ServiceKey[object], key),
+                value,
+                self._fiber,
+            )
+
+            async def cleanup() -> None:
+                await self._root._remove_provider(
+                    cast(ServiceKey[object], key),
+                    self._fiber,
+                )
+
+            return cleanup
+
+        return await self.effect(setup, label=f"service:{key.name}")
+
+    def get(self, key: ServiceKey[T]) -> T | None:
+        provider = self._fiber.dependency_store.get(cast(ServiceKey[object], key))
+        if provider is None:
+            provider = self._root._active_provider(cast(ServiceKey[object], key))
+        return cast(T | None, None if provider is None else provider.value)
+
+    def require(self, key: ServiceKey[T]) -> T:
+        value = self.get(key)
+        if value is None:
+            raise CompositionError(
+                "INACTIVE_SERVICE",
+                f"当前 Fiber 无法取得 Service: {key.name}",
+            )
+        return value
+
+    async def effect(self, setup: EffectSetup, *, label: str = "effect") -> Effect:
+        return await self._fiber.add_effect(setup, label=label)
+
+
+class Fiber:
+    """Activate one plugin against a stable dependency epoch."""
+
+    def __init__(
+        self,
+        *,
+        root: CompositionRoot,
+        fiber_id: int,
+        name: str,
+        apply: PluginApply,
+        dependencies: tuple[ServiceKey[object], ...],
+        parent: Fiber | None,
+        required_for_readiness: bool,
+        is_root: bool = False,
+    ) -> None:
+        self.root = root
+        self.fiber_id = fiber_id
+        self.name = name
+        self.apply = apply
+        self.dependencies = dependencies
+        self.parent = parent
+        self.required_for_readiness = required_for_readiness
+        self.state = FiberState.ACTIVE if is_root else FiberState.PENDING
+        self.context = Context(root, self)
+        self.dependency_store: dict[ServiceKey[object], _Provider] = {}
+        self.effects: list[Effect] = []
+        self.children: list[Fiber] = []
+        self.error: BaseException | None = None
+        self._epoch: tuple[tuple[str, int], ...] | None = () if is_root else None
+        self._transition = asyncio.Lock()
+        self._transition_owner: asyncio.Task[object] | None = None
+        self._dispose_requested = False
+        self._dispose_task: asyncio.Task[None] | None = None
+        self._restart_task: asyncio.Task[None] | None = None
+        self._is_root = is_root
+
+    @property
+    def missing_services(self) -> tuple[str, ...]:
+        return tuple(
+            key.name
+            for key in self.dependencies
+            if self.root._active_provider(key) is None
+        )
+
+    async def add_effect(self, setup: EffectSetup, *, label: str) -> Effect:
+        """Register ownership before setup and expose only live Fiber states."""
+
+        if self.state in {FiberState.UNLOADING, FiberState.DISPOSED}:
+            raise CompositionError(
+                "INACTIVE_EFFECT",
+                f"{self.name} 在 {self.state.value} 状态不能注册 Effect",
+            )
+        effect = Effect(label=label, remove_from_owner=self._remove_effect)
+        self.effects.append(effect)
+        return await effect.start(setup)
+
+    async def reconcile(self) -> None:
+        """Move to the state implied by the newest dependency epoch."""
+
+        async with self._locked_transition():
+            if self._dispose_requested or self._is_root:
+                return
+            providers = self.root._dependency_snapshot(self.dependencies)
+            target_epoch = self.root._provider_epoch(providers)
+            if providers is None:
+                if self.state in {FiberState.ACTIVE, FiberState.FAILED}:
+                    await self._unload(next_state=FiberState.PENDING)
+                return
+            assert target_epoch is not None
+            if self.state == FiberState.ACTIVE and self._epoch == target_epoch:
+                return
+            if self.state in {FiberState.ACTIVE, FiberState.FAILED}:
+                await self._unload(next_state=FiberState.PENDING)
+            await self._load(providers, target_epoch)
+
+    async def restart(self) -> None:
+        self._reject_direct_reentrant_wait("restart")
+        if self._restart_task is None or self._restart_task.done():
+            self._restart_task = asyncio.create_task(
+                self._restart(),
+                name=f"plugin-fiber-restart:{self.name}",
+            )
+        await _await_critical(self._restart_task)
+
+    async def _restart(self) -> None:
+        async with self._locked_transition():
+            if self._dispose_requested or self._is_root:
+                return
+            if self.state in {FiberState.ACTIVE, FiberState.FAILED}:
+                await self._unload(next_state=FiberState.PENDING)
+        await self.reconcile()
+
+    async def dispose(self) -> None:
+        """Permanently unload this Fiber and join all child/effect cleanup."""
+
+        self._reject_direct_reentrant_wait("dispose")
+        if self._dispose_task is None:
+            self._dispose_task = asyncio.create_task(
+                self._dispose(),
+                name=f"plugin-fiber-dispose:{self.name}",
+            )
+        await _await_critical(self._dispose_task)
+
+    async def _dispose(self) -> None:
+        async with self._locked_transition():
+            if self.state == FiberState.DISPOSED:
+                return
+            self._dispose_requested = True
+            unload_error: BaseException | None = None
+            try:
+                if self.state != FiberState.UNLOADING:
+                    await self._unload(next_state=FiberState.DISPOSED)
+            except BaseException as error:
+                unload_error = error
+            finally:
+                self.state = FiberState.DISPOSED
+                self.root._remove_fiber(self)
+                if self.parent is not None and self in self.parent.children:
+                    self.parent.children.remove(self)
+        await self.root._notify_disposed(self)
+        if unload_error is not None:
+            raise unload_error
+
+    async def _load(
+        self,
+        providers: dict[ServiceKey[object], _Provider],
+        epoch: tuple[tuple[str, int], ...],
+    ) -> None:
+        # 1. Freeze the dependency values for this activation.
+        self.state = FiberState.LOADING
+        self.dependency_store = providers
+        self.error = None
+        await self.root._notify_status(self)
+        await asyncio.sleep(0)
+        if (
+            self._dispose_requested
+            or self.root._provider_epoch_if_active(self.dependencies) != epoch
+        ):
+            await self._unload(next_state=FiberState.PENDING)
+            return
+
+        # 2. Apply the plugin and publish its services only after success.
+        try:
+            result = self.apply(self.context)
+            if inspect.isawaitable(result):
+                await result
+        except asyncio.CancelledError:
+            cleanup_task = asyncio.create_task(
+                self._unload(next_state=FiberState.PENDING),
+                name=f"plugin-fiber-cancel-cleanup:{self.name}",
+            )
+            await _await_critical(cleanup_task)
+            raise
+        except Exception as error:
+            self.error = error
+            self.root._record_error(self, error)
+            await self._unload(next_state=FiberState.FAILED)
+            return
+        if (
+            self._dispose_requested
+            or self.root._provider_epoch_if_active(self.dependencies) != epoch
+        ):
+            await self._unload(next_state=FiberState.PENDING)
+            return
+        self._epoch = epoch
+        self.state = FiberState.ACTIVE
+        await self.root._notify_status(self)
+        await self.root._owner_became_active(self)
+
+    async def _unload(self, *, next_state: FiberState) -> None:
+        # 1. Make owned services unavailable before dependents clean up.
+        self.state = FiberState.UNLOADING
+        await self.root._notify_status(self)
+        errors: list[BaseException] = []
+        try:
+            await self.root._owner_became_inactive(self)
+        except BaseException as error:
+            errors.append(error)
+
+        # 2. Children and effects are fully drained in reverse ownership order.
+        for child in reversed(tuple(self.children)):
+            try:
+                await child.dispose()
+            except BaseException as error:
+                errors.append(error)
+        for effect in reversed(tuple(self.effects)):
+            try:
+                await effect.aclose()
+            except BaseException as error:
+                errors.append(error)
+        self.dependency_store = {}
+        self._epoch = None
+        self.state = next_state
+        await self.root._notify_status(self)
+        if errors:
+            raise BaseExceptionGroup(f"Fiber 卸载失败: {self.name}", errors)
+
+    @asynccontextmanager
+    async def _locked_transition(self) -> AsyncGenerator[None]:
+        """Own one lifecycle transition and expose direct self-waits."""
+
+        async with self._transition:
+            owner = asyncio.current_task()
+            self._transition_owner = cast(asyncio.Task[object] | None, owner)
+            try:
+                yield
+            finally:
+                self._transition_owner = None
+
+    def _reject_direct_reentrant_wait(self, operation: str) -> None:
+        current = asyncio.current_task()
+        if current is not None and current is self._transition_owner:
+            raise CompositionError(
+                "REENTRANT_LIFECYCLE_WAIT",
+                f"{self.name} 不能在自身生命周期过渡中直接等待 {operation}；"
+                "请用 asyncio.create_task 调度",
+            )
+
+    def _remove_effect(self, effect: Effect) -> None:
+        if effect in self.effects:
+            self.effects.remove(effect)
+
+
+class CompositionRoot:
+    """Own one generation topology and derive its validation receipt."""
+
+    def __init__(
+        self,
+        generation_id: str,
+        *,
+        audit: CompositionAudit | None = None,
+    ) -> None:
+        if not generation_id:
+            raise ValueError("generation_id 不能为空")
+        self.generation_id = generation_id
+        self._next_fiber_id = 1
+        self._next_provider_revision = 1
+        self._fibers: dict[int, Fiber] = {}
+        self._providers: dict[ServiceKey[object], _Provider] = {}
+        self._mount_observers: list[FiberObserver] = []
+        self._status_observers: list[FiberObserver] = []
+        self._dispose_observers: list[FiberObserver] = []
+        self._errors: list[str] = []
+        self._audit = audit or CompositionAudit()
+        self._dispose_task: asyncio.Task[None] | None = None
+        self.root_fiber = Fiber(
+            root=self,
+            fiber_id=0,
+            name="root",
+            apply=lambda _: None,
+            dependencies=(),
+            parent=None,
+            required_for_readiness=True,
+            is_root=True,
+        )
+        self.context = self.root_fiber.context
+
+    def on_mount(self, observer: FiberObserver) -> Callable[[], None]:
+        return self._add_observer(self._mount_observers, observer)
+
+    def on_status(self, observer: FiberObserver) -> Callable[[], None]:
+        return self._add_observer(self._status_observers, observer)
+
+    def on_dispose(self, observer: FiberObserver) -> Callable[[], None]:
+        return self._add_observer(self._dispose_observers, observer)
+
+    async def mount(
+        self,
+        plugin: Plugin | PluginApply,
+        *,
+        name: str | None = None,
+        inject: Iterable[ServiceKey[object]] | None = None,
+    ) -> Fiber:
+        return await self.context.mount(plugin, name=name, inject=inject)
+
+    async def dispose(self) -> None:
+        if self._dispose_task is None:
+            self._dispose_task = asyncio.create_task(
+                self._dispose(),
+                name=f"plugin-composition-dispose:{self.generation_id}",
+            )
+        await _await_critical(self._dispose_task)
+
+    async def _dispose(self) -> None:
+        self.root_fiber.state = FiberState.UNLOADING
+        errors: list[BaseException] = []
+        for child in reversed(tuple(self.root_fiber.children)):
+            try:
+                await child.dispose()
+            except BaseException as error:
+                errors.append(error)
+        for effect in reversed(tuple(self.root_fiber.effects)):
+            try:
+                await effect.aclose()
+            except BaseException as error:
+                errors.append(error)
+        self.root_fiber.state = FiberState.DISPOSED
+        if errors:
+            raise BaseExceptionGroup("Root Context 清理失败", errors)
+
+    def receipt(self) -> CompositionReceipt:
+        fibers = tuple(self._fiber_view(fiber) for fiber in self._fibers.values())
+        external_effects = self._audit.external_effects
+        required_pending = tuple(
+            view.name
+            for view in fibers
+            if view.required_for_readiness and view.state != FiberState.ACTIVE
+        )
+        optional_pending = tuple(
+            view.name
+            for view in fibers
+            if not view.required_for_readiness and view.state != FiberState.ACTIVE
+        )
+        effects = tuple(
+            f"{fiber.name}:{effect.label}"
+            for fiber in (self.root_fiber, *self._fibers.values())
+            for effect in fiber.effects
+        )
+        return CompositionReceipt(
+            generation_id=self.generation_id,
+            ready=(
+                self.root_fiber.state == FiberState.ACTIVE
+                and not required_pending
+                and not self._errors
+                and not external_effects
+            ),
+            fibers=fibers,
+            services=tuple(sorted(key.name for key in self._providers)),
+            effects=effects,
+            required_pending=required_pending,
+            optional_pending=optional_pending,
+            errors=tuple(self._errors),
+            writes=self._audit.writes,
+            external_effects=external_effects,
+        )
+
+    def topology_identity(self) -> str:
+        """Return the logical topology identity, excluding transient Fiber ids."""
+
+        receipt = self.receipt()
+        fibers = ",".join(
+            sorted(
+                f"{fiber.name}:{fiber.state.value}:"
+                f"{'required' if fiber.required_for_readiness else 'optional'}"
+                for fiber in receipt.fibers
+            )
+        )
+        return (
+            f"{receipt.generation_id}:{','.join(receipt.services)}:{fibers}:"
+            f"{','.join(sorted(receipt.effects))}"
+        )
+
+    def validation_identity(self) -> str:
+        """Bind the Core-observed topology and audit receipt at validation close."""
+
+        receipt = self.receipt()
+        writes = ",".join(
+            f"{item.plugin_id}:{item.operation}:{item.relative_path}:{item.sha256}"
+            for item in receipt.writes
+        )
+        external = ",".join(
+            f"{item.kind}:{item.target}:{item.outcome}"
+            for item in receipt.external_effects
+        )
+        return "|".join(
+            (
+                self.topology_identity(),
+                f"required:{','.join(receipt.required_pending)}",
+                f"optional:{','.join(receipt.optional_pending)}",
+                f"errors:{','.join(receipt.errors)}",
+                f"writes:{writes}",
+                f"external:{external}",
+            )
+        )
+
+    async def _mount(
+        self,
+        *,
+        parent: Fiber,
+        plugin: Plugin | PluginApply,
+        name: str | None,
+        inject: Iterable[ServiceKey[object]] | None,
+        required_for_readiness: bool,
+    ) -> Fiber:
+        """Publish only after parent ownership exists, then reconcile."""
+
+        # 1. Resolve the narrow apply(ctx) contract.
+        apply, resolved_name, dependencies = self._resolve_plugin(
+            plugin,
+            name=name,
+            inject=inject,
+        )
+        if parent.state in {FiberState.UNLOADING, FiberState.DISPOSED}:
+            raise CompositionError(
+                "INACTIVE_PLUGIN_OWNER",
+                f"{parent.name} 不能挂载子插件",
+            )
+        if any(fiber.name == resolved_name for fiber in self._fibers.values()):
+            raise CompositionError(
+                "DUPLICATE_PLUGIN",
+                f"同一拓扑不能重复挂载插件: {resolved_name}",
+            )
+
+        # 2. Parent ownership is visible before publication observers run.
+        fiber = Fiber(
+            root=self,
+            fiber_id=self._next_fiber_id,
+            name=resolved_name,
+            apply=apply,
+            dependencies=dependencies,
+            parent=parent,
+            required_for_readiness=required_for_readiness,
+        )
+        self._next_fiber_id += 1
+        parent.children.append(fiber)
+        self._fibers[fiber.fiber_id] = fiber
+        try:
+            await self._notify_mount(fiber)
+        except BaseException:
+            await fiber.dispose()
+            raise
+        if parent.state in {FiberState.UNLOADING, FiberState.DISPOSED}:
+            await fiber.dispose()
+            return fiber
+        try:
+            await fiber.reconcile()
+        except BaseException:
+            await fiber.dispose()
+            raise
+        return fiber
+
+    def _resolve_plugin(
+        self,
+        plugin: Plugin | PluginApply,
+        *,
+        name: str | None,
+        inject: Iterable[ServiceKey[object]] | None,
+    ) -> tuple[PluginApply, str, tuple[ServiceKey[object], ...]]:
+        if callable(plugin) and not hasattr(plugin, "apply"):
+            apply = cast(PluginApply, plugin)
+        else:
+            candidate = getattr(plugin, "apply", None)
+            if not callable(candidate):
+                raise TypeError("插件必须是 callable 或提供 apply(ctx)")
+            apply = cast(PluginApply, candidate)
+        resolved_name = name or str(getattr(plugin, "name", "")).strip()
+        resolved_name = resolved_name or getattr(apply, "__name__", "plugin")
+        raw_dependencies = inject
+        if raw_dependencies is None:
+            raw_dependencies = getattr(plugin, "inject", ())
+        dependencies = tuple(cast(Iterable[ServiceKey[object]], raw_dependencies))
+        if len(set(dependencies)) != len(dependencies):
+            raise ValueError(f"插件依赖重复: {resolved_name}")
+        return apply, resolved_name, dependencies
+
+    def _register_provider(
+        self,
+        key: ServiceKey[object],
+        value: object,
+        owner: Fiber,
+    ) -> None:
+        existing = self._providers.get(key)
+        if existing is not None:
+            raise CompositionError(
+                "DUPLICATE_SERVICE",
+                f"Service {key.name} 已由 {existing.owner.name} 提供",
+            )
+        self._providers[key] = _Provider(
+            key=key,
+            value=value,
+            owner=owner,
+            revision=self._next_provider_revision,
+        )
+        self._next_provider_revision += 1
+
+    async def _remove_provider(
+        self,
+        key: ServiceKey[object],
+        owner: Fiber,
+    ) -> None:
+        provider = self._providers.get(key)
+        if provider is None:
+            return
+        if provider.owner is not owner:
+            raise CompositionError(
+                "SERVICE_OWNER_MISMATCH",
+                f"{owner.name} 不能移除 {provider.owner.name} 的 Service {key.name}",
+            )
+        del self._providers[key]
+        await self._reconcile_dependents((key,), exclude=owner)
+
+    def _active_provider(self, key: ServiceKey[object]) -> _Provider | None:
+        provider = self._providers.get(key)
+        if provider is None or provider.owner.state != FiberState.ACTIVE:
+            return None
+        return provider
+
+    def _dependency_snapshot(
+        self,
+        dependencies: tuple[ServiceKey[object], ...],
+    ) -> dict[ServiceKey[object], _Provider] | None:
+        providers: dict[ServiceKey[object], _Provider] = {}
+        for key in dependencies:
+            provider = self._active_provider(key)
+            if provider is None:
+                return None
+            providers[key] = provider
+        return providers
+
+    @staticmethod
+    def _provider_epoch(
+        providers: Mapping[ServiceKey[object], _Provider] | None,
+    ) -> tuple[tuple[str, int], ...] | None:
+        if providers is None:
+            return None
+        return tuple(
+            sorted((key.name, provider.revision) for key, provider in providers.items())
+        )
+
+    def _provider_epoch_if_active(
+        self,
+        dependencies: tuple[ServiceKey[object], ...],
+    ) -> tuple[tuple[str, int], ...] | None:
+        return self._provider_epoch(self._dependency_snapshot(dependencies))
+
+    async def _owner_became_active(self, owner: Fiber) -> None:
+        keys = tuple(
+            key for key, provider in self._providers.items() if provider.owner is owner
+        )
+        await self._reconcile_dependents(keys, exclude=owner)
+
+    async def _owner_became_inactive(self, owner: Fiber) -> None:
+        keys = tuple(
+            key for key, provider in self._providers.items() if provider.owner is owner
+        )
+        await self._reconcile_dependents(keys, exclude=owner)
+
+    async def _reconcile_dependents(
+        self,
+        keys: tuple[ServiceKey[object], ...],
+        *,
+        exclude: Fiber,
+    ) -> None:
+        if not keys:
+            return
+        affected = [
+            fiber
+            for fiber in tuple(self._fibers.values())
+            if fiber is not exclude
+            and fiber.state != FiberState.DISPOSED
+            and any(key in fiber.dependencies for key in keys)
+        ]
+        if affected:
+            results = await asyncio.gather(
+                *(fiber.reconcile() for fiber in affected),
+                return_exceptions=True,
+            )
+            errors = [result for result in results if isinstance(result, BaseException)]
+            if errors:
+                raise BaseExceptionGroup("依赖 Fiber 协调失败", errors)
+
+    async def _notify_mount(self, fiber: Fiber) -> None:
+        for observer in tuple(self._mount_observers):
+            result = observer(fiber)
+            if inspect.isawaitable(result):
+                await result
+
+    async def _notify_status(self, fiber: Fiber) -> None:
+        await self._notify_contained(self._status_observers, fiber)
+
+    async def _notify_disposed(self, fiber: Fiber) -> None:
+        await self._notify_contained(self._dispose_observers, fiber)
+
+    async def _notify_contained(
+        self,
+        observers: list[FiberObserver],
+        fiber: Fiber,
+    ) -> None:
+        for observer in tuple(observers):
+            try:
+                result = observer(fiber)
+                if inspect.isawaitable(result):
+                    await result
+            except asyncio.CancelledError as error:
+                current = asyncio.current_task()
+                if current is not None and current.cancelling():
+                    raise
+                self._record_error(fiber, error)
+            except Exception as error:
+                self._record_error(fiber, error)
+
+    def _record_error(self, fiber: Fiber, error: BaseException) -> None:
+        self._errors.append(f"{fiber.name}:{type(error).__name__}:{error}")
+
+    def _remove_fiber(self, fiber: Fiber) -> None:
+        _ = self._fibers.pop(fiber.fiber_id, None)
+
+    def _fiber_view(self, fiber: Fiber) -> FiberView:
+        return FiberView(
+            fiber_id=fiber.fiber_id,
+            name=fiber.name,
+            state=fiber.state,
+            required_for_readiness=fiber.required_for_readiness,
+            missing_services=fiber.missing_services,
+            error=(
+                None
+                if fiber.error is None
+                else f"{type(fiber.error).__name__}: {fiber.error}"
+            ),
+        )
+
+    @staticmethod
+    def _add_observer(
+        observers: list[FiberObserver],
+        observer: FiberObserver,
+    ) -> Callable[[], None]:
+        observers.append(observer)
+
+        def remove() -> None:
+            if observer in observers:
+                observers.remove(observer)
+
+        return remove
+
+
+async def _await_critical(task: asyncio.Task[None]) -> None:
+    """Finish lifecycle cleanup before propagating caller cancellation."""
+
+    try:
+        await asyncio.shield(task)
+    except asyncio.CancelledError:
+        await task
+        raise

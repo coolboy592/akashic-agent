@@ -13,6 +13,10 @@
 - 在独立 Fitbit canonical source 变更中让 monitor 与 MCP 读取同一个 `validation_port_env`，再以一次性 workspace 验收真实隔离 listener、child tool trace、正式切换和旧 listener 恢复；不得在 Core 中添加 Fitbit 特判。
 - 补充 turn-boundary rollout 的进程崩溃注入矩阵，覆盖 terminal 封口后、候选服务停止后、正式 endpoint 切换后和 pointer 提交前；恢复失败必须保持 degraded 可见，不能只恢复 pointer。
 
+## P0 · 插件组合内核
+
+- 第一阶段已按[0036](decisions/0036-plugin-composition-keeps-promotion-owner.md)和[任务合同](design/plugin-composition-kernel-task-contract.md)完成。下一步按差分回放选择 Citation/Meme 或 GitHub Watch 迁移试点；不得在证据出现前改写现有插件或删除 legacy host。
+
 ## P0 · 独立语义验收
 
 - 将 CTX-001 当前的 trace、完整状态快照和 fixture `DELETE` pilot 升级为 SQLite authorizer 与一次性候选真实 retry seam mutant；导入失败、fixture 失败或超时不得计为 mutant kill。

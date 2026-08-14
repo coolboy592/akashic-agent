@@ -1,6 +1,6 @@
 # Cordis 插件迁移能力等价验收设计
 
-- 状态：proposed / local review
+- 状态：accepted / phase 1 implemented
 - 核对日期：2026-08-14
 - 文档基线：`akashic-agent@d1b1295b8490ffe899f27476bf97ae7b261ef76e`
 - 当前运行基线：`akashic-agent@07068e2bfb2dac0173298ed0c60a7f5c466ad745`
@@ -15,13 +15,21 @@ Akashic 可以采用 Cordis 的 service、typed event、effect、fiber 和配置
 
 本设计保留现有插件发布语义：候选隔离、父 Turn 授权、stable/latest 内部双快照、generation lease、领域 oracle、自动提交或丢弃。Cordis 负责挂载、依赖等待和可逆注册，不取得插件代码晋升、持久数据恢复或外部效果回滚的所有权。
 
-本设计只定义迁移前的能力基线与验收方法，不批准以下动作：
+本设计同时作为迁移前的能力基线与验收方法。维护者已批准第一阶段组合内核和实验插件，边界见[0036](../decisions/0036-plugin-composition-keeps-promotion-owner.md)与[任务合同](plugin-composition-kernel-task-contract.md)。第一阶段不批准以下动作：
 
 - 不修改当前正式 runtime、workspace、plugin-data 或插件 manifest。
 - 不把当前安装缓存当成可编辑源码。
-- 不批准将任一现有插件迁移到 Cordis。
+- 不批准将任一现有插件迁移到新内核；先只运行全新的实验插件。
 - 不批准修复当前 Wake ACK 故障或改变缺失依赖的错误语义。
 - 不批准向真实渠道、GitHub、浏览器账号或外部 API 发送测试效果。
+
+### 1.1 实施收敛：选择组合语义，不复制整套工具链
+
+第一阶段转译 Cordis 的 Context、Service、Inject、Fiber 与 Effect，并让 Root/Fiber 直接拥有 scope 生命周期；它吸收 DeepSeek Harness 对重入卸载、owner 先登记、UNLOADING 禁止新 Effect、child 先归属后发布、epoch 防陈旧激活和 observer 隔离的加固。它不移植独立 service isolation scope、Loader、Include、HMR、Timer、Logger、Schemastery 或 CosmoKit：Akashic 已有 artifact、安装、generation、热重载和晋升 owner；Timer 与 Logger 可以像 Job 一样成为普通 Service；配置继续使用 Python 类型和现有 Pydantic 边界。
+
+实现后的 publication seam 在候选 lease 排空后由 Core 封存拓扑、写集和外部效果回执；晋升前再次复核。Service 实例本身仍可承载运行时可变状态，不能为了消除 TOCTOU 而把 Cordis 的动态服务错误冻结成序列化值。任何被 `ExternalEffectGate` 拒绝的尝试即使被插件捕获，也会令候选不再 ready。
+
+因此本文后续出现的“Cordis 候选”表示采用上述组合语义的 Python 候选拓扑，不表示逐包、逐 API 或 TypeScript ABI 完整兼容。能力等价仍以可观察行为为准。
 
 ## 2. 本设计与现有自验证设计的关系
 

@@ -16,6 +16,7 @@ from agent.plugins.specs import RegisteredProactiveSource, proactive_source_key
 from agent.tools.registry import ToolRegistry
 from agent.tool_hooks import ToolHook
 from agent.skills import SkillIndex
+from agent.plugin_composition import CompositionRoot
 from bus.event_bus import Handler
 from infra.channels.contract import Channel
 
@@ -59,6 +60,9 @@ class RuntimeSnapshot:
     event_handlers: Mapping[type[object], tuple[Handler[object], ...]] = field(
         default_factory=lambda: MappingProxyType({})
     )
+    composition_root: CompositionRoot | None = None
+    composition_topology_identity: str | None = None
+    composition_validation_identity: str | None = None
     state: SnapshotState = "compiled"
     lease_count: int = 0
     accepting_leases: bool = True
@@ -118,6 +122,7 @@ class RuntimeSnapshotCompiler:
         catalog_generation: PluginGeneration | None = None,
         snapshot_revision: str = "",
         workspace_mcp_generation: WorkspaceMcpGeneration | None = None,
+        composition_root: CompositionRoot | None = None,
     ) -> RuntimeSnapshot:
         ordered = [generations[key] for key in sorted(generations)]
         if any(generation.plugin_id != key for key, generation in generations.items()):
@@ -197,6 +202,18 @@ class RuntimeSnapshotCompiler:
             else ""
         )
         identity += f"|snapshot:{snapshot_revision}"
+        composition_identity: str | None = None
+        if composition_root is not None:
+            receipt = composition_root.receipt()
+            if not receipt.ready:
+                raise RuntimeError(
+                    "RuntimeSnapshot 插件组合拓扑未就绪: "
+                    f"required_pending={receipt.required_pending}, "
+                    f"errors={receipt.errors}, "
+                    f"external_effects={receipt.external_effects}"
+                )
+            composition_identity = composition_root.topology_identity()
+            identity += f"|composition:{composition_identity}"
         snapshot_id = hashlib.sha256(identity.encode()).hexdigest()[:16]
         return RuntimeSnapshot(
             snapshot_id=snapshot_id,
@@ -229,6 +246,8 @@ class RuntimeSnapshotCompiler:
             after_step_modules=phases["after_step_modules"],
             after_reasoning_modules=phases["after_reasoning_modules"],
             after_turn_modules=phases["after_turn_modules"],
+            composition_root=composition_root,
+            composition_topology_identity=composition_identity,
         )
 
     @staticmethod
@@ -446,9 +465,26 @@ class RuntimeSnapshotStore:
             for snapshot in self._snapshots.values()
         )
 
+    def composition_is_referenced_elsewhere(
+        self,
+        root: CompositionRoot,
+        *,
+        excluding_snapshot_id: str,
+    ) -> bool:
+        return any(
+            snapshot.snapshot_id != excluding_snapshot_id
+            and (
+                snapshot.state in {"validating", "committed"}
+                or snapshot.lease_count > 0
+            )
+            and snapshot.composition_root is root
+            for snapshot in self._snapshots.values()
+        )
+
     def install(self, snapshot: RuntimeSnapshot) -> None:
         if self._current is not None or self._pending is not None:
             raise RuntimeError("RuntimeSnapshotStore 已安装初始快照")
+        self._validate_composition(snapshot)
         self._adopt(snapshot)
         snapshot.state = "committed"
         self._current = snapshot
@@ -467,6 +503,7 @@ class RuntimeSnapshotStore:
             raise RuntimeError("已有 RuntimeSnapshot 候选等待 promote/discard")
         if candidate.snapshot_id in self._snapshots:
             raise RuntimeError(f"RuntimeSnapshot 已存在: {candidate.snapshot_id}")
+        self._validate_composition(candidate)
         self._adopt(candidate)
         transaction = SnapshotTransaction(previous=self._current, candidate=candidate)
         candidate.state = "validating"
@@ -483,6 +520,7 @@ class RuntimeSnapshotStore:
         after_open: Callable[[], None] | None = None,
     ) -> None:
         self._require_pending(transaction)
+        self._validate_composition(transaction.candidate)
         if before_open is not None:
             before_open()
         transaction.candidate.state = "committed"
@@ -509,6 +547,7 @@ class RuntimeSnapshotStore:
 
         # 1. Open only the explicitly selected candidate.
         self._require_pending(transaction)
+        self._validate_composition(transaction.candidate)
         if before_open is not None:
             before_open()
         transaction.candidate.state = "committed"
@@ -534,6 +573,7 @@ class RuntimeSnapshotStore:
             raise RuntimeError("没有等待 promote 的 RuntimeSnapshot 候选")
         if candidate.accepting_leases:
             raise RuntimeError("promote 前必须先暂停 candidate lease admission")
+        self._validate_composition(candidate, require_validation=True)
         if before_open is not None:
             before_open()
         previous = self._current
@@ -635,6 +675,20 @@ class RuntimeSnapshotStore:
             raise RuntimeError("等待 promote 的 RuntimeSnapshot 候选不一致")
         candidate.accepting_leases = False
         return candidate
+
+    def seal_candidate_validation(self, expected: RuntimeSnapshot) -> None:
+        """Seal the Core-observed receipt after validation leases have drained."""
+
+        candidate = self.unpromoted_candidate
+        if candidate is None or candidate is not expected:
+            raise RuntimeError("等待封存验证回执的 RuntimeSnapshot 候选不一致")
+        if candidate.accepting_leases or candidate.lease_count:
+            raise RuntimeError("封存验证回执前必须暂停并排空 candidate lease")
+        self._validate_composition(candidate)
+        root = candidate.composition_root
+        candidate.composition_validation_identity = (
+            None if root is None else root.validation_identity()
+        )
 
     async def wait_for_no_leases(self, snapshot: RuntimeSnapshot) -> None:
         async with self._condition:
@@ -841,6 +895,35 @@ class RuntimeSnapshotStore:
 
     def _adopt(self, snapshot: RuntimeSnapshot) -> None:
         snapshot.claim(self._token)
+
+    @staticmethod
+    def _validate_composition(
+        snapshot: RuntimeSnapshot,
+        *,
+        require_validation: bool = False,
+    ) -> None:
+        root = snapshot.composition_root
+        if root is None:
+            if snapshot.composition_topology_identity is not None:
+                raise RuntimeError(
+                    "RuntimeSnapshot composition identity 缺少 Root Context"
+                )
+            return
+        receipt = root.receipt()
+        if not receipt.ready:
+            raise RuntimeError(
+                "RuntimeSnapshot 插件组合拓扑未就绪: "
+                f"required_pending={receipt.required_pending}, "
+                f"errors={receipt.errors}, "
+                f"external_effects={receipt.external_effects}"
+            )
+        if root.topology_identity() != snapshot.composition_topology_identity:
+            raise RuntimeError("RuntimeSnapshot 插件组合拓扑在编译后发生变化")
+        if require_validation:
+            if snapshot.composition_validation_identity is None:
+                raise RuntimeError("RuntimeSnapshot 插件组合候选缺少 Core 验证回执")
+            if root.validation_identity() != snapshot.composition_validation_identity:
+                raise RuntimeError("RuntimeSnapshot 插件组合验证回执在封存后发生变化")
 
     def _selected(self, selector: RuntimeSelector) -> RuntimeSnapshot | None:
         if selector == "stable":

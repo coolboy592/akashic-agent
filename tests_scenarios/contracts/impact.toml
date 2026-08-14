@@ -131,9 +131,12 @@ scenarios = ["mcp_call_finality", "mcp_process_lifecycle"]
 priority = "p0"
 requirements = ["PLG-001", "PLG-004", "PLG-009"]
 paths = [
+  "agent/plugin_composition/**",
   "agent/plugins/**",
+  "examples/plugin_composition/**",
   "plugin_packages/**",
   "plugins/**",
+  "scripts/plugin_composition_experiment.py",
   "bootstrap/tools.py",
   "bootstrap/wiring.py",
   "tests/fixtures/plugins/**",

@@ -1248,6 +1248,15 @@ class PluginManager:
             _ = self._draining_generations.pop(generation.plugin_id, None)
 
     async def _on_snapshot_drained(self, snapshot: RuntimeSnapshot) -> None:
+        composition_root = snapshot.composition_root
+        if (
+            composition_root is not None
+            and not self._snapshot_store.composition_is_referenced_elsewhere(
+                composition_root,
+                excluding_snapshot_id=snapshot.snapshot_id,
+            )
+        ):
+            await composition_root.dispose()
         catalog_id = self._snapshot_skill_catalogs.pop(snapshot.snapshot_id, None)
         if catalog_id is not None:
             self._skill_host.close(catalog_id)
@@ -1740,6 +1749,8 @@ class PluginManager:
                     if self._ready_candidate is ready:
                         await self._drop_ready(plugin_id)
                     raise
+
+            self._snapshot_store.seal_candidate_validation(ready.snapshot)
 
             # 2. 先切可回滚的 Skill 投影，再提交持久 pointer；整个回调不跨 await。
             skill_links_switched = False
