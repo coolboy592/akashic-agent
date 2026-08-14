@@ -12,6 +12,7 @@ from agent.lifecycle.phase import (
     collect_prefixed_slots,
     topo_sort_modules,
 )
+from agent.lifecycle.composition import PROMPT_RENDER_EVENT, run_composition_lifecycle
 from agent.lifecycle.types import PromptRenderCtx, PromptRenderInput, PromptRenderResult
 from agent.prompting import PromptSectionRender
 from bus.event_bus import EventBus
@@ -70,6 +71,10 @@ class _EmitPromptRenderCtxModule:
     async def run(self, frame: PromptRenderFrame) -> PromptRenderFrame:
         ctx = cast(PromptRenderCtx, frame.slots[_CTX_SLOT])
         frame.slots[_CTX_SLOT] = await self._bus.emit(ctx)
+        await run_composition_lifecycle(
+            PROMPT_RENDER_EVENT,
+            cast(PromptRenderCtx, frame.slots[_CTX_SLOT]),
+        )
         return frame
 
 

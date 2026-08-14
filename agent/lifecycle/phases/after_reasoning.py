@@ -17,6 +17,11 @@ from agent.lifecycle.phase import (
     collect_prefixed_slots,
     topo_sort_modules,
 )
+from agent.lifecycle.composition import (
+    AFTER_REASONING_CLEANUP_EVENT,
+    AFTER_REASONING_PREPROCESS_EVENT,
+    run_composition_lifecycle,
+)
 from agent.lifecycle.types import (
     AfterReasoningCtx,
     AfterReasoningInput,
@@ -151,13 +156,25 @@ class _EmitAfterReasoningCtxModule:
 
     async def run(self, frame: AfterReasoningFrame) -> AfterReasoningFrame:
         ctx = cast(AfterReasoningCtx, frame.slots[_CTX_SLOT])
+        await run_composition_lifecycle(AFTER_REASONING_PREPROCESS_EVENT, ctx)
         frame.slots[_CTX_SLOT] = await self._bus.emit(ctx)
+        return frame
+
+
+class _RunCompositionAfterReasoningCleanupModule:
+    slot = "after_reasoning.composition_cleanup"
+    requires = ("after_reasoning.emit", _CTX_SLOT)
+    produces = (_CTX_SLOT,)
+
+    async def run(self, frame: AfterReasoningFrame) -> AfterReasoningFrame:
+        ctx = cast(AfterReasoningCtx, frame.slots[_CTX_SLOT])
+        await run_composition_lifecycle(AFTER_REASONING_CLEANUP_EVENT, ctx)
         return frame
 
 
 class _PersistUserMessageModule:
     slot = "after_reasoning.persist_user"
-    requires = ("after_reasoning.emit", _CTX_SLOT)
+    requires = ("after_reasoning.composition_cleanup", _CTX_SLOT)
     produces = (_PERSISTED_USER_SLOT,)
 
     def __init__(self, session_services: SessionServices) -> None:
@@ -457,6 +474,7 @@ def default_after_reasoning_modules(
     builtins: AfterReasoningModules = [
         _BuildAfterReasoningCtxModule(),
         _EmitAfterReasoningCtxModule(bus),
+        _RunCompositionAfterReasoningCleanupModule(),
         _PersistUserMessageModule(session_services),
         _PersistAssistantMessageModule(),
         _UpdateSessionMetadataModule(),

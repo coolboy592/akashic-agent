@@ -15,7 +15,7 @@
 
 ## P0 · 插件组合内核
 
-- 组合内核、事件/同步执行能力与[TopologyView 阶段](design/plugin-topology-view-task-contract.md)已完成。下一张 PR 只实现 Prompt/回答处理的 lifecycle 领域接入点；随后再以 Citation/Meme 做首组差分迁移和独立 legacy 清理。不得把这些阶段重新合进一张 PR，也不得在差分证据出现前删除 legacy host。
+- 组合内核、事件/同步执行、TopologyView 与[lifecycle 接入点](design/plugin-lifecycle-seam-task-contract.md)已完成。下一张 PR 只建立 v3 generation loader 并以 Citation/Meme 做首组差分迁移；随后用独立 PR 删除这组已无消费者的 legacy 路径。不得在差分证据出现前删除 legacy host。
 
 ## P0 · 独立语义验收
 
