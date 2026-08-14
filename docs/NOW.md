@@ -15,7 +15,7 @@
 
 ## P0 · 插件组合内核
 
-- 组合内核、事件/同步执行、TopologyView 与[lifecycle 接入点](design/plugin-lifecycle-seam-task-contract.md)已完成。下一张 PR 只建立 v3 generation loader 并以 Citation/Meme 做首组差分迁移；随后用独立 PR 删除这组已无消费者的 legacy 路径。不得在差分证据出现前删除 legacy host。
+- 组合内核、事件/同步执行、TopologyView、lifecycle 接入点与[v3 generation loader](design/plugin-v3-loader-task-contract.md)已完成。下一张 PR 只迁移 Citation/Meme 并产出首组差分证据；随后用独立 PR 删除这组已无消费者的 legacy 路径。不得在差分证据出现前删除 legacy host。
 
 ## P0 · 独立语义验收
 

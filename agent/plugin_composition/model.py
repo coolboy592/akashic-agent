@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 from typing import Generic, TypeVar
 
 T = TypeVar("T", covariant=True)
@@ -57,6 +58,17 @@ class TopologyView:
     services: tuple[str, ...]
     effects: tuple[str, ...]
     listeners: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class PluginRuntime:
+    """Expose the Core-assigned paths and config to one mounted plugin tree."""
+
+    plugin_id: str
+    plugin_dir: Path
+    data_dir: Path
+    workspace: Path
+    config: object
 
 
 @dataclass(frozen=True, slots=True)

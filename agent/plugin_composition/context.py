@@ -28,6 +28,7 @@ from agent.plugin_composition.model import (
     CompositionReceipt,
     FiberState,
     FiberView,
+    PluginRuntime,
     ServiceKey,
     TopologyFiberView,
     TopologyView,
@@ -68,6 +69,19 @@ class Context:
         reject_executor_context_access()
         return self._root.generation_id
 
+    @property
+    def runtime(self) -> PluginRuntime:
+        """Return the Core-owned runtime identity for this plugin tree."""
+
+        reject_executor_context_access()
+        runtime = self._fiber.runtime
+        if runtime is None:
+            raise CompositionError(
+                "PLUGIN_RUNTIME_UNAVAILABLE",
+                f"{self._fiber.name} 没有绑定插件运行环境",
+            )
+        return runtime
+
     async def mount(
         self,
         plugin: Plugin | PluginApply,
@@ -83,6 +97,7 @@ class Context:
             name=name,
             inject=inject,
             required_for_readiness=required_for_readiness,
+            runtime=self._fiber.runtime,
         )
 
     async def inject(
@@ -228,6 +243,7 @@ class Fiber:
         dependencies: tuple[ServiceKey[object], ...],
         parent: Fiber | None,
         required_for_readiness: bool,
+        runtime: PluginRuntime | None,
         is_root: bool = False,
     ) -> None:
         self.root = root
@@ -237,6 +253,7 @@ class Fiber:
         self.dependencies = dependencies
         self.parent = parent
         self.required_for_readiness = required_for_readiness
+        self.runtime = runtime
         self.state = FiberState.ACTIVE if is_root else FiberState.PENDING
         self.context = Context(root, self)
         self.dependency_store: dict[ServiceKey[object], _Provider] = {}
@@ -469,6 +486,7 @@ class CompositionRoot:
             dependencies=(),
             parent=None,
             required_for_readiness=True,
+            runtime=None,
             is_root=True,
         )
         self.context = self.root_fiber.context
@@ -488,8 +506,16 @@ class CompositionRoot:
         *,
         name: str | None = None,
         inject: Iterable[ServiceKey[object]] | None = None,
+        runtime: PluginRuntime | None = None,
     ) -> Fiber:
-        return await self.context.mount(plugin, name=name, inject=inject)
+        return await self._mount(
+            parent=self.root_fiber,
+            plugin=plugin,
+            name=name,
+            inject=inject,
+            required_for_readiness=True,
+            runtime=runtime,
+        )
 
     async def dispose(self) -> None:
         if self._dispose_task is None:
@@ -642,6 +668,7 @@ class CompositionRoot:
         name: str | None,
         inject: Iterable[ServiceKey[object]] | None,
         required_for_readiness: bool,
+        runtime: PluginRuntime | None,
     ) -> Fiber:
         """Publish only after parent ownership exists, then reconcile."""
 
@@ -671,6 +698,7 @@ class CompositionRoot:
             dependencies=dependencies,
             parent=parent,
             required_for_readiness=required_for_readiness,
+            runtime=runtime,
         )
         self._next_fiber_id += 1
         parent.children.append(fiber)

@@ -1,6 +1,6 @@
 # Cordis 插件迁移能力等价验收设计
 
-- 状态：accepted / phase 1 implemented
+- 状态：accepted / phases 1–2 implemented
 - 核对日期：2026-08-14
 - 文档基线：`akashic-agent@d1b1295b8490ffe899f27476bf97ae7b261ef76e`
 - 当前运行基线：`akashic-agent@07068e2bfb2dac0173298ed0c60a7f5c466ad745`

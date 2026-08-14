@@ -32,6 +32,7 @@ from agent.plugins.manifest import (
     workspace_plugin_data_dir,
 )
 from agent.plugins.registry import plugin_registry
+from agent.plugins.composable import ComposablePlugin
 from agent.plugins.specs import McpServerSpec
 
 
@@ -188,7 +189,7 @@ def install_git_plugin(
         source_revision = _run_git(["rev-parse", "HEAD"], cwd=clone_root)
         if re.fullmatch(r"[0-9a-f]{40}", source_revision) is None:
             raise RuntimeError(f"插件 Git HEAD 无效: {source_revision}")
-        plugin_class = _load_plugin_class(clone_root)
+        plugin_class = _load_plugin_entry(clone_root)
         plugin_name = _validate_path_segment(
             getattr(plugin_class, "name", None),
             "插件 name",
@@ -552,7 +553,9 @@ def _require_plugin_path(plugin_root: Path, path: Path, label: str) -> None:
         raise ValueError(f"插件 {label} 越界: {path}") from error
 
 
-def _load_plugin_class(plugin_root: Path) -> type:
+def _load_plugin_entry(plugin_root: Path) -> type | ComposablePlugin:
+    """Load one legacy class or v3 namespace declaration for install validation."""
+
     plugin_path = plugin_root / "plugin.py"
     if not plugin_path.exists():
         raise ValueError("插件缺少 plugin.py")
@@ -568,9 +571,11 @@ def _load_plugin_class(plugin_root: Path) -> type:
     sys.modules[module_name] = module
     try:
         spec.loader.exec_module(module)
+        if getattr(module, "api_version", None) == 3:
+            return ComposablePlugin.from_module(module)
         plugin_class = plugin_registry.get_class(module_name)
         if plugin_class is None:
-            raise ValueError("plugin.py 未声明 Plugin 子类")
+            raise ValueError("plugin.py 未声明 Plugin 子类或 v3 apply 模块")
         return plugin_class
     finally:
         plugin_registry.remove_module_tree(module_name)
@@ -581,7 +586,20 @@ def _load_plugin_class(plugin_root: Path) -> type:
                 _ = sys.modules.pop(imported_name, None)
 
 
-def _load_mcp_specs(plugin_class: type) -> list[McpServerSpec]:
+def _load_plugin_class(plugin_root: Path) -> type:
+    """Load the legacy class contract retained for v2 install callers."""
+
+    entry = _load_plugin_entry(plugin_root)
+    if isinstance(entry, ComposablePlugin):
+        raise ValueError("v3 插件没有 legacy Plugin 子类")
+    return entry
+
+
+def _load_mcp_specs(
+    plugin_class: type | ComposablePlugin,
+) -> list[McpServerSpec]:
+    if isinstance(plugin_class, ComposablePlugin):
+        return []
     provider = getattr(plugin_class, "mcp_servers", None)
     if not callable(provider):
         raise ValueError("插件缺少 mcp_servers() 声明")

@@ -15,12 +15,15 @@ import sys
 import tomllib
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from types import MappingProxyType
+from types import MappingProxyType, ModuleType
 from collections.abc import Awaitable, Callable, Mapping
 from typing import Any, Literal, TypeVar, cast
 from urllib.parse import urlsplit, urlunsplit
 
 from pydantic import BaseModel, ValidationError
+
+from agent.plugin_composition import CompositionRoot, PluginRuntime
+from agent.plugins.composable import ComposablePlugin
 
 from agent.plugins.manifest import (
     ensure_workspace_plugin_data_dir,
@@ -274,6 +277,7 @@ class PluginManager:
         self._gate_results: dict[str, GateResult] = {}
         self._stable_aliases: dict[str, str] = {}
         self._generation_sequence = 0
+        self._composition_pending: tuple[str, ...] = ()
         self._candidate_prepare_lock = asyncio.Lock()
         self._fresh_importer = FreshPluginImporter()
         self._manager_namespace = secrets.token_hex(4)
@@ -900,6 +904,11 @@ class PluginManager:
         # 3. stable 先恢复服务；latest 候选随后以新事务重新准备和验证。
         for mod in stable_by_id.values():
             _ = await self._load_one(mod)
+        if self._composition_pending:
+            raise RuntimeError(
+                "v3 插件缺少必需 Service: "
+                + ", ".join(self._composition_pending)
+            )
         self._finish_committed_recovery(restore_committed)
         await self._restore_latest_candidates(restore_candidates, latest_by_id)
 
@@ -1155,7 +1164,13 @@ class PluginManager:
 
         from agent.plugins.context import allow_plugin_cleanup_writes
 
-        # 1. 终止生命周期对象，并在调用方取消后继续完成它
+        # 1. 回收尚未交给 snapshot store 的组合 Root。
+        if generation.runtime_snapshot is not None:
+            await self._dispose_unreferenced_composition_root(
+                generation.runtime_snapshot
+            )
+
+        # 2. 终止 lifecycle v2 对象，并在调用方取消后继续完成它
         externally_cancelled = False
         if generation.prepare_started:
             terminator = getattr(generation.instance, "terminate", None)
@@ -1178,7 +1193,7 @@ class PluginManager:
                         )
                     )
 
-        # 2. 收集作用域失败，确保外部取消不会截断资源清理
+        # 3. 收集作用域失败，确保外部取消不会截断资源清理
         with allow_plugin_cleanup_writes(generation.generation_id):
             cleanup_failures, cleanup_cancelled = await _complete_critical(
                 generation.scope.aclose()
@@ -1186,7 +1201,7 @@ class PluginManager:
         self._cleanup_failures.extend(cleanup_failures)
         externally_cancelled = externally_cancelled or cleanup_cancelled
 
-        # 3. 清理注册表和模块树
+        # 4. 清理注册表和模块树
         _ = self._scopes.pop(generation.module_path, None)
         self._loaded.discard(generation.module_path)
         _ = self._active_plugins.pop(generation.module_path, None)
@@ -1209,6 +1224,18 @@ class PluginManager:
         if externally_cancelled:
             raise asyncio.CancelledError
 
+    async def _dispose_unreferenced_composition_root(
+        self,
+        snapshot: RuntimeSnapshot,
+    ) -> None:
+        root = snapshot.composition_root
+        if root is None or self._snapshot_store.composition_is_referenced_elsewhere(
+            root,
+            excluding_snapshot_id="",
+        ):
+            return
+        await root.dispose()
+
     def _retire_generation(self, generation: PluginGeneration) -> None:
         """通知已关闭 admission 的 generation 进入退役状态。"""
 
@@ -1221,6 +1248,8 @@ class PluginManager:
         self._draining_generations.setdefault(generation.plugin_id, []).append(
             generation
         )
+        if isinstance(generation.instance, ComposablePlugin):
+            return
         try:
             cast(Any, generation.instance).retire()
         except Exception as error:
@@ -1480,13 +1509,14 @@ class PluginManager:
             for key, generation in self._active_generations.items()
             if key != plugin_id
         }
-        snapshot, catalog_id = self._compile_topology_snapshot(generations)
+        snapshot, catalog_id = await self._compile_topology_snapshot(generations)
         try:
             self._compile_snapshot_event_handlers(snapshot)
             if self._dashboard_preparer is not None:
                 self._dashboard_preparer(snapshot)
         except BaseException:
             self._skill_host.close(catalog_id)
+            await self._dispose_unreferenced_composition_root(snapshot)
             raise
 
         old_services = active.contributions.managed_services
@@ -1495,6 +1525,7 @@ class PluginManager:
 
         if (old_services or old_channels) and get_current_runtime_lease() is not None:
             self._skill_host.close(catalog_id)
+            await self._dispose_unreferenced_composition_root(snapshot)
             raise RuntimeError("持有 RuntimeSnapshot lease 时不能切换独占端点")
         quiesced = (
             self._snapshot_store.pause_admission()
@@ -1542,6 +1573,7 @@ class PluginManager:
                 await self._snapshot_store.resume(quiesced)
                 _ = self._snapshot_skill_catalogs.pop(snapshot.snapshot_id, None)
                 self._skill_host.close(catalog_id)
+                await self._dispose_unreferenced_composition_root(snapshot)
             if self._endpoint_resumer is not None and quiesced is not None:
                 await self._endpoint_resumer()
             if endpoint_error is not None:
@@ -1616,7 +1648,7 @@ class PluginManager:
                 raise RuntimeError("Channel 宿主未绑定")
             await self._channel_switcher(plugin_id, old_channels, new_channels)
 
-    def _compile_topology_snapshot(
+    async def _compile_topology_snapshot(
         self,
         generations: dict[str, PluginGeneration],
     ) -> tuple[RuntimeSnapshot, str]:
@@ -1638,11 +1670,15 @@ class PluginManager:
                 for root in generation.contributions.drift_skill_roots
             ),
         )
+        composition_root, created_root = await self._resolve_composition_root(
+            generations
+        )
         try:
             snapshot = self._snapshot_compiler.compile(
                 generations,
                 snapshot_revision=catalog_id,
                 workspace_mcp_generation=self._active_workspace_mcp,
+                composition_root=composition_root,
             )
             snapshot.skill_catalog_generation_id = catalog_id
             snapshot.plugin_skill_index = catalog.normal_plugins
@@ -1654,6 +1690,8 @@ class PluginManager:
             return snapshot, catalog_id
         except BaseException:
             self._skill_host.close(catalog_id)
+            if created_root and composition_root is not None:
+                await composition_root.dispose()
             raise
 
     async def publish_prepared(self, plugin_id: str) -> dict[str, object]:
@@ -1922,6 +1960,7 @@ class PluginManager:
 
         context = cast(Any, generation.instance).context
         context.data_dir = production_data_dir
+        context.workspace = self._workspace
         context.kv_store = PreparedPluginKVStore(
             production_data_dir / ".kv.json",
             can_write=lambda: _generation_can_write(generation),
@@ -1938,13 +1977,17 @@ class PluginManager:
                 "production_mcp_catalog",
                 lambda: self._mcp_host.close(generation.generation_id),
             )
-        replacement = self._compile_generation_snapshot(generation)
+        previous_root = ready.snapshot.composition_root
+        replacement = await self._compile_generation_snapshot(generation)
         if replacement.snapshot_id != ready.snapshot.snapshot_id:
+            await self._dispose_unreferenced_composition_root(replacement)
             raise RuntimeError(
                 "候选隔离资源恢复后 snapshot identity 发生变化: "
                 f"{ready.snapshot.snapshot_id} -> {replacement.snapshot_id}"
             )
         _replace_snapshot_payload(ready.snapshot, replacement)
+        if previous_root is not None and previous_root is not ready.snapshot.composition_root:
+            await previous_root.dispose()
         self._compile_snapshot_event_handlers(ready.snapshot)
         if self._dashboard_preparer is not None:
             self._dashboard_preparer(ready.snapshot)
@@ -2185,7 +2228,17 @@ class PluginManager:
                 raise RuntimeError(
                     f"插件 MCP 与 workspace server 名称冲突: {', '.join(conflicts)}"
                 )
-            generation.runtime_snapshot = self._compile_generation_snapshot(generation)
+            prepared_snapshot = generation.runtime_snapshot
+            generation.runtime_snapshot = await self._compile_generation_snapshot(
+                generation
+            )
+            if (
+                prepared_snapshot is not None
+                and prepared_snapshot is not generation.runtime_snapshot
+            ):
+                await self._dispose_unreferenced_composition_root(
+                    prepared_snapshot
+                )
             snapshot = generation.runtime_snapshot
             cast(Any, generation.instance).context.tool_registry = (
                 snapshot.tool_registry
@@ -2396,11 +2449,12 @@ class PluginManager:
             context.memory_engine = self._memory_engine
             context.llm = self._llm
             generation.state = "activating"
-            try:
-                cast(Any, generation.instance).activate()
-            except BaseException:
-                context.data_dir = None
-                raise
+            if not isinstance(generation.instance, ComposablePlugin):
+                try:
+                    cast(Any, generation.instance).activate()
+                except BaseException:
+                    context.data_dir = None
+                    raise
             if isinstance(context.kv_store, PreparedPluginKVStore) and not stage_latest:
                 context.kv_store.commit()
             if generation.staged_event_bus is not None:
@@ -2450,7 +2504,7 @@ class PluginManager:
                 )
             _ = self._prepared_generations.pop(plugin_id, None)
             generation.state = "aborted"
-            endpoint_error: BaseException | None = None
+            commit_endpoint_error: BaseException | None = None
             if endpoints_switched:
                 try:
                     await self._switch_plugin_endpoints(
@@ -2461,7 +2515,7 @@ class PluginManager:
                         old_channels,
                     )
                 except BaseException as error:
-                    endpoint_error = error
+                    commit_endpoint_error = error
             await self._abort_failed_publication(
                 generation,
                 transaction,
@@ -2469,10 +2523,10 @@ class PluginManager:
             )
             if self._endpoint_resumer is not None:
                 await self._endpoint_resumer()
-            if endpoint_error is not None:
+            if commit_endpoint_error is not None:
                 raise RuntimeError(
                     "Snapshot commit 失败后旧端点恢复失败"
-                ) from endpoint_error
+                ) from commit_endpoint_error
             raise commit_error
 
         _ = self._prepared_generations.pop(plugin_id)
@@ -2586,6 +2640,12 @@ class PluginManager:
     ) -> None:
         if generation.prepare_started:
             return
+        if isinstance(generation.instance, ComposablePlugin):
+            context = generation.instance.context
+            assert generation.runtime_snapshot is not None
+            context.tool_registry = generation.runtime_snapshot.tool_registry
+            generation.minimum_resource_count = generation.scope.resource_count
+            return
         from agent.plugins.context import PreparedPluginKVStore
 
         instance = cast(Any, generation.instance)
@@ -2608,6 +2668,7 @@ class PluginManager:
             "candidate",
         }
         context.scope = generation.scope
+        assert generation.runtime_snapshot is not None
         context.tool_registry = generation.runtime_snapshot.tool_registry
         generation.prepare_started = True
         await instance.prepare()
@@ -3096,8 +3157,13 @@ class PluginManager:
                 error=f"import: {error_text}",
             )
             return None
+        loaded_module = sys.modules.get(mp)
+        is_v3 = (
+            loaded_module is not None
+            and getattr(loaded_module, "api_version", None) == 3
+        )
         cls = plugin_registry.get_class(mp)
-        if cls is None:
+        if not is_v3 and cls is None:
             logger.warning("插件 %s 未注册类", mod["name"])
             self._remove_module_tree(mp)
             self._record_failed_gate(
@@ -3112,7 +3178,15 @@ class PluginManager:
             )
             return None
         try:
-            instance = cls()
+            if is_v3:
+                if not isinstance(loaded_module, ModuleType):
+                    raise RuntimeError("v3 插件模块未保留在 import registry")
+                instance: Any = ComposablePlugin.from_module(loaded_module)
+                config_model = instance.ConfigModel
+            else:
+                assert cls is not None
+                instance = cls()
+                config_model = getattr(cls, "ConfigModel", None)
             name = str(instance.name or mod["name"]).strip()
             if not name:
                 raise RuntimeError("插件缺少 name")
@@ -3123,7 +3197,7 @@ class PluginManager:
                 )
             plugin_config = _load_plugin_config(
                 data_dir,
-                getattr(cls, "ConfigModel", None),
+                config_model,
             )
         except Exception as error:
             self._remove_module_tree(mp)
@@ -3160,6 +3234,7 @@ class PluginManager:
         )
         plugin_registry.register_instance(mp, instance)
         prepare_started = False
+        generation: PluginGeneration | None = None
 
         async def rollback_load(error: str) -> None:
             if reload_tx_id is not None:
@@ -3170,6 +3245,10 @@ class PluginManager:
                         "aborted",
                         error=error,
                     )
+            if generation is not None and generation.runtime_snapshot is not None:
+                await self._dispose_unreferenced_composition_root(
+                    generation.runtime_snapshot
+                )
             terminator = getattr(instance, "terminate", None)
             if prepare_started and callable(terminator):
                 try:
@@ -3370,6 +3449,8 @@ class PluginManager:
                     ),
                 )
                 generation.data_dir = validation_data_dir
+                if isinstance(generation.instance, ComposablePlugin):
+                    generation.instance.context.workspace = validation_workspace
                 generation.contributions = _validation_contributions(
                     generation,
                     self._active_generations.get(plugin_id),
@@ -3467,7 +3548,7 @@ class PluginManager:
                 if gate_result.status == "failed":
                     raise _CandidateRejected(gate_result)
                 if not activate:
-                    generation.runtime_snapshot = self._compile_generation_snapshot(
+                    generation.runtime_snapshot = await self._compile_generation_snapshot(
                         generation
                     )
                     self._advance_reload(
@@ -3478,18 +3559,22 @@ class PluginManager:
                     generation.minimum_resource_count = scope.resource_count
                     self._prepared_generations[plugin_id] = generation
                     return generation
-            generation.runtime_snapshot = self._compile_generation_snapshot(generation)
+            generation.runtime_snapshot = await self._compile_generation_snapshot(
+                generation,
+                allow_pending_composition=True,
+            )
             from agent.plugins.context import PreparedPluginKVStore
 
             load_phase = "prepare"
-            prepare_started = True
+            prepare_started = not isinstance(instance, ComposablePlugin)
             await self._prepare_generation(generation)
             instance.context.data_dir = data_dir
             instance.context.session_manager = self._session_manager
             instance.context.memory_engine = self._memory_engine
             instance.context.llm = self._llm
             generation.state = "activating"
-            instance.activate()
+            if not isinstance(instance, ComposablePlugin):
+                instance.activate()
             if isinstance(instance.context.kv_store, PreparedPluginKVStore):
                 instance.context.kv_store.commit()
             load_phase = "publish"
@@ -3497,8 +3582,8 @@ class PluginManager:
             self._bind_tool_hooks(instance, mp)
             self._publish_contributions(contributions)
             self._channels.extend(contributions.channels)
-            assert generation.staged_event_bus is not None
-            generation.staged_event_bus.publish()
+            if generation.staged_event_bus is not None:
+                generation.staged_event_bus.publish()
             generation.minimum_resource_count = scope.resource_count
         except asyncio.CancelledError:
             rollback_task = asyncio.create_task(
@@ -3556,17 +3641,24 @@ class PluginManager:
         logger.info("插件已加载: %s", mod["name"])
         return generation
 
-    def _compile_generation_snapshot(
+    async def _compile_generation_snapshot(
         self,
         generation: PluginGeneration,
+        *,
+        allow_pending_composition: bool = False,
     ) -> RuntimeSnapshot:
         generations = dict(self._active_generations)
         generations[generation.plugin_id] = generation
+        composition_root, created_root = await self._resolve_composition_root(
+            generations,
+            allow_pending=allow_pending_composition,
+        )
         try:
             snapshot = self._snapshot_compiler.compile(
                 generations,
                 catalog_generation=generation,
                 workspace_mcp_generation=self._active_workspace_mcp,
+                composition_root=composition_root,
             )
             snapshot.tool_registry = self._compile_snapshot_tools(
                 generations,
@@ -3575,6 +3667,8 @@ class PluginManager:
             snapshot.tool_hooks = self._compile_snapshot_tool_hooks(generations)
             return snapshot
         except Exception as error:
+            if created_root and composition_root is not None:
+                await composition_root.dispose()
             gate = _with_gate_check(
                 generation.gate_result,
                 check_id="runtime_snapshot",
@@ -3584,6 +3678,99 @@ class PluginManager:
             generation.gate_result = gate
             self._gate_results[generation.plugin_id] = gate
             raise _CandidateRejected(gate) from error
+
+    async def _resolve_composition_root(
+        self,
+        generations: dict[str, PluginGeneration],
+        *,
+        allow_pending: bool = False,
+    ) -> tuple[CompositionRoot | None, bool]:
+        """Reuse an unchanged Root or mount one complete v3 generation topology."""
+
+        # 1. Snapshot-only changes share the exact Root and its drain ownership.
+        ordered = tuple(
+            generation
+            for generation in sorted(
+                generations.values(), key=lambda item: item.plugin_id
+            )
+            if isinstance(generation.instance, ComposablePlugin)
+        )
+        current = self.current_snapshot
+        current_ordered = (
+            tuple(
+                generation
+                for generation in sorted(
+                    current.generations.values(), key=lambda item: item.plugin_id
+                )
+                if isinstance(generation.instance, ComposablePlugin)
+            )
+            if current is not None
+            else ()
+        )
+        if current is not None and len(ordered) == len(current_ordered) and all(
+            left is right for left, right in zip(ordered, current_ordered, strict=True)
+        ):
+            return current.composition_root, False
+        if not ordered:
+            return None, False
+
+        # 2. A topology-changing candidate receives an isolated, complete Root.
+        identity = "|".join(
+            f"{item.plugin_id}:{item.generation_id}" for item in ordered
+        )
+        root = CompositionRoot(
+            "plugins:" + hashlib.sha256(identity.encode()).hexdigest()[:16]
+        )
+        try:
+            for item in ordered:
+                context = cast(Any, item.instance).context
+                workspace = context.workspace
+                if not isinstance(workspace, Path):
+                    raise RuntimeError(
+                        f"v3 插件缺少 Core 分配的 workspace: {item.plugin_id}"
+                    )
+                _ = await root.mount(
+                    cast(ComposablePlugin, item.instance),
+                    name=item.plugin_id,
+                    runtime=PluginRuntime(
+                        plugin_id=item.plugin_id,
+                        plugin_dir=Path(context.plugin_dir),
+                        data_dir=item.data_dir,
+                        workspace=workspace,
+                        config=context.config,
+                    ),
+                )
+            receipt = root.receipt()
+            if not receipt.ready:
+                if (
+                    allow_pending
+                    and receipt.required_pending
+                    and not receipt.errors
+                    and not receipt.external_effects
+                ):
+                    self._composition_pending = tuple(
+                        sorted(
+                            {
+                                service
+                                for fiber in receipt.fibers
+                                if fiber.name in receipt.required_pending
+                                for service in fiber.missing_services
+                            }
+                        )
+                    )
+                    await root.dispose()
+                    return None, False
+                raise RuntimeError(
+                    "v3 插件组合拓扑未就绪: "
+                    f"required_pending={receipt.required_pending}, "
+                    f"errors={receipt.errors}, "
+                    f"external_effects={receipt.external_effects}"
+                )
+            self._composition_pending = ()
+        except BaseException:
+            await root.dispose()
+            raise
+        return root, True
 
     def _compile_snapshot_tools(
         self,
@@ -3672,6 +3859,11 @@ class PluginManager:
             self._active_generations,
             snapshot_revision=generation.revision,
             workspace_mcp_generation=generation,
+            composition_root=(
+                self.current_snapshot.composition_root
+                if self.current_snapshot is not None
+                else None
+            ),
         )
         snapshot.tool_registry = self._compile_snapshot_tools(
             self._active_generations,
@@ -3740,6 +3932,15 @@ class PluginManager:
         module_path: str,
         source_revision: str,
     ) -> PluginContributions:
+        if isinstance(instance, ComposablePlugin):
+            return PluginContributions(
+                manifest={
+                    "name": instance.name,
+                    "version": instance.version,
+                    "desc": instance.desc,
+                    "author": instance.author,
+                }
+            )
         cls = cast(type[Any], type(instance))
         _reject_legacy_mobile_ui_api(cls, plugin_id)
         sources: list[RegisteredProactiveSource] = []
@@ -3858,24 +4059,28 @@ class PluginManager:
                 )
             )
 
+        composable = isinstance(instance, ComposablePlugin)
         check(
             "api_version",
-            getattr(instance, "api_version", None) == 2,
+            getattr(instance, "api_version", None) == (3 if composable else 2),
             getattr(instance, "api_version", None),
         )
-        lifecycle_type = type(instance)
-        legacy_lifecycle = [
-            name for name in ("initialize",) if name in lifecycle_type.__dict__
-        ]
-        check(
-            "lifecycle_api",
-            not legacy_lifecycle
-            and inspect.iscoroutinefunction(instance.prepare)
-            and not inspect.iscoroutinefunction(instance.activate)
-            and not inspect.iscoroutinefunction(instance.retire)
-            and inspect.iscoroutinefunction(instance.terminate),
-            {"legacy": legacy_lifecycle},
-        )
+        if composable:
+            check("lifecycle_api", True, {"contract": "apply(ctx, config)"})
+        else:
+            lifecycle_type = type(instance)
+            legacy_lifecycle = [
+                name for name in ("initialize",) if name in lifecycle_type.__dict__
+            ]
+            check(
+                "lifecycle_api",
+                not legacy_lifecycle
+                and inspect.iscoroutinefunction(instance.prepare)
+                and not inspect.iscoroutinefunction(instance.activate)
+                and not inspect.iscoroutinefunction(instance.retire)
+                and inspect.iscoroutinefunction(instance.terminate),
+                {"legacy": legacy_lifecycle},
+            )
         metadata = plugin_registry.get_handlers_by_module_path(
             type(instance).__module__
         )
@@ -4949,6 +5154,8 @@ def _replace_snapshot_payload(
         "tool_registry",
         "plugin_skill_index",
         "event_handlers",
+        "composition_root",
+        "composition_topology",
     ):
         setattr(target, name, getattr(source, name))
 

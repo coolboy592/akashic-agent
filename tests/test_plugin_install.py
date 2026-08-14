@@ -87,6 +87,31 @@ def test_install_git_plugin_uses_programmatic_declaration(tmp_path: Path) -> Non
     assert manifest == {"plugins": {"feed@lab": {"enabled": True}}}
 
 
+def test_install_git_plugin_accepts_v3_namespace_declaration(tmp_path: Path) -> None:
+    repo = tmp_path / "citation"
+    repo.mkdir()
+    (repo / "plugin.py").write_text(
+        "api_version = 3\n"
+        "name = 'citation'\n"
+        "version = '2.0.0'\n"
+        "def apply(ctx, config):\n"
+        "    return None\n",
+        encoding="utf-8",
+    )
+    _commit(repo)
+
+    result = install_git_plugin(
+        workspace=tmp_path / "workspace",
+        source=str(repo),
+        marketplace="lab",
+        plugins_home=tmp_path / "plugins-home",
+    )
+
+    assert result.plugin_name == "citation"
+    assert result.plugin_version == "2.0.0"
+    assert (result.installed_path / "plugin.py").is_file()
+
+
 def test_install_git_plugin_prepares_declared_mcp_runtime(
     tmp_path: Path,
     monkeypatch,
