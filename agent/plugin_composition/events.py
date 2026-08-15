@@ -31,9 +31,18 @@ class EmitEventKey(Generic[P]):
 @dataclass(frozen=True, slots=True)
 class SerialEventKey(Generic[P, R]):
     name: str
+    bail_type: type[R] | None = None
+    bail_contract: str | None = None
 
     def __post_init__(self) -> None:
         _validate_event_name(self.name)
+        if (self.bail_type is None) != (self.bail_contract is None):
+            raise ValueError("串行 Bail type 与 contract 必须同时声明")
+        if self.bail_contract is not None and (
+            not self.bail_contract
+            or self.bail_contract.strip() != self.bail_contract
+        ):
+            raise ValueError("串行 Bail contract 必须是非空且无首尾空白的字符串")
 
 
 @dataclass(frozen=True, slots=True)
@@ -164,17 +173,37 @@ class EventRegistry:
         payload: P,
     ) -> Bail[R] | None:
         for listener in self._active_listeners(cast(EventKey, key)):
-            result = listener.callback(payload)
-            if inspect.isawaitable(result):
-                result = await result
-            if result is None:
-                continue
-            if isinstance(result, Bail):
-                return cast(Bail[R], result)
-            raise CompositionError(
-                "INVALID_SERIAL_RESULT",
-                f"串行事件 {key.name} 的 listener 只能返回 None 或 Bail",
-            )
+            try:
+                result = listener.callback(payload)
+                if inspect.isawaitable(result):
+                    result = await result
+                if result is None:
+                    continue
+                if isinstance(result, Bail):
+                    bail = cast(Bail[object], result)
+                    if key.bail_type is not None and not isinstance(
+                        bail.value,
+                        key.bail_type,
+                    ):
+                        raise CompositionError(
+                            "INVALID_SERIAL_BAIL",
+                            f"串行事件 {key.name} 的 Bail value 必须符合 "
+                            f"{key.bail_contract}",
+                        )
+                    return cast(Bail[R], bail)
+                raise CompositionError(
+                    "INVALID_SERIAL_RESULT",
+                    f"串行事件 {key.name} 的 listener 只能返回 None 或 Bail",
+                )
+            except asyncio.CancelledError as error:
+                task = asyncio.current_task()
+                if task is not None and task.cancelling():
+                    raise
+                self._on_listener_failure(listener.owner, "serial_failure", error)
+                raise
+            except BaseException as error:
+                self._on_listener_failure(listener.owner, "serial_failure", error)
+                raise
         return None
 
     async def parallel(self, key: ParallelEventKey[P], payload: P) -> None:
@@ -401,7 +430,12 @@ def _event_descriptor(key: EventKey) -> str:
     if isinstance(key, EmitEventKey):
         return f"emit:{key.name}"
     if isinstance(key, SerialEventKey):
-        return f"serial:{key.name}"
+        suffix = (
+            f"[bail={key.bail_contract}]"
+            if key.bail_contract is not None
+            else ""
+        )
+        return f"serial:{key.name}{suffix}"
     if isinstance(key, ParallelEventKey):
         return f"parallel:{key.name}"
     if isinstance(key, TransformEventKey):

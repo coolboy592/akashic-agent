@@ -663,7 +663,7 @@ install 成功只表示候选可验证。至少一个匹配当前候选的 attac
 
 新插件只通过 generation Root 下的 Context、Service、Inject、Fiber 和 Effect 组合能力；Job、Channel、Prompt、Tool、UI、MCP、存储和外部效果由各自领域 Service 定义，Core 不维护新的固定插件能力总表。`inject` 只表达 Fiber 激活所必需的硬依赖；可选能力由使用点查询，或由不阻塞 Root readiness 的嵌套 Fiber 承载。listener、后台 task 和其他注册随所属 Fiber 逆序回收，依赖消失、重启和卸载后不得残留。
 
-通用事件只有三种 dispatch 合同：`emit` 同步串行并立即传播失败；`serial` 逐个等待且只有显式 `Bail` 可以短路；`parallel` 只接收异步 listener，并发执行、等待全部 settle 后聚合失败。listener 只使用同一 generation 内稳定注册顺序，不增加 priority、listener dependency DAG 或通用 waterfall。同步并发由有界 Executor Service 执行插件显式提交的纯同步任务；工作线程不得取得 Context、Fiber 或 Core 权限。
+通用事件只有五种 dispatch 合同：`emit` 同步串行并立即传播失败；`serial` 逐个等待且只有显式 `Bail` 可以短路；`parallel` 只接收异步 listener，并发执行、等待全部 settle 后聚合失败；`transform` 按注册顺序把同类型 immutable payload 显式变换成下一份；`observe` 调用全部 observer、等待异步 settle，并把普通失败隔离成 Incident 而不改写最终事实。listener 只使用同一 generation 内稳定注册顺序，不增加 priority、listener dependency DAG 或通用 waterfall。同步并发由有界 Executor Service 执行插件显式提交的纯同步任务；工作线程不得取得 Context、Fiber 或 Core 权限。
 
 组合拓扑只能生成候选能力，不能自行声明成功或晋升。Core 继续唯一拥有 artifact、generation identity、候选隔离、readiness、行为验证回执、stable/latest、snapshot lease、父 Turn 授权、晋升、丢弃和恢复日志。旧插件在逐个完成能力等价回放前保持原 lifecycle 与顺序；迁移完成后删除对应 legacy 分支，不为每个旧插件长期保留适配器。
 

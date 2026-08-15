@@ -23,6 +23,8 @@ class ToolExecutionRequest:
     tool_batch_index: int = 0
 
 
+# V2_REMOVAL(tool-hooks)：删除 HookContext/Outcome/Trace 与 HookEvent/Decision；
+# ToolExecutionRequest/Result 是 ToolExecutor 边界 DTO，不随 legacy hook 一起删除。
 @dataclass
 class HookContext:
     event: HookEvent

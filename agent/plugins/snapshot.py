@@ -46,6 +46,7 @@ class RuntimeSnapshot:
     proactive_lifecycles: tuple[object, ...]
     proactive_module_factories: tuple[object, ...]
     proactive_runtime_factories: tuple[object, ...]
+    # V2_REMOVAL(tool-hooks)：全部 hook consumer 迁移后删除 catalog 与编译路径。
     tool_hooks: tuple[ToolHook, ...]
     channels: Mapping[str, Channel]
     skill_catalog_generation_id: str | None

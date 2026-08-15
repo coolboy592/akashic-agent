@@ -253,6 +253,7 @@ class PluginManager:
         ) = None
         self._loaded: set[str] = set()
         self._channels: list[Channel] = []
+        # V2_REMOVAL(tool-hooks)：迁移完外部 consumer 后删除可变 catalog。
         self._tool_hooks: list[ToolHook] = []
         self._before_turn_modules: list[object] = []
         self._before_reasoning_modules: list[object] = []
@@ -4380,6 +4381,7 @@ class PluginManager:
         self,
         generations: dict[str, PluginGeneration],
     ) -> tuple[ToolHook, ...]:
+        # V2_REMOVAL(tool-hooks)：typed Tool events 接管后删除 metadata 编译。
         hooks: list[ToolHook] = []
         for generation in sorted(generations.values(), key=lambda item: item.plugin_id):
             for metadata in plugin_registry.get_handlers_by_module_path(
@@ -4865,6 +4867,7 @@ class PluginManager:
             logger.info("插件工具已注册: %s (来自 %s)", tool_name, plugin_name)
 
     def _bind_tool_hooks(self, instance: Any, module_path: str) -> None:
+        # V2_REMOVAL(tool-hooks)：legacy 非 generation load path，随 v2 Manager 删除。
         for md in plugin_registry.get_handlers_by_module_path(module_path):
             if md.kind != MetadataKind.TOOL_HOOK:
                 continue
@@ -5758,6 +5761,8 @@ def _make_execute(bound: Any) -> Any:
 
 class _PluginToolHook(ToolHook):
     """将插件的 @on_tool_pre handler 适配为 ToolExecutor 的 ToolHook 接口。"""
+
+    # V2_REMOVAL(tool-hooks)：四矩阵 Gate 全绿且 consumer 迁完后删除 adapter。
 
     event = "pre_tool_use"
     snapshot_managed = True
