@@ -189,9 +189,22 @@ async def test_v3_loader_publishes_declared_package_contributions(
         encoding="utf-8",
     )
     (plugin_dir / "dashboard.py").write_text(
-        "def register(app, plugin_dir, workspace):\n"
+        "from agent.plugin_composition import DashboardContext\n"
+        "def plugin_enabled(context):\n"
+        "    return isinstance(context, DashboardContext) and not context.validation\n"
+        "def register(app, context):\n"
+        "    assert not hasattr(app.state, 'memory_admin')\n"
+        "    assert not hasattr(app.state, 'memory_store')\n"
+        "    (context.data_root / 'dashboard-context-ready').write_text(context.plugin_id)\n"
         "    @app.get('/api/dashboard/package-contributor')\n"
-        "    def status(): return {'plugin': 'package_contributor'}\n",
+        "    def status(): return {'plugin': 'package_contributor'}\n"
+        "    class Closeable:\n"
+        "        def __init__(self, path): self.path = path\n"
+        "        def close(self): self.path.write_text('closed')\n"
+        "    return (\n"
+        "        Closeable(context.data_root / 'dashboard-close-one'),\n"
+        "        Closeable(context.data_root / 'dashboard-close-two'),\n"
+        "    )\n",
         encoding="utf-8",
     )
     manager = _manager(tmp_path)
@@ -237,10 +250,113 @@ async def test_v3_loader_publishes_declared_package_contributions(
     binding = snapshot.dashboard_bindings[0]
     assert isinstance(binding, DashboardBinding)
     assert binding.plugin_id == "package_contributor"
+    assert binding.runtime_data_root == generation.data_dir.resolve()
+    assert (generation.data_dir / "dashboard-context-ready").read_text() == (
+        "package_contributor"
+    )
     assert [route.path for route in binding.routes] == [
         "/api/dashboard/package-contributor"
     ]
 
+    await manager.terminate_all()
+
+    assert (generation.data_dir / "dashboard-close-one").is_file()
+    assert (generation.data_dir / "dashboard-close-two").is_file()
+
+
+@pytest.mark.asyncio
+async def test_v3_dashboard_rejects_legacy_register_signature(tmp_path: Path) -> None:
+    plugin_dir = _write_plugin(
+        tmp_path / "plugins",
+        "legacy_dashboard_signature",
+        "api_version = 3\n"
+        "name = 'legacy_dashboard_signature'\n"
+        "version = '1.0.0'\n"
+        "dashboard_module = 'dashboard.py'\n"
+        "def apply(ctx, config): pass\n",
+    )
+    (plugin_dir / "dashboard.py").write_text(
+        "def register(app, plugin_dir, workspace): return None\n",
+        encoding="utf-8",
+    )
+    manager = _manager(tmp_path)
+    await manager.load_all()
+    snapshot = manager.current_snapshot
+    assert snapshot is not None
+    dashboard_host = PluginDashboardHost(
+        workspace=tmp_path / "workspace",
+        memory_admin=object(),
+        memory_store=object(),
+        core_routes=(),
+    )
+
+    with pytest.raises(TypeError, match="missing 1 required positional argument"):
+        dashboard_host.prepare_snapshot(snapshot)
+
+    assert snapshot.dashboard_bindings == ()
+    await manager.terminate_all()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("dashboard_source", "message"),
+    [
+        (
+            "plugin_enabled = 1\n"
+            "def register(app, context): return None\n",
+            "plugin_enabled 必须是可调用对象",
+        ),
+        (
+            "async def plugin_enabled(context): return True\n"
+            "def register(app, context): return None\n",
+            "plugin_enabled 不支持 async",
+        ),
+        (
+            "async def register(app, context): return None\n",
+            "register 不支持 async",
+        ),
+        (
+            "def register(app, context): return object()\n",
+            "register 返回值不是 closeable",
+        ),
+    ],
+)
+async def test_v3_dashboard_rejects_invalid_callable_contracts(
+    tmp_path: Path,
+    dashboard_source: str,
+    message: str,
+) -> None:
+    plugin_dir = _write_plugin(
+        tmp_path / "plugins",
+        "invalid_dashboard_contract",
+        "api_version = 3\n"
+        "name = 'invalid_dashboard_contract'\n"
+        "version = '1.0.0'\n"
+        "dashboard_module = 'dashboard.py'\n"
+        "def apply(ctx, config): pass\n",
+    )
+    (plugin_dir / "dashboard.py").write_text(
+        dashboard_source,
+        encoding="utf-8",
+    )
+    manager = _manager(tmp_path)
+    await manager.load_all()
+    generation = manager.generation("invalid_dashboard_contract")
+    snapshot = manager.current_snapshot
+    assert generation is not None and snapshot is not None
+    dashboard_host = PluginDashboardHost(
+        workspace=tmp_path / "workspace",
+        memory_admin=object(),
+        memory_store=object(),
+        core_routes=(),
+    )
+
+    with pytest.raises(RuntimeError, match=message):
+        dashboard_host.prepare_snapshot(snapshot)
+
+    assert snapshot.dashboard_bindings == ()
+    assert tuple(generation.data_dir.iterdir()) == ()
+    assert f"{generation.module_path}.dashboard" not in sys.modules
     await manager.terminate_all()
 
 
@@ -865,7 +981,7 @@ async def test_installed_v3_candidate_rebuilds_runtime_then_promotes(
             encoding="utf-8",
         )
         (root / "dashboard.py").write_text(
-            "def register(app, plugin_dir, workspace): return None\n",
+            "def register(app, context): return None\n",
             encoding="utf-8",
         )
     stable_pointer = ArtifactPointer(".artifacts/1.0.0-aaaa")
@@ -984,15 +1100,16 @@ async def test_installed_v3_dashboard_uses_validation_workspace_until_promotion(
         encoding="utf-8",
     )
     (stable_root / "dashboard.py").write_text(
-        "def register(app, plugin_dir, workspace): return None\n",
+        "def register(app, context): return None\n",
         encoding="utf-8",
     )
     (latest_root / "dashboard.py").write_text(
-        "def register(app, plugin_dir, workspace):\n"
-        "    (workspace / 'dashboard-v2-registered').write_text('ready')\n"
+        "def register(app, context):\n"
+        "    marker = 'candidate-registered' if context.validation else 'formal-registered'\n"
+        "    (context.data_root / marker).write_text('ready')\n"
         "    class Closeable:\n"
         "        def close(self):\n"
-        "            (workspace / 'dashboard-v2-closed').write_text('closed')\n"
+        "            (context.data_root / 'dashboard-v3-closed').write_text('closed')\n"
         "    return Closeable()\n",
         encoding="utf-8",
     )
@@ -1029,8 +1146,14 @@ async def test_installed_v3_dashboard_uses_validation_workspace_until_promotion(
     assert isinstance(candidate_binding, DashboardBinding)
     assert candidate_binding.validation is True
     assert candidate_binding.runtime_workspace == validation_workspace.resolve()
-    assert (validation_workspace / "dashboard-v2-registered").is_file()
-    assert not (tmp_path / "workspace" / "dashboard-v2-registered").exists()
+    candidate_data_root = candidate_binding.runtime_data_root
+    assert candidate_data_root is not None
+    assert candidate_data_root.is_relative_to(validation_workspace)
+    assert (candidate_data_root / "candidate-registered").is_file()
+    assert not (candidate_data_root / "formal-registered").exists()
+    production_data_root = tmp_path / "workspace" / "plugin-data" / "dashboard_v3-lab"
+    assert not (production_data_root / "candidate-registered").exists()
+    assert not (production_data_root / "formal-registered").exists()
     validation_root = validation_workspace.parent
     validation_module = candidate_binding.module_name
 
@@ -1039,7 +1162,8 @@ async def test_installed_v3_dashboard_uses_validation_workspace_until_promotion(
     assert manager.current_snapshot is stable_snapshot
     assert not validation_root.exists()
     assert validation_module not in sys.modules
-    assert not (tmp_path / "workspace" / "dashboard-v2-registered").exists()
+    assert not (production_data_root / "candidate-registered").exists()
+    assert not (production_data_root / "formal-registered").exists()
 
     write_pointers(plugin_base, stable=stable_pointer, latest=latest_pointer)
     assert (await manager.reconcile_changed())[0]["publication_state"] == "latest_ready"
@@ -1058,8 +1182,78 @@ async def test_installed_v3_dashboard_uses_validation_workspace_until_promotion(
     assert isinstance(formal_binding, DashboardBinding)
     assert formal_binding.validation is False
     assert formal_binding.runtime_workspace == (tmp_path / "workspace").resolve()
-    assert (tmp_path / "workspace" / "dashboard-v2-registered").is_file()
+    assert formal_binding.runtime_data_root == production_data_root.resolve()
+    assert (production_data_root / "formal-registered").is_file()
+    assert not (production_data_root / "candidate-registered").exists()
     assert not promoted_validation_root.exists()
+    await manager.terminate_all()
+
+
+@pytest.mark.asyncio
+async def test_builtin_v3_dashboard_candidate_clones_data_root_before_publish(
+    tmp_path: Path,
+) -> None:
+    plugin_dir = _write_plugin(
+        tmp_path / "plugins",
+        "dashboard_builtin_v3",
+        "api_version = 3\n"
+        "name = 'dashboard_builtin_v3'\n"
+        "version = '1.0.0'\n"
+        "dashboard_module = 'dashboard.py'\n"
+        "def apply(ctx, config): pass\n",
+    )
+    (plugin_dir / "dashboard.py").write_text(
+        "def register(app, context): return None\n",
+        encoding="utf-8",
+    )
+    manager = _manager(tmp_path)
+    await manager.load_all()
+    stable = manager.generation("dashboard_builtin_v3")
+    stable_snapshot = manager.current_snapshot
+    assert stable is not None and stable_snapshot is not None
+    (stable.data_dir / "existing.txt").write_text("stable", encoding="utf-8")
+    dashboard_host = PluginDashboardHost(
+        workspace=tmp_path / "workspace",
+        memory_admin=object(),
+        memory_store=object(),
+        core_routes=(),
+    )
+    dashboard_host.prepare_initial_snapshot(stable_snapshot)
+    manager.bind_dashboard_preparer(
+        dashboard_host.prepare_snapshot,
+        validation_releaser=dashboard_host.release_validation,
+    )
+    (plugin_dir / "plugin.py").write_text(
+        "api_version = 3\n"
+        "name = 'dashboard_builtin_v3'\n"
+        "version = '2.0.0'\n"
+        "dashboard_module = 'dashboard.py'\n"
+        "def apply(ctx, config): pass\n",
+        encoding="utf-8",
+    )
+    (plugin_dir / "dashboard.py").write_text(
+        "def register(app, context):\n"
+        "    assert (context.data_root / 'existing.txt').read_text() == 'stable'\n"
+        "    marker = 'candidate.txt' if context.validation else 'formal.txt'\n"
+        "    (context.data_root / marker).write_text('ready')\n",
+        encoding="utf-8",
+    )
+    candidate = await manager.prepare_candidate("dashboard_builtin_v3")
+    assert candidate is not None and candidate.validation_workspace is not None
+    validation_root = candidate.validation_workspace.parent
+
+    result = await manager.publish_prepared("dashboard_builtin_v3")
+
+    assert result["publication_state"] == "committed"
+    current = manager.current_snapshot
+    assert current is not None
+    binding = current.dashboard_bindings[0]
+    assert isinstance(binding, DashboardBinding)
+    assert binding.runtime_data_root == stable.data_dir.resolve()
+    assert (stable.data_dir / "existing.txt").read_text() == "stable"
+    assert (stable.data_dir / "formal.txt").is_file()
+    assert not (stable.data_dir / "candidate.txt").exists()
+    assert not validation_root.exists()
     await manager.terminate_all()
 
 

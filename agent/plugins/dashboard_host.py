@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import logging
 import re
+import shutil
 import sys
 from dataclasses import dataclass, field
 from collections.abc import Sequence
@@ -21,6 +23,8 @@ from starlette.convertors import (
 )
 from starlette.routing import Match
 
+from agent.plugin_composition import DashboardContext
+from agent.plugins.composable import ComposablePlugin
 from agent.plugins.generation import PluginGeneration
 from agent.plugins.scope import PluginScope
 from agent.plugins.snapshot import (
@@ -43,6 +47,7 @@ class DashboardBinding:
     app: FastAPI
     routes: tuple[APIRoute, ...]
     runtime_workspace: Path | None = None
+    runtime_data_root: Path | None = None
     validation: bool = False
     module_name: str = ""
     _scope: PluginScope | None = field(default=None, repr=False)
@@ -109,11 +114,20 @@ class PluginDashboardHost:
                         ),
                     )
                 try:
+                    data_root = _dashboard_data_root(
+                        generation,
+                        workspace=runtime_workspace,
+                        validation=(
+                            validation_workspace is not None
+                            and isinstance(generation.instance, ComposablePlugin)
+                        ),
+                    )
                     binding = self._build_binding(
                         generation,
                         module_path,
                         occupied=occupied,
                         workspace=runtime_workspace,
+                        data_root=data_root,
                         scope=binding_scope,
                         validation=validation_workspace is not None,
                     )
@@ -194,12 +208,17 @@ class PluginDashboardHost:
         *,
         occupied: list[APIRoute],
         workspace: Path,
+        data_root: Path,
         scope: PluginScope,
         validation: bool,
     ) -> DashboardBinding:
         app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
-        app.state.memory_admin = self._memory_admin
-        app.state.memory_store = self._memory_store
+        is_v3 = isinstance(generation.instance, ComposablePlugin)
+        if not is_v3:
+            # V2_REMOVAL(dashboard-register)：v2 Dashboard 迁移后删除 app.state
+            # capability 与 register(app, plugin_dir, workspace) 三参数调用。
+            app.state.memory_admin = self._memory_admin
+            app.state.memory_store = self._memory_store
         suffix = (
             ""
             if not validation
@@ -221,11 +240,45 @@ class PluginDashboardHost:
             if not callable(register):
                 raise RuntimeError(f"dashboard module 缺少 register: {module_path}")
             enabled = getattr(module, "plugin_enabled", None)
-            closeables = (
-                []
-                if callable(enabled) and not enabled(app)
-                else _closeables(register(app, module_path.parent, workspace))
+            if is_v3 and enabled is not None and not callable(enabled):
+                raise RuntimeError("v3 dashboard plugin_enabled 必须是可调用对象")
+            dashboard_context = DashboardContext(
+                plugin_id=generation.plugin_id,
+                plugin_dir=module_path.parent,
+                data_root=data_root,
+                validation=validation,
             )
+            enabled_result = True
+            if callable(enabled):
+                enabled_result = (
+                    enabled(dashboard_context) if is_v3 else enabled(app)
+                )
+                if is_v3:
+                    _reject_v3_dashboard_awaitable(
+                        enabled_result,
+                        operation="plugin_enabled",
+                    )
+            if is_v3 and not isinstance(enabled_result, bool):
+                raise RuntimeError("v3 dashboard plugin_enabled 必须返回 bool")
+            registered = None
+            if enabled_result:
+                registered = (
+                    register(app, dashboard_context)
+                    if is_v3
+                    else register(app, module_path.parent, workspace)
+                )
+                if is_v3:
+                    _reject_v3_dashboard_awaitable(
+                        registered,
+                        operation="register",
+                    )
+            closeables: list[object] = []
+            if enabled_result:
+                closeables = (
+                    _v3_dashboard_closeables(registered)
+                    if is_v3
+                    else _closeables(registered)
+                )
             for index, closeable in enumerate(closeables):
                 scope.defer(
                     f"dashboard_closeable:{index}",
@@ -239,6 +292,7 @@ class PluginDashboardHost:
                 app=app,
                 routes=routes,
                 runtime_workspace=workspace,
+                runtime_data_root=data_root if is_v3 else None,
                 validation=validation,
                 module_name=name,
                 _scope=scope,
@@ -253,6 +307,60 @@ class PluginDashboardHost:
 
         scope.defer("dashboard_module", remove_module)
         return binding
+
+
+def _dashboard_data_root(
+    generation: PluginGeneration,
+    *,
+    workspace: Path,
+    validation: bool,
+) -> Path:
+    """返回正式数据根，或为 candidate Dashboard 建立隔离副本。"""
+
+    source = generation.data_dir.resolve(strict=False)
+    if not validation:
+        return source
+    target = (
+        workspace / "plugin-data" / generation.data_dir.name
+    ).resolve(strict=False)
+    if target == source:
+        return target
+    if target.exists():
+        raise RuntimeError(f"candidate Dashboard 数据根已存在: {target}")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(source, target)
+    return target
+
+
+def _reject_v3_dashboard_awaitable(value: object, *, operation: str) -> None:
+    """关闭不受支持的 awaitable，并让 v3 Dashboard ABI 错误显式失败。"""
+
+    if not inspect.isawaitable(value):
+        return
+    close = getattr(value, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception as error:
+            raise RuntimeError(
+                f"v3 dashboard {operation} 不支持 async，且 awaitable 关闭失败"
+            ) from error
+    raise RuntimeError(f"v3 dashboard {operation} 不支持 async")
+
+
+def _v3_dashboard_closeables(value: object) -> list[object]:
+    """严格归一化 v3 register 返回的受 scope 管理资源。"""
+
+    if value is None:
+        return []
+    values = value if isinstance(value, (list, tuple)) else (value,)
+    closeables = list(values)
+    for index, item in enumerate(closeables):
+        if not callable(getattr(item, "close", None)):
+            raise RuntimeError(
+                f"v3 dashboard register 返回值不是 closeable: index={index}"
+            )
+    return closeables
 
 
 class SnapshotDashboardMiddleware:

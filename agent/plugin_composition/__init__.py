@@ -6,6 +6,7 @@ from agent.plugin_composition.context import (
     HealthHandle,
     Plugin,
 )
+from agent.plugin_composition.dashboard import DashboardContext
 from agent.plugin_composition.access import (
     CompositionAudit,
 )
@@ -48,6 +49,7 @@ __all__ = [
     "CompositionRoot",
     "CompositionAudit",
     "Context",
+    "DashboardContext",
     "Bail",
     "EmitEventKey",
     "Effect",
