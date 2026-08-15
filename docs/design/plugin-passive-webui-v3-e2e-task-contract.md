@@ -56,17 +56,20 @@ installed stable artifacts ──► supervised Gateway ──► WebUI-only cha
    runtime capabilities 必须列出两个 installed plugin 和 `meme-manage` Skill。
 8. 被动链路前后 `workspace/memes` 摘要相同。Gate 只允许临时 SessionDB、runtime、
    plugin-data、Skill link 和日志等正常运行写入。
-9. 两个 installed artifact 的逐文件摘要在 Gateway 运行前后必须相同，Dashboard 编译和
-   PluginWatcher 都不得修改或重发布锁内 generation。
-10. Gateway 必须经 SIGTERM 优雅停止；Compose down 后本项目不得残留 container、network
-   或 volume，临时 sandbox 必须删除。
+9. 两个 installed artifact 的逐文件摘要、artifact inventory 与 stable/latest 指针对在
+   运行完成及 Gateway 优雅停止后都必须与安装时相同；Dashboard 编译、PluginWatcher 和
+   dispose callback 都不得修改或重发布锁内 generation。
+10. Gateway 必须经 SIGTERM 优雅停止；停止后的 `workspace/memes` 仍须与运行前一致。
+    Compose down 后本项目不得残留 container、network 或 volume，临时 sandbox 必须删除。
 
 ## 4. 失败、证据与恢复
 
 - 浮动 revision、artifact/manifest 漂移、非 WebUI channel、prompt 顺序、最终输出、
   SessionDB、媒体、Dashboard、能力或 cleanup 任一不符都 fail-loud；
 - 报告固定 Core head/tree、Gate version、scenario hash、lock hash、provider commit/tree、
-  config hash、installed pointer、模型请求、WebUI frame、持久消息、workspace 摘要和 cleanup；
+  config hash、installed pointers/artifact inventory、模型请求状态/顺序索引/payload SHA、
+  WebUI frame、持久消息、运行后与停止后的 workspace 摘要和 cleanup；报告不记录请求
+  headers、凭证或完整 prompt；
 - Gateway 日志和运行报告只写被 Git 忽略的 Gate 报告目录；不记录凭证；
 - 失败时仍执行 Compose down 与 sandbox 删除。源码恢复点为
   `backup/plugin-v3-webui-e2e-before-20260816`。

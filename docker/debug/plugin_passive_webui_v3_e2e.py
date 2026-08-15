@@ -23,7 +23,11 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in os.sys.path:
     os.sys.path.insert(0, str(ROOT))
 
-from agent.plugins.artifacts import ArtifactPointer, write_pointers  # noqa: E402
+from agent.plugins.artifacts import (  # noqa: E402
+    ArtifactPointer,
+    read_pointers,
+    write_pointers,
+)
 from agent.plugins.manifest import write_plugin_manifest  # noqa: E402
 from docker.debug import (
     plugin_passive_composition_v3_gate as composition_gate,
@@ -32,7 +36,7 @@ from docker.debug import programmatic_control_probe as control_probe  # noqa: E4
 
 DEFAULT_REPORT = ROOT / "docker/debug/reports/plugin-passive-webui-v3" / "gate.json"
 COMPOSE_FILE = ROOT / "docker/debug/docker-compose.control-gate.yml"
-GATE_VERSION = 1
+GATE_VERSION = 2
 SCENARIO_PROFILE = "citation-meme-webui-v3-v1"
 MODEL_RESPONSE = "答复正文\n§cited:[mem_1]§ <meme:shy>"
 USER_INPUT = "请给我一条带引用和表情的回复"
@@ -163,19 +167,12 @@ def _run_host(report_path: Path, *, require_clean: bool) -> int:
         runtime = cast(dict[str, object], json.loads(host_inside_report.read_text()))
         if inside.returncode != 0 or runtime.get("status") != "passed":
             raise GateFailure(f"inside WebUI Gate 失败: {inside.returncode} {runtime}")
-        if _tree_sha256(sandbox / "workspace/memes") != meme_before_sha256:
-            raise GateFailure("真实 WebUI 被动链路改写了 workspace/memes")
-        for item in installed:
-            artifact = (
-                sandbox
-                / "home/.akashic-plugin/cache"
-                / MARKETPLACE
-                / item["plugin_id"].removesuffix(f"@{MARKETPLACE}")
-                / item["pointer"]
-            )
-            item["artifact_sha256_after"] = _tree_sha256(artifact)
-            if item["artifact_sha256_after"] != item["artifact_sha256_before"]:
-                raise GateFailure(f"运行时改写 immutable artifact: {item['plugin_id']}")
+        runtime["immutability_after_runtime"] = _verify_runtime_immutability(
+            sandbox,
+            installed,
+            meme_before_sha256,
+            phase="after_runtime",
+        )
         runtime["installed_artifacts"] = installed
 
         # 4. Stop through the supervised lifecycle before removing the project.
@@ -186,6 +183,12 @@ def _run_host(report_path: Path, *, require_clean: bool) -> int:
         )
         if stopped.returncode != 0:
             raise GateFailure(f"Gateway 优雅停止失败: {stopped.returncode}")
+        runtime["immutability_after_stop"] = _verify_runtime_immutability(
+            sandbox,
+            installed,
+            meme_before_sha256,
+            phase="after_stop",
+        )
     except BaseException as error:
         controller_error = f"{type(error).__name__}: {error}"
     finally:
@@ -242,6 +245,7 @@ def _run_inside() -> dict[str, object]:
     base_url = "http://127.0.0.1:2236"
     shell_state = _wait_json(f"{base_url}/api/shell/state")
     health = _http_json("GET", f"{base_url}/api/chat/health")
+    _assert_ready(health, "/api/chat/health")
     config = tomllib.loads(Path("/sandbox/config.toml").read_text(encoding="utf-8"))
     _assert_webui_only(config)
     capabilities = cast(
@@ -357,11 +361,11 @@ def _install_exact_plugins(
     sandbox: Path,
     locks: tuple[composition_gate.SourceLock, ...],
     checkouts: dict[str, Path],
-) -> list[dict[str, str]]:
+) -> list[dict[str, object]]:
     """Publish exact checkouts in the installed stable artifact layout."""
 
     cache = sandbox / "home/.akashic-plugin/cache"
-    installed: list[dict[str, str]] = []
+    installed: list[dict[str, object]] = []
     manifest: dict[str, bool] = {}
     for item in locks:
         plugin_base = cache / MARKETPLACE / item.id
@@ -383,6 +387,8 @@ def _install_exact_plugins(
                 "pointer": relative,
                 "tree": _git_output(checkouts[item.id], "rev-parse", "HEAD^{tree}"),
                 "artifact_sha256_before": _tree_sha256(artifact),
+                "pointers_before": _pointer_paths(plugin_base),
+                "artifact_inventory_before": _artifact_inventory(plugin_base),
             }
         )
     _ = write_plugin_manifest(manifest, plugins_home=sandbox / "home/.akashic-plugin")
@@ -469,6 +475,8 @@ def _assert_messages(
         raise GateFailure(f"持久 user 消息错误: {user}")
     if user.get("content") != USER_INPUT:
         raise GateFailure(f"持久 user 正文错误: {user}")
+    if assistant.get("session_key") != session_id:
+        raise GateFailure(f"持久 assistant session 错误: {assistant}")
     if assistant.get("role") != "assistant" or assistant.get("content") != "答复正文":
         raise GateFailure(f"持久 assistant 正文错误: {assistant}")
     if assistant.get("cited_memory_ids") != ["mem_1"]:
@@ -539,6 +547,60 @@ def _cleanup_evidence(
     if down_returncode != 0:
         residuals.append("compose_down")
     return {"compose_down_returncode": down_returncode, "residuals": residuals}
+
+
+def _verify_runtime_immutability(
+    sandbox: Path,
+    installed: list[dict[str, object]],
+    meme_before_sha256: str,
+    *,
+    phase: str,
+) -> dict[str, object]:
+    """Verify plugin publication state and Meme assets at a lifecycle boundary."""
+
+    # 1. Keep the product asset tree immutable through runtime and shutdown.
+    meme_sha256 = _tree_sha256(sandbox / "workspace/memes")
+    if meme_sha256 != meme_before_sha256:
+        raise GateFailure(f"{phase} 改写了 workspace/memes")
+
+    # 2. Keep both pointer facts and the full artifact inventory frozen.
+    for item in installed:
+        plugin_id = str(item["plugin_id"])
+        plugin_name = plugin_id.removesuffix(f"@{MARKETPLACE}")
+        plugin_base = sandbox / "home/.akashic-plugin/cache" / MARKETPLACE / plugin_name
+        pointers = _pointer_paths(plugin_base)
+        if pointers != item["pointers_before"]:
+            raise GateFailure(f"{phase} 改写 installed pointers: {plugin_id}")
+        inventory = _artifact_inventory(plugin_base)
+        if inventory != item["artifact_inventory_before"]:
+            raise GateFailure(f"{phase} 重发布 installed artifact: {plugin_id}")
+        artifact = plugin_base / str(item["pointer"])
+        digest = _tree_sha256(artifact)
+        if digest != item["artifact_sha256_before"]:
+            raise GateFailure(f"{phase} 改写 immutable artifact: {plugin_id}")
+        item[f"pointers_{phase}"] = pointers
+        item[f"artifact_inventory_{phase}"] = inventory
+        item[f"artifact_sha256_{phase}"] = digest
+    return {"meme_sha256": meme_sha256, "plugins": len(installed)}
+
+
+def _pointer_paths(plugin_base: Path) -> dict[str, str | None]:
+    pointers = read_pointers(plugin_base)
+    if pointers is None:
+        raise GateFailure(f"installed pointer state 丢失: {plugin_base}")
+    return {"stable": pointers.stable.path, "latest": pointers.latest.path}
+
+
+def _artifact_inventory(plugin_base: Path) -> list[str]:
+    root = plugin_base / ".artifacts"
+    if not root.is_dir() or root.is_symlink():
+        raise GateFailure(f"installed artifact root 无效: {root}")
+    return sorted(path.name for path in root.iterdir())
+
+
+def _assert_ready(payload: object, endpoint: str) -> None:
+    if not isinstance(payload, dict) or payload.get("status") != "ready":
+        raise GateFailure(f"{endpoint} 未 ready: {payload}")
 
 
 def _wait_json(url: str) -> object:
