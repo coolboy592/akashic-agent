@@ -3,7 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Generic, TypeVar
+from collections.abc import Mapping
+from types import MappingProxyType
+from typing import Generic, TypeVar, cast
 
 T = TypeVar("T", covariant=True)
 
@@ -30,6 +32,26 @@ class ServiceKey(Generic[T]):
     def __post_init__(self) -> None:
         if not self.name or self.name.strip() != self.name:
             raise ValueError("ServiceKey.name 必须是非空且无首尾空白的字符串")
+
+
+@dataclass(frozen=True, slots=True)
+class ServiceView:
+    """暴露一组由 Core 冻结的 composition service。"""
+
+    _values: Mapping[ServiceKey[object], object]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "_values", MappingProxyType(dict(self._values)))
+
+    @classmethod
+    def freeze(
+        cls,
+        values: Mapping[ServiceKey[object], object],
+    ) -> ServiceView:
+        return cls(values)
+
+    def get(self, key: ServiceKey[T]) -> T | None:
+        return cast(T | None, self._values.get(key))
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +87,7 @@ class TopologyFiberView:
     name: str
     required_for_readiness: bool
     dependencies: tuple[str, ...]
+    static_active: bool
 
 
 @dataclass(frozen=True, slots=True)

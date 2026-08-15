@@ -28,6 +28,7 @@ from agent.plugin_composition import (
     FiberState,
     MemoryRuntimeInfo,
     PluginRuntime,
+    ServiceView,
 )
 from agent.plugins.composable import ComposablePlugin
 
@@ -432,6 +433,7 @@ class PluginManager:
     def _prepare_skill_links_for_promotion(
         self,
         generation: PluginGeneration,
+        candidate_snapshot: RuntimeSnapshot,
     ) -> tuple[Any, list[ActivePluginInfo], list[ActivePluginInfo]]:
         """Build and validate both sides of the stable skill projection switch."""
 
@@ -456,7 +458,10 @@ class PluginManager:
             for plugin in stable
             if plugin.plugin_id != generation.plugin_id
         ]
-        post_promotion.append(target)
+        if any(
+            item is generation for item in candidate_snapshot.active_generations()
+        ):
+            post_promotion.append(target)
         linker = PluginSkillLinker(
             workspace=self._workspace,
             plugin_roots=self.skill_projection_roots,
@@ -797,6 +802,14 @@ class PluginManager:
         instance = plugin_registry.get_instance(module_path)
         if instance is None:
             return True
+        if (
+            isinstance(instance, ComposablePlugin)
+            and self.current_snapshot is not None
+        ):
+            return any(
+                generation.module_path == module_path
+                for generation in self.current_snapshot.active_generations()
+            )
         return plugin_is_active(instance, plugin_id=module_path)
 
     @property
@@ -1486,6 +1499,8 @@ class PluginManager:
             excluding_snapshot_id="",
         ):
             return
+        if self._dashboard_validation_releaser is not None:
+            await self._dashboard_validation_releaser(snapshot)
         await root.dispose()
 
     def _retire_generation(self, generation: PluginGeneration) -> None:
@@ -1537,6 +1552,8 @@ class PluginManager:
                 excluding_snapshot_id=snapshot.snapshot_id,
             )
         ):
+            if self._dashboard_validation_releaser is not None:
+                await self._dashboard_validation_releaser(snapshot)
             await composition_root.dispose()
         catalog_id = self._snapshot_skill_catalogs.pop(snapshot.snapshot_id, None)
         if catalog_id is not None:
@@ -1907,18 +1924,19 @@ class PluginManager:
         self._generation_sequence += 1
         catalog_id = f"topology:{self._generation_sequence}:{secrets.token_hex(4)}"
         ordered = list(generations.values())
+        active_ordered = self._static_active_generations(ordered)
         catalog = self._skill_host.prepare(
             catalog_id,
-            normal_roots=PluginSkillHost.roots_for(ordered, drift=False),
-            drift_roots=PluginSkillHost.roots_for(ordered, drift=True),
+            normal_roots=PluginSkillHost.roots_for(active_ordered, drift=False),
+            drift_roots=PluginSkillHost.roots_for(active_ordered, drift=True),
             ignored_normal_roots=tuple(
                 root
-                for generation in ordered
+                for generation in active_ordered
                 for root in generation.contributions.skill_roots
             ),
             ignored_drift_roots=tuple(
                 root
-                for generation in ordered
+                for generation in active_ordered
                 for root in generation.contributions.drift_skill_roots
             ),
         )
@@ -1986,7 +2004,7 @@ class PluginManager:
             )
 
             skill_linker, stable_skill_plugins, target_skill_plugins = (
-                self._prepare_skill_links_for_promotion(generation)
+                self._prepare_skill_links_for_promotion(generation, ready.snapshot)
             )
 
             # 1. Seal both stable and validation leases before touching ownership.
@@ -2191,11 +2209,11 @@ class PluginManager:
             raise RuntimeError("候选缺少 production plugin-data identity")
 
         # 1. 隔离 Root 已封存，先停止其任务，再进入任何 formal await。
+        if self._dashboard_validation_releaser is not None:
+            await self._dashboard_validation_releaser(ready.snapshot)
         validation_root = ready.snapshot.composition_root
         if validation_root is not None:
             await validation_root.dispose()
-        if self._dashboard_validation_releaser is not None:
-            await self._dashboard_validation_releaser(ready.snapshot)
 
         # 2. Stop isolated services after every validation lease has ended.
         if generation.validation_managed_services:
@@ -2902,11 +2920,11 @@ class PluginManager:
     ) -> RuntimeSnapshot:
         """直接发布前用正式 runtime 重建并关闭 candidate Root。"""
 
+        if self._dashboard_validation_releaser is not None:
+            await self._dashboard_validation_releaser(validation_snapshot)
         previous_root = validation_snapshot.composition_root
         if previous_root is not None:
             await previous_root.dispose()
-        if self._dashboard_validation_releaser is not None:
-            await self._dashboard_validation_releaser(validation_snapshot)
         production_snapshot = await self._compile_generation_snapshot(
             generation,
             allow_unready_stable_composition=True,
@@ -3642,6 +3660,8 @@ class PluginManager:
 
         try:
             load_phase = "declarations"
+            if isinstance(instance, ComposablePlugin):
+                instance.bind_static_services(self._composition_service_view())
             contributions = self._collect_candidate_contributions(
                 instance=instance,
                 plugin_id=plugin_id,
@@ -3686,7 +3706,12 @@ class PluginManager:
                 if active_generation.plugin_id != plugin_id
             ]
             catalog_generations.append(generation)
-            ignored_generations = [*self._active_generations.values(), generation]
+            catalog_generations = self._static_active_generations(
+                catalog_generations
+            )
+            ignored_generations = self._static_active_generations(
+                [*self._active_generations.values(), generation]
+            )
             try:
                 skill_catalog = self._skill_host.prepare(
                     generation_id,
@@ -4180,6 +4205,31 @@ class PluginManager:
             self._composition_memory_runtime,
         )
 
+    def _composition_service_view(self) -> ServiceView:
+        """冻结静态 v3 声明可读取的 Core service 输入。"""
+
+        values: dict[Any, object] = {}
+        memory_runtime = self._get_composition_memory_runtime()
+        if memory_runtime is not None:
+            values[MEMORY_RUNTIME] = memory_runtime
+        return ServiceView.freeze(values)
+
+    @staticmethod
+    def _static_active_generations(
+        generations: list[PluginGeneration],
+    ) -> list[PluginGeneration]:
+        """用 snapshot 相同的 active 合同过滤静态 catalog。"""
+
+        # V2_REMOVAL(static-active)：v2 删除后不再保留未冻结的 legacy generation。
+        return [
+            generation
+            for generation in generations
+            if not isinstance(generation.instance, ComposablePlugin)
+            or plugin_is_active(
+                generation.instance, plugin_id=generation.plugin_id
+            )
+        ]
+
     async def _mount_generation_composition(
         self,
         root: CompositionRoot,
@@ -4296,6 +4346,7 @@ class PluginManager:
                     f"{generation.plugin_id}"
                 ),
             )
+            clone.bind_static_services(self._composition_service_view())
             plugin_registry.register_instance(module_path, clone)
             return clone, module_path, data_dir
         except BaseException:
@@ -5730,6 +5781,7 @@ def _replace_snapshot_payload(
         "event_handlers",
         "composition_root",
         "composition_topology",
+        "composition_active_plugin_ids",
         "composition_health_exempt_root_token",
     ):
         setattr(target, name, getattr(source, name))

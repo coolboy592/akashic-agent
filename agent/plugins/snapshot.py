@@ -63,6 +63,7 @@ class RuntimeSnapshot:
     )
     composition_root: CompositionRoot | None = None
     composition_topology: TopologyView | None = None
+    composition_active_plugin_ids: frozenset[str] | None = None
     composition_validation_identity: str | None = None
     composition_validation_root_token: object | None = field(
         default=None,
@@ -79,10 +80,19 @@ class RuntimeSnapshot:
     _store_token: object | None = field(default=None, repr=False)
 
     def active_generations(self) -> tuple[PluginGeneration, ...]:
+        # V2_REMOVAL(static-active)：v2 删除后全部 generation 只读冻结的 Root active 集合。
         return tuple(
             generation
             for generation in self.generations.values()
-            if plugin_is_active(generation.instance, plugin_id=generation.plugin_id)
+            if (
+                generation.plugin_id in self.composition_active_plugin_ids
+                if self.composition_active_plugin_ids is not None
+                and getattr(generation.instance, "api_version", None) == 3
+                else plugin_is_active(
+                    generation.instance,
+                    plugin_id=generation.plugin_id,
+                )
+            )
         )
 
     def claim(self, store_token: object) -> None:
@@ -92,6 +102,7 @@ class RuntimeSnapshot:
 
 
 def plugin_is_active(instance: object, *, plugin_id: str) -> bool:
+    # V2_REMOVAL(static-active)：v2 删除后仅保留 ComposablePlugin 的绑定期校验。
     checker = getattr(instance, "is_active", None)
     if not callable(checker):
         return True
@@ -214,6 +225,7 @@ class RuntimeSnapshotCompiler:
         )
         identity += f"|snapshot:{snapshot_revision}"
         composition_topology: TopologyView | None = None
+        composition_active_plugin_ids: frozenset[str] | None = None
         if composition_root is not None:
             receipt = composition_root.receipt()
             if require_composition_ready and not receipt.ready:
@@ -225,6 +237,7 @@ class RuntimeSnapshotCompiler:
                     f"external_effects={receipt.external_effects}"
                 )
             composition_topology = composition_root.topology_view()
+            composition_active_plugin_ids = composition_root.active_plugin_ids()
             identity += f"|composition:{composition_topology.identity}"
         snapshot_id = hashlib.sha256(identity.encode()).hexdigest()[:16]
         return RuntimeSnapshot(
@@ -260,6 +273,7 @@ class RuntimeSnapshotCompiler:
             after_turn_modules=phases["after_turn_modules"],
             composition_root=composition_root,
             composition_topology=composition_topology,
+            composition_active_plugin_ids=composition_active_plugin_ids,
         )
 
     @staticmethod

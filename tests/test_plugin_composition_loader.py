@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from agent.plugin_composition import ServiceView
 from agent.plugins.composable import ComposablePlugin
 from agent.plugins.artifacts import ArtifactPointer, read_pointer, write_pointers
 from agent.plugins.dashboard_host import DashboardBinding, PluginDashboardHost
@@ -14,6 +15,7 @@ from agent.plugins.generation import PluginGeneration
 from agent.plugins.manager import PluginManager
 from agent.plugins.manifest import write_plugin_manifest
 from agent.plugins.registry import plugin_registry
+from agent.plugins.snapshot import plugin_is_active
 from bus.event_bus import EventBus
 
 
@@ -367,6 +369,7 @@ async def test_v3_dashboard_rejects_invalid_callable_contracts(
         ("drift_skill_roots = ('',)", "drift_skill_roots 必须只包含非空字符串"),
         ("skill_roots = ('skills', 'skills')", "skill_roots 不得重复"),
         ("dashboard_module = ''", "dashboard_module 必须是非空字符串或 None"),
+        ("is_active = 1", "is_active 必须是可调用对象"),
     ],
 )
 def test_v3_namespace_rejects_invalid_package_contributions(
@@ -401,6 +404,77 @@ def test_v3_namespace_freezes_package_contribution_lists() -> None:
     roots.append("mutated")
 
     assert plugin.skill_roots == ("skills",)
+
+
+@pytest.mark.parametrize("value", [None, 1, "active"])
+def test_v3_active_predicate_must_return_bool(value: object) -> None:
+    from types import ModuleType
+
+    module = ModuleType("invalid_v3_active_result")
+    module.api_version = 3
+    module.name = "invalid_active"
+    module.version = "1.0.0"
+    module.apply = lambda ctx, config: None
+    module.is_active = lambda services: value
+    plugin = ComposablePlugin.from_module(module)
+
+    with pytest.raises(RuntimeError, match="is_active 必须返回 bool"):
+        plugin.bind_static_services(ServiceView.freeze({}))
+
+
+def test_v3_active_predicate_rejects_async_without_leaking_coroutine() -> None:
+    from types import ModuleType
+
+    module = ModuleType("async_v3_active_result")
+    module.api_version = 3
+    module.name = "async_active"
+    module.version = "1.0.0"
+    module.apply = lambda ctx, config: None
+
+    async def active(services: ServiceView) -> bool:
+        return True
+
+    module.is_active = active
+    plugin = ComposablePlugin.from_module(module)
+
+    with pytest.raises(RuntimeError, match="is_active 不支持 async"):
+        plugin.bind_static_services(ServiceView.freeze({}))
+
+
+@pytest.mark.asyncio
+async def test_inactive_v3_does_not_wait_for_declared_runtime_dependency(
+    tmp_path: Path,
+) -> None:
+    _write_plugin(
+        tmp_path / "plugins",
+        "inactive_missing",
+        "from agent.plugin_composition import ServiceKey\n"
+        "api_version = 3\n"
+        "name = 'inactive_missing'\n"
+        "version = '1.0.0'\n"
+        "MISSING = ServiceKey('missing.runtime')\n"
+        "inject = (MISSING,)\n"
+        "def is_active(services): return False\n"
+        "def apply(ctx, config): raise RuntimeError('inactive apply ran')\n",
+    )
+    manager = _manager(tmp_path)
+
+    await manager.load_all()
+
+    snapshot = manager.current_snapshot
+    assert snapshot is not None and snapshot.composition_root is not None
+    assert snapshot.composition_root.receipt().ready is True
+    assert snapshot.composition_root.receipt().required_pending == ()
+    assert snapshot.composition_topology is not None
+    fiber = next(
+        item
+        for item in snapshot.composition_topology.fibers
+        if item.name == "inactive_missing"
+    )
+    assert fiber.dependencies == ("missing.runtime",)
+    assert fiber.static_active is False
+    assert snapshot.active_generations() == ()
+    await manager.terminate_all()
 
 
 @pytest.mark.asyncio
@@ -1079,7 +1153,7 @@ async def test_installed_v3_candidate_rebuilds_runtime_then_promotes(
 
 
 @pytest.mark.asyncio
-async def test_installed_v3_dashboard_uses_validation_workspace_until_promotion(
+async def test_installed_v3_dashboard_uses_composition_runtime_until_promotion(
     tmp_path: Path,
 ) -> None:
     plugin_base = tmp_path / "home" / "cache" / "lab" / "dashboard_v3"
@@ -1092,6 +1166,8 @@ async def test_installed_v3_dashboard_uses_validation_workspace_until_promotion(
         "name = 'dashboard_v3'\n"
         "version = '1.0.0'\n"
         "dashboard_module = 'dashboard.py'\n"
+        "drift_skill_roots = ('drift/skills',)\n"
+        "def is_active(services): return True\n"
         "def apply(ctx, config): pass\n"
     )
     (stable_root / "plugin.py").write_text(source, encoding="utf-8")
@@ -1113,6 +1189,10 @@ async def test_installed_v3_dashboard_uses_validation_workspace_until_promotion(
         "    return Closeable()\n",
         encoding="utf-8",
     )
+    for artifact in (stable_root, latest_root):
+        skill = artifact / "drift" / "skills" / "dashboard-v3-static"
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text("# static projection\n", encoding="utf-8")
     stable_pointer = ArtifactPointer(".artifacts/1.0.0-aaaa")
     latest_pointer = ArtifactPointer(".artifacts/2.0.0-bbbb")
     write_pointers(plugin_base, stable=stable_pointer, latest=stable_pointer)
@@ -1122,6 +1202,11 @@ async def test_installed_v3_dashboard_uses_validation_workspace_until_promotion(
     )
     manager = _manager(tmp_path)
     await manager.load_all()
+    manager.sync_skill_links()
+    skill_link = (
+        tmp_path / "workspace" / "drift" / "skills" / "dashboard-v3-static"
+    )
+    assert skill_link.exists()
     stable_snapshot = manager.current_snapshot
     assert stable_snapshot is not None
     dashboard_host = PluginDashboardHost(
@@ -1140,15 +1225,22 @@ async def test_installed_v3_dashboard_uses_validation_workspace_until_promotion(
     assert (await manager.reconcile_changed())[0]["publication_state"] == "latest_ready"
     candidate = manager.ready_candidate
     assert candidate is not None and candidate.runtime_snapshot is not None
+    assert "dashboard_v3@lab" in {
+        item.plugin_id for item in candidate.runtime_snapshot.active_generations()
+    }
     validation_workspace = candidate.validation_workspace
     assert validation_workspace is not None
     candidate_binding = candidate.runtime_snapshot.dashboard_bindings[0]
     assert isinstance(candidate_binding, DashboardBinding)
     assert candidate_binding.validation is True
-    assert candidate_binding.runtime_workspace == validation_workspace.resolve()
+    candidate_root = candidate.runtime_snapshot.composition_root
+    assert candidate_root is not None
+    candidate_runtime = candidate_root.plugin_runtime("dashboard_v3@lab")
+    assert candidate_binding.runtime_workspace == candidate_runtime.workspace.resolve()
     candidate_data_root = candidate_binding.runtime_data_root
     assert candidate_data_root is not None
-    assert candidate_data_root.is_relative_to(validation_workspace)
+    assert candidate_data_root == candidate_runtime.data_dir.resolve()
+    assert candidate_data_root.is_relative_to(validation_workspace.parent)
     assert (candidate_data_root / "candidate-registered").is_file()
     assert not (candidate_data_root / "formal-registered").exists()
     production_data_root = tmp_path / "workspace" / "plugin-data" / "dashboard_v3-lab"
@@ -1185,7 +1277,48 @@ async def test_installed_v3_dashboard_uses_validation_workspace_until_promotion(
     assert formal_binding.runtime_data_root == production_data_root.resolve()
     assert (production_data_root / "formal-registered").is_file()
     assert not (production_data_root / "candidate-registered").exists()
+    assert skill_link.exists()
     assert not promoted_validation_root.exists()
+    await manager.terminate_all()
+
+
+@pytest.mark.asyncio
+async def test_inactive_v3_does_not_claim_active_plugin_skill_name(
+    tmp_path: Path,
+) -> None:
+    plugin_root = tmp_path / "plugins"
+    for name, active in (("inactive_owner", False), ("active_owner", True)):
+        plugin = _write_plugin(
+            plugin_root,
+            name,
+            "api_version = 3\n"
+            f"name = '{name}'\n"
+            "version = '1.0.0'\n"
+            "drift_skill_roots = ('drift/skills',)\n"
+            f"def is_active(services): return {active!r}\n"
+            "def apply(ctx, config): pass\n",
+        )
+        skill = plugin / "drift" / "skills" / "shared-static-skill"
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text(f"# {name}\n", encoding="utf-8")
+    manager = _manager(tmp_path)
+
+    await manager.load_all()
+    manager.sync_skill_links()
+
+    snapshot = manager.current_snapshot
+    assert snapshot is not None
+    assert {item.plugin_id for item in snapshot.active_generations()} == {
+        "active_owner"
+    }
+    link = tmp_path / "workspace" / "drift" / "skills" / "shared-static-skill"
+    assert link.resolve() == (
+        plugin_root
+        / "active_owner"
+        / "drift"
+        / "skills"
+        / "shared-static-skill"
+    ).resolve()
     await manager.terminate_all()
 
 

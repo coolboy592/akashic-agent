@@ -9,6 +9,7 @@ from typing import Any, cast
 from agent.config import Config
 from agent.plugins.artifacts import read_pointers, resolve_pointer
 from agent.plugins.base import Plugin
+from agent.plugins.composable import ComposablePlugin
 from agent.plugins.manifest import load_plugin_manifest, plugins_root
 from agent.plugins.registry import plugin_registry
 from agent.plugins.specs import McpServerSpec
@@ -79,10 +80,10 @@ def _inspect_plugin(
     if stable_root is not None:
         checks.append(_check("install", "ok", f"stable plugin.py: {stable_root}"))
         try:
-            plugin_class = _load_plugin_class(stable_root)
+            declaration = _load_plugin_declaration(stable_root)
             checks.extend(
                 _check_capabilities(
-                    plugin_class,
+                    declaration,
                     stable_root,
                     workspace,
                     projection_root=projection_root,
@@ -98,8 +99,8 @@ def _inspect_plugin(
             _check("install", "ok", f"latest candidate plugin.py: {latest_root}")
         )
         try:
-            candidate_class = _load_plugin_class(latest_root)
-            checks.extend(_check_candidate_declaration(candidate_class, latest_root))
+            declaration = _load_plugin_declaration(latest_root)
+            checks.extend(_check_candidate_declaration(declaration, latest_root))
             checks.extend(
                 _check_empty_projection(
                     workspace,
@@ -158,7 +159,12 @@ def _find_plugin_roots(
     return root, root, base
 
 
-def _load_plugin_class(plugin_root: Path) -> type[Plugin]:
+PluginDeclaration = type[Plugin] | ComposablePlugin
+
+
+def _load_plugin_declaration(plugin_root: Path) -> PluginDeclaration:
+    """读取一个 v3 namespace，或暂时兼容 v2 Plugin class。"""
+
     module_name = f"akasic_plugin_doctor_{uuid.uuid4().hex}"
     path = plugin_root / "plugin.py"
     spec = importlib.util.spec_from_file_location(
@@ -172,6 +178,10 @@ def _load_plugin_class(plugin_root: Path) -> type[Plugin]:
     sys.modules[module_name] = module
     try:
         spec.loader.exec_module(module)
+        if getattr(module, "api_version", None) == 3:
+            return ComposablePlugin.from_module(module)
+        # V2_REMOVAL(plugin-doctor-declaration)：最后一个 v2 插件迁移后删除
+        # registry class 发现与 Plugin 子类校验。
         plugin_class = plugin_registry.get_class(module_name)
         if plugin_class is None:
             raise ValueError("plugin.py 未声明 Plugin 子类")
@@ -184,7 +194,7 @@ def _load_plugin_class(plugin_root: Path) -> type[Plugin]:
 
 
 def _check_capabilities(
-    plugin_class: type[Plugin],
+    declaration: PluginDeclaration,
     plugin_root: Path,
     workspace: Path,
     *,
@@ -195,13 +205,13 @@ def _check_capabilities(
     for label, roots, target, subpath in (
         (
             "skills",
-            plugin_class.skill_roots(),
+            _declared_skill_roots(declaration, drift=False),
             workspace / "skills",
             ("skills",),
         ),
         (
             "drift_skills",
-            plugin_class.drift_skill_roots(),
+            _declared_skill_roots(declaration, drift=True),
             workspace / "drift" / "skills",
             ("drift", "skills"),
         ),
@@ -228,7 +238,7 @@ def _check_capabilities(
                 f"misdirected={misdirected} stale={stale}",
             )
         )
-    servers = plugin_class.mcp_servers()
+    servers = _declared_mcp_servers(declaration)
     invalid = [item for item in servers if not isinstance(item, McpServerSpec)]
     checks.append(
         _check("mcp", "error" if invalid else "ok", f"servers={len(servers)}")
@@ -237,13 +247,13 @@ def _check_capabilities(
 
 
 def _check_candidate_declaration(
-    plugin_class: type[Plugin],
+    declaration: PluginDeclaration,
     plugin_root: Path,
 ) -> list[dict[str, str]]:
     checks: list[dict[str, str]] = []
     for label, roots in (
-        ("candidate_skills", plugin_class.skill_roots()),
-        ("candidate_drift_skills", plugin_class.drift_skill_roots()),
+        ("candidate_skills", _declared_skill_roots(declaration, drift=False)),
+        ("candidate_drift_skills", _declared_skill_roots(declaration, drift=True)),
     ):
         missing = [raw for raw in roots if not (plugin_root / raw).is_dir()]
         checks.append(
@@ -253,7 +263,7 @@ def _check_candidate_declaration(
                 f"roots={len(roots)} missing={missing}",
             )
         )
-    servers = plugin_class.mcp_servers()
+    servers = _declared_mcp_servers(declaration)
     invalid = [item for item in servers if not isinstance(item, McpServerSpec)]
     checks.append(
         _check(
@@ -263,6 +273,24 @@ def _check_candidate_declaration(
         )
     )
     return checks
+
+
+def _declared_skill_roots(
+    declaration: PluginDeclaration,
+    *,
+    drift: bool,
+) -> tuple[str, ...]:
+    if isinstance(declaration, ComposablePlugin):
+        return declaration.drift_skill_roots if drift else declaration.skill_roots
+    return declaration.drift_skill_roots() if drift else declaration.skill_roots()
+
+
+def _declared_mcp_servers(
+    declaration: PluginDeclaration,
+) -> tuple[McpServerSpec, ...] | list[McpServerSpec]:
+    if isinstance(declaration, ComposablePlugin):
+        return ()
+    return declaration.mcp_servers()
 
 
 def _check_empty_projection(

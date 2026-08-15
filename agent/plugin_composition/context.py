@@ -104,6 +104,12 @@ class Context:
 
         return self.runtime.data_dir
 
+    def _set_static_active(self, active: bool) -> None:
+        """把 adapter 决定的静态贡献状态冻结在当前 Fiber。"""
+
+        reject_executor_context_access()
+        self._root._set_static_active(self._fiber, active)
+
     async def mount(
         self,
         plugin: Plugin | PluginApply,
@@ -384,6 +390,7 @@ class Fiber:
         parent: Fiber | None,
         required_for_readiness: bool,
         runtime: PluginRuntime | None,
+        static_active: bool = True,
         is_root: bool = False,
     ) -> None:
         self.root = root
@@ -391,6 +398,7 @@ class Fiber:
         self.name = name
         self.apply = apply
         self.dependencies = dependencies
+        self._activation_dependencies = dependencies if static_active else ()
         self.parent = parent
         self.required_for_readiness = required_for_readiness
         self.runtime = runtime
@@ -401,6 +409,7 @@ class Fiber:
         self.children: list[Fiber] = []
         self.error: BaseException | None = None
         self._task_failures: dict[str, str] = {}
+        self.static_active = static_active
         self._epoch: tuple[tuple[str, int], ...] | None = () if is_root else None
         self._transition = asyncio.Lock()
         self._transition_owner: asyncio.Task[object] | None = None
@@ -413,7 +422,7 @@ class Fiber:
     def missing_services(self) -> tuple[str, ...]:
         return tuple(
             key.name
-            for key in self.dependencies
+            for key in self._activation_dependencies
             if self.root._active_provider(key) is None
         )
 
@@ -435,7 +444,7 @@ class Fiber:
         async with self._locked_transition():
             if self._dispose_requested or self._is_root:
                 return
-            providers = self.root._dependency_snapshot(self.dependencies)
+            providers = self.root._dependency_snapshot(self._activation_dependencies)
             target_epoch = self.root._provider_epoch(providers)
             if providers is None:
                 if self.state in {FiberState.ACTIVE, FiberState.FAILED}:
@@ -509,7 +518,8 @@ class Fiber:
         await asyncio.sleep(0)
         if (
             self._dispose_requested
-            or self.root._provider_epoch_if_active(self.dependencies) != epoch
+            or self.root._provider_epoch_if_active(self._activation_dependencies)
+            != epoch
         ):
             await self._unload(next_state=FiberState.PENDING)
             return
@@ -533,7 +543,8 @@ class Fiber:
             return
         if (
             self._dispose_requested
-            or self.root._provider_epoch_if_active(self.dependencies) != epoch
+            or self.root._provider_epoch_if_active(self._activation_dependencies)
+            != epoch
         ):
             await self._unload(next_state=FiberState.PENDING)
             return
@@ -650,6 +661,7 @@ class CompositionRoot:
             parent=None,
             required_for_readiness=True,
             runtime=None,
+            static_active=True,
             is_root=True,
         )
         self.context = self.root_fiber.context
@@ -794,6 +806,7 @@ class CompositionRoot:
                         dependencies=tuple(
                             sorted(key.name for key in fiber.dependencies)
                         ),
+                        static_active=fiber.static_active,
                     )
                     for fiber in self._fibers.values()
                 ),
@@ -810,6 +823,7 @@ class CompositionRoot:
                     "name": fiber.name,
                     "required": fiber.required_for_readiness,
                     "dependencies": fiber.dependencies,
+                    "static_active": fiber.static_active,
                 }
                 for fiber in fibers
             ],
@@ -835,6 +849,32 @@ class CompositionRoot:
 
     def topology_identity(self) -> str:
         return self.topology_view().identity
+
+    def active_plugin_ids(self) -> frozenset[str]:
+        """返回当前 Root 中 active 的顶层插件身份。"""
+
+        return frozenset(
+            runtime.plugin_id
+            for fiber in self.root_fiber.children
+            if fiber.static_active
+            if (runtime := fiber.runtime) is not None
+        )
+
+    def plugin_runtime(self, plugin_id: str) -> PluginRuntime:
+        """返回顶层插件 Fiber 使用的 Core-owned runtime。"""
+
+        matches = tuple(
+            runtime
+            for fiber in self.root_fiber.children
+            if (runtime := fiber.runtime) is not None
+            and runtime.plugin_id == plugin_id
+        )
+        if len(matches) != 1:
+            raise CompositionError(
+                "PLUGIN_RUNTIME_UNAVAILABLE",
+                f"Root 中没有唯一插件 runtime: {plugin_id}",
+            )
+        return matches[0]
 
     def validation_identity(self) -> str:
         """Bind the Core-observed topology and audit receipt at validation close."""
@@ -892,6 +932,9 @@ class CompositionRoot:
             )
 
         # 2. Parent ownership is visible before publication observers run.
+        static_active = getattr(plugin, "static_active", True)
+        if not isinstance(static_active, bool):
+            raise TypeError("插件 static_active 必须是 bool")
         fiber = Fiber(
             root=self,
             fiber_id=self._next_fiber_id,
@@ -901,6 +944,7 @@ class CompositionRoot:
             parent=parent,
             required_for_readiness=required_for_readiness,
             runtime=runtime,
+            static_active=static_active,
         )
         self._next_fiber_id += 1
         parent.children.append(fiber)
@@ -964,6 +1008,14 @@ class CompositionRoot:
             revision=self._next_provider_revision,
         )
         self._next_provider_revision += 1
+        self._bump_composition_revision()
+
+    def _set_static_active(self, owner: Fiber, active: bool) -> None:
+        if not isinstance(active, bool):
+            raise TypeError("static active 状态必须是 bool")
+        if owner.static_active == active:
+            return
+        owner.static_active = active
         self._bump_composition_revision()
 
     async def _remove_provider(
@@ -1042,7 +1094,7 @@ class CompositionRoot:
             for fiber in tuple(self._fibers.values())
             if fiber is not exclude
             and fiber.state != FiberState.DISPOSED
-            and any(key in fiber.dependencies for key in keys)
+            and any(key in fiber._activation_dependencies for key in keys)
         ]
         if affected:
             results = await asyncio.gather(

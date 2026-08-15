@@ -86,24 +86,48 @@ class PluginDashboardHost:
     ) -> None:
         bindings: list[DashboardBinding] = []
         occupied = list(self._core_routes)
+        active_generations = {
+            generation.plugin_id for generation in snapshot.active_generations()
+        }
         for generation in snapshot.generations.values():
+            is_v3 = isinstance(generation.instance, ComposablePlugin)
+            if is_v3 and generation.plugin_id not in active_generations:
+                continue
             module_path = generation.contributions.dashboard_module
             generation_id = generation.generation_id
             if module_path is None or generation_id in self._unavailable:
                 continue
-            validation_workspace = generation.validation_workspace
-            runtime_workspace = (
-                validation_workspace
-                if validation_workspace is not None
-                else self._workspace
-            ).resolve(strict=False)
-            if validation_workspace is not None:
+            if is_v3:
+                root = snapshot.composition_root
+                if root is None:
+                    raise RuntimeError(
+                        f"v3 Dashboard 缺少 composition Root: {generation.plugin_id}"
+                    )
+                runtime = root.plugin_runtime(generation.plugin_id)
+                runtime_workspace = runtime.workspace.resolve(strict=False)
+                data_root = runtime.data_dir.resolve(strict=False)
+                validation = data_root != generation.data_dir.resolve(strict=False)
+            else:
+                # V2_REMOVAL(dashboard-context)：v2 删除后移除此三参数 workspace 副本。
+                validation_workspace = generation.validation_workspace
+                runtime_workspace = (
+                    validation_workspace
+                    if validation_workspace is not None
+                    else self._workspace
+                ).resolve(strict=False)
+                validation = validation_workspace is not None
+                data_root = _dashboard_data_root(
+                    generation,
+                    workspace=runtime_workspace,
+                    validation=validation,
+                )
+            if validation:
                 runtime_workspace.mkdir(parents=True, exist_ok=True)
             binding_key = (generation_id, runtime_workspace)
             binding = self._bindings.get(binding_key)
             if binding is None:
                 binding_scope = generation.scope
-                if validation_workspace is not None:
+                if validation:
                     binding_scope = PluginScope(
                         f"{generation.plugin_id}:dashboard-validation"
                     )
@@ -114,14 +138,6 @@ class PluginDashboardHost:
                         ),
                     )
                 try:
-                    data_root = _dashboard_data_root(
-                        generation,
-                        workspace=runtime_workspace,
-                        validation=(
-                            validation_workspace is not None
-                            and isinstance(generation.instance, ComposablePlugin)
-                        ),
-                    )
                     binding = self._build_binding(
                         generation,
                         module_path,
@@ -129,7 +145,7 @@ class PluginDashboardHost:
                         workspace=runtime_workspace,
                         data_root=data_root,
                         scope=binding_scope,
-                        validation=validation_workspace is not None,
+                        validation=validation,
                     )
                 except Exception as error:
                     if not tolerate_failures or not isinstance(

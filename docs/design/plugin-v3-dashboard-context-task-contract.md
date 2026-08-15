@@ -60,9 +60,10 @@ client_only_alternative: "Not applicable; the server selects Dashboard routes an
 - v3 Dashboard 的临时 FastAPI app 不注入 `memory_admin` 或 `memory_store`。
   插件需要领域能力时，由自己的 composition `apply` 决定状态或实现 reader，不能从
   Dashboard 绕过已声明 capability。
-- 正式 binding 使用 generation 的正式 `data_dir`。candidate binding 使用 validation
-  workspace 下的同名 plugin-data；若 generation 尚未拥有 candidate 副本，Core 先复制
-  当前正式 plugin-data，再调用插件。
+- 正式 binding 使用 generation 的正式 `data_dir`。后续
+  [静态投影与 exact runtime 合同](plugin-v3-static-projection-runtime-task-contract.md) 收紧
+  candidate 语义：binding 直接使用 exact composition attempt 的
+  `PluginRuntime.workspace/data_dir`，不再建立第二份 Dashboard-only 副本。
 - candidate Dashboard 的 module、route、closeable 与数据副本仍由 candidate generation
   scope 拥有。discard 或失败不修改正式数据；promotion 先关闭 validation binding，再用
   正式 `data_root` 重建 binding。
@@ -98,8 +99,9 @@ v2 继续取得旧三参数 ABI 与 `app.state.memory_admin/memory_store`，现�
 
 - stable v3 Dashboard 只取得 `DashboardContext`，FastAPI app 不含 Memory capability，
   binding 的 `runtime_data_root` 与 generation 一致。
-- installed candidate 写入只落在 validation data root；discard 零正式残留，promotion 后
-  formal binding 才写正式 data root。
+- installed candidate 写入只落在 exact composition attempt data root；listener 与
+  Dashboard 读同一副本，discard 零正式残留，promotion 后 formal binding 才写正式 data
+  root。
 - builtin direct candidate 先读到正式数据的隔离副本；candidate marker 不进入正式目录，
   formal marker 在 commit 后出现。
 - v2 Dashboard hot reload、route conflict、snapshot lease 与异步 close 回归保持不变。

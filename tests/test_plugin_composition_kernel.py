@@ -1077,6 +1077,7 @@ async def test_plugin_manager_drains_snapshot_composition_root() -> None:
     manager = object.__new__(PluginManager)
     manager._snapshot_store = RuntimeSnapshotStore()
     manager._snapshot_skill_catalogs = {}
+    manager._dashboard_validation_releaser = None
     manager._finish_drained_reload = lambda _: None
 
     await manager._on_snapshot_drained(snapshot)

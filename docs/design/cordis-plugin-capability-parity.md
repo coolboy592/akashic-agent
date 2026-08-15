@@ -105,7 +105,10 @@ wake_proactive
 wake_proactive_flow
 ```
 
-当前 memory engine 是 Akasha。`default_memory` 虽然已加载，但 `is_active()` 为 false，不应贡献 before-turn 模块、Skill、Dashboard 或写入。因此当前基线是 16 个 loaded implementation、15 个有效贡献者。
+当前 memory engine 是 Akasha。旧 v2 基线由实例 `is_active()` 返回 false；v3 迁移后由
+`is_active(ServiceView)` 在 Root 装配前冻结同一事实。两者都要求 `default_memory` 不贡献
+listener、Skill、Dashboard 或写入。因此当前基线是 16 个 loaded implementation、15 个
+有效贡献者。
 
 以下对象已安装但禁用：
 
