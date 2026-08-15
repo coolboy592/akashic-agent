@@ -84,10 +84,15 @@ def test_gate_pins_protocol_source_and_version() -> None:
 
 def test_ci_fetches_protocol_source_history() -> None:
     workflow = (gate.ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
-    job = workflow.split("  plugin-composition-v3-gate:\n", 1)[1].split(
+    gate_job = workflow.split("  plugin-composition-v3-gate:\n", 1)[1].split(
         "\n  check-and-test:",
+        1,
+    )[0]
+    check_job = workflow.split("  check-and-test:\n", 1)[1].split(
+        "\n  docker-control-gate:",
         1,
     )[0]
 
     assert "  workflow_dispatch:\n" in workflow
-    assert "fetch-depth: 0" in job
+    assert "fetch-depth: 0" in gate_job
+    assert "fetch-depth: 0" in check_job
