@@ -321,6 +321,9 @@ class PluginManager:
             return list(self.current_snapshot.tool_hooks)
         return list(self._tool_hooks)
 
+    # V2_REMOVAL(plugin-manager-projections)：channels/phase/proactive/jobs 是 v2 固定贡献的
+    # Manager 投影。每个族群迁入 stable Root capability/catalog 且 bootstrap consumer 改读新
+    # owner 后，删除下面的属性与 mutable fallback。
     @property
     def channels(self) -> list[Channel]:
         if self.current_snapshot is not None:
@@ -815,6 +818,8 @@ class PluginManager:
 
     @property
     def telegram_bot_commands(self) -> list[tuple[str, str]]:
+        # V2_REMOVAL(channel-command-catalog)：Observe/Setup Helper/Status Commands 迁到只发布
+        # stable generation 的 channel command catalog 后，连同 mobile 聚合和 bootstrap 传参删除。
         return self._declared_bot_commands("telegram_bot_commands")
 
     @property
@@ -4573,6 +4578,9 @@ class PluginManager:
                     instance.dashboard_module,
                 ),
             )
+        # V2_REMOVAL(plugin-contribution-collector-v2)：以下分支逐项调用 v2 class 领域方法。
+        # command/MCP/process/channel/proactive/mobile/phase 首个 v3 consumer 建立 capability 后
+        # 按迁移地图逐族删除；最后删除整个 legacy branch。
         cls = cast(type[Any], type(instance))
         _reject_legacy_mobile_ui_api(cls, plugin_id)
         sources: list[RegisteredProactiveSource] = []

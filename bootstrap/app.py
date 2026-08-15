@@ -461,6 +461,8 @@ class AppRuntime:
                     self.mobile_gateway_runtime.channel.bind_mobile_ui_provider(
                         plugin_ui_provider
                     )
+            # V2_REMOVAL(channel-capability-v2)：ChannelHost 改从 committed stable v3 channel
+            # capability 绑定后删除 Manager.channels 投影；candidate 不得经 bootstrap 提前发布。
             plugin_channels = list(plugin_manager.channels) if plugin_manager else []
             if self.mobile_gateway_runtime is not None:
                 plugin_channels.append(self.mobile_gateway_runtime.channel)
@@ -471,6 +473,8 @@ class AppRuntime:
                     channel_name=self.config.channels.chat.channel_name,
                 )
                 plugin_channels.append(self.web_chat_channel)
+            # V2_REMOVAL(channel-command-catalog)：channel host 改读 committed stable command
+            # catalog 后，删除两个 Manager command 列表和对应 start_channels 参数。
             self.channel_host = await start_channels(
                 self.config,
                 bus=self.bus,
@@ -491,6 +495,8 @@ class AppRuntime:
             if self.readiness is not None:
                 self.readiness.mark_stage("channels.ready")
             if plugin_manager is not None:
+                # V2_REMOVAL(channel-capability-v2)：stable v3 channel catalog 接管 generation
+                # binding、drain 与 endpoint swap 后，删除 PluginContributions.channels 回读。
                 channel_bindings = (
                     {
                         plugin_id: generation.contributions.channels
@@ -577,6 +583,9 @@ class AppRuntime:
                     self.chat_server.serve(),
                     name="chat_server",
                 )
+            # V2_REMOVAL(proactive-capability-v2)：全部 legacy proactive/job consumer 迁入 v3
+            # timer/turn-enqueue capability 或明确删除，并由 full-fleet Gate 覆盖后，删除
+            # proactive_* 固定参数投影。
             proactive_tasks, self.proactive_loop = build_proactive_runtime(
                 self.config,
                 self.workspace,
@@ -587,6 +596,8 @@ class AppRuntime:
                 presence=self.presence,
                 agent_loop=self.agent_loop,
                 event_bus=event_bus,
+                # V2_REMOVAL(tool-hooks)：全部 ToolHook consumer 与 Tool Gate 迁到 typed events
+                # 后，独立删除此参数；不以 proactive 族群迁移完成作为前置。
                 tool_hooks=list(plugin_manager.tool_hooks) if plugin_manager else None,
                 proactive_modules=(
                     list(plugin_manager.proactive_modules) if plugin_manager else None

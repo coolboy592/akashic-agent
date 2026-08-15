@@ -573,6 +573,8 @@ def _load_plugin_entry(plugin_root: Path) -> type | ComposablePlugin:
         spec.loader.exec_module(module)
         if getattr(module, "api_version", None) == 3:
             return ComposablePlugin.from_module(module)
+        # V2_REMOVAL(plugin-install-v2)：full-fleet 只剩 v3 namespace 后删除 class registry
+        # fallback，unknown/legacy declaration 在这一边界直接 fail-loud。
         plugin_class = plugin_registry.get_class(module_name)
         if plugin_class is None:
             raise ValueError("plugin.py 未声明 Plugin 子类或 v3 apply 模块")

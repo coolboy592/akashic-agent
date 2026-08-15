@@ -115,6 +115,8 @@ class CoreRuntime:
                 manifest_path = sync_manifest()
                 logger.info("插件清单已同步: %s", manifest_path)
             logger.info("插件加载完成: %d 个", self.plugin_manager.loaded_count)
+            # V2_REMOVAL(tool-hooks)：全部 ToolHook consumer 迁到 typed Tool events 后，删除
+            # passive loop 与 SpawnTool 的 hook 注入；子代理/proactive 转发点按同一删除批次处理。
             if self.plugin_manager.tool_hooks:
                 self.loop.add_tool_hooks(self.plugin_manager.tool_hooks)
                 spawn_tool = self.tools.get_tool("spawn")
@@ -149,6 +151,8 @@ class CoreRuntime:
         from agent.lifecycle.phases.prompt_render import default_prompt_render_modules
 
         # 2. 收集各阶段插件贡献。
+        # V2_REMOVAL(plugin-manager-projections)：inspect 改读 stable Root lifecycle topology 后，
+        # 删除 Manager.before_*/after_*/prompt_render_modules 的诊断投影。
         manager = self.plugin_manager
         before_turn_modules = manager.before_turn_modules if manager is not None else []
         before_reasoning_modules = (

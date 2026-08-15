@@ -4,6 +4,10 @@ from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Callable, Any
 
+# V2_REMOVAL(plugin-registry-v2)：_classes 与 decorator handler metadata 是 v2 全局注册面。
+# v3 loader 只读 namespace，listener/service 由 Root 持有；最后一个 v2 class/decorator/tool
+# consumer 迁走后删除 class discovery 与 metadata registry，只保留另有 owner 的实例查询前
+# 先迁移该 consumer。
 
 class HandlerType(Enum):
     GATE = auto()

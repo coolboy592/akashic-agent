@@ -27,6 +27,8 @@ async def start_channels(
     interrupt_controller: InterruptController | None = None,
     plugin_channels: list[Channel] | None = None,
 ) -> ChannelHost:
+    # V2_REMOVAL(channel-command-catalog)：Telegram/mobile 改从 stable command catalog 投影后，
+    # 删除两个 list 参数；candidate catalog 不得经此启动路径提前发布。
     attachment_store = AttachmentStore(session_manager.workspace / "uploads")
 
     def _ctx_factory(channel: Channel) -> ChannelContext:

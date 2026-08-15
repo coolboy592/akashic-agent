@@ -33,6 +33,9 @@ RuntimeSelector = Literal["stable", "latest"]
 class RuntimeSnapshot:
     snapshot_id: str
     generations: Mapping[str, PluginGeneration]
+    # V2_REMOVAL(snapshot-fixed-contributions)：这些 phase/job/proactive/channel/MCP/process 字段
+    # 是 v2 固定贡献目录。最后一个 consumer 迁到 stable Root capability/catalog 后删除，最终
+    # snapshot 只保留 generation、CompositionRoot/topology 与必要的派生 catalog identity。
     before_turn_modules: tuple[object, ...]
     before_reasoning_modules: tuple[object, ...]
     prompt_render_modules: tuple[object, ...]

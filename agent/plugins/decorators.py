@@ -13,6 +13,9 @@ from agent.plugins.registry import (
     plugin_registry,
 )
 
+# V2_REMOVAL(plugin-decorators-v2)：这些全局 decorator metadata 只服务 v2 class 插件。
+# lifecycle/tool consumer 全部迁到 typed event、Service 与 v3 tool registration 后删除本模块，
+# 不保留转发到 CompositionRoot 的兼容 decorator。
 
 def _get_or_create_handler(
     func: Callable[..., Any],
