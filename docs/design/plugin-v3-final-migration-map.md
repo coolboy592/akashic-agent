@@ -148,7 +148,7 @@ Core 是受支持 API 的 owner，不是 Python 安全沙箱。同 UID 的恶意
 |---|---|
 | Tool/被动回复试点 | 6/6 候选已实现并有行为 Gate |
 | 全插件实现 | 6/29 有纯 v3 候选；23 个待迁移 |
-| Core 试点底座 | #425～#441 已形成可审阅栈；尚未合并 |
+| Core 试点底座 | foundation #395/#397～#401 与 remediation #425～#441 已形成可审阅栈；尚未合并 |
 | v2 物理删除 | 尚未开始；最后一个真实 consumer 迁走后才删除 |
 | 全量 v3-only runtime | 未完成；MCP/process/channel/proactive 等族群仍需迁移 |
 
@@ -164,6 +164,15 @@ Core 是受支持 API 的 owner，不是 Python 安全沙箱。同 UID 的恶意
 | Default Memory | static activation、Memory capability、result observer、Dashboard | [Core #437](https://github.com/kachofugetsu09/akashic-agent/pull/437) |
 
 ### 4.1 Core 实现栈
+
+本轮 remediation 并非直接从 `main` 起步。它依赖已经单独评审的组合 foundation：
+
+```text
+#395 → #397 → #398 → #399 → #400 → #401
+```
+
+#396 是另一条独立修复，不在这条 parent chain；#402～#424 也从 #401 分出，是既有 capability
+lane，不是 #425 的父链。下面只列本轮 remediation 与试点 Gate：
 
 | PR | 目的 |
 |---|---|
@@ -185,9 +194,12 @@ Core 是受支持 API 的 owner，不是 Python 安全沙箱。同 UID 的恶意
 | [#440](https://github.com/kachofugetsu09/akashic-agent/pull/440) | immutable Dashboard artifact 派生缓存 |
 | [#441](https://github.com/kachofugetsu09/akashic-agent/pull/441) | WebUI-only 真实 Docker E2E |
 
-真实依赖在 #431 后分叉，不是 #425～#441 的单链：
+真实依赖从 foundation #401 接入，并在 #431 后再次分叉，不是 #425～#441 的单链：
 
 ```text
+#395 → #397 → #398 → #399 → #400 → #401
+                                      │
+                                      ▼
 #425 → #426 → #427 → #428 → #429 → #430 → #431
                                                 ├─► #432  Tool 跨仓 Gate
                                                 └─► #433 → #434 → #435 → #436
@@ -274,14 +286,15 @@ repository、确认凭证边界、公开性与真实 installed artifact，再加
 ## 8. 实施与合并顺序
 
 ```text
-1. Review/merge #425 → ... → #431，并合入 exact plugin contract
-2. Tool lane：合入 Shell Restore/Safety/Loop Guard pure-v3 source，再 merge #432
-3. Passive lane：merge #433 → ... → #438 与 Default Memory；合入 Citation/Meme pure-v3 source
-4. Merge #439 → #440 → #441，并在 exact heads 重跑 composition 与 WebUI E2E
-5. 按 lifecycle/command → MCP/process → channel → proactive/mobile 迁移剩余 23 个
-6. 每个 seam 的最后 consumer 迁走后，提交对应 A～I 小型删除 PR
-7. 建立 pure-v3 full-fleet Gate，冷启动/热重载/晋升/回滚/停止全部通过
-8. 最后执行 J：删除 v2 lock/Gate 与 runtime 双路径，doctor 只接受 api_version=3
+1. 先按 parent chain review/merge #395 → #397 → #398 → #399 → #400 → #401
+2. Review/merge #425 → ... → #431，并合入 exact plugin contract
+3. Tool lane：合入 Shell Restore/Safety/Loop Guard pure-v3 source，再 merge #432
+4. Passive lane：merge #433 → ... → #438 与 Default Memory；合入 Citation/Meme pure-v3 source
+5. Merge #439 → #440 → #441，并在 exact heads 重跑 composition 与 WebUI E2E
+6. 按 lifecycle/command → MCP/process → channel → proactive/mobile 迁移剩余 23 个
+7. 每个 seam 的最后 consumer 迁走后，提交对应 A～I 小型删除 PR
+8. 建立 pure-v3 full-fleet Gate，冷启动/热重载/晋升/回滚/停止全部通过
+9. 最后执行 J：删除 v2 lock/Gate 与 runtime 双路径，doctor 只接受 api_version=3
 ```
 
 每张 PR 都必须可以单独 review：一个能力 seam、一个迁移族群或一个已无 consumer 的删除批次。
