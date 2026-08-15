@@ -1952,13 +1952,15 @@ async def test_skill_projection_io_failure_does_not_switch_stable(
     assert manager.current_snapshot is stable_snapshot
     assert manager.generation("installed_snapshot@lab") is stable_generation
     assert read_pointer(plugin_base, "stable") == stable_pointer
+    assert read_pointer(plugin_base, "latest") == stable_pointer
+    assert manager.ready_candidate is None
+    assert manager.latest_snapshot is stable_snapshot
     monkeypatch.setattr(PluginSkillLinker, "sync", original_sync)
-    await manager.drop_candidate("installed_snapshot@lab")
     await manager.terminate_all()
 
 
 @pytest.mark.asyncio
-async def test_installed_candidate_promotion_failure_can_retry(
+async def test_installed_candidate_promotion_failure_discards_restored_runtime(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1972,14 +1974,8 @@ async def test_installed_candidate_promotion_failure_can_retry(
         "2.0.0-bbbb",
         _installed_snapshot_source("v2"),
     )
-    _, _ = _write_installed_artifact(
-        tmp_path,
-        "3.0.0-cccc",
-        _installed_snapshot_source("v3"),
-    )
     stable_pointer = ArtifactPointer(".artifacts/1.0.0-aaaa")
     latest_pointer = ArtifactPointer(".artifacts/2.0.0-bbbb")
-    next_pointer = ArtifactPointer(".artifacts/3.0.0-cccc")
     _ = write_pointers(
         plugin_base,
         stable=stable_pointer,
@@ -2016,29 +2012,12 @@ async def test_installed_candidate_promotion_failure_can_retry(
         await manager.switch_ready("installed_snapshot@lab")
 
     assert manager.current_snapshot is old_snapshot
-    assert manager.ready_candidate is ready
-    assert manager.reload_journal.get(ready.reload_tx_id).phase == "promoting"
-    assert read_pointer(plugin_base, "stable") == latest_pointer
-    promoted = await manager.switch_ready("installed_snapshot@lab")
-    assert promoted["publication_state"] == "promoted"
-    assert manager.generation("installed_snapshot@lab").instance.version == "v2"  # type: ignore[union-attr]
-
-    _ = write_pointers(
-        plugin_base,
-        stable=cast(ArtifactPointer, read_pointer(plugin_base, "stable")),
-        latest=next_pointer,
-    )
-    _ = await manager.reconcile_changed()
-    next_ready = manager.ready_candidate
-    assert next_ready is not None and next_ready.reload_tx_id is not None
-    attempts = 0
-    with pytest.raises(RuntimeError, match="owner switch failed"):
-        await manager.switch_ready("installed_snapshot@lab")
-    discarded = await manager.drop_candidate("installed_snapshot@lab")
-    assert discarded["publication_state"] == "discarded"
-    assert manager.reload_journal.get(next_ready.reload_tx_id).phase == "aborted"
-    assert read_pointer(plugin_base, "stable") == latest_pointer
-    assert read_pointer(plugin_base, "latest") == latest_pointer
+    assert manager.ready_candidate is None
+    assert manager.latest_snapshot is old_snapshot
+    assert manager.reload_journal.get(ready.reload_tx_id).phase == "aborted"
+    assert ready.scope.closed is True
+    assert read_pointer(plugin_base, "stable") == stable_pointer
+    assert read_pointer(plugin_base, "latest") == stable_pointer
     await manager.terminate_all()
 
 

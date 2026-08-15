@@ -477,6 +477,7 @@ class CompositionRoot:
         self._errors: list[str] = []
         self._audit = audit or CompositionAudit()
         self._events = EventRegistry()
+        self._internal_cleanups: list[tuple[str, Callable[[], object]]] = []
         self._dispose_task: asyncio.Task[None] | None = None
         self.root_fiber = Fiber(
             root=self,
@@ -525,6 +526,15 @@ class CompositionRoot:
             )
         await _await_critical(self._dispose_task)
 
+    def _defer_internal_cleanup(
+        self,
+        resource: str,
+        cleanup: Callable[[], object],
+    ) -> None:
+        """登记不进入拓扑身份的 Core-owned cleanup。"""
+
+        self._internal_cleanups.append((resource, cleanup))
+
     async def _dispose(self) -> None:
         self.root_fiber.state = FiberState.UNLOADING
         errors: list[BaseException] = []
@@ -538,6 +548,19 @@ class CompositionRoot:
                 await effect.aclose()
             except BaseException as error:
                 errors.append(error)
+        for resource, cleanup in reversed(self._internal_cleanups):
+            try:
+                result = cleanup()
+                if inspect.isawaitable(result):
+                    await result
+            except BaseException as error:
+                errors.append(
+                    BaseExceptionGroup(
+                        f"Core cleanup 失败: {resource}",
+                        [error],
+                    )
+                )
+        self._internal_cleanups.clear()
         self.root_fiber.state = FiberState.DISPOSED
         if errors:
             raise BaseExceptionGroup("Root Context 清理失败", errors)

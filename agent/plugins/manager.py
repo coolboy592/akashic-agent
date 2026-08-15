@@ -1980,6 +1980,7 @@ class PluginManager:
                 self._snapshot_store.pause_admission() if endpoint_changed else None
             )
             endpoints_switched = False
+            runtime_restore_started = False
             if endpoint_changed:
                 try:
                     if self._endpoint_quiescer is not None:
@@ -1987,6 +1988,7 @@ class PluginManager:
                     if quiesced_snapshot is not None:
                         await self._snapshot_store.wait_for_no_leases(quiesced_snapshot)
                     await self._snapshot_store.wait_for_no_leases(ready.snapshot)
+                    runtime_restore_started = True
                     await self._restore_ready_runtime(ready)
                     generation = ready.candidate
                     kv_store = cast(Any, generation.instance).context.kv_store
@@ -2002,25 +2004,25 @@ class PluginManager:
                     endpoints_switched = True
                 except BaseException:
                     await self._snapshot_store.resume(quiesced_snapshot)
-                    await self._snapshot_store.resume(candidate_snapshot)
                     if self._endpoint_resumer is not None:
                         await self._endpoint_resumer()
-                    if self._ready_candidate is ready:
-                        await self._drop_ready(plugin_id)
+                    if runtime_restore_started and self._ready_candidate is ready:
+                        _ = await self._drop_ready(plugin_id)
+                    else:
+                        await self._snapshot_store.resume(candidate_snapshot)
                     raise
             else:
                 try:
                     await self._snapshot_store.wait_for_no_leases(ready.snapshot)
+                    runtime_restore_started = True
                     await self._restore_ready_runtime(ready)
                     generation = ready.candidate
                     kv_store = cast(Any, generation.instance).context.kv_store
-                except asyncio.CancelledError:
-                    await self._snapshot_store.resume(candidate_snapshot)
-                    raise
-                except Exception:
-                    await self._snapshot_store.resume(candidate_snapshot)
-                    if self._ready_candidate is ready:
-                        await self._drop_ready(plugin_id)
+                except BaseException:
+                    if runtime_restore_started and self._ready_candidate is ready:
+                        _ = await self._drop_ready(plugin_id)
+                    else:
+                        await self._snapshot_store.resume(candidate_snapshot)
                     raise
 
             self._snapshot_store.seal_candidate_validation(ready.snapshot)
@@ -2101,9 +2103,10 @@ class PluginManager:
                         None,
                     )
                 await self._snapshot_store.resume(quiesced_snapshot)
-                await self._snapshot_store.resume(candidate_snapshot)
                 if self._endpoint_resumer is not None and endpoint_changed:
                     await self._endpoint_resumer()
+                if self._ready_candidate is ready:
+                    _ = await self._drop_ready(plugin_id)
                 if endpoint_error is not None:
                     raise RuntimeError(
                         "插件 promote 失败后旧 endpoint 恢复失败"
@@ -2112,8 +2115,6 @@ class PluginManager:
                     raise RuntimeError(
                         "插件 promote 失败后 stable skill 投影恢复失败"
                     ) from skill_error
-                if endpoint_changed and self._ready_candidate is ready:
-                    await self._drop_ready(plugin_id)
                 raise
             self._ready_candidate = None
             self._track_reload_drain(generation, transaction.previous)
@@ -2223,6 +2224,9 @@ class PluginManager:
         _replace_snapshot_payload(ready.snapshot, replacement)
         if previous_root is not None and previous_root is not ready.snapshot.composition_root:
             await previous_root.dispose()
+        validation_workspace = generation.validation_workspace
+        if validation_workspace is not None:
+            _remove_validation_data_dir(validation_workspace.parent)
         self._compile_snapshot_event_handlers(ready.snapshot)
         if self._dashboard_preparer is not None:
             self._dashboard_preparer(ready.snapshot)
@@ -2232,6 +2236,7 @@ class PluginManager:
         generation.production_contributions = None
         generation.validation_managed_services = {}
         generation.production_data_dir = None
+        generation.validation_workspace = None
 
     async def drop_candidate(self, plugin_id: str) -> dict[str, object]:
         """Discard the one ready installed candidate and preserve stable."""
@@ -2437,10 +2442,11 @@ class PluginManager:
                         generation.generation_id,
                         generation.validation_managed_services,
                     )
-                    assert self._candidate_service_stopper is not None
+                    candidate_service_stopper = self._candidate_service_stopper
+                    assert candidate_service_stopper is not None
                     generation.scope.defer(
                         "validation_managed_services",
-                        lambda: self._candidate_service_stopper(
+                        lambda: candidate_service_stopper(
                             generation.generation_id
                         ),
                     )
@@ -2465,7 +2471,8 @@ class PluginManager:
                 )
             prepared_snapshot = generation.runtime_snapshot
             generation.runtime_snapshot = await self._compile_generation_snapshot(
-                generation
+                generation,
+                candidate_owner=generation,
             )
             if (
                 prepared_snapshot is not None
@@ -2647,7 +2654,7 @@ class PluginManager:
         except (asyncio.CancelledError, Exception):
             _ = self._prepared_generations.pop(plugin_id, None)
             generation.state = "aborted"
-            endpoint_error: BaseException | None = None
+            invariant_endpoint_error: BaseException | None = None
             if endpoints_switched:
                 try:
                     await self._switch_plugin_endpoints(
@@ -2658,7 +2665,7 @@ class PluginManager:
                         old_channels,
                     )
                 except BaseException as error:
-                    endpoint_error = error
+                    invariant_endpoint_error = error
             await self._abort_failed_publication(
                 generation,
                 transaction,
@@ -2666,11 +2673,52 @@ class PluginManager:
             )
             if self._endpoint_resumer is not None:
                 await self._endpoint_resumer()
-            if endpoint_error is not None:
+            if invariant_endpoint_error is not None:
                 raise RuntimeError(
                     "Snapshot abort 后旧端点恢复失败"
-                ) from endpoint_error
+                ) from invariant_endpoint_error
             raise
+
+        if not stage_latest:
+            try:
+                _ = await self._restore_direct_candidate_runtime(
+                    generation,
+                    validation_snapshot=snapshot,
+                )
+            except (asyncio.CancelledError, Exception) as error:
+                error_text = str(error) or type(error).__name__
+                self._record_failed_gate(
+                    plugin_id=plugin_id,
+                    revision=generation.source_revision,
+                    check_id="production_rebuild",
+                    reason=error_text,
+                )
+                _ = self._prepared_generations.pop(plugin_id, None)
+                generation.state = "aborted"
+                production_endpoint_error: BaseException | None = None
+                if endpoints_switched:
+                    try:
+                        await self._switch_plugin_endpoints(
+                            plugin_id,
+                            new_services,
+                            old_services,
+                            new_channels,
+                            old_channels,
+                        )
+                    except BaseException as rollback_error:
+                        production_endpoint_error = rollback_error
+                await self._abort_failed_publication(
+                    generation,
+                    transaction,
+                    error=f"production_rebuild: {error_text}",
+                )
+                if self._endpoint_resumer is not None:
+                    await self._endpoint_resumer()
+                if production_endpoint_error is not None:
+                    raise RuntimeError(
+                        "production Root 重建失败后旧端点恢复失败"
+                    ) from production_endpoint_error
+                raise
 
         commit_error: BaseException | None = None
         commit_cancelled = False
@@ -2820,6 +2868,43 @@ class PluginManager:
             json.dumps(result, ensure_ascii=False, sort_keys=True),
         )
         return result
+
+    async def _restore_direct_candidate_runtime(
+        self,
+        generation: PluginGeneration,
+        *,
+        validation_snapshot: RuntimeSnapshot,
+    ) -> RuntimeSnapshot:
+        """直接发布前用正式 runtime 重建并关闭 candidate Root。"""
+
+        production_snapshot = await self._compile_generation_snapshot(generation)
+        if production_snapshot.snapshot_id != validation_snapshot.snapshot_id:
+            await self._dispose_unreferenced_composition_root(production_snapshot)
+            raise RuntimeError(
+                "候选隔离资源恢复后 snapshot identity 发生变化: "
+                f"{validation_snapshot.snapshot_id} -> "
+                f"{production_snapshot.snapshot_id}"
+            )
+        validation_event_handlers = validation_snapshot.event_handlers
+        validation_dashboard_bindings = validation_snapshot.dashboard_bindings
+        previous_root = validation_snapshot.composition_root
+        _replace_snapshot_payload(validation_snapshot, production_snapshot)
+        validation_snapshot.event_handlers = validation_event_handlers
+        validation_snapshot.dashboard_bindings = validation_dashboard_bindings
+        generation.runtime_snapshot = validation_snapshot
+        if (
+            previous_root is not None
+            and previous_root is not validation_snapshot.composition_root
+        ):
+            await previous_root.dispose()
+        validation_workspace = generation.validation_workspace
+        if validation_workspace is not None:
+            _remove_validation_data_dir(validation_workspace.parent)
+            generation.validation_workspace = None
+        cast(Any, generation.instance).context.tool_registry = (
+            validation_snapshot.tool_registry
+        )
+        return validation_snapshot
 
     def _activate_published_generation(
         self,
@@ -3664,9 +3749,7 @@ class PluginManager:
             )
             self._gate_results[plugin_id] = gate_result
             generation.gate_result = gate_result
-            if not activate and _installed_generation_is_candidate(generation):
-                generation.production_contributions = contributions
-                generation.production_data_dir = generation.data_dir
+            if not activate:
                 validation_root = (
                     self._workspace
                     / "runtime"
@@ -3678,26 +3761,33 @@ class PluginManager:
                         f"候选验证目录已存在: {validation_root}"
                     )
                 validation_workspace = validation_root / "workspace"
-                validation_data_dir = (
-                    validation_workspace
-                    / "plugin-data"
-                    / generation.data_dir.name
-                )
-                validation_data_dir.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copytree(generation.data_dir, validation_data_dir)
+                generation.validation_workspace = validation_workspace
                 generation.scope.defer(
                     "validation_plugin_data",
                     lambda: asyncio.to_thread(
                         _remove_validation_data_dir, validation_root
                     ),
                 )
+            if not activate and _installed_generation_is_candidate(generation):
+                generation.production_contributions = contributions
+                generation.production_data_dir = generation.data_dir
+                assert generation.validation_workspace is not None
+                validation_data_dir = (
+                    generation.validation_workspace
+                    / "plugin-data"
+                    / generation.data_dir.name
+                )
+                validation_data_dir.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copytree(generation.data_dir, validation_data_dir)
                 generation.data_dir = validation_data_dir
                 if isinstance(generation.instance, ComposablePlugin):
-                    generation.instance.context.workspace = validation_workspace
+                    generation.instance.context.workspace = (
+                        generation.validation_workspace
+                    )
                 generation.contributions = _validation_contributions(
                     generation,
                     self._active_generations.get(plugin_id),
-                    validation_workspace=validation_workspace,
+                    validation_workspace=generation.validation_workspace,
                 )
                 contributions = generation.contributions
             if (
@@ -3792,7 +3882,8 @@ class PluginManager:
                     raise _CandidateRejected(gate_result)
                 if not activate:
                     generation.runtime_snapshot = await self._compile_generation_snapshot(
-                        generation
+                        generation,
+                        candidate_owner=generation,
                     )
                     self._advance_reload(
                         generation,
@@ -3891,12 +3982,14 @@ class PluginManager:
         generation: PluginGeneration,
         *,
         allow_pending_composition: bool = False,
+        candidate_owner: PluginGeneration | None = None,
     ) -> RuntimeSnapshot:
         generations = dict(self._active_generations)
         generations[generation.plugin_id] = generation
         composition_root, created_root = await self._resolve_composition_root(
             generations,
             allow_pending=allow_pending_composition,
+            candidate_owner=candidate_owner,
         )
         try:
             snapshot = self._snapshot_compiler.compile(
@@ -3929,10 +4022,11 @@ class PluginManager:
         generations: dict[str, PluginGeneration],
         *,
         allow_pending: bool = False,
+        candidate_owner: PluginGeneration | None = None,
     ) -> tuple[CompositionRoot | None, bool]:
-        """Reuse an unchanged Root or mount one complete v3 generation topology."""
+        """复用 stable Root，或挂载一个完整且隔离的 v3 generation 拓扑。"""
 
-        # 1. Snapshot-only changes share the exact Root and its drain ownership.
+        # 1. 只有 stable-to-stable 的纯 payload 变化可以复用 Root。
         ordered = tuple(
             generation
             for generation in sorted(
@@ -3952,14 +4046,20 @@ class PluginManager:
             if current is not None
             else ()
         )
-        if current is not None and len(ordered) == len(current_ordered) and all(
-            left is right for left, right in zip(ordered, current_ordered, strict=True)
+        if (
+            candidate_owner is None
+            and current is not None
+            and len(ordered) == len(current_ordered)
+            and all(
+                left is right
+                for left, right in zip(ordered, current_ordered, strict=True)
+            )
         ):
             return current.composition_root, False
         if not ordered:
             return None, False
 
-        # 2. A topology-changing candidate receives an isolated, complete Root.
+        # 2. candidate 总是创建独立 Root；stable 拓扑变化也创建完整 Root。
         identity = "|".join(
             f"{item.plugin_id}:{item.generation_id}" for item in ordered
         )
@@ -3967,23 +4067,14 @@ class PluginManager:
             "plugins:" + hashlib.sha256(identity.encode()).hexdigest()[:16]
         )
         try:
-            for item in ordered:
-                context = cast(Any, item.instance).context
-                workspace = context.workspace
-                if not isinstance(workspace, Path):
-                    raise RuntimeError(
-                        f"v3 插件缺少 Core 分配的 workspace: {item.plugin_id}"
-                    )
-                _ = await root.mount(
-                    cast(ComposablePlugin, item.instance),
-                    name=item.plugin_id,
-                    runtime=PluginRuntime(
-                        plugin_id=item.plugin_id,
-                        plugin_dir=Path(context.plugin_dir),
-                        data_dir=item.data_dir,
-                        workspace=workspace,
-                        config=context.config,
-                    ),
+            if candidate_owner is None:
+                for item in ordered:
+                    await self._mount_generation_composition(root, item)
+            else:
+                await self._mount_candidate_composition(
+                    root,
+                    ordered,
+                    candidate_owner=candidate_owner,
                 )
             receipt = root.receipt()
             if not receipt.ready:
@@ -4018,6 +4109,128 @@ class PluginManager:
             await root.dispose()
             raise
         return root, True
+
+    async def _mount_generation_composition(
+        self,
+        root: CompositionRoot,
+        generation: PluginGeneration,
+    ) -> None:
+        """用 generation 自己的正式 runtime 挂载一个 v3 插件。"""
+
+        context = cast(Any, generation.instance).context
+        workspace = context.workspace
+        if not isinstance(workspace, Path):
+            raise RuntimeError(
+                f"v3 插件缺少 Core 分配的 workspace: {generation.plugin_id}"
+            )
+        _ = await root.mount(
+            cast(ComposablePlugin, generation.instance),
+            name=generation.plugin_id,
+            runtime=PluginRuntime(
+                plugin_id=generation.plugin_id,
+                plugin_dir=Path(context.plugin_dir),
+                data_dir=generation.data_dir,
+                workspace=workspace,
+                config=context.config,
+            ),
+        )
+
+    async def _mount_candidate_composition(
+        self,
+        root: CompositionRoot,
+        ordered: tuple[PluginGeneration, ...],
+        *,
+        candidate_owner: PluginGeneration,
+    ) -> None:
+        """在 candidate-owned runtime 中重建全部未变化的 v3 参与者。"""
+
+        validation_workspace = candidate_owner.validation_workspace
+        if validation_workspace is None:
+            raise RuntimeError(
+                f"候选缺少隔离 workspace: {candidate_owner.plugin_id}"
+            )
+        attempt_root = (
+            validation_workspace.parent / "composition" / secrets.token_hex(8)
+        )
+        attempt_workspace = attempt_root / "workspace"
+        root._defer_internal_cleanup(  # pyright: ignore[reportPrivateUsage]
+            "candidate_attempt_data",
+            lambda: _remove_validation_data_dir(attempt_root),
+        )
+        for generation in ordered:
+            clone, module_path, data_dir = self._clone_candidate_composable(
+                generation,
+                candidate_owner=candidate_owner,
+                attempt_workspace=attempt_workspace,
+            )
+            root._defer_internal_cleanup(  # pyright: ignore[reportPrivateUsage]
+                f"candidate_module:{module_path}",
+                lambda module_path=module_path: self._remove_module_tree(module_path),
+            )
+            _ = await root.mount(
+                clone,
+                name=generation.plugin_id,
+                runtime=PluginRuntime(
+                    plugin_id=generation.plugin_id,
+                    plugin_dir=Path(clone.context.plugin_dir),
+                    data_dir=data_dir,
+                    workspace=attempt_workspace,
+                    config=clone.context.config,
+                ),
+            )
+
+    def _clone_candidate_composable(
+        self,
+        generation: PluginGeneration,
+        *,
+        candidate_owner: PluginGeneration,
+        attempt_workspace: Path,
+    ) -> tuple[ComposablePlugin, str, Path]:
+        """重新导入一个 stable v3 插件并绑定 candidate 临时数据。"""
+
+        from agent.plugins.context import PluginContext, PluginKVStore
+
+        source_context = cast(Any, generation.instance).context
+        plugin_dir = Path(source_context.plugin_dir)
+        data_dir = attempt_workspace / "plugin-data" / generation.data_dir.name
+        _ = data_dir.parent.mkdir(parents=True, exist_ok=True)
+        _ = shutil.copytree(generation.data_dir, data_dir)
+        module_path = (
+            f"{generation.module_path}__candidate_"
+            f"{candidate_owner.generation_id.replace(':', '_')}_"
+            f"{secrets.token_hex(4)}"
+        )
+        self._import_plugin(module_path, plugin_dir / "plugin.py")
+        try:
+            module = sys.modules[module_path]
+            clone = ComposablePlugin.from_module(module)
+            config = _load_plugin_config(
+                data_dir,
+                cast(type[BaseModel] | None, clone.ConfigModel),
+            )
+            clone.context = PluginContext(
+                event_bus=None,  # type: ignore[arg-type]
+                tool_registry=None,
+                plugin_id=generation.plugin_id,
+                plugin_dir=plugin_dir,
+                data_dir=None,
+                kv_store=PluginKVStore(data_dir / ".kv.json", writable=False),
+                config=config,
+                workspace=attempt_workspace,
+                session_manager=None,
+                memory_engine=None,
+                llm=None,
+                scope=None,
+                generation_id=(
+                    f"{candidate_owner.generation_id}:composition:"
+                    f"{generation.plugin_id}"
+                ),
+            )
+            plugin_registry.register_instance(module_path, clone)
+            return clone, module_path, data_dir
+        except BaseException:
+            self._remove_module_tree(module_path)
+            raise
 
     def _compile_snapshot_tools(
         self,
@@ -5387,10 +5600,10 @@ def _replace_snapshot_payload(
     target: RuntimeSnapshot,
     source: RuntimeSnapshot,
 ) -> None:
-    """Refresh an unleased candidate while preserving store-owned lifecycle fields."""
+    """刷新无 lease 候选载荷，并保留 store 拥有的生命周期字段。"""
 
-    if target.lease_count or target.state != "committed":
-        raise RuntimeError("只能刷新无 lease 的 committed candidate snapshot")
+    if target.lease_count or target.state not in {"validating", "committed"}:
+        raise RuntimeError("只能刷新无 lease 的 candidate snapshot")
     for name in (
         "generations",
         "before_turn_modules",

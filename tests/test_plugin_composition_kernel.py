@@ -731,6 +731,24 @@ async def test_external_effect_attempt_rejects_candidate_even_when_caught() -> N
 
 
 @pytest.mark.asyncio
+async def test_internal_root_cleanup_is_fail_loud_and_not_in_topology() -> None:
+    root = CompositionRoot("internal-cleanup")
+
+    def fail_cleanup() -> None:
+        raise RuntimeError("cleanup failed")
+
+    root._defer_internal_cleanup(  # pyright: ignore[reportPrivateUsage]
+        "candidate-module",
+        fail_cleanup,
+    )
+    _ = await root.mount(lambda _: None, name="plugin")
+
+    assert "candidate-module" not in root.topology_view().effects
+    with pytest.raises(BaseExceptionGroup, match="Root Context 清理失败"):
+        await root.dispose()
+
+
+@pytest.mark.asyncio
 async def test_promotion_requires_sealed_receipt_and_rejects_later_write(
     tmp_path,
 ) -> None:
