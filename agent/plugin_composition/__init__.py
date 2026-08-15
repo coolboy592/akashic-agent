@@ -37,6 +37,10 @@ from agent.plugin_composition.model import (
     TopologyView,
     WriteObservation,
 )
+from agent.plugin_composition.runtime_services import (
+    MEMORY_RUNTIME,
+    MemoryRuntimeInfo,
+)
 
 __all__ = [
     "CompositionError",
@@ -57,6 +61,8 @@ __all__ = [
     "HealthView",
     "HealthHandle",
     "IncidentView",
+    "MEMORY_RUNTIME",
+    "MemoryRuntimeInfo",
     "ObserveEventKey",
     "Plugin",
     "PluginRuntime",

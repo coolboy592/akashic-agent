@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -34,13 +35,18 @@ def _write_plugin(root: Path, name: str, source: str) -> Path:
     return plugin_dir
 
 
-def _manager(tmp_path: Path) -> PluginManager:
+def _manager(
+    tmp_path: Path,
+    *,
+    memory_engine: object | None = None,
+) -> PluginManager:
     return PluginManager(
         plugin_dirs=[tmp_path / "plugins"],
         event_bus=EventBus(),
         tool_registry=None,
         workspace=tmp_path / "workspace",
         installed_cache_root=tmp_path / "home" / "cache",
+        memory_engine=memory_engine,
     )
 
 
@@ -113,6 +119,46 @@ async def test_v3_namespace_loader_waits_for_service_not_scan_order(
     await manager.terminate_all()
 
     assert consumer.instance.module.disposed is True
+
+
+@pytest.mark.asyncio
+async def test_v3_loader_provides_read_only_memory_runtime_info(
+    tmp_path: Path,
+) -> None:
+    _write_plugin(
+        tmp_path / "plugins",
+        "memory_consumer",
+        "from agent.plugin_composition import MEMORY_RUNTIME\n"
+        "api_version = 3\n"
+        "name = 'memory_consumer'\n"
+        "version = '1.0.0'\n"
+        "inject = (MEMORY_RUNTIME,)\n"
+        "observed = None\n"
+        "async def apply(ctx, config):\n"
+        "    global observed\n"
+        "    runtime = ctx.require(MEMORY_RUNTIME)\n"
+        "    observed = (runtime.name, hasattr(runtime, 'secret'))\n",
+    )
+    engine = SimpleNamespace(
+        describe=lambda: SimpleNamespace(name="default", secret="not exposed")
+    )
+    manager = _manager(tmp_path, memory_engine=engine)
+
+    await manager.load_all()
+
+    generation = manager.generation("memory_consumer")
+    snapshot = manager.current_snapshot
+    assert generation is not None and snapshot is not None
+    assert generation.instance.module.observed == ("default", False)
+    root = snapshot.composition_root
+    assert root is not None
+    assert root.receipt().services == ("core.memory.runtime",)
+    assert snapshot.composition_topology is not None
+    assert snapshot.composition_topology.services == ("core.memory.runtime",)
+
+    await manager.terminate_all()
+
+    assert root.receipt().services == ()
 
 
 @pytest.mark.asyncio
@@ -783,17 +829,19 @@ async def test_installed_v3_candidate_rebuilds_runtime_then_promotes(
     stable_root.mkdir(parents=True)
     latest_root.mkdir(parents=True)
     source = (
+        "from agent.plugin_composition import MEMORY_RUNTIME\n"
         "api_version = 3\n"
         "name = 'installed_v3'\n"
         "version = '1.0.0'\n"
         "skill_roots = ('skills',)\n"
         "drift_skill_roots = ('drift/skills',)\n"
         "dashboard_module = 'dashboard.py'\n"
+        "inject = (MEMORY_RUNTIME,)\n"
         "applied = []\n"
         "disposed = []\n"
         "async def apply(ctx, config):\n"
         "    workspace = str(ctx.runtime.workspace)\n"
-        "    applied.append(workspace)\n"
+        "    applied.append((workspace, ctx.require(MEMORY_RUNTIME).name))\n"
         "    def cleanup():\n"
         "        disposed.append(workspace)\n"
         "    await ctx.effect(lambda: cleanup, label='runtime')\n"
@@ -827,7 +875,19 @@ async def test_installed_v3_candidate_rebuilds_runtime_then_promotes(
         {"installed_v3@lab": True},
         plugins_home=tmp_path / "home",
     )
-    manager = _manager(tmp_path)
+    describe_calls = 0
+
+    def describe_memory_runtime() -> object:
+        nonlocal describe_calls
+        describe_calls += 1
+        return SimpleNamespace(
+            name="default" if describe_calls == 1 else "drifted"
+        )
+
+    manager = _manager(
+        tmp_path,
+        memory_engine=SimpleNamespace(describe=describe_memory_runtime),
+    )
     await manager.load_all()
     stable = manager.generation("installed_v3@lab")
     stable_snapshot = manager.current_snapshot
@@ -887,7 +947,11 @@ async def test_installed_v3_candidate_rebuilds_runtime_then_promotes(
     assert promoted_snapshot.generations[
         "installed_v3@lab"
     ].contributions.dashboard_module == (latest_root / "dashboard.py").resolve()
-    assert candidate.instance.module.applied[-1] == str(tmp_path / "workspace")
+    assert candidate.instance.module.applied[-1] == (
+        str(tmp_path / "workspace"),
+        "default",
+    )
+    assert describe_calls == 1
     assert clone_modules.isdisjoint(sys.modules)
     assert not validation_root.exists()
     assert stable.instance.module.disposed == []

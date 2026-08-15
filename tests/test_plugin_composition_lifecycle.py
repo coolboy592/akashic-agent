@@ -10,8 +10,13 @@ from agent.core.response_parser import ResponseMetadata
 from agent.lifecycle.composition import (
     AFTER_REASONING_CLEANUP_EVENT,
     AFTER_REASONING_PREPROCESS_EVENT,
+    CONTEXT_PREPARED_EVENT,
     PROMPT_RENDER_EVENT,
     run_composition_lifecycle,
+)
+from agent.lifecycle.phases.before_turn import (
+    BeforeTurnFrame,
+    default_before_turn_modules,
 )
 from agent.lifecycle.phases.after_reasoning import (
     AfterReasoningFrame,
@@ -21,7 +26,7 @@ from agent.lifecycle.phases.prompt_render import (
     PromptRenderFrame,
     default_prompt_render_modules,
 )
-from agent.lifecycle.types import AfterReasoningCtx, PromptRenderCtx
+from agent.lifecycle.types import AfterReasoningCtx, BeforeTurnCtx, PromptRenderCtx
 from agent.plugin_composition import Bail, CompositionError, CompositionRoot
 from agent.plugins.snapshot import (
     RuntimeSnapshotCompiler,
@@ -60,6 +65,19 @@ def _prompt_ctx() -> PromptRenderCtx:
         retrieved_memory_block="",
         disabled_sections=set(),
         turn_injection_prompt="",
+    )
+
+
+def _before_turn_ctx() -> BeforeTurnCtx:
+    return BeforeTurnCtx(
+        session_key="session",
+        channel="test",
+        chat_id="chat",
+        content="hello",
+        timestamp=datetime.now(),
+        retrieved_memory_block="memory",
+        retrieval_trace_raw={"trace": 1},
+        history_messages=(),
     )
 
 
@@ -116,6 +134,74 @@ async def test_prompt_seam_runs_before_legacy_phase_modules() -> None:
 
     assert order == ["event-bus", "composition", "legacy-phase"]
     assert slots.index("legacy.prompt") < slots.index("prompt_render.collect_exports")
+
+
+@pytest.mark.asyncio
+async def test_context_prepared_seam_runs_after_legacy_before_turn_modules() -> None:
+    order: list[str] = []
+    observed: list[BeforeTurnCtx] = []
+    root = CompositionRoot("context-prepared-seam")
+
+    async def plugin(ctx) -> None:
+        def observe(payload: BeforeTurnCtx) -> None:
+            order.append("composition")
+            assert payload.extra_hints == ["legacy hint"]
+            observed.append(payload)
+
+        await ctx.on(CONTEXT_PREPARED_EVENT, observe)
+
+    class LegacyModule:
+        slot = "legacy.before_turn"
+        requires = ("before_turn.emit", "session:ctx")
+
+        async def run(self, frame):
+            order.append("legacy-phase")
+            frame.slots["session:extra_hint:legacy"] = "legacy hint"
+            return frame
+
+    await root.mount(plugin, name="context-plugin")
+    bus = EventBus()
+    bus.on(BeforeTurnCtx, lambda _: order.append("event-bus"))
+    modules = default_before_turn_modules(
+        bus,
+        cast(Any, object()),
+        cast(Any, object()),
+        plugin_modules=cast(Any, [LegacyModule()]),
+    )
+    slots = [cast(str, getattr(module, "slot")) for module in modules]
+    payload = _before_turn_ctx()
+    frame = BeforeTurnFrame(
+        input=cast(Any, None),
+        slots={"session:ctx": payload},
+    )
+
+    async with _bound_root(root):
+        for module in modules[
+            slots.index("before_turn.emit") :
+            slots.index("before_turn.composition_context_prepared") + 1
+        ]:
+            frame = await module.run(frame)
+
+    assert order == ["event-bus", "legacy-phase", "composition"]
+    assert observed == [payload]
+    assert slots.index("before_turn.collect_exports") < slots.index(
+        "before_turn.composition_context_prepared"
+    ) < slots.index("before_turn.return")
+
+
+@pytest.mark.asyncio
+async def test_context_prepared_seam_is_noop_without_composition_root() -> None:
+    store = RuntimeSnapshotStore()
+    store.install(RuntimeSnapshotCompiler().compile({}))
+    lease = store.lease()
+    token = bind_runtime_snapshot(lease)
+
+    try:
+        await run_composition_lifecycle(CONTEXT_PREPARED_EVENT, _before_turn_ctx())
+    finally:
+        reset_runtime_snapshot(token)
+        await lease.release()
+        await store.close()
 
 
 @pytest.mark.asyncio

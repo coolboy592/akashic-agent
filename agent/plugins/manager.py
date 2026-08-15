@@ -22,7 +22,13 @@ from urllib.parse import urlsplit, urlunsplit
 
 from pydantic import BaseModel, ValidationError
 
-from agent.plugin_composition import CompositionRoot, FiberState, PluginRuntime
+from agent.plugin_composition import (
+    MEMORY_RUNTIME,
+    CompositionRoot,
+    FiberState,
+    MemoryRuntimeInfo,
+    PluginRuntime,
+)
 from agent.plugins.composable import ComposablePlugin
 
 from agent.plugins.manifest import (
@@ -119,6 +125,7 @@ from infra.channels.contract import Channel
 from infra.persistence.json_store import atomic_save_json
 
 logger = logging.getLogger(__name__)
+_UNRESOLVED_MEMORY_RUNTIME = object()
 U = TypeVar("U")
 
 
@@ -212,6 +219,9 @@ class PluginManager:
         self._workspace = workspace
         self._session_manager = session_manager
         self._memory_engine = memory_engine
+        self._composition_memory_runtime: MemoryRuntimeInfo | None | object = (
+            _UNRESOLVED_MEMORY_RUNTIME if memory_engine is not None else None
+        )
         self._llm = llm
         self._installed_cache_root = installed_cache_root
         self._channel_switcher: (
@@ -4099,6 +4109,12 @@ class PluginManager:
             candidate_incident_limit=(1024 if candidate_owner is not None else None),
         )
         try:
+            memory_runtime = self._get_composition_memory_runtime()
+            if memory_runtime is not None:
+                _ = await root.context.provide(
+                    MEMORY_RUNTIME,
+                    memory_runtime,
+                )
             if candidate_owner is None:
                 for item in ordered:
                     await self._mount_generation_composition(root, item)
@@ -4149,6 +4165,20 @@ class PluginManager:
             await root.dispose()
             raise
         return root, True
+
+    def _get_composition_memory_runtime(self) -> MemoryRuntimeInfo | None:
+        """为本 Manager 构建的全部 Root 冻结同一份 Memory 描述能力。"""
+
+        if self._composition_memory_runtime is _UNRESOLVED_MEMORY_RUNTIME:
+            if self._memory_engine is None:
+                raise RuntimeError("Memory runtime 冻结状态与 engine 不一致")
+            self._composition_memory_runtime = _memory_runtime_info(
+                self._memory_engine
+            )
+        return cast(
+            MemoryRuntimeInfo | None,
+            self._composition_memory_runtime,
+        )
 
     async def _mount_generation_composition(
         self,
@@ -5309,6 +5339,17 @@ def _resolve_declared_roots(
         seen.add(path)
         roots.append(path)
     return tuple(roots)
+
+
+def _memory_runtime_info(memory_engine: object) -> MemoryRuntimeInfo:
+    describe = getattr(memory_engine, "describe", None)
+    if not callable(describe):
+        raise RuntimeError("Core Memory engine 缺少 describe()")
+    descriptor = describe()
+    name = getattr(descriptor, "name", None)
+    if not isinstance(name, str) or not name or name.strip() != name:
+        raise RuntimeError("Core Memory engine descriptor.name 无效")
+    return MemoryRuntimeInfo(name=name)
 
 
 def _resolve_dashboard_module(plugin_dir: Path, declared: str | None) -> Path | None:

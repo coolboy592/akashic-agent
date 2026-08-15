@@ -6,6 +6,10 @@ from typing import TYPE_CHECKING, TypeAlias, cast
 from bus.event_bus import EventBus
 from agent.core.runtime_support import SessionLike
 from agent.core.types import ContextBundle
+from agent.lifecycle.composition import (
+    CONTEXT_PREPARED_EVENT,
+    run_composition_lifecycle,
+)
 from agent.lifecycle.phase import (
     PhaseFrame,
     PhaseModule,
@@ -140,10 +144,21 @@ class _EmitBeforeTurnCtxModule:
 
 class _ReturnBeforeTurnCtxModule:
     slot = "before_turn.return"
-    requires = ("before_turn.collect_exports", _CTX_SLOT)
+    requires = ("before_turn.composition_context_prepared", _CTX_SLOT)
 
     async def run(self, frame: BeforeTurnFrame) -> BeforeTurnFrame:
         frame.output = cast(BeforeTurnCtx, frame.slots[_CTX_SLOT])
+        return frame
+
+
+class _RunCompositionContextPreparedModule:
+    slot = "before_turn.composition_context_prepared"
+    requires = ("before_turn.collect_exports", _CTX_SLOT)
+    produces = (_CTX_SLOT,)
+
+    async def run(self, frame: BeforeTurnFrame) -> BeforeTurnFrame:
+        ctx = cast(BeforeTurnCtx, frame.slots[_CTX_SLOT])
+        await run_composition_lifecycle(CONTEXT_PREPARED_EVENT, ctx)
         return frame
 
 
@@ -178,6 +193,7 @@ def default_before_turn_modules(
         _PrepareContextModule(context_store),
         _BuildBeforeTurnCtxModule(),
         _EmitBeforeTurnCtxModule(bus),
+        _RunCompositionContextPreparedModule(),
         _CollectBeforeTurnExportSlotsModule(),
         _ReturnBeforeTurnCtxModule(),
     ]
