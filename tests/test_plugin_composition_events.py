@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 
 import pytest
 
@@ -11,15 +12,26 @@ from agent.plugin_composition import (
     Effect,
     EmitEventKey,
     FiberState,
+    ObserveEventKey,
     ParallelEventKey,
     SerialEventKey,
     ServiceKey,
+    TransformEventKey,
 )
 
 NOTICE = EmitEventKey[str]("notice")
 TRANSFORM = SerialEventKey[list[str], str]("transform")
 OBSERVE = ParallelEventKey[str]("observe")
+FINAL_OBSERVE = ObserveEventKey[str]("final-observe")
 DEPENDENCY = ServiceKey[str]("event-dependency")
+
+
+@dataclass(frozen=True, slots=True)
+class Rewrite:
+    steps: tuple[str, ...]
+
+
+REWRITE = TransformEventKey("rewrite", Rewrite, "test.rewrite.v1")
 
 
 @pytest.mark.asyncio
@@ -208,6 +220,390 @@ async def test_serial_rejects_implicit_truthy_result() -> None:
     with pytest.raises(CompositionError) as caught:
         await root.context.serial(TRANSFORM, [])
     assert caught.value.code == "INVALID_SERIAL_RESULT"
+
+
+@pytest.mark.asyncio
+async def test_transform_returns_original_without_listeners() -> None:
+    root = CompositionRoot("transform-empty")
+    original = Rewrite(("original",))
+
+    transformed = await root.context.transform(REWRITE, original)
+
+    assert transformed is original
+
+
+@pytest.mark.asyncio
+async def test_transform_chains_sync_and_async_listeners_in_order() -> None:
+    root = CompositionRoot("transform-order")
+
+    def first(value: Rewrite) -> Rewrite:
+        return Rewrite((*value.steps, "first"))
+
+    async def second(value: Rewrite) -> Rewrite:
+        await asyncio.sleep(0)
+        return Rewrite((*value.steps, "second"))
+
+    async def first_plugin(ctx) -> None:
+        await ctx.on(REWRITE, first)
+
+    async def second_plugin(ctx) -> None:
+        await ctx.on(REWRITE, second)
+
+    await root.mount(first_plugin, name="first")
+    await root.mount(second_plugin, name="second")
+
+    transformed = await root.context.transform(REWRITE, Rewrite(()))
+
+    assert transformed == Rewrite(("first", "second"))
+    assert root.topology_view().listeners == (
+        "transform:rewrite[test.rewrite.v1]:first",
+        "transform:rewrite[test.rewrite.v1]:second",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid", [None, Bail("stop"), "wrong-type"])
+async def test_transform_rejects_implicit_or_wrong_result(invalid: object) -> None:
+    root = CompositionRoot("transform-invalid")
+
+    async def plugin(ctx) -> None:
+        await ctx.on(REWRITE, lambda _: invalid)
+
+    await root.mount(plugin, name="invalid")
+
+    with pytest.raises(CompositionError) as caught:
+        await root.context.transform(REWRITE, Rewrite(()))
+    assert caught.value.code == "INVALID_TRANSFORM_RESULT"
+    assert root.receipt().incidents[-1].kind == "transform_failure"
+
+
+@pytest.mark.asyncio
+async def test_transform_failure_stops_chain_and_records_incident() -> None:
+    observed: list[str] = []
+    root = CompositionRoot("transform-failure")
+
+    def broken(_: Rewrite) -> Rewrite:
+        raise RuntimeError("rewrite failed")
+
+    async def first(ctx) -> None:
+        await ctx.on(REWRITE, broken)
+
+    async def second(ctx) -> None:
+        await ctx.on(REWRITE, lambda value: observed.append("second") or value)
+
+    await root.mount(first, name="broken")
+    await root.mount(second, name="second")
+
+    with pytest.raises(RuntimeError, match="rewrite failed"):
+        await root.context.transform(REWRITE, Rewrite(()))
+
+    assert observed == []
+    incident = root.receipt().incidents[-1]
+    assert (incident.owner, incident.kind, incident.error_type) == (
+        "broken",
+        "transform_failure",
+        "RuntimeError",
+    )
+
+
+@pytest.mark.asyncio
+async def test_transform_uses_one_frozen_listener_list_per_dispatch() -> None:
+    root = CompositionRoot("transform-frozen-list")
+    observed: list[str] = []
+    second_fiber = None
+
+    async def first_listener(value: Rewrite) -> Rewrite:
+        assert second_fiber is not None
+        observed.append("first")
+        await second_fiber.dispose()
+        return Rewrite((*value.steps, "first"))
+
+    async def first(ctx) -> None:
+        await ctx.on(REWRITE, first_listener)
+
+    async def second(ctx) -> None:
+        await ctx.on(
+            REWRITE,
+            lambda value: observed.append("second")
+            or Rewrite((*value.steps, "second")),
+        )
+
+    await root.mount(first, name="first")
+    second_fiber = await root.mount(second, name="second")
+
+    transformed = await root.context.transform(REWRITE, Rewrite(()))
+
+    assert transformed == Rewrite(("first", "second"))
+    assert observed == ["first", "second"]
+    assert second_fiber.state == FiberState.DISPOSED
+
+
+@pytest.mark.asyncio
+async def test_observe_runs_every_listener_and_contains_all_failures() -> None:
+    observed: list[str] = []
+    root = CompositionRoot("observe-failures")
+
+    def sync_failure(_: str) -> None:
+        observed.append("sync-failure")
+        raise ValueError("sync observer failed")
+
+    async def async_failure(_: str) -> None:
+        await asyncio.sleep(0)
+        observed.append("async-failure")
+        raise RuntimeError("async observer failed")
+
+    async def first(ctx) -> None:
+        await ctx.on(FINAL_OBSERVE, sync_failure)
+
+    async def second(ctx) -> None:
+        await ctx.on(FINAL_OBSERVE, async_failure)
+
+    async def third(ctx) -> None:
+        await ctx.on(FINAL_OBSERVE, lambda value: observed.append(value))
+
+    await root.mount(first, name="sync")
+    await root.mount(second, name="async")
+    await root.mount(third, name="final")
+
+    await root.context.observe(FINAL_OBSERVE, "settled")
+
+    assert observed == ["sync-failure", "settled", "async-failure"]
+    failures = [
+        (incident.owner, incident.kind, incident.error_type)
+        for incident in root.receipt().incidents
+    ]
+    assert failures == [
+        ("sync", "observer_failure", "ValueError"),
+        ("async", "observer_failure", "RuntimeError"),
+    ]
+    assert root.receipt().ready is True
+
+
+@pytest.mark.asyncio
+async def test_observe_contains_failure_with_unprintable_exception() -> None:
+    observed: list[str] = []
+    root = CompositionRoot("observe-unprintable")
+
+    class UnprintableError(Exception):
+        def __str__(self) -> str:
+            raise RuntimeError("coercion trap")
+
+    def broken(_: str) -> None:
+        raise UnprintableError()
+
+    async def first(ctx) -> None:
+        await ctx.on(FINAL_OBSERVE, broken)
+
+    async def second(ctx) -> None:
+        await ctx.on(FINAL_OBSERVE, lambda value: observed.append(value))
+
+    await root.mount(first, name="broken")
+    await root.mount(second, name="final")
+
+    await root.context.observe(FINAL_OBSERVE, "settled")
+
+    assert observed == ["settled"]
+    incident = root.receipt().incidents[-1]
+    assert incident.message == "<unprintable UnprintableError>"
+
+
+@pytest.mark.asyncio
+async def test_observe_caller_cancellation_cancels_and_drains_listeners() -> None:
+    started = [asyncio.Event(), asyncio.Event()]
+    cleaned = [asyncio.Event(), asyncio.Event()]
+    root = CompositionRoot("observe-cancel")
+
+    def listener(index: int):
+        async def run(_: str) -> None:
+            started[index].set()
+            try:
+                await asyncio.Future()
+            finally:
+                cleaned[index].set()
+
+        return run
+
+    async def first(ctx) -> None:
+        await ctx.on(FINAL_OBSERVE, listener(0))
+
+    async def second(ctx) -> None:
+        await ctx.on(FINAL_OBSERVE, listener(1))
+
+    await root.mount(first, name="first")
+    await root.mount(second, name="second")
+    dispatch = asyncio.create_task(root.context.observe(FINAL_OBSERVE, "settled"))
+    await asyncio.gather(*(event.wait() for event in started))
+    _ = dispatch.cancel()
+    await asyncio.sleep(0)
+    _ = dispatch.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await dispatch
+    assert all(event.is_set() for event in cleaned)
+    assert root.receipt().incidents == ()
+
+
+@pytest.mark.asyncio
+async def test_observe_sync_system_exit_closes_unstarted_listener_and_propagates() -> None:
+    started = asyncio.Event()
+    created = []
+    root = CompositionRoot("observe-system-exit")
+
+    async def blocking(_: str) -> None:
+        started.set()
+        await asyncio.Future()
+
+    def create_blocking(value: str):
+        result = blocking(value)
+        created.append(result)
+        return result
+
+    def terminate(_: str) -> None:
+        raise SystemExit(7)
+
+    async def first(ctx) -> None:
+        await ctx.on(FINAL_OBSERVE, create_blocking)
+
+    async def second(ctx) -> None:
+        await ctx.on(FINAL_OBSERVE, terminate)
+
+    await root.mount(first, name="blocking")
+    await root.mount(second, name="terminate")
+
+    with pytest.raises(SystemExit) as caught:
+        await root.context.observe(FINAL_OBSERVE, "settled")
+
+    assert caught.value.code == 7
+    assert not started.is_set()
+    assert len(created) == 1
+    assert created[0].cr_frame is None
+    assert root.receipt().incidents == ()
+
+
+@pytest.mark.asyncio
+async def test_observe_cleanup_failure_does_not_mask_system_exit() -> None:
+    created = []
+    root = CompositionRoot("observe-cleanup-failure")
+
+    class BrokenCloseAwaitable:
+        def __await__(self):
+            if False:
+                yield None
+            return None
+
+        def close(self) -> None:
+            raise RuntimeError("close failed")
+
+    async def blocking(_: str) -> None:
+        await asyncio.Future()
+
+    def create_blocking(value: str):
+        result = blocking(value)
+        created.append(result)
+        return result
+
+    def terminate(_: str) -> None:
+        raise SystemExit(8)
+
+    async def first(ctx) -> None:
+        await ctx.on(FINAL_OBSERVE, lambda _: BrokenCloseAwaitable())
+
+    async def second(ctx) -> None:
+        await ctx.on(FINAL_OBSERVE, create_blocking)
+
+    async def third(ctx) -> None:
+        await ctx.on(FINAL_OBSERVE, terminate)
+
+    await root.mount(first, name="broken-close")
+    await root.mount(second, name="blocking")
+    await root.mount(third, name="terminate")
+
+    with pytest.raises(SystemExit) as caught:
+        await root.context.observe(FINAL_OBSERVE, "settled")
+
+    assert caught.value.code == 8
+    assert len(created) == 1
+    assert created[0].cr_frame is None
+    incident = root.receipt().incidents[-1]
+    assert incident.owner == "broken-close"
+    assert incident.kind == "observer_cleanup_failure"
+    assert incident.error_type == "RuntimeError"
+
+
+@pytest.mark.asyncio
+async def test_observe_async_system_exit_propagates_after_all_callbacks() -> None:
+    observed: list[str] = []
+    root = CompositionRoot("observe-async-system-exit")
+
+    async def terminate(_: str) -> None:
+        raise SystemExit(9)
+
+    async def first(ctx) -> None:
+        await ctx.on(FINAL_OBSERVE, terminate)
+
+    async def second(ctx) -> None:
+        await ctx.on(FINAL_OBSERVE, lambda _: observed.append("later"))
+
+    await root.mount(first, name="terminate")
+    await root.mount(second, name="later")
+
+    with pytest.raises(SystemExit) as caught:
+        await root.context.observe(FINAL_OBSERVE, "settled")
+
+    assert caught.value.code == 9
+    assert observed == ["later"]
+    assert root.receipt().incidents == ()
+
+
+@pytest.mark.asyncio
+async def test_transform_event_name_cannot_change_payload_contract() -> None:
+    root = CompositionRoot("transform-contract-conflict")
+    conflicting = TransformEventKey("rewrite", str, "test.rewrite.v1")
+
+    async def first(ctx) -> None:
+        await ctx.on(REWRITE, lambda value: value)
+
+    async def second(ctx) -> None:
+        await ctx.on(conflicting, lambda value: value)
+
+    await root.mount(first, name="rewrite-owner")
+    fiber = await root.mount(second, name="string-owner")
+
+    assert fiber.state == FiberState.FAILED
+    assert any(
+        "EVENT_MODE_CONFLICT" in incident.message
+        for incident in root.receipt().incidents
+    )
+
+
+@pytest.mark.asyncio
+async def test_transform_topology_uses_stable_payload_contract_token() -> None:
+    class CandidateRewrite:
+        pass
+
+    class FormalRewrite:
+        pass
+
+    async def build(payload_type: type[object], token: str):
+        root = CompositionRoot(f"transform-contract:{token}")
+        key = TransformEventKey("stable-rewrite", payload_type, token)
+
+        async def plugin(ctx) -> None:
+            await ctx.on(key, lambda value: value)
+
+        await root.mount(plugin, name="owner")
+        return root.topology_view()
+
+    candidate = await build(CandidateRewrite, "plugin.rewrite.v1")
+    formal = await build(FormalRewrite, "plugin.rewrite.v1")
+    changed = await build(FormalRewrite, "plugin.rewrite.v2")
+
+    assert candidate.listeners == formal.listeners == (
+        "transform:stable-rewrite[plugin.rewrite.v1]:owner",
+    )
+    assert candidate.identity == formal.identity
+    assert changed.listeners != formal.listeners
+    assert changed.identity != formal.identity
 
 
 @pytest.mark.asyncio

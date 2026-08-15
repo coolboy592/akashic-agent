@@ -16,8 +16,10 @@ from agent.plugin_composition.effect import Effect
 from agent.plugin_composition.events import (
     Bail,
     EmitEventKey,
+    ObserveEventKey,
     ParallelEventKey,
     SerialEventKey,
+    TransformEventKey,
 )
 from agent.plugin_composition.executor import (
     EXECUTOR_SERVICE,
@@ -59,6 +61,7 @@ __all__ = [
     "HealthView",
     "HealthHandle",
     "IncidentView",
+    "ObserveEventKey",
     "Plugin",
     "PluginDataAccess",
     "PluginRuntime",
@@ -69,5 +72,6 @@ __all__ = [
     "SyncTask",
     "TopologyFiberView",
     "TopologyView",
+    "TransformEventKey",
     "WriteObservation",
 ]

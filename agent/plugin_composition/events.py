@@ -45,12 +45,42 @@ class ParallelEventKey(Generic[P]):
 
 
 @dataclass(frozen=True, slots=True)
+class TransformEventKey(Generic[P]):
+    name: str
+    payload_type: type[P]
+    payload_contract: str
+
+    def __post_init__(self) -> None:
+        _validate_event_name(self.name)
+        if (
+            not self.payload_contract
+            or self.payload_contract.strip() != self.payload_contract
+        ):
+            raise ValueError("变换 payload contract 必须是非空且无首尾空白的字符串")
+
+
+@dataclass(frozen=True, slots=True)
+class ObserveEventKey(Generic[P]):
+    name: str
+
+    def __post_init__(self) -> None:
+        _validate_event_name(self.name)
+
+
+@dataclass(frozen=True, slots=True)
 class Bail(Generic[R]):
     value: R
 
 
-EventKey = EmitEventKey[object] | SerialEventKey[object, object] | ParallelEventKey[object]
+EventKey = (
+    EmitEventKey[object]
+    | SerialEventKey[object, object]
+    | ParallelEventKey[object]
+    | TransformEventKey[object]
+    | ObserveEventKey[object]
+)
 EventListener = Callable[[object], object]
+ListenerFailureHandler = Callable[["Fiber", str, BaseException], None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,10 +92,15 @@ class _Listener:
 class EventRegistry:
     """Own typed listeners and execute one frozen listener list per dispatch."""
 
-    def __init__(self, on_structure_changed: Callable[[], None]) -> None:
+    def __init__(
+        self,
+        on_structure_changed: Callable[[], None],
+        on_listener_failure: ListenerFailureHandler,
+    ) -> None:
         self._listeners: dict[EventKey, list[_Listener]] = {}
-        self._modes: dict[str, type[object]] = {}
+        self._contracts: dict[str, EventKey] = {}
         self._on_structure_changed = on_structure_changed
+        self._on_listener_failure = on_listener_failure
 
     def register(
         self,
@@ -76,12 +111,11 @@ class EventRegistry:
         """Validate and publish one listener until its owning Effect closes."""
 
         # 1. One event name has one dispatch contract for the whole Root.
-        mode = type(key)
-        existing_mode = self._modes.get(key.name)
-        if existing_mode is not None and existing_mode is not mode:
+        existing_contract = self._contracts.get(key.name)
+        if existing_contract is not None and existing_contract != key:
             raise CompositionError(
                 "EVENT_MODE_CONFLICT",
-                f"事件 {key.name} 已声明为 {existing_mode.__name__}",
+                f"事件 {key.name} 已声明为 {type(existing_contract).__name__}",
             )
         if isinstance(key, EmitEventKey) and _is_async_callable(callback):
             raise CompositionError(
@@ -95,7 +129,7 @@ class EventRegistry:
             )
 
         # 2. Registration order is the only listener order contract.
-        self._modes[key.name] = mode
+        self._contracts[key.name] = key
         listener = _Listener(owner=owner, callback=callback)
         listeners = self._listeners.setdefault(key, [])
         listeners.append(listener)
@@ -110,7 +144,7 @@ class EventRegistry:
             if current:
                 return
             del self._listeners[key]
-            _ = self._modes.pop(key.name, None)
+            _ = self._contracts.pop(key.name, None)
 
         return remove
 
@@ -165,9 +199,114 @@ class EventRegistry:
         if errors:
             raise BaseExceptionGroup(f"并发事件失败: {key.name}", errors)
 
+    async def transform(self, key: TransformEventKey[P], payload: P) -> P:
+        """按注册顺序组合显式同类型变换。"""
+
+        current = payload
+        for listener in self._active_listeners(cast(EventKey, key)):
+            try:
+                result = listener.callback(current)
+                if inspect.isawaitable(result):
+                    result = await result
+                if (
+                    result is None
+                    or isinstance(result, Bail)
+                    or not isinstance(result, key.payload_type)
+                ):
+                    raise CompositionError(
+                        "INVALID_TRANSFORM_RESULT",
+                        f"变换事件 {key.name} 的 listener 必须返回 "
+                        f"{key.payload_type.__name__}",
+                    )
+            except asyncio.CancelledError as error:
+                task = asyncio.current_task()
+                if task is not None and task.cancelling():
+                    raise
+                self._on_listener_failure(listener.owner, "transform_failure", error)
+                raise
+            except BaseException as error:
+                self._on_listener_failure(listener.owner, "transform_failure", error)
+                raise
+            current = cast(P, result)
+        return current
+
+    async def observe(self, key: ObserveEventKey[P], payload: P) -> None:
+        """调用全部 observer，并把各自失败隔离为 Incident。"""
+
+        # 1. 冻结并调用完整 observer 列表，不让异步 body 改变后续调用顺序。
+        awaitables: list[tuple[_Listener, object]] = []
+        try:
+            for listener in self._active_listeners(cast(EventKey, key)):
+                try:
+                    result = listener.callback(payload)
+                except asyncio.CancelledError as error:
+                    task = asyncio.current_task()
+                    if task is not None and task.cancelling():
+                        raise
+                    self._on_listener_failure(
+                        listener.owner,
+                        "observer_failure",
+                        error,
+                    )
+                    continue
+                except Exception as error:
+                    self._on_listener_failure(
+                        listener.owner,
+                        "observer_failure",
+                        error,
+                    )
+                    continue
+                if inspect.isawaitable(result):
+                    awaitables.append((listener, result))
+        except BaseException:
+            for listener, error in _close_unstarted_observers(awaitables):
+                self._on_listener_failure(
+                    listener.owner,
+                    "observer_cleanup_failure",
+                    error,
+                )
+            raise
+
+        # 2. 全部 callback 已调用后再统一启动并等待异步 observer。
+        pending = [
+            (
+                listener,
+                asyncio.create_task(
+                    _capture_observer_failure(result),
+                    name=f"plugin-observer:{key.name}:{listener.owner.name}",
+                ),
+            )
+            for listener, result in awaitables
+        ]
+        if not pending:
+            return
+        task_owners = {task: listener for listener, task in pending}
+        remaining = set(task_owners)
+        try:
+            while remaining:
+                done, remaining = await asyncio.wait(
+                    remaining,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for task in done:
+                    error = task.result()
+                    if error is None:
+                        continue
+                    if not isinstance(error, (Exception, asyncio.CancelledError)):
+                        await _cancel_observer_tasks(list(remaining))
+                        raise error
+                    self._on_listener_failure(
+                        task_owners[task].owner,
+                        "observer_failure",
+                        error,
+                    )
+        except asyncio.CancelledError as cancellation:
+            await _cancel_observer_tasks(list(remaining))
+            raise cancellation
+
     def registrations(self) -> tuple[str, ...]:
         return tuple(
-            f"{_mode_name(key)}:{key.name}:{listener.owner.name}"
+            f"{_event_descriptor(key)}:{listener.owner.name}"
             for key, listeners in self._listeners.items()
             for listener in listeners
         )
@@ -188,6 +327,32 @@ async def _run_parallel_listener(callback: EventListener, payload: object) -> No
             "并发事件 listener 没有返回 awaitable",
         )
     _ = await result
+
+
+async def _capture_observer_failure(result: object) -> BaseException | None:
+    assert inspect.isawaitable(result)
+    try:
+        _ = await result
+    except BaseException as error:
+        return error
+    return None
+
+
+async def _cancel_observer_tasks(
+    tasks: list[asyncio.Task[BaseException | None]],
+) -> None:
+    for task in tasks:
+        if not task.done():
+            _ = task.cancel()
+    if not tasks:
+        return
+    drain = asyncio.gather(*tasks, return_exceptions=True)
+    while not drain.done():
+        try:
+            _ = await asyncio.shield(drain)
+        except asyncio.CancelledError:
+            continue
+    _ = drain.result()
 
 
 async def _drain_tasks(tasks: list[asyncio.Task[None]]) -> None:
@@ -215,9 +380,30 @@ def _close_unexpected_awaitable(result: object) -> None:
         _ = result.cancel()
 
 
-def _mode_name(key: EventKey) -> str:
+def _close_unstarted_observers(
+    observers: list[tuple[_Listener, object]],
+) -> list[tuple[_Listener, BaseException]]:
+    failures: list[tuple[_Listener, BaseException]] = []
+    for listener, result in observers:
+        try:
+            if isinstance(result, asyncio.Future):
+                _ = result.cancel()
+                continue
+            close = getattr(result, "close", None)
+            if callable(close):
+                _ = close()
+        except BaseException as error:
+            failures.append((listener, error))
+    return failures
+
+
+def _event_descriptor(key: EventKey) -> str:
     if isinstance(key, EmitEventKey):
-        return "emit"
+        return f"emit:{key.name}"
     if isinstance(key, SerialEventKey):
-        return "serial"
-    return "parallel"
+        return f"serial:{key.name}"
+    if isinstance(key, ParallelEventKey):
+        return f"parallel:{key.name}"
+    if isinstance(key, TransformEventKey):
+        return f"transform:{key.name}[{key.payload_contract}]"
+    return f"observe:{key.name}"

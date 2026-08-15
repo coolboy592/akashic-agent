@@ -19,8 +19,10 @@ from agent.plugin_composition.events import (
     EventKey,
     EventListener,
     EventRegistry,
+    ObserveEventKey,
     ParallelEventKey,
     SerialEventKey,
+    TransformEventKey,
 )
 from agent.plugin_composition.executor import reject_executor_context_access
 from agent.plugin_composition.access import CompositionAudit
@@ -211,7 +213,13 @@ class Context:
 
     async def on(
         self,
-        key: EmitEventKey[T] | SerialEventKey[T, object] | ParallelEventKey[T],
+        key: (
+            EmitEventKey[T]
+            | SerialEventKey[T, object]
+            | ParallelEventKey[T]
+            | TransformEventKey[T]
+            | ObserveEventKey[T]
+        ),
         listener: Callable[[T], object],
     ) -> Effect:
         """Register one typed listener as an Effect of the current Fiber."""
@@ -243,6 +251,14 @@ class Context:
     async def parallel(self, key: ParallelEventKey[T], payload: T) -> None:
         reject_executor_context_access()
         await self._root._events.parallel(key, payload)
+
+    async def transform(self, key: TransformEventKey[T], payload: T) -> T:
+        reject_executor_context_access()
+        return await self._root._events.transform(key, payload)
+
+    async def observe(self, key: ObserveEventKey[T], payload: T) -> None:
+        reject_executor_context_access()
+        await self._root._events.observe(key, payload)
 
     async def spawn(
         self,
@@ -612,7 +628,10 @@ class CompositionRoot:
             )
         )
         self._audit = audit or CompositionAudit()
-        self._events = EventRegistry(self._bump_composition_revision)
+        self._events = EventRegistry(
+            self._bump_composition_revision,
+            self._record_listener_failure,
+        )
         self._internal_cleanups: list[tuple[str, Callable[[], object]]] = []
         self._dispose_task: asyncio.Task[None] | None = None
         self.root_fiber = Fiber(
@@ -1174,7 +1193,20 @@ class CompositionRoot:
         _ = self._report_incident(
             fiber,
             kind="runtime_error",
-            message=str(error) or type(error).__name__,
+            message=_error_message(error),
+            error_type=type(error).__name__,
+        )
+
+    def _record_listener_failure(
+        self,
+        fiber: Fiber,
+        kind: str,
+        error: BaseException,
+    ) -> None:
+        _ = self._report_incident(
+            fiber,
+            kind=kind,
+            message=_error_message(error),
             error_type=type(error).__name__,
         )
 
@@ -1188,7 +1220,7 @@ class CompositionRoot:
             return
         error = task.exception()
         if error is not None:
-            reason = str(error) or type(error).__name__
+            reason = _error_message(error)
             fiber._task_failures[name] = reason
             _ = self._report_incident(
                 fiber,
@@ -1234,6 +1266,16 @@ class CompositionRoot:
                 observers.remove(observer)
 
         return remove
+
+
+def _error_message(error: BaseException) -> str:
+    """把任意插件异常转换成不会再次失败的 Incident 文本。"""
+
+    try:
+        message = str(error)
+    except BaseException:
+        return f"<unprintable {type(error).__name__}>"
+    return message or type(error).__name__
 
 
 async def _await_critical(task: asyncio.Task[None]) -> None:
