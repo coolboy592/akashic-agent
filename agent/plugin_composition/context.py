@@ -222,7 +222,7 @@ class Context:
         self,
         key: (
             EmitEventKey[T]
-            | SerialEventKey[T, object]
+            | SerialEventKey[T, R]
             | ParallelEventKey[T]
             | TransformEventKey[T]
             | ObserveEventKey[T]
