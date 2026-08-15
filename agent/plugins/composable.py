@@ -23,6 +23,9 @@ class ComposablePlugin:
     desc: str
     author: str
     inject: tuple[ServiceKey[object], ...]
+    skill_roots: tuple[str, ...]
+    drift_skill_roots: tuple[str, ...]
+    dashboard_module: str | None
     _apply: Callable[[Context, object], object] = field(repr=False)
     context: PluginContext = field(init=False, repr=False)
     api_version: int = field(default=3, init=False)
@@ -66,6 +69,15 @@ class ComposablePlugin:
             export = getattr(module, export_name, None)
             if export is not None and not callable(export):
                 raise ValueError(f"v3 插件 {export_name} 必须可调用")
+        skill_roots = _string_tuple_export(module, "skill_roots")
+        drift_skill_roots = _string_tuple_export(module, "drift_skill_roots")
+        dashboard_module = getattr(module, "dashboard_module", None)
+        if dashboard_module is not None and (
+            not isinstance(dashboard_module, str)
+            or not dashboard_module.strip()
+            or dashboard_module != dashboard_module.strip()
+        ):
+            raise ValueError("v3 插件 dashboard_module 必须是非空字符串或 None")
         return cls(
             module=module,
             name=name,
@@ -73,6 +85,9 @@ class ComposablePlugin:
             desc=str(getattr(module, "desc", "")),
             author=str(getattr(module, "author", "")),
             inject=inject,
+            skill_roots=skill_roots,
+            drift_skill_roots=drift_skill_roots,
+            dashboard_module=cast(str | None, dashboard_module),
             _apply=cast(Callable[[Context, object], object], apply),
         )
 
@@ -102,3 +117,21 @@ class ComposablePlugin:
         if inspect.isawaitable(result):
             result = await result
         return cast(list[PluginSemanticCheck], result)
+
+
+def _string_tuple_export(module: ModuleType, name: str) -> tuple[str, ...]:
+    raw = cast(object, getattr(module, name, ()))
+    if not isinstance(raw, (tuple, list)):
+        raise ValueError(f"v3 插件 {name} 必须是字符串序列")
+    items = cast(tuple[object, ...] | list[object], raw)
+    if any(
+        not isinstance(item, str)
+        or not item.strip()
+        or item != item.strip()
+        for item in items
+    ):
+        raise ValueError(f"v3 插件 {name} 必须只包含非空字符串")
+    typed = tuple(cast(str, item) for item in items)
+    if len(set(typed)) != len(typed):
+        raise ValueError(f"v3 插件 {name} 不得重复")
+    return typed

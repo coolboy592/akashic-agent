@@ -222,6 +222,9 @@ class PluginManager:
             | None
         ) = None
         self._dashboard_preparer: Callable[[RuntimeSnapshot], None] | None = None
+        self._dashboard_validation_releaser: (
+            Callable[[RuntimeSnapshot], Awaitable[None]] | None
+        ) = None
         self._service_switcher: (
             Callable[
                 [str, dict[str, dict[str, Any]], dict[str, dict[str, Any]]],
@@ -649,8 +652,11 @@ class PluginManager:
     def bind_dashboard_preparer(
         self,
         preparer: Callable[[RuntimeSnapshot], None],
+        *,
+        validation_releaser: Callable[[RuntimeSnapshot], Awaitable[None]],
     ) -> None:
         self._dashboard_preparer = preparer
+        self._dashboard_validation_releaser = validation_releaser
 
     def bind_service_switcher(
         self,
@@ -2178,6 +2184,8 @@ class PluginManager:
         validation_root = ready.snapshot.composition_root
         if validation_root is not None:
             await validation_root.dispose()
+        if self._dashboard_validation_releaser is not None:
+            await self._dashboard_validation_releaser(ready.snapshot)
 
         # 2. Stop isolated services after every validation lease has ended.
         if generation.validation_managed_services:
@@ -2231,6 +2239,7 @@ class PluginManager:
             )
         _replace_snapshot_payload(ready.snapshot, replacement)
         validation_workspace = generation.validation_workspace
+        generation.validation_workspace = None
         if validation_workspace is not None:
             _remove_validation_data_dir(validation_workspace.parent)
         self._compile_snapshot_event_handlers(ready.snapshot)
@@ -2242,7 +2251,6 @@ class PluginManager:
         generation.production_contributions = None
         generation.validation_managed_services = {}
         generation.production_data_dir = None
-        generation.validation_workspace = None
 
     async def drop_candidate(self, plugin_id: str) -> dict[str, object]:
         """Discard the one ready installed candidate and preserve stable."""
@@ -2887,6 +2895,8 @@ class PluginManager:
         previous_root = validation_snapshot.composition_root
         if previous_root is not None:
             await previous_root.dispose()
+        if self._dashboard_validation_releaser is not None:
+            await self._dashboard_validation_releaser(validation_snapshot)
         production_snapshot = await self._compile_generation_snapshot(
             generation,
             allow_unready_stable_composition=True,
@@ -2899,15 +2909,15 @@ class PluginManager:
                 f"{production_snapshot.snapshot_id}"
             )
         validation_event_handlers = validation_snapshot.event_handlers
-        validation_dashboard_bindings = validation_snapshot.dashboard_bindings
         _replace_snapshot_payload(validation_snapshot, production_snapshot)
         validation_snapshot.event_handlers = validation_event_handlers
-        validation_snapshot.dashboard_bindings = validation_dashboard_bindings
-        generation.runtime_snapshot = validation_snapshot
         validation_workspace = generation.validation_workspace
+        generation.validation_workspace = None
+        if self._dashboard_preparer is not None:
+            self._dashboard_preparer(validation_snapshot)
+        generation.runtime_snapshot = validation_snapshot
         if validation_workspace is not None:
             _remove_validation_data_dir(validation_workspace.parent)
-            generation.validation_workspace = None
         cast(Any, generation.instance).context.tool_registry = (
             validation_snapshot.tool_registry
         )
@@ -4430,7 +4440,19 @@ class PluginManager:
                     "version": instance.version,
                     "desc": instance.desc,
                     "author": instance.author,
-                }
+                },
+                skill_roots=_resolve_declared_roots(
+                    plugin_dir,
+                    instance.skill_roots,
+                ),
+                drift_skill_roots=_resolve_declared_roots(
+                    plugin_dir,
+                    instance.drift_skill_roots,
+                ),
+                dashboard_module=_resolve_dashboard_module(
+                    plugin_dir,
+                    instance.dashboard_module,
+                ),
             )
         cls = cast(type[Any], type(instance))
         _reject_legacy_mobile_ui_api(cls, plugin_id)
@@ -5276,11 +5298,15 @@ def _resolve_declared_roots(
 ) -> tuple[Path, ...]:
     plugin_root = plugin_dir.resolve(strict=False)
     roots: list[Path] = []
+    seen: set[Path] = set()
     for raw_path in declared:
         path = (plugin_dir / raw_path).resolve(strict=False)
         _require_plugin_path(plugin_root, path, "能力目录")
         if not path.is_dir():
             raise RuntimeError(f"插件能力目录不存在: {path}")
+        if path in seen:
+            raise RuntimeError(f"插件能力目录重复: {path}")
+        seen.add(path)
         roots.append(path)
     return tuple(roots)
 

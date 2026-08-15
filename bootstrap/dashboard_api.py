@@ -1467,7 +1467,10 @@ def create_dashboard_app(
         snapshot = plugin_manager.current_snapshot
         if snapshot is not None:
             dashboard_host.prepare_initial_snapshot(snapshot)
-        plugin_manager.bind_dashboard_preparer(dashboard_host.prepare_snapshot)
+        plugin_manager.bind_dashboard_preparer(
+            dashboard_host.prepare_snapshot,
+            validation_releaser=dashboard_host.release_validation,
+        )
         app.add_middleware(
             SnapshotDashboardMiddleware,
             snapshot_store=plugin_manager.snapshot_store,

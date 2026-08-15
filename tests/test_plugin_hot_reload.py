@@ -5934,7 +5934,9 @@ async def test_dashboard_candidate_cannot_override_core_route(tmp_path: Path) ->
         plugin_manager=manager,
     )
     write_dashboard("/api/dashboard/sessions", async_close=True)
-    assert await manager.prepare_candidate("dashboard_conflict") is not None
+    candidate = await manager.prepare_candidate("dashboard_conflict")
+    assert candidate is not None and candidate.validation_workspace is not None
+    validation_root = candidate.validation_workspace.parent
 
     result = await manager.publish_prepared("dashboard_conflict")
 
@@ -5944,7 +5946,8 @@ async def test_dashboard_candidate_cannot_override_core_route(tmp_path: Path) ->
     assert "dashboard:" in str(status["candidate_error"])
     assert "/api/dashboard/sessions" in str(status["candidate_error"])
     assert manager.generation("dashboard_conflict") is old_generation
-    assert (tmp_path / "workspace" / "async-dashboard-closed").exists()
+    assert not (tmp_path / "workspace" / "async-dashboard-closed").exists()
+    assert not validation_root.exists()
     assert TestClient(app).get("/api/dashboard/plugin-owned").json() == {
         "owner": "plugin"
     }

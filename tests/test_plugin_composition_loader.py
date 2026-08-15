@@ -8,6 +8,7 @@ import pytest
 
 from agent.plugins.composable import ComposablePlugin
 from agent.plugins.artifacts import ArtifactPointer, read_pointer, write_pointers
+from agent.plugins.dashboard_host import DashboardBinding, PluginDashboardHost
 from agent.plugins.generation import PluginGeneration
 from agent.plugins.manager import PluginManager
 from agent.plugins.manifest import write_plugin_manifest
@@ -112,6 +113,181 @@ async def test_v3_namespace_loader_waits_for_service_not_scan_order(
     await manager.terminate_all()
 
     assert consumer.instance.module.disposed is True
+
+
+@pytest.mark.asyncio
+async def test_v3_loader_publishes_declared_package_contributions(
+    tmp_path: Path,
+) -> None:
+    plugin_dir = _write_plugin(
+        tmp_path / "plugins",
+        "package_contributor",
+        "api_version = 3\n"
+        "name = 'package_contributor'\n"
+        "version = '1.0.0'\n"
+        "skill_roots = ('skills',)\n"
+        "drift_skill_roots = ('drift/skills',)\n"
+        "dashboard_module = 'dashboard.py'\n"
+        "def apply(ctx, config): pass\n",
+    )
+    skill_dir = plugin_dir / "skills" / "package-skill"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: package-skill\ndescription: package skill\n---\nnormal body\n",
+        encoding="utf-8",
+    )
+    drift_skill_dir = plugin_dir / "drift" / "skills" / "package-drift"
+    drift_skill_dir.mkdir(parents=True)
+    (drift_skill_dir / "SKILL.md").write_text(
+        "---\nname: package-drift\ndescription: package drift\n---\ndrift body\n",
+        encoding="utf-8",
+    )
+    (plugin_dir / "dashboard.py").write_text(
+        "def register(app, plugin_dir, workspace):\n"
+        "    @app.get('/api/dashboard/package-contributor')\n"
+        "    def status(): return {'plugin': 'package_contributor'}\n",
+        encoding="utf-8",
+    )
+    manager = _manager(tmp_path)
+
+    await manager.load_all()
+
+    generation = manager.generation("package_contributor")
+    snapshot = manager.current_snapshot
+    assert generation is not None and snapshot is not None
+    assert generation.contributions.skill_roots == (
+        (plugin_dir / "skills").resolve(),
+    )
+    assert generation.contributions.drift_skill_roots == (
+        (plugin_dir / "drift" / "skills").resolve(),
+    )
+    assert generation.contributions.dashboard_module == (
+        plugin_dir / "dashboard.py"
+    ).resolve()
+    active = {item.plugin_id: item for item in manager.active_plugins()}
+    assert active["package_contributor"].skill_roots == (
+        (plugin_dir / "skills").resolve(),
+    )
+    assert active["package_contributor"].drift_skill_roots == (
+        (plugin_dir / "drift" / "skills").resolve(),
+    )
+    catalog_id = snapshot.skill_catalog_generation_id
+    assert catalog_id is not None
+    catalog = manager._skill_host.get(catalog_id)
+    assert catalog is not None
+    assert snapshot.plugin_skill_index is not None
+    assert set(snapshot.plugin_skill_index.records) == {"package-skill"}
+    assert set(catalog.drift.records) == {"package-drift"}
+    assert snapshot.plugin_skill_index.records["package-skill"].root_dir != skill_dir
+
+    dashboard_host = PluginDashboardHost(
+        workspace=tmp_path / "workspace",
+        memory_admin=object(),
+        memory_store=object(),
+        core_routes=(),
+    )
+    dashboard_host.prepare_snapshot(snapshot)
+    assert len(snapshot.dashboard_bindings) == 1
+    binding = snapshot.dashboard_bindings[0]
+    assert isinstance(binding, DashboardBinding)
+    assert binding.plugin_id == "package_contributor"
+    assert [route.path for route in binding.routes] == [
+        "/api/dashboard/package-contributor"
+    ]
+
+    await manager.terminate_all()
+
+
+@pytest.mark.parametrize(
+    ("declaration", "message"),
+    [
+        ("skill_roots = 'skills'", "skill_roots 必须是字符串序列"),
+        ("drift_skill_roots = ('',)", "drift_skill_roots 必须只包含非空字符串"),
+        ("skill_roots = ('skills', 'skills')", "skill_roots 不得重复"),
+        ("dashboard_module = ''", "dashboard_module 必须是非空字符串或 None"),
+    ],
+)
+def test_v3_namespace_rejects_invalid_package_contributions(
+    declaration: str,
+    message: str,
+) -> None:
+    from types import ModuleType
+
+    module = ModuleType("invalid_v3_contribution")
+    module.api_version = 3
+    module.name = "invalid"
+    module.version = "1.0.0"
+    module.apply = lambda ctx, config: None
+    exec(declaration, module.__dict__)
+
+    with pytest.raises(ValueError, match=message):
+        _ = ComposablePlugin.from_module(module)
+
+
+def test_v3_namespace_freezes_package_contribution_lists() -> None:
+    from types import ModuleType
+
+    roots = ["skills"]
+    module = ModuleType("frozen_v3_contribution")
+    module.api_version = 3
+    module.name = "frozen"
+    module.version = "1.0.0"
+    module.skill_roots = roots
+    module.apply = lambda ctx, config: None
+
+    plugin = ComposablePlugin.from_module(module)
+    roots.append("mutated")
+
+    assert plugin.skill_roots == ("skills",)
+
+
+@pytest.mark.asyncio
+async def test_v3_package_contribution_path_cannot_escape_plugin_root(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    outside = tmp_path / "plugins" / "outside"
+    outside.mkdir(parents=True)
+    _write_plugin(
+        tmp_path / "plugins",
+        "escaped_contributor",
+        "api_version = 3\n"
+        "name = 'escaped_contributor'\n"
+        "version = '1.0.0'\n"
+        "skill_roots = ('../outside',)\n"
+        "def apply(ctx, config): pass\n",
+    )
+    manager = _manager(tmp_path)
+
+    await manager.load_all()
+
+    assert "插件 能力目录 越界" in caplog.text
+    assert manager.current_snapshot is None
+    assert manager.generation("escaped_contributor") is None
+
+
+@pytest.mark.asyncio
+async def test_v3_package_contribution_rejects_duplicate_resolved_roots(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    plugin_dir = _write_plugin(
+        tmp_path / "plugins",
+        "duplicate_contributor",
+        "api_version = 3\n"
+        "name = 'duplicate_contributor'\n"
+        "version = '1.0.0'\n"
+        "skill_roots = ('skills', './skills')\n"
+        "def apply(ctx, config): pass\n",
+    )
+    (plugin_dir / "skills").mkdir()
+    manager = _manager(tmp_path)
+
+    await manager.load_all()
+
+    assert "插件能力目录重复" in caplog.text
+    assert manager.current_snapshot is None
+    assert manager.generation("duplicate_contributor") is None
 
 
 @pytest.mark.asyncio
@@ -610,6 +786,9 @@ async def test_installed_v3_candidate_rebuilds_runtime_then_promotes(
         "api_version = 3\n"
         "name = 'installed_v3'\n"
         "version = '1.0.0'\n"
+        "skill_roots = ('skills',)\n"
+        "drift_skill_roots = ('drift/skills',)\n"
+        "dashboard_module = 'dashboard.py'\n"
         "applied = []\n"
         "disposed = []\n"
         "async def apply(ctx, config):\n"
@@ -624,6 +803,23 @@ async def test_installed_v3_candidate_rebuilds_runtime_then_promotes(
         source.replace("version = '1.0.0'", "version = '2.0.0'"),
         encoding="utf-8",
     )
+    for root, version in ((stable_root, "v1"), (latest_root, "v2")):
+        skill_dir = root / "skills" / "installed-skill"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            f"---\ndescription: installed {version}\n---\nbody {version}\n",
+            encoding="utf-8",
+        )
+        drift_dir = root / "drift" / "skills" / "installed-drift"
+        drift_dir.mkdir(parents=True)
+        (drift_dir / "SKILL.md").write_text(
+            f"---\ndescription: drift {version}\n---\ndrift {version}\n",
+            encoding="utf-8",
+        )
+        (root / "dashboard.py").write_text(
+            "def register(app, plugin_dir, workspace): return None\n",
+            encoding="utf-8",
+        )
     stable_pointer = ArtifactPointer(".artifacts/1.0.0-aaaa")
     latest_pointer = ArtifactPointer(".artifacts/2.0.0-bbbb")
     write_pointers(plugin_base, stable=stable_pointer, latest=stable_pointer)
@@ -634,7 +830,12 @@ async def test_installed_v3_candidate_rebuilds_runtime_then_promotes(
     manager = _manager(tmp_path)
     await manager.load_all()
     stable = manager.generation("installed_v3@lab")
-    assert stable is not None
+    stable_snapshot = manager.current_snapshot
+    assert stable is not None and stable_snapshot is not None
+    assert stable_snapshot.plugin_skill_index is not None
+    assert "body v1" in stable_snapshot.plugin_skill_index.get(
+        "installed-skill"
+    ).content  # type: ignore[union-attr]
     stable_lease = manager.snapshot_store.lease()
 
     write_pointers(plugin_base, stable=stable_pointer, latest=latest_pointer)
@@ -645,6 +846,13 @@ async def test_installed_v3_candidate_rebuilds_runtime_then_promotes(
     assert candidate is not None
     candidate_snapshot = candidate.runtime_snapshot
     assert candidate_snapshot is not None
+    assert candidate_snapshot.plugin_skill_index is not None
+    assert "body v2" in candidate_snapshot.plugin_skill_index.get(
+        "installed-skill"
+    ).content  # type: ignore[union-attr]
+    assert candidate.contributions.dashboard_module == (
+        latest_root / "dashboard.py"
+    ).resolve()
     candidate_root = candidate_snapshot.composition_root
     stable_root_runtime = manager.current_snapshot.composition_root
     assert candidate_root is not None
@@ -663,6 +871,22 @@ async def test_installed_v3_candidate_rebuilds_runtime_then_promotes(
     promoted = await manager.switch_ready("installed_v3@lab")
 
     assert promoted["publication_state"] == "promoted"
+    promoted_snapshot = manager.current_snapshot
+    assert promoted_snapshot is not None
+    assert promoted_snapshot.plugin_skill_index is not None
+    assert "body v2" in promoted_snapshot.plugin_skill_index.get(
+        "installed-skill"
+    ).content  # type: ignore[union-attr]
+    promoted_catalog_id = promoted_snapshot.skill_catalog_generation_id
+    assert promoted_catalog_id is not None
+    promoted_catalog = manager._skill_host.get(promoted_catalog_id)
+    assert promoted_catalog is not None
+    assert "drift v2" in promoted_catalog.drift.get(
+        "installed-drift"
+    ).content  # type: ignore[union-attr]
+    assert promoted_snapshot.generations[
+        "installed_v3@lab"
+    ].contributions.dashboard_module == (latest_root / "dashboard.py").resolve()
     assert candidate.instance.module.applied[-1] == str(tmp_path / "workspace")
     assert clone_modules.isdisjoint(sys.modules)
     assert not validation_root.exists()
@@ -671,6 +895,107 @@ async def test_installed_v3_candidate_rebuilds_runtime_then_promotes(
     await manager.snapshot_store.retry_drains()
     assert stable.instance.module.disposed == [str(tmp_path / "workspace")]
 
+    await manager.terminate_all()
+
+
+@pytest.mark.asyncio
+async def test_installed_v3_dashboard_uses_validation_workspace_until_promotion(
+    tmp_path: Path,
+) -> None:
+    plugin_base = tmp_path / "home" / "cache" / "lab" / "dashboard_v3"
+    stable_root = plugin_base / ".artifacts" / "1.0.0-aaaa"
+    latest_root = plugin_base / ".artifacts" / "2.0.0-bbbb"
+    stable_root.mkdir(parents=True)
+    latest_root.mkdir(parents=True)
+    source = (
+        "api_version = 3\n"
+        "name = 'dashboard_v3'\n"
+        "version = '1.0.0'\n"
+        "dashboard_module = 'dashboard.py'\n"
+        "def apply(ctx, config): pass\n"
+    )
+    (stable_root / "plugin.py").write_text(source, encoding="utf-8")
+    (latest_root / "plugin.py").write_text(
+        source.replace("version = '1.0.0'", "version = '2.0.0'"),
+        encoding="utf-8",
+    )
+    (stable_root / "dashboard.py").write_text(
+        "def register(app, plugin_dir, workspace): return None\n",
+        encoding="utf-8",
+    )
+    (latest_root / "dashboard.py").write_text(
+        "def register(app, plugin_dir, workspace):\n"
+        "    (workspace / 'dashboard-v2-registered').write_text('ready')\n"
+        "    class Closeable:\n"
+        "        def close(self):\n"
+        "            (workspace / 'dashboard-v2-closed').write_text('closed')\n"
+        "    return Closeable()\n",
+        encoding="utf-8",
+    )
+    stable_pointer = ArtifactPointer(".artifacts/1.0.0-aaaa")
+    latest_pointer = ArtifactPointer(".artifacts/2.0.0-bbbb")
+    write_pointers(plugin_base, stable=stable_pointer, latest=stable_pointer)
+    write_plugin_manifest(
+        {"dashboard_v3@lab": True},
+        plugins_home=tmp_path / "home",
+    )
+    manager = _manager(tmp_path)
+    await manager.load_all()
+    stable_snapshot = manager.current_snapshot
+    assert stable_snapshot is not None
+    dashboard_host = PluginDashboardHost(
+        workspace=tmp_path / "workspace",
+        memory_admin=object(),
+        memory_store=object(),
+        core_routes=(),
+    )
+    dashboard_host.prepare_initial_snapshot(stable_snapshot)
+    manager.bind_dashboard_preparer(
+        dashboard_host.prepare_snapshot,
+        validation_releaser=dashboard_host.release_validation,
+    )
+
+    write_pointers(plugin_base, stable=stable_pointer, latest=latest_pointer)
+    assert (await manager.reconcile_changed())[0]["publication_state"] == "latest_ready"
+    candidate = manager.ready_candidate
+    assert candidate is not None and candidate.runtime_snapshot is not None
+    validation_workspace = candidate.validation_workspace
+    assert validation_workspace is not None
+    candidate_binding = candidate.runtime_snapshot.dashboard_bindings[0]
+    assert isinstance(candidate_binding, DashboardBinding)
+    assert candidate_binding.validation is True
+    assert candidate_binding.runtime_workspace == validation_workspace.resolve()
+    assert (validation_workspace / "dashboard-v2-registered").is_file()
+    assert not (tmp_path / "workspace" / "dashboard-v2-registered").exists()
+    validation_root = validation_workspace.parent
+    validation_module = candidate_binding.module_name
+
+    await manager.drop_candidate("dashboard_v3@lab")
+
+    assert manager.current_snapshot is stable_snapshot
+    assert not validation_root.exists()
+    assert validation_module not in sys.modules
+    assert not (tmp_path / "workspace" / "dashboard-v2-registered").exists()
+
+    write_pointers(plugin_base, stable=stable_pointer, latest=latest_pointer)
+    assert (await manager.reconcile_changed())[0]["publication_state"] == "latest_ready"
+    promoted_candidate = manager.ready_candidate
+    assert promoted_candidate is not None
+    promoted_validation_workspace = promoted_candidate.validation_workspace
+    assert promoted_validation_workspace is not None
+    promoted_validation_root = promoted_validation_workspace.parent
+
+    promoted = await manager.switch_ready("dashboard_v3@lab")
+
+    assert promoted["publication_state"] == "promoted"
+    current = manager.current_snapshot
+    assert current is not None
+    formal_binding = current.dashboard_bindings[0]
+    assert isinstance(formal_binding, DashboardBinding)
+    assert formal_binding.validation is False
+    assert formal_binding.runtime_workspace == (tmp_path / "workspace").resolve()
+    assert (tmp_path / "workspace" / "dashboard-v2-registered").is_file()
+    assert not promoted_validation_root.exists()
     await manager.terminate_all()
 
 
