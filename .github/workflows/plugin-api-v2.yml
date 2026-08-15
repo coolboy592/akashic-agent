@@ -17,12 +17,13 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: akashic-plugins/plugin-contracts
-          ref: 24543445c7b99ca63fcd90b5828f754a148b184c
+          ref: 4dd69dd621e029e51e99aa428443fa3a4ec1f6cf
           path: .plugin-contracts
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-      - name: Check built-in Plugin API v2
+      # V2_REMOVAL(plugin-contract-workflow): 全部内置插件迁完后重命名此 workflow。
+      - name: Check built-in Plugin API transition
         env:
           PYTHONPATH: .plugin-contracts
         run: >-
