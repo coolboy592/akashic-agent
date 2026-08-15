@@ -7,22 +7,21 @@ from pathlib import Path
 from typing import Any, cast
 
 from fastapi import FastAPI, HTTPException
+from agent.plugin_composition import DashboardContext
 
 _RAG_HIT_RE = re.compile(
     r"RagHitLog\(item_id='(?P<id>[^']*)', memory_type='(?P<memory_type>[^']*)', "
     r"score=(?P<score>[-0-9.]+), summary='(?P<summary>(?:\\'|[^'])*)', "
     r"injected=(?P<injected>True|False)\)"
 )
-_MEMORY_META_RE = re.compile(r"（(?P<meta>[^（）]*(?:证据|src|有印象|不确定)[^（）]*)）$")
-
-
-def plugin_enabled(app: FastAPI) -> bool:
-    return _active_memory_engine(app) == "default"
+_MEMORY_META_RE = re.compile(
+    r"（(?P<meta>[^（）]*(?:证据|src|有印象|不确定)[^（）]*)）$"
+)
 
 
 class RecallInspectorDashboardReader:
-    def __init__(self, workspace: Path) -> None:
-        self.data_path = workspace / "observe" / "recall_inspector.jsonl"
+    def __init__(self, data_root: Path) -> None:
+        self.data_path = data_root / "recall_inspector.jsonl"
         self._lock = threading.RLock()
 
     def get_overview(self) -> dict[str, Any]:
@@ -40,14 +39,15 @@ class RecallInspectorDashboardReader:
     ) -> tuple[list[dict[str, Any]], int]:
         normalized_q = q.strip().lower()
         turns = [
-            item for item in self._collect_turns()
+            item
+            for item in self._collect_turns()
             if _matches_recall_turn(item, session_key=session_key, q=normalized_q)
         ]
         total = len(turns)
         safe_page = max(1, page)
         safe_size = max(1, min(page_size, 200))
         start = (safe_page - 1) * safe_size
-        return turns[start:start + safe_size], total
+        return turns[start : start + safe_size], total
 
     def get_turn(self, turn_id: str) -> dict[str, Any] | None:
         for item in self._collect_turns():
@@ -105,8 +105,7 @@ class RecallInspectorDashboardReader:
                 ]
             item["context_prepare_count"] = int(context_prepare.get("count") or 0)
             item["recall_memory_count"] = sum(
-                int(call.get("count") or 0)
-                for call in recall_calls
+                int(call.get("count") or 0) for call in recall_calls
             )
             item["recall_call_count"] = len(recall_calls)
         result.sort(key=lambda item: str(item.get("timestamp") or ""), reverse=True)
@@ -119,9 +118,7 @@ class RecallInspectorDashboardReader:
         try:
             lines = self.data_path.read_text(encoding="utf-8").splitlines()
         except OSError as exc:
-            raise RuntimeError(
-                f"读取默认记忆召回记录失败: {self.data_path}"
-            ) from exc
+            raise RuntimeError(f"读取默认记忆召回记录失败: {self.data_path}") from exc
         for line_number, line in enumerate(lines, start=1):
             try:
                 value = json.loads(line)
@@ -138,9 +135,8 @@ class RecallInspectorDashboardReader:
         return records
 
 
-def register(app: FastAPI, plugin_dir: Path, workspace: Path) -> None:
-    _ = plugin_dir
-    reader = RecallInspectorDashboardReader(workspace)
+def register(app: FastAPI, context: DashboardContext) -> None:
+    reader = RecallInspectorDashboardReader(context.data_root)
 
     @app.get("/api/dashboard/recall-inspector/overview")
     def get_recall_inspector_overview() -> dict[str, Any]:
@@ -202,14 +198,6 @@ def _is_default_record(record: dict[str, Any]) -> bool:
     channel = str(record.get("channel", "") or "")
     session_key = str(record.get("session_key", "") or "")
     return channel != "cross_mem" and not session_key.startswith("cross_mem:")
-
-
-def _active_memory_engine(app: FastAPI) -> str:
-    memory_admin = getattr(app.state, "memory_admin", None)
-    describe = getattr(memory_admin, "describe", None)
-    if not callable(describe):
-        return ""
-    return str(describe().name)
 
 
 def _normalize_context_prepare(value: object) -> dict[str, Any]:

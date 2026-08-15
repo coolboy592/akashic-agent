@@ -215,7 +215,8 @@ workspace 之外还有两组明确的全局状态：
 ├── uploads/
 ├── plugin-data/
 │   ├── default_memory-builtin/
-│   │   └── config.local.toml
+│   │   ├── config.local.toml
+│   │   └── recall_inspector.jsonl     v3 inspector 追加式诊断证据
 │   ├── akasha-builtin/
 │   │   └── config.local.toml
 │   └── <plugin>-<marketplace>/
@@ -246,7 +247,7 @@ workspace 之外还有两组明确的全局状态：
 │   ├── backups/<server>/*.toml        直装兼容路径的声明备份
 │   └── <legacy server files>          不再作为新增能力的 canonical 安装位置
 ├── observe/
-│   └── recall_inspector.jsonl         default memory inspector 启用时
+│   └── recall_inspector.jsonl         v2 兼容名字；迁移后与 plugin-data 文件同 inode
 ├── subagent-runs/<job-id>/            子任务产物
 ├── runtime/
 │   ├── plugin-reloads.sqlite3         插件热重载事务与恢复阶段
@@ -485,7 +486,7 @@ Akasha V2 保存 turn 指针、稀疏特征、engram hub、有向关系、activa
 
 | 路径 | writer | 当前用途 |
 |---|---|---|
-| `observe/recall_inspector.jsonl` | default memory inspector | 记录实际注入与 recall 结果，供 dashboard 审查 |
+| `plugin-data/default_memory-builtin/recall_inspector.jsonl` | default memory inspector | 记录实际注入与 recall 结果，供 dashboard 审查；v3 首次接续已有 `observe/recall_inspector.jsonl` 时建立 hard link，不改写或删除旧名字，直到最终 v2 清理另行批准 |
 | `memory/spawn_trace.jsonl` | subagent manager | spawn 决策与完成 trace |
 | `memory/proactive_*_trace.jsonl` | proactive loop | 配置和频率决策 trace |
 | `subagent-runs/<job-id>/` | background subagent | 隔离的子任务报告和脚本产物 |
