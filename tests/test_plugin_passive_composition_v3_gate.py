@@ -134,3 +134,7 @@ def test_ci_runs_real_gate_with_full_history_and_clean_core() -> None:
     ) in job
     assert "continue-on-error" not in job
     assert "pytest.skip" not in _GATE_PATH.read_text(encoding="utf-8")
+
+    check_and_test = workflow.split("  check-and-test:\n", 1)[1]
+    checkout = check_and_test.split("      - name: Set up Python\n", 1)[0]
+    assert "fetch-depth: 0" in checkout
