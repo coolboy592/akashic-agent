@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "contract": {
+    "id": "plugin_contracts",
+    "repository": "https://github.com/akashic-plugins/plugin-contracts.git",
+    "requested_ref": "4dd69dd621e029e51e99aa428443fa3a4ec1f6cf",
+    "resolved_sha": "4dd69dd621e029e51e99aa428443fa3a4ec1f6cf",
+    "change_source_pr_head": "4dd69dd621e029e51e99aa428443fa3a4ec1f6cf"
+  },
+  "plugins": [
+    {
+      "id": "citation",
+      "repository": "https://github.com/akashic-plugins/citation.git",
+      "requested_ref": "b82453cd1eae71da8d25eb31aada30b01c659b54",
+      "resolved_sha": "b82453cd1eae71da8d25eb31aada30b01c659b54",
+      "change_source_pr_head": "b82453cd1eae71da8d25eb31aada30b01c659b54"
+    },
+    {
+      "id": "meme",
+      "repository": "https://github.com/akashic-plugins/meme.git",
+      "requested_ref": "cbb02f2edf3903c7a73a6223eb3e4a41a8cc1836",
+      "resolved_sha": "cbb02f2edf3903c7a73a6223eb3e4a41a8cc1836",
+      "change_source_pr_head": "cbb02f2edf3903c7a73a6223eb3e4a41a8cc1836"
+    }
+  ]
+}

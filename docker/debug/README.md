@@ -33,6 +33,33 @@ python docker/debug/gate.py plan --base origin/main
 
 公开 Gate 不安装也不枚举私有插件，不依赖外部私有验证或 provider 身份；公开报告是当前仓库的合并依据。
 
+## Citation + Meme 纯 v3 组合 Gate
+
+`plugin_passive_composition_v3_gate.py` 从锁文件 fresh checkout 纯 v3 Citation、Meme
+与公共插件合同，在临时 workspace 中通过真实 `PluginManager.load_all()` 发布 stable
+snapshot。Gate 只从该 snapshot lease 执行 prompt、回复预处理和清理事件，并验证
+Service/Fiber 依赖、Skill、Dashboard、workspace asset 零改写和终止回收。
+
+```text
+┌─ Citation Fiber ── provide citation.protocol ───────────────┐
+│  ├─ prompt protocol                                        │
+│  ├─ citation metadata                                      │
+│  └─ final protocol cleanup                                 │
+│                                                            ▼
+└─────────────────────────────── Meme Fiber (required inject)
+                                 ├─ prompt catalog
+                                 ├─ reply media decoration
+                                 ├─ meme-manage Skill
+                                 └─ Dashboard + workspace/memes
+```
+
+```bash
+python docker/debug/plugin_passive_composition_v3_gate.py --require-clean-core
+```
+
+证据写入 `docker/debug/reports/plugin-passive-composition-v3/gate.json`。运行期间只写
+临时 checkout、临时 workspace 与被 Git 忽略的报告目录，不读取或修改正式 workspace。
+
 ### Shell execution 固定 Runtime 场景
 
 `shell_execution_contract` 在 change-gate 的只读 Arch Linux runtime 中运行，不读取
