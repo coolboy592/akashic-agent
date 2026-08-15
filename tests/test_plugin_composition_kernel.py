@@ -12,6 +12,7 @@ from agent.plugin_composition import (
     CompositionRoot,
     ExternalEffectGate,
     FiberState,
+    HealthHandle,
     PluginDataAccess,
     ServiceKey,
 )
@@ -424,7 +425,11 @@ async def test_dispose_observer_failure_is_contained_and_peers_run() -> None:
     child = await root.mount(lambda _: None, name="child")
     await child.dispose()
     assert observed == ["child"]
-    assert any("broken observer" in error for error in root.receipt().errors)
+    assert any(
+        "broken observer" in incident.message
+        for incident in root.receipt().incidents
+    )
+    assert root.receipt().ready is True
 
 
 @pytest.mark.asyncio
@@ -515,7 +520,230 @@ async def test_observer_cancelled_error_is_contained_when_owner_not_cancelled() 
     child = await root.mount(lambda _: None, name="child")
     await child.dispose()
     assert observed == ["child"]
-    assert any("CancelledError" in error for error in root.receipt().errors)
+    assert any(
+        incident.error_type == "CancelledError"
+        for incident in root.receipt().incidents
+    )
+    assert root.receipt().ready is True
+
+
+@pytest.mark.asyncio
+async def test_explicit_health_and_incident_are_independent_facts() -> None:
+    root = CompositionRoot("health-incident")
+    handles: list[HealthHandle] = []
+
+    async def plugin(ctx) -> None:
+        handles.append(await ctx.health("poller", required=True))
+        _ = ctx.report_incident("poll_failed", "first attempt failed")
+
+    await root.mount(plugin, name="watcher")
+    initial = root.receipt()
+    assert initial.ready is True
+    assert initial.required_degraded == ()
+    assert initial.incident_sequence == 1
+
+    handles[0].degrade("upstream unavailable")
+    degraded = root.receipt()
+    assert degraded.ready is False
+    assert degraded.required_degraded == ("watcher:poller",)
+    assert degraded.incident_sequence == 1
+
+    handles[0].recover()
+    recovered = root.receipt()
+    assert recovered.ready is True
+    assert recovered.required_degraded == ()
+    assert recovered.incidents == initial.incidents
+    assert "watcher:health:poller" in recovered.effects
+    _ = RuntimeSnapshotCompiler().compile({}, composition_root=root)
+    await root.dispose()
+    with pytest.raises(CompositionError) as caught:
+        handles[0].recover()
+    assert caught.value.code == "INACTIVE_HEALTH"
+
+
+@pytest.mark.asyncio
+async def test_fiber_restart_invalidates_old_health_handle() -> None:
+    root = CompositionRoot("health-restart")
+    handles: list[HealthHandle] = []
+
+    async def plugin(ctx) -> None:
+        handles.append(await ctx.health("worker", required=True))
+
+    fiber = await root.mount(plugin, name="plugin")
+    first = handles[0]
+    first.degrade("first epoch failed")
+
+    await fiber.restart()
+
+    assert len(handles) == 2
+    assert root.receipt().required_degraded == ()
+    with pytest.raises(CompositionError) as caught:
+        first.recover()
+    assert caught.value.code == "INACTIVE_HEALTH"
+    handles[1].degrade("second epoch failed")
+    assert root.receipt().required_degraded == ("plugin:worker",)
+    await root.dispose()
+
+
+@pytest.mark.asyncio
+async def test_optional_health_degradation_does_not_block_readiness() -> None:
+    root = CompositionRoot("optional-health")
+    handles: list[HealthHandle] = []
+
+    async def plugin(ctx) -> None:
+        handles.append(await ctx.health("telemetry", required=False))
+
+    await root.mount(plugin, name="observer")
+    handles[0].degrade("metrics endpoint unavailable")
+
+    receipt = root.receipt()
+    assert receipt.ready is True
+    assert receipt.required_degraded == ()
+    assert receipt.health[0].healthy is False
+    await root.dispose()
+
+
+@pytest.mark.asyncio
+async def test_optional_fiber_failure_records_incident_without_poisoning_root() -> None:
+    root = CompositionRoot("optional-failure")
+
+    async def broken(_) -> None:
+        raise RuntimeError("optional failed")
+
+    _ = await root.context.inject((), broken, name="optional")
+
+    receipt = root.receipt()
+    assert receipt.ready is True
+    assert receipt.optional_pending == ("optional",)
+    assert any(
+        incident.message == "optional failed"
+        for incident in receipt.incidents
+    )
+    await root.dispose()
+
+
+@pytest.mark.asyncio
+async def test_candidate_incident_overflow_fails_loud() -> None:
+    root = CompositionRoot("candidate-incidents", candidate_incident_limit=2)
+    _ = await root.mount(lambda _: None, name="plugin")
+
+    for index in range(3):
+        _ = root.context.report_incident("probe", f"failure {index}")
+
+    receipt = root.receipt()
+    assert receipt.ready is False
+    assert receipt.incident_sequence == 3
+    assert receipt.incident_overflowed is True
+    assert tuple(item.sequence for item in receipt.incidents) == (1, 2)
+    with pytest.raises(RuntimeError, match="incident_overflowed=True"):
+        RuntimeSnapshotCompiler().compile({}, composition_root=root)
+    await root.dispose()
+
+
+@pytest.mark.asyncio
+async def test_stable_incident_buffer_is_bounded_without_poisoning_health() -> None:
+    root = CompositionRoot("stable-incidents")
+    _ = await root.mount(lambda _: None, name="plugin")
+
+    for index in range(root.RECENT_INCIDENT_LIMIT + 2):
+        _ = root.context.report_incident("probe", f"failure {index}")
+
+    receipt = root.receipt()
+    assert receipt.ready is True
+    assert receipt.incident_overflowed is False
+    assert receipt.incident_sequence == root.RECENT_INCIDENT_LIMIT + 2
+    assert len(receipt.incidents) == root.RECENT_INCIDENT_LIMIT
+    assert receipt.incidents[0].sequence == 3
+    await root.dispose()
+
+
+@pytest.mark.asyncio
+async def test_incident_after_candidate_seal_invalidates_validation_receipt() -> None:
+    root = CompositionRoot("sealed-incidents", candidate_incident_limit=8)
+    _ = await root.mount(lambda _: None, name="plugin")
+    compiler = RuntimeSnapshotCompiler()
+    candidate = compiler.compile({}, composition_root=root)
+    store = RuntimeSnapshotStore()
+    store.install(compiler.compile({}))
+    transaction = store.begin_publish(candidate)
+    await store.commit_latest(transaction)
+    store.pause_candidate_admission(candidate)
+    store.seal_candidate_validation(candidate)
+
+    _ = root.context.report_incident("late_failure", "after seal")
+
+    with pytest.raises(RuntimeError, match="验证回执在封存后发生变化"):
+        await store.promote_latest()
+    _ = await store.discard_latest(candidate)
+    await store.close()
+    await root.dispose()
+
+
+@pytest.mark.asyncio
+async def test_rebuilt_formal_root_health_is_rechecked_after_candidate_seal() -> None:
+    compiler = RuntimeSnapshotCompiler()
+    validation_root = CompositionRoot("validation-root")
+    _ = await validation_root.mount(lambda _: None, name="plugin")
+    candidate = compiler.compile({}, composition_root=validation_root)
+    store = RuntimeSnapshotStore()
+    store.install(compiler.compile({}))
+    await store.commit_latest(store.begin_publish(candidate))
+    store.pause_candidate_admission(candidate)
+    store.seal_candidate_validation(candidate)
+
+    formal_root = CompositionRoot("formal-root")
+    handles: list[HealthHandle] = []
+
+    async def plugin(ctx) -> None:
+        handles.append(await ctx.health("worker", required=True))
+
+    _ = await formal_root.mount(plugin, name="plugin")
+    formal_snapshot = compiler.compile({}, composition_root=formal_root)
+    candidate.composition_root = formal_root
+    candidate.composition_topology = formal_snapshot.composition_topology
+    handles[0].degrade("formal worker unavailable")
+
+    with pytest.raises(RuntimeError, match="required_degraded"):
+        await store.promote_latest()
+
+    _ = await store.discard_latest(candidate)
+    await store.close()
+    await validation_root.dispose()
+    await formal_root.dispose()
+
+
+@pytest.mark.asyncio
+async def test_reused_stable_health_exemption_never_allows_external_effects() -> None:
+    compiler = RuntimeSnapshotCompiler()
+    validation_root = CompositionRoot("validation-root")
+    _ = await validation_root.mount(lambda _: None, name="plugin")
+    candidate = compiler.compile({}, composition_root=validation_root)
+    store = RuntimeSnapshotStore()
+    store.install(compiler.compile({}))
+    await store.commit_latest(store.begin_publish(candidate))
+    store.pause_candidate_admission(candidate)
+    store.seal_candidate_validation(candidate)
+
+    stable_audit = CompositionAudit()
+    reused_stable_root = CompositionRoot("reused-stable", audit=stable_audit)
+    _ = await reused_stable_root.mount(lambda _: None, name="plugin")
+    reused_snapshot = compiler.compile({}, composition_root=reused_stable_root)
+    candidate.composition_root = reused_stable_root
+    candidate.composition_topology = reused_snapshot.composition_topology
+    candidate.composition_health_exempt_root_token = reused_stable_root.instance_token
+    stable_audit.record_external(
+        kind="http",
+        target="https://example.invalid",
+        outcome="denied",
+    )
+
+    with pytest.raises(RuntimeError, match="external_effects"):
+        await store.promote_latest()
+
+    _ = await store.discard_latest(candidate)
+    await store.close()
+    await validation_root.dispose()
+    await reused_stable_root.dispose()
 
 
 @pytest.mark.asyncio

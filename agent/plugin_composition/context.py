@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import inspect
 import json
+from collections import deque
 from collections.abc import Awaitable, Callable, Coroutine, Iterable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -28,6 +29,8 @@ from agent.plugin_composition.model import (
     CompositionReceipt,
     FiberState,
     FiberView,
+    HealthView,
+    IncidentView,
     PluginRuntime,
     ServiceKey,
     TopologyFiberView,
@@ -50,6 +53,15 @@ class _Provider:
     value: object
     owner: Fiber
     revision: int
+
+
+@dataclass(slots=True)
+class _HealthEntry:
+    owner: Fiber
+    name: str
+    required: bool
+    reason: str | None = None
+    active: bool = True
 
 
 class Context:
@@ -160,6 +172,43 @@ class Context:
         reject_executor_context_access()
         return await self._fiber.add_effect(setup, label=label)
 
+    async def health(
+        self,
+        name: str,
+        *,
+        required: bool = True,
+    ) -> HealthHandle:
+        """注册一个由当前 Fiber Effect 持有的健康项。"""
+
+        reject_executor_context_access()
+        entry = self._root._new_health_entry(
+            self._fiber,
+            name=name,
+            required=required,
+        )
+        handle = HealthHandle(self._root, entry)
+
+        def setup() -> Callable[[], None]:
+            self._root._register_health(entry)
+            return lambda: self._root._remove_health(entry)
+
+        _ = await self.effect(setup, label=f"health:{name}")
+        return handle
+
+    def report_incident(self, kind: str, message: str) -> IncidentView:
+        """记录一条结构化 Incident，但不隐式改变当前 Health。"""
+
+        reject_executor_context_access()
+        if not kind or kind.strip() != kind:
+            raise ValueError("Incident kind 必须是非空且无首尾空白的字符串")
+        if not message or message.strip() != message:
+            raise ValueError("Incident message 必须是非空且无首尾空白的字符串")
+        return self._root._report_incident(
+            self._fiber,
+            kind=kind,
+            message=message,
+        )
+
     async def on(
         self,
         key: EmitEventKey[T] | SerialEventKey[T, object] | ParallelEventKey[T],
@@ -215,6 +264,7 @@ class Context:
             task.add_done_callback(
                 lambda completed: self._root._record_task_result(
                     self._fiber,
+                    name,
                     cast(asyncio.Task[object], completed),
                 )
             )
@@ -242,21 +292,59 @@ class FiberHandle:
 
     @property
     def fiber_id(self) -> int:
+        reject_executor_context_access()
         return self._fiber.fiber_id
 
     @property
     def name(self) -> str:
+        reject_executor_context_access()
         return self._fiber.name
 
     @property
     def state(self) -> FiberState:
+        reject_executor_context_access()
         return self._fiber.state
 
     async def restart(self) -> None:
+        reject_executor_context_access()
         await self._fiber.restart()
 
     async def dispose(self) -> None:
+        reject_executor_context_access()
         await self._fiber.dispose()
+
+
+class HealthHandle:
+    """允许插件显式降级或恢复一个 Effect-owned 健康项。"""
+
+    __slots__ = ("_root", "_entry")
+
+    def __init__(self, root: CompositionRoot, entry: _HealthEntry) -> None:
+        self._root = root
+        self._entry = entry
+
+    @property
+    def name(self) -> str:
+        reject_executor_context_access()
+        return self._entry.name
+
+    @property
+    def healthy(self) -> bool:
+        reject_executor_context_access()
+        return self._entry.active and self._entry.reason is None
+
+    @property
+    def reason(self) -> str | None:
+        reject_executor_context_access()
+        return self._entry.reason
+
+    def degrade(self, reason: str) -> None:
+        reject_executor_context_access()
+        self._root._degrade_health(self._entry, reason)
+
+    def recover(self) -> None:
+        reject_executor_context_access()
+        self._root._recover_health(self._entry)
 
 
 class Fiber:
@@ -289,6 +377,7 @@ class Fiber:
         self.effects: list[Effect] = []
         self.children: list[Fiber] = []
         self.error: BaseException | None = None
+        self._task_failures: dict[str, str] = {}
         self._epoch: tuple[tuple[str, int], ...] | None = () if is_root else None
         self._transition = asyncio.Lock()
         self._transition_owner: asyncio.Task[object] | None = None
@@ -452,6 +541,7 @@ class Fiber:
             except BaseException as error:
                 errors.append(error)
         self.dependency_store = {}
+        self._task_failures.clear()
         self._epoch = None
         self.state = next_state
         await self.root._notify_status(self)
@@ -487,15 +577,21 @@ class Fiber:
 class CompositionRoot:
     """Own one generation topology and derive its validation receipt."""
 
+    RECENT_INCIDENT_LIMIT = 128
+
     def __init__(
         self,
         generation_id: str,
         *,
         audit: CompositionAudit | None = None,
+        candidate_incident_limit: int | None = None,
     ) -> None:
         if not generation_id:
             raise ValueError("generation_id 不能为空")
+        if candidate_incident_limit is not None and candidate_incident_limit <= 0:
+            raise ValueError("candidate_incident_limit 必须大于零")
         self.generation_id = generation_id
+        self._instance_token = object()
         self._next_fiber_id = 1
         self._next_provider_revision = 1
         self._composition_revision = 0
@@ -504,7 +600,17 @@ class CompositionRoot:
         self._mount_observers: list[FiberObserver] = []
         self._status_observers: list[FiberObserver] = []
         self._dispose_observers: list[FiberObserver] = []
-        self._errors: list[str] = []
+        self._health_entries: dict[tuple[int, str], _HealthEntry] = {}
+        self._incident_sequence = 0
+        self._candidate_incident_limit = candidate_incident_limit
+        self._incident_overflowed = False
+        self._recent_incidents: deque[IncidentView] = deque(
+            maxlen=(
+                candidate_incident_limit
+                if candidate_incident_limit is not None
+                else self.RECENT_INCIDENT_LIMIT
+            )
+        )
         self._audit = audit or CompositionAudit()
         self._events = EventRegistry(self._bump_composition_revision)
         self._internal_cleanups: list[tuple[str, Callable[[], object]]] = []
@@ -521,6 +627,12 @@ class CompositionRoot:
             is_root=True,
         )
         self.context = self.root_fiber.context
+
+    @property
+    def instance_token(self) -> object:
+        """标识单个 Root 实例，不参与可持久化拓扑身份。"""
+
+        return self._instance_token
 
     def on_mount(self, observer: FiberObserver) -> Callable[[], None]:
         return self._add_observer(self._mount_observers, observer)
@@ -613,12 +725,19 @@ class CompositionRoot:
             for fiber in (self.root_fiber, *self._fibers.values())
             for effect in fiber.effects
         )
+        health = self._health_view()
+        required_degraded = tuple(
+            f"{item.owner}:{item.name}"
+            for item in health
+            if item.required and not item.healthy
+        )
         return CompositionReceipt(
             generation_id=self.generation_id,
             ready=(
                 self.root_fiber.state == FiberState.ACTIVE
                 and not required_pending
-                and not self._errors
+                and not required_degraded
+                and not self._incident_overflowed
                 and not external_effects
             ),
             fibers=fibers,
@@ -626,7 +745,11 @@ class CompositionRoot:
             effects=effects,
             required_pending=required_pending,
             optional_pending=optional_pending,
-            errors=tuple(self._errors),
+            health=health,
+            required_degraded=required_degraded,
+            incidents=self.recent_incidents(),
+            incident_sequence=self._incident_sequence,
+            incident_overflowed=self._incident_overflowed,
             writes=self._audit.writes,
             external_effects=external_effects,
         )
@@ -705,7 +828,9 @@ class CompositionRoot:
                 f"revision:{self._composition_revision}",
                 f"required:{','.join(receipt.required_pending)}",
                 f"optional:{','.join(receipt.optional_pending)}",
-                f"errors:{','.join(receipt.errors)}",
+                f"degraded:{','.join(receipt.required_degraded)}",
+                f"incidents:{receipt.incident_sequence}",
+                f"incident_overflowed:{receipt.incident_overflowed}",
                 f"writes:{writes}",
                 f"external:{external}",
             )
@@ -932,24 +1057,145 @@ class CompositionRoot:
             except Exception as error:
                 self._record_error(fiber, error)
 
+    def _new_health_entry(
+        self,
+        owner: Fiber,
+        *,
+        name: str,
+        required: bool,
+    ) -> _HealthEntry:
+        if not name or name.strip() != name:
+            raise ValueError("健康项名称必须是非空且无首尾空白的字符串")
+        if (owner.fiber_id, name) in self._health_entries:
+            raise CompositionError(
+                "DUPLICATE_HEALTH",
+                f"Fiber {owner.name} 已注册健康项: {name}",
+            )
+        return _HealthEntry(owner=owner, name=name, required=required)
+
+    def _register_health(self, entry: _HealthEntry) -> None:
+        key = (entry.owner.fiber_id, entry.name)
+        if key in self._health_entries:
+            raise CompositionError(
+                "DUPLICATE_HEALTH",
+                f"Fiber {entry.owner.name} 已注册健康项: {entry.name}",
+            )
+        self._health_entries[key] = entry
+
+    def _remove_health(self, entry: _HealthEntry) -> None:
+        key = (entry.owner.fiber_id, entry.name)
+        if self._health_entries.get(key) is not entry:
+            return
+        del self._health_entries[key]
+        entry.active = False
+        entry.reason = None
+
+    @staticmethod
+    def _require_active_health(entry: _HealthEntry) -> None:
+        if not entry.active:
+            raise CompositionError(
+                "INACTIVE_HEALTH",
+                f"健康项已经注销: {entry.owner.name}:{entry.name}",
+            )
+
+    def _degrade_health(self, entry: _HealthEntry, reason: str) -> None:
+        self._require_active_health(entry)
+        if not reason or reason.strip() != reason:
+            raise ValueError("健康降级原因必须是非空且无首尾空白的字符串")
+        entry.reason = reason
+
+    def _recover_health(self, entry: _HealthEntry) -> None:
+        self._require_active_health(entry)
+        entry.reason = None
+
+    def _health_view(self) -> tuple[HealthView, ...]:
+        entries = [
+            HealthView(
+                owner=entry.owner.name,
+                name=entry.name,
+                required=entry.required,
+                healthy=entry.reason is None,
+                reason=entry.reason,
+            )
+            for entry in self._health_entries.values()
+        ]
+        for fiber in (self.root_fiber, *self._fibers.values()):
+            entries.extend(
+                HealthView(
+                    owner=fiber.name,
+                    name=f"task:{name}",
+                    required=fiber.required_for_readiness,
+                    healthy=False,
+                    reason=reason,
+                )
+                for name, reason in fiber._task_failures.items()
+            )
+        return tuple(sorted(entries, key=lambda item: (item.owner, item.name)))
+
+    def _report_incident(
+        self,
+        fiber: Fiber,
+        *,
+        kind: str,
+        message: str,
+        error_type: str | None = None,
+    ) -> IncidentView:
+        self._incident_sequence += 1
+        incident = IncidentView(
+            sequence=self._incident_sequence,
+            owner=fiber.name,
+            kind=kind,
+            message=message,
+            error_type=error_type,
+        )
+        limit = self._candidate_incident_limit
+        if limit is not None and len(self._recent_incidents) >= limit:
+            self._incident_overflowed = True
+            return incident
+        self._recent_incidents.append(incident)
+        return incident
+
+    def recent_incidents(self) -> tuple[IncidentView, ...]:
+        return tuple(self._recent_incidents)
+
+    @property
+    def incident_sequence(self) -> int:
+        return self._incident_sequence
+
     def _record_error(self, fiber: Fiber, error: BaseException) -> None:
         if isinstance(error, CompositionError):
-            self._errors.append(
-                f"{fiber.name}:{type(error).__name__}:{error.code}:{error}"
+            _ = self._report_incident(
+                fiber,
+                kind="composition_error",
+                message=f"{error.code}: {error}",
+                error_type=type(error).__name__,
             )
             return
-        self._errors.append(f"{fiber.name}:{type(error).__name__}:{error}")
+        _ = self._report_incident(
+            fiber,
+            kind="runtime_error",
+            message=str(error) or type(error).__name__,
+            error_type=type(error).__name__,
+        )
 
     def _record_task_result(
         self,
         fiber: Fiber,
+        name: str,
         task: asyncio.Task[object],
     ) -> None:
         if task.cancelled():
             return
         error = task.exception()
         if error is not None:
-            self._record_error(fiber, error)
+            reason = str(error) or type(error).__name__
+            fiber._task_failures[name] = reason
+            _ = self._report_incident(
+                fiber,
+                kind="task_failure",
+                message=reason,
+                error_type=type(error).__name__,
+            )
 
     def _remove_fiber(self, fiber: Fiber) -> None:
         if self._fibers.pop(fiber.fiber_id, None) is not None:

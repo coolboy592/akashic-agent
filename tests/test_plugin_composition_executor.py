@@ -10,6 +10,7 @@ from agent.plugin_composition import (
     CompositionError,
     CompositionRoot,
     ExecutorService,
+    HealthHandle,
     SyncTask,
 )
 
@@ -70,6 +71,46 @@ async def test_parallel_sync_worker_cannot_access_context() -> None:
     with pytest.raises(BaseExceptionGroup) as caught:
         await executor.parallel_sync(
             (SyncTask("escape", lambda: root.context.generation_id),)
+        )
+
+    error = caught.value.exceptions[0]
+    assert isinstance(error, CompositionError)
+    assert error.code == "CONTEXT_IN_SYNC_WORKER"
+
+
+@pytest.mark.asyncio
+async def test_parallel_sync_worker_cannot_mutate_saved_health_handle() -> None:
+    root = CompositionRoot("executor-health-boundary")
+    await root.mount(ExecutorService(max_workers=1))
+    handles: list[HealthHandle] = []
+
+    async def plugin(ctx) -> None:
+        handles.append(await ctx.health("worker", required=True))
+
+    await root.mount(plugin, name="plugin")
+    executor = root.context.require(EXECUTOR_SERVICE)
+
+    with pytest.raises(BaseExceptionGroup) as caught:
+        await executor.parallel_sync(
+            (SyncTask("escape", lambda: handles[0].degrade("thread write")),)
+        )
+
+    error = caught.value.exceptions[0]
+    assert isinstance(error, CompositionError)
+    assert error.code == "CONTEXT_IN_SYNC_WORKER"
+    assert root.receipt().required_degraded == ()
+
+
+@pytest.mark.asyncio
+async def test_parallel_sync_worker_cannot_read_saved_fiber_handle() -> None:
+    root = CompositionRoot("executor-fiber-boundary")
+    await root.mount(ExecutorService(max_workers=1))
+    handle = await root.context.mount(lambda _: None, name="plugin")
+    executor = root.context.require(EXECUTOR_SERVICE)
+
+    with pytest.raises(BaseExceptionGroup) as caught:
+        await executor.parallel_sync(
+            (SyncTask("escape", lambda: handle.state),)
         )
 
     error = caught.value.exceptions[0]

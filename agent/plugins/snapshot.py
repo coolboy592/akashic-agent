@@ -63,6 +63,15 @@ class RuntimeSnapshot:
     composition_root: CompositionRoot | None = None
     composition_topology: TopologyView | None = None
     composition_validation_identity: str | None = None
+    composition_validation_root_token: object | None = field(
+        default=None,
+        repr=False,
+    )
+    # V2_REMOVAL: legacy-only candidate 消失后删除此 stable Root Health 豁免令牌。
+    composition_health_exempt_root_token: object | None = field(
+        default=None,
+        repr=False,
+    )
     state: SnapshotState = "compiled"
     lease_count: int = 0
     accepting_leases: bool = True
@@ -123,6 +132,7 @@ class RuntimeSnapshotCompiler:
         snapshot_revision: str = "",
         workspace_mcp_generation: WorkspaceMcpGeneration | None = None,
         composition_root: CompositionRoot | None = None,
+        require_composition_ready: bool = True,
     ) -> RuntimeSnapshot:
         ordered = [generations[key] for key in sorted(generations)]
         if any(generation.plugin_id != key for key, generation in generations.items()):
@@ -205,11 +215,12 @@ class RuntimeSnapshotCompiler:
         composition_topology: TopologyView | None = None
         if composition_root is not None:
             receipt = composition_root.receipt()
-            if not receipt.ready:
+            if require_composition_ready and not receipt.ready:
                 raise RuntimeError(
                     "RuntimeSnapshot 插件组合拓扑未就绪: "
                     f"required_pending={receipt.required_pending}, "
-                    f"errors={receipt.errors}, "
+                    f"required_degraded={receipt.required_degraded}, "
+                    f"incident_overflowed={receipt.incident_overflowed}, "
                     f"external_effects={receipt.external_effects}"
                 )
             composition_topology = composition_root.topology_view()
@@ -684,10 +695,28 @@ class RuntimeSnapshotStore:
             raise RuntimeError("等待封存验证回执的 RuntimeSnapshot 候选不一致")
         if candidate.accepting_leases or candidate.lease_count:
             raise RuntimeError("封存验证回执前必须暂停并排空 candidate lease")
+        self._seal_composition_validation(candidate)
+
+    def seal_pending_validation(self, expected: RuntimeSnapshot) -> None:
+        """封存尚未公开的 direct candidate 组合验证事实。"""
+
+        candidate = self.pending_candidate
+        if candidate is None or candidate is not expected:
+            raise RuntimeError("等待封存验证回执的 pending candidate 不一致")
+        self._seal_composition_validation(candidate)
+
+    def _seal_composition_validation(self, candidate: RuntimeSnapshot) -> None:
+        """在无 lease 的隔离 Root 上保存不可变验证证明。"""
+
+        if candidate.accepting_leases or candidate.lease_count:
+            raise RuntimeError("封存验证回执前必须暂停并排空 candidate lease")
         self._validate_composition(candidate)
         root = candidate.composition_root
         candidate.composition_validation_identity = (
             None if root is None else root.validation_identity()
+        )
+        candidate.composition_validation_root_token = (
+            None if root is None else root.instance_token
         )
 
     async def wait_for_no_leases(self, snapshot: RuntimeSnapshot) -> None:
@@ -913,11 +942,27 @@ class RuntimeSnapshotStore:
         if topology is None:
             raise RuntimeError("RuntimeSnapshot composition Root 缺少 TopologyView")
         receipt = root.receipt()
-        if not receipt.ready:
+        validated_reused_stable_root = (
+            snapshot.composition_validation_identity is not None
+            and snapshot.composition_validation_root_token is not None
+            and snapshot.composition_validation_root_token is not root.instance_token
+            and snapshot.composition_health_exempt_root_token
+            is root.instance_token
+        )
+        if receipt.incident_overflowed or receipt.external_effects:
             raise RuntimeError(
                 "RuntimeSnapshot 插件组合拓扑未就绪: "
                 f"required_pending={receipt.required_pending}, "
-                f"errors={receipt.errors}, "
+                f"required_degraded={receipt.required_degraded}, "
+                f"incident_overflowed={receipt.incident_overflowed}, "
+                f"external_effects={receipt.external_effects}"
+            )
+        if not receipt.ready and not validated_reused_stable_root:
+            raise RuntimeError(
+                "RuntimeSnapshot 插件组合拓扑未就绪: "
+                f"required_pending={receipt.required_pending}, "
+                f"required_degraded={receipt.required_degraded}, "
+                f"incident_overflowed={receipt.incident_overflowed}, "
                 f"external_effects={receipt.external_effects}"
             )
         if root.topology_identity() != topology.identity:
@@ -925,9 +970,16 @@ class RuntimeSnapshotStore:
         if root.composition_revision != topology.composition_revision:
             raise RuntimeError("RuntimeSnapshot 插件组合拓扑在编译后发生过结构变化")
         if require_validation:
-            if snapshot.composition_validation_identity is None:
+            if (
+                snapshot.composition_validation_identity is None
+                or snapshot.composition_validation_root_token is None
+            ):
                 raise RuntimeError("RuntimeSnapshot 插件组合候选缺少 Core 验证回执")
-            if root.validation_identity() != snapshot.composition_validation_identity:
+            if (
+                snapshot.composition_validation_root_token is root.instance_token
+                and root.validation_identity()
+                != snapshot.composition_validation_identity
+            ):
                 raise RuntimeError("RuntimeSnapshot 插件组合验证回执在封存后发生变化")
 
     def _selected(self, selector: RuntimeSelector) -> RuntimeSnapshot | None:

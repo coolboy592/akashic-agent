@@ -116,7 +116,10 @@ async def test_emit_rejects_async_listener_during_registration() -> None:
     fiber = await root.mount(plugin, name="broken")
 
     assert fiber.state == FiberState.FAILED
-    assert any("ASYNC_LISTENER_ON_EMIT" in error for error in root.receipt().errors)
+    assert any(
+        "ASYNC_LISTENER_ON_EMIT" in incident.message
+        for incident in root.receipt().incidents
+    )
 
 
 @pytest.mark.asyncio
@@ -151,7 +154,10 @@ async def test_event_name_cannot_change_dispatch_mode_while_registered() -> None
     fiber = await root.mount(serial_plugin, name="serial-owner")
 
     assert fiber.state == FiberState.FAILED
-    assert any("EVENT_MODE_CONFLICT" in error for error in root.receipt().errors)
+    assert any(
+        "EVENT_MODE_CONFLICT" in incident.message
+        for incident in root.receipt().incidents
+    )
 
 
 @pytest.mark.asyncio
@@ -364,21 +370,42 @@ async def test_spawned_task_is_cancelled_with_owning_fiber() -> None:
 @pytest.mark.asyncio
 async def test_spawned_task_failure_is_visible_to_candidate_readiness() -> None:
     failed = asyncio.Event()
+    recovered = asyncio.Event()
+    attempts = 0
     root = CompositionRoot("spawn-failure")
 
     async def worker() -> None:
-        try:
-            raise RuntimeError("background failed")
-        finally:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
             failed.set()
+            raise RuntimeError("background failed")
+        recovered.set()
+        await asyncio.Event().wait()
 
     async def plugin(ctx) -> None:
         _ = await ctx.spawn(worker(), name="broken-worker")
 
-    await root.mount(plugin, name="task-owner")
+    fiber = await root.mount(plugin, name="task-owner")
     await failed.wait()
     await asyncio.sleep(0)
 
     receipt = root.receipt()
     assert receipt.ready is False
-    assert any("background failed" in error for error in receipt.errors)
+    assert receipt.required_degraded == ("task-owner:task:broken-worker",)
+    assert any(
+        incident.kind == "task_failure"
+        and "background failed" in incident.message
+        for incident in receipt.incidents
+    )
+
+    await fiber.restart()
+    await recovered.wait()
+    recovered_receipt = root.receipt()
+    assert recovered_receipt.ready is True
+    assert recovered_receipt.required_degraded == ()
+    assert any(
+        "background failed" in incident.message
+        for incident in recovered_receipt.incidents
+    )
+    await root.dispose()

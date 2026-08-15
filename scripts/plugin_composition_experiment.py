@@ -131,32 +131,20 @@ async def _run(workspace: Path) -> dict[str, object]:
     optional_receipt = root.receipt()
     _ = await root.mount(ProbeFormatterProvider())
     ready_receipt = root.receipt()
+    initial_signal = root.context.require(PROBE_SIGNAL)
 
-    # 3. Publish the complete topology as latest and validate through a lease.
+    # 3. Capture identity, then exercise dependency loss/recovery before publication.
     compiler = RuntimeSnapshotCompiler()
-    stable = compiler.compile({}, snapshot_revision=f"stable:{run_id}")
-    candidate = compiler.compile(
+    original_snapshot = compiler.compile(
         {},
         snapshot_revision=f"candidate:{run_id}",
         composition_root=root,
     )
-    store = RuntimeSnapshotStore(_drain_snapshot)
-    store.install(stable)
-    transaction = store.begin_publish(candidate)
-    await store.commit_latest(transaction)
-    lease = store.lease(selector="latest")
-    leased_root = lease.snapshot.composition_root
-    if leased_root is None:
-        raise RuntimeError("latest snapshot 缺少 composition root")
-    signal = leased_root.context.require(PROBE_SIGNAL)
-    await lease.release()
-
-    # 4. Exercise dependency loss/recovery on the isolated candidate itself.
     await provider.dispose()
     removed_receipt = root.receipt()
     _ = await root.mount(ProbeProvider("second", trace))
     restored_receipt = root.receipt()
-    restored_snapshot = compiler.compile(
+    candidate = compiler.compile(
         {},
         snapshot_revision=f"candidate:{run_id}",
         composition_root=root,
@@ -169,11 +157,22 @@ async def _run(workspace: Path) -> dict[str, object]:
         removed_receipt=removed_receipt,
         restored_receipt=restored_receipt,
         external_effect_count=len(audit.external_effects),
-        original_snapshot_id=candidate.snapshot_id,
-        restored_snapshot_id=restored_snapshot.snapshot_id,
+        original_snapshot_id=original_snapshot.snapshot_id,
+        restored_snapshot_id=candidate.snapshot_id,
     )
 
-    # 5. Promote the exact validated object, lease stable, then drain it.
+    # 4. Publish only the fresh restored snapshot, validate, then promote it.
+    stable = compiler.compile({}, snapshot_revision=f"stable:{run_id}")
+    store = RuntimeSnapshotStore(_drain_snapshot)
+    store.install(stable)
+    transaction = store.begin_publish(candidate)
+    await store.commit_latest(transaction)
+    lease = store.lease(selector="latest")
+    leased_root = lease.snapshot.composition_root
+    if leased_root is None:
+        raise RuntimeError("latest snapshot 缺少 composition root")
+    promoted_signal = leased_root.context.require(PROBE_SIGNAL)
+    await lease.release()
     _ = store.pause_candidate_admission(candidate)
     await store.wait_for_no_leases(candidate)
     store.seal_candidate_validation(candidate)
@@ -190,7 +189,8 @@ async def _run(workspace: Path) -> dict[str, object]:
         "run_id": run_id,
         "workspace": str(workspace),
         "stable_snapshot_id": promoted_snapshot_id,
-        "observed_signal": signal.value,
+        "observed_signal": initial_signal.value,
+        "promoted_signal": promoted_signal.value,
         "trace": trace.events,
         "receipts": {
             "pending": pending_receipt,

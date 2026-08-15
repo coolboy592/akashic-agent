@@ -675,6 +675,129 @@ async def test_installed_v3_candidate_rebuilds_runtime_then_promotes(
 
 
 @pytest.mark.asyncio
+async def test_installed_v3_candidate_health_blocks_promotion_until_recovered(
+    tmp_path: Path,
+) -> None:
+    plugin_base = tmp_path / "home" / "cache" / "lab" / "installed_v3"
+    stable_artifact = plugin_base / ".artifacts" / "1.0.0-aaaa"
+    latest_artifact = plugin_base / ".artifacts" / "2.0.0-bbbb"
+    stable_artifact.mkdir(parents=True)
+    latest_artifact.mkdir(parents=True)
+    source = (
+        "api_version = 3\n"
+        "name = 'installed_v3'\n"
+        "version = '1.0.0'\n"
+        "health = None\n"
+        "async def apply(ctx, config):\n"
+        "    global health\n"
+        "    health = await ctx.health('worker', required=True)\n"
+    )
+    (stable_artifact / "plugin.py").write_text(source, encoding="utf-8")
+    (latest_artifact / "plugin.py").write_text(
+        source.replace("version = '1.0.0'", "version = '2.0.0'"),
+        encoding="utf-8",
+    )
+    stable_pointer = ArtifactPointer(".artifacts/1.0.0-aaaa")
+    latest_pointer = ArtifactPointer(".artifacts/2.0.0-bbbb")
+    write_pointers(plugin_base, stable=stable_pointer, latest=stable_pointer)
+    write_plugin_manifest(
+        {"installed_v3@lab": True},
+        plugins_home=tmp_path / "home",
+    )
+    manager = _manager(tmp_path)
+    await manager.load_all()
+    stable_snapshot = manager.current_snapshot
+    assert stable_snapshot is not None
+
+    write_pointers(plugin_base, stable=stable_pointer, latest=latest_pointer)
+    assert (await manager.reconcile_changed())[0]["publication_state"] == "latest_ready"
+    candidate = manager.ready_candidate
+    assert candidate is not None and candidate.runtime_snapshot is not None
+    candidate_root = candidate.runtime_snapshot.composition_root
+    assert candidate_root is not None
+    clone_name = next(
+        name
+        for name in sys.modules
+        if name.startswith(f"{candidate.module_path}__candidate_")
+    )
+    candidate_health = sys.modules[clone_name].health
+    candidate_health.degrade("validation worker unavailable")
+
+    with pytest.raises(RuntimeError, match="required_degraded"):
+        await manager.switch_ready("installed_v3@lab")
+
+    assert manager.current_snapshot is stable_snapshot
+    assert manager.ready_candidate is candidate
+    assert candidate_root.root_fiber.children[0].state.value == "active"
+
+    candidate_health.recover()
+    promoted = await manager.switch_ready("installed_v3@lab")
+
+    assert promoted["publication_state"] == "promoted"
+    assert manager.ready_candidate is None
+    assert clone_name not in sys.modules
+    await manager.terminate_all()
+
+
+@pytest.mark.asyncio
+async def test_installed_v3_candidate_incident_overflow_blocks_promotion(
+    tmp_path: Path,
+) -> None:
+    plugin_base = tmp_path / "home" / "cache" / "lab" / "installed_v3"
+    stable_artifact = plugin_base / ".artifacts" / "1.0.0-aaaa"
+    latest_artifact = plugin_base / ".artifacts" / "2.0.0-bbbb"
+    stable_artifact.mkdir(parents=True)
+    latest_artifact.mkdir(parents=True)
+    source = (
+        "api_version = 3\n"
+        "name = 'installed_v3'\n"
+        "version = '1.0.0'\n"
+        "saved_ctx = None\n"
+        "async def apply(ctx, config):\n"
+        "    global saved_ctx\n"
+        "    saved_ctx = ctx\n"
+    )
+    (stable_artifact / "plugin.py").write_text(source, encoding="utf-8")
+    (latest_artifact / "plugin.py").write_text(
+        source.replace("version = '1.0.0'", "version = '2.0.0'"),
+        encoding="utf-8",
+    )
+    stable_pointer = ArtifactPointer(".artifacts/1.0.0-aaaa")
+    latest_pointer = ArtifactPointer(".artifacts/2.0.0-bbbb")
+    write_pointers(plugin_base, stable=stable_pointer, latest=stable_pointer)
+    write_plugin_manifest(
+        {"installed_v3@lab": True},
+        plugins_home=tmp_path / "home",
+    )
+    manager = _manager(tmp_path)
+    await manager.load_all()
+    stable_snapshot = manager.current_snapshot
+
+    write_pointers(plugin_base, stable=stable_pointer, latest=latest_pointer)
+    assert (await manager.reconcile_changed())[0]["publication_state"] == "latest_ready"
+    candidate = manager.ready_candidate
+    assert candidate is not None and candidate.runtime_snapshot is not None
+    clone_name = next(
+        name
+        for name in sys.modules
+        if name.startswith(f"{candidate.module_path}__candidate_")
+    )
+    candidate_context = sys.modules[clone_name].saved_ctx
+    for index in range(1025):
+        candidate_context.report_incident("probe", f"failure {index}")
+
+    with pytest.raises(RuntimeError, match="incident_overflowed"):
+        await manager.switch_ready("installed_v3@lab")
+
+    assert manager.current_snapshot is stable_snapshot
+    assert manager.ready_candidate is candidate
+    dropped = await manager.drop_candidate("installed_v3@lab")
+    assert dropped["publication_state"] == "discarded"
+    assert clone_name not in sys.modules
+    await manager.terminate_all()
+
+
+@pytest.mark.asyncio
 async def test_installed_v3_owner_commit_failure_discards_production_root(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -752,8 +875,11 @@ async def test_v2_only_candidate_clones_stable_v3_root_and_data(
         "name = 'stable_v3'\n"
         "version = '1.0.0'\n"
         "applied = []\n"
+        "health = None\n"
         "async def apply(ctx, config):\n"
+        "    global health\n"
         "    applied.append(str(ctx.runtime.workspace))\n"
+        "    health = await ctx.health('worker', required=True)\n"
         "    Path(ctx.runtime.data_dir, 'composition-probe').write_text('ready')\n",
     )
     plugin_base = tmp_path / "home" / "cache" / "lab" / "legacy"
@@ -787,6 +913,8 @@ async def test_v2_only_candidate_clones_stable_v3_root_and_data(
     stable_root = stable_snapshot.composition_root
     assert stable_root is not None
     assert stable_v3.instance.module.applied == [str(tmp_path / "workspace")]
+    stable_v3.instance.module.health.degrade("stable worker unavailable")
+    assert stable_root.receipt().required_degraded == ("stable_v3:worker",)
 
     write_pointers(plugin_base, stable=stable_pointer, latest=latest_pointer)
     result = (await manager.reconcile_changed())[0]
@@ -848,6 +976,7 @@ async def test_v2_only_candidate_clones_stable_v3_root_and_data(
     assert promoted["publication_state"] == "promoted"
     assert manager.current_snapshot is not stable_snapshot
     assert manager.current_snapshot.composition_root is stable_root
+    assert stable_root.receipt().required_degraded == ("stable_v3:worker",)
     assert promoted_clone_modules.isdisjoint(sys.modules)
     assert not promoted_attempt_root.exists()
 

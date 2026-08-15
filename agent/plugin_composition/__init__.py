@@ -3,6 +3,7 @@ from agent.plugin_composition.context import (
     Context,
     Fiber,
     FiberHandle,
+    HealthHandle,
     Plugin,
 )
 from agent.plugin_composition.access import (
@@ -29,6 +30,8 @@ from agent.plugin_composition.model import (
     ExternalEffectObservation,
     FiberState,
     FiberView,
+    HealthView,
+    IncidentView,
     PluginRuntime,
     ServiceKey,
     TopologyFiberView,
@@ -53,6 +56,9 @@ __all__ = [
     "FiberHandle",
     "FiberState",
     "FiberView",
+    "HealthView",
+    "HealthHandle",
+    "IncidentView",
     "Plugin",
     "PluginDataAccess",
     "PluginRuntime",

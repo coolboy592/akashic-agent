@@ -30,6 +30,7 @@ def test_experiment_runs_full_candidate_promotion_in_isolated_workspace(
     evidence = json.loads(result_path.read_text(encoding="utf-8"))
     assert evidence["workspace"] == str(workspace)
     assert evidence["observed_signal"] == "first"
+    assert evidence["promoted_signal"] == "second"
     assert evidence["receipts"]["pending"]["ready"] is False
     assert evidence["receipts"]["ready"]["ready"] is True
     assert evidence["receipts"]["removed"]["ready"] is False

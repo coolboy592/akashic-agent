@@ -22,7 +22,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from pydantic import BaseModel, ValidationError
 
-from agent.plugin_composition import CompositionRoot, PluginRuntime
+from agent.plugin_composition import CompositionRoot, FiberState, PluginRuntime
 from agent.plugins.composable import ComposablePlugin
 
 from agent.plugins.manifest import (
@@ -1988,6 +1988,7 @@ class PluginManager:
                     if quiesced_snapshot is not None:
                         await self._snapshot_store.wait_for_no_leases(quiesced_snapshot)
                     await self._snapshot_store.wait_for_no_leases(ready.snapshot)
+                    self._snapshot_store.seal_candidate_validation(ready.snapshot)
                     runtime_restore_started = True
                     await self._restore_ready_runtime(ready)
                     generation = ready.candidate
@@ -2014,6 +2015,7 @@ class PluginManager:
             else:
                 try:
                     await self._snapshot_store.wait_for_no_leases(ready.snapshot)
+                    self._snapshot_store.seal_candidate_validation(ready.snapshot)
                     runtime_restore_started = True
                     await self._restore_ready_runtime(ready)
                     generation = ready.candidate
@@ -2024,8 +2026,6 @@ class PluginManager:
                     else:
                         await self._snapshot_store.resume(candidate_snapshot)
                     raise
-
-            self._snapshot_store.seal_candidate_validation(ready.snapshot)
 
             # 2. 先切可回滚的 Skill 投影，再提交持久 pointer；整个回调不跨 await。
             skill_links_switched = False
@@ -2173,7 +2173,12 @@ class PluginManager:
         if production_data_dir is None:
             raise RuntimeError("候选缺少 production plugin-data identity")
 
-        # 1. Stop isolated services after every validation lease has ended.
+        # 1. 隔离 Root 已封存，先停止其任务，再进入任何 formal await。
+        validation_root = ready.snapshot.composition_root
+        if validation_root is not None:
+            await validation_root.dispose()
+
+        # 2. Stop isolated services after every validation lease has ended.
         if generation.validation_managed_services:
             if self._candidate_service_stopper is None:
                 raise RuntimeError("候选 managed service 隔离宿主未绑定")
@@ -2186,7 +2191,7 @@ class PluginManager:
             assert self._candidate_service_stopper is not None
             await self._candidate_service_stopper(generation.generation_id)
 
-        # 2. Reconnect MCP with formal endpoint env, then refresh snapshot payload.
+        # 3. Reconnect MCP with formal endpoint env, then refresh snapshot payload.
         if generation.mcp_catalog is not None:
             await self._mcp_host.close(generation.generation_id)
             generation.mcp_catalog = None
@@ -2213,8 +2218,10 @@ class PluginManager:
                 "production_mcp_catalog",
                 lambda: self._mcp_host.close(generation.generation_id),
             )
-        previous_root = ready.snapshot.composition_root
-        replacement = await self._compile_generation_snapshot(generation)
+        replacement = await self._compile_generation_snapshot(
+            generation,
+            allow_unready_stable_composition=True,
+        )
         if replacement.snapshot_id != ready.snapshot.snapshot_id:
             await self._dispose_unreferenced_composition_root(replacement)
             raise RuntimeError(
@@ -2222,8 +2229,6 @@ class PluginManager:
                 f"{ready.snapshot.snapshot_id} -> {replacement.snapshot_id}"
             )
         _replace_snapshot_payload(ready.snapshot, replacement)
-        if previous_root is not None and previous_root is not ready.snapshot.composition_root:
-            await previous_root.dispose()
         validation_workspace = generation.validation_workspace
         if validation_workspace is not None:
             _remove_validation_data_dir(validation_workspace.parent)
@@ -2681,6 +2686,7 @@ class PluginManager:
 
         if not stage_latest:
             try:
+                self._snapshot_store.seal_pending_validation(snapshot)
                 _ = await self._restore_direct_candidate_runtime(
                     generation,
                     validation_snapshot=snapshot,
@@ -2877,7 +2883,13 @@ class PluginManager:
     ) -> RuntimeSnapshot:
         """直接发布前用正式 runtime 重建并关闭 candidate Root。"""
 
-        production_snapshot = await self._compile_generation_snapshot(generation)
+        previous_root = validation_snapshot.composition_root
+        if previous_root is not None:
+            await previous_root.dispose()
+        production_snapshot = await self._compile_generation_snapshot(
+            generation,
+            allow_unready_stable_composition=True,
+        )
         if production_snapshot.snapshot_id != validation_snapshot.snapshot_id:
             await self._dispose_unreferenced_composition_root(production_snapshot)
             raise RuntimeError(
@@ -2887,16 +2899,10 @@ class PluginManager:
             )
         validation_event_handlers = validation_snapshot.event_handlers
         validation_dashboard_bindings = validation_snapshot.dashboard_bindings
-        previous_root = validation_snapshot.composition_root
         _replace_snapshot_payload(validation_snapshot, production_snapshot)
         validation_snapshot.event_handlers = validation_event_handlers
         validation_snapshot.dashboard_bindings = validation_dashboard_bindings
         generation.runtime_snapshot = validation_snapshot
-        if (
-            previous_root is not None
-            and previous_root is not validation_snapshot.composition_root
-        ):
-            await previous_root.dispose()
         validation_workspace = generation.validation_workspace
         if validation_workspace is not None:
             _remove_validation_data_dir(validation_workspace.parent)
@@ -3983,6 +3989,7 @@ class PluginManager:
         *,
         allow_pending_composition: bool = False,
         candidate_owner: PluginGeneration | None = None,
+        allow_unready_stable_composition: bool = False,
     ) -> RuntimeSnapshot:
         generations = dict(self._active_generations)
         generations[generation.plugin_id] = generation
@@ -3992,12 +3999,25 @@ class PluginManager:
             candidate_owner=candidate_owner,
         )
         try:
+            current = self.current_snapshot
+            # V2_REMOVAL: legacy-only candidate 消失后删除 stable Root Health 豁免。
+            reuses_stable_root = (
+                allow_unready_stable_composition
+                and candidate_owner is None
+                and current is not None
+                and composition_root is current.composition_root
+            )
             snapshot = self._snapshot_compiler.compile(
                 generations,
                 catalog_generation=generation,
                 workspace_mcp_generation=self._active_workspace_mcp,
                 composition_root=composition_root,
+                require_composition_ready=not reuses_stable_root,
             )
+            if reuses_stable_root and composition_root is not None:
+                snapshot.composition_health_exempt_root_token = (
+                    composition_root.instance_token
+                )
             snapshot.tool_registry = self._compile_snapshot_tools(
                 generations,
                 self._active_workspace_mcp,
@@ -4064,7 +4084,8 @@ class PluginManager:
             f"{item.plugin_id}:{item.generation_id}" for item in ordered
         )
         root = CompositionRoot(
-            "plugins:" + hashlib.sha256(identity.encode()).hexdigest()[:16]
+            "plugins:" + hashlib.sha256(identity.encode()).hexdigest()[:16],
+            candidate_incident_limit=(1024 if candidate_owner is not None else None),
         )
         try:
             if candidate_owner is None:
@@ -4091,7 +4112,13 @@ class PluginManager:
                 if (
                     allow_pending
                     and receipt.required_pending
-                    and not receipt.errors
+                    and all(
+                        fiber.state == FiberState.PENDING
+                        for fiber in receipt.fibers
+                        if fiber.name in receipt.required_pending
+                    )
+                    and not receipt.required_degraded
+                    and not receipt.incident_overflowed
                     and not receipt.external_effects
                 ):
                     self._composition_pending = missing_services
@@ -4101,7 +4128,9 @@ class PluginManager:
                     "v3 插件组合拓扑未就绪: "
                     f"required_pending={receipt.required_pending}, "
                     f"missing_services={missing_services}, "
-                    f"errors={receipt.errors}, "
+                    f"required_degraded={receipt.required_degraded}, "
+                    f"incidents={receipt.incidents}, "
+                    f"incident_overflowed={receipt.incident_overflowed}, "
                     f"external_effects={receipt.external_effects}"
                 )
             self._composition_pending = ()
@@ -5631,6 +5660,7 @@ def _replace_snapshot_payload(
         "event_handlers",
         "composition_root",
         "composition_topology",
+        "composition_health_exempt_root_token",
     ):
         setattr(target, name, getattr(source, name))
 

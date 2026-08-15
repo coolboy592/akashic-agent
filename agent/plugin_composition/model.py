@@ -43,6 +43,24 @@ class FiberView:
 
 
 @dataclass(frozen=True, slots=True)
+class HealthView:
+    owner: str
+    name: str
+    required: bool
+    healthy: bool
+    reason: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class IncidentView:
+    sequence: int
+    owner: str
+    kind: str
+    message: str
+    error_type: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class TopologyFiberView:
     name: str
     required_for_readiness: bool
@@ -95,6 +113,10 @@ class CompositionReceipt:
     effects: tuple[str, ...]
     required_pending: tuple[str, ...]
     optional_pending: tuple[str, ...]
-    errors: tuple[str, ...]
+    health: tuple[HealthView, ...]
+    required_degraded: tuple[str, ...]
+    incidents: tuple[IncidentView, ...]
+    incident_sequence: int
+    incident_overflowed: bool
     writes: tuple[WriteObservation, ...]
     external_effects: tuple[ExternalEffectObservation, ...]
