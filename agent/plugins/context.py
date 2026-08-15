@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeVar, cast
 
-from infra.persistence.json_store import atomic_save_json, load_json
+from infra.persistence.json_store import atomic_save_json, atomic_write_text, load_json
 
 T = TypeVar("T")
 _CLEANUP_WRITER_ID: ContextVar[str] = ContextVar(
@@ -162,6 +162,10 @@ class PreparedPluginKVStore(PluginKVStore):
             writer_id=writer_id,
         )
         self._prepared_data = super()._read()
+        try:
+            self._original_text = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            self._original_text = None
         self._is_committed = False
         self._is_dirty = False
 
@@ -195,3 +199,18 @@ class PreparedPluginKVStore(PluginKVStore):
         if self._is_dirty:
             super()._write(self._prepared_data)
         self._is_committed = True
+
+    def rollback_commit(self) -> None:
+        """失败的 stable 启动批次按原始文本恢复 KV 文件。"""
+
+        if not self._is_committed or not self._is_dirty:
+            return
+        if self._original_text is None:
+            self._path.unlink(missing_ok=True)
+        else:
+            atomic_write_text(
+                self._path,
+                self._original_text,
+                domain=f"plugin_kv_rollback:{self._path}",
+            )
+        self._is_committed = False

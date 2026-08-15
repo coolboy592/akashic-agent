@@ -116,3 +116,4 @@ class PluginGeneration:
     production_contributions: PluginContributions | None = None
     validation_managed_services: dict[str, dict[str, Any]] = field(default_factory=dict)
     production_data_dir: Path | None = None
+    boot_created_data_dir: bool = False

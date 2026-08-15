@@ -901,16 +901,251 @@ class PluginManager:
             self._reload_journal.finish_recovery(action)
             self._write_startup_recovery_fact(action, committed=False)
 
-        # 3. stable 先恢复服务；latest 候选随后以新事务重新准备和验证。
-        for mod in stable_by_id.values():
-            _ = await self._load_one(mod)
-        if self._composition_pending:
-            raise RuntimeError(
-                "v3 插件缺少必需 Service: "
-                + ", ".join(self._composition_pending)
-            )
+        # 3. stable 在未发布事务中完整装配；latest 随后以新事务恢复。
+        if self._active_generations:
+            for mod in stable_by_id.values():
+                _ = await self._load_one(mod)
+        else:
+            await self._load_stable_batch(tuple(stable_by_id.values()))
         self._finish_committed_recovery(restore_committed)
         await self._restore_latest_candidates(restore_candidates, latest_by_id)
+
+    async def _load_stable_batch(
+        self,
+        mods: tuple[dict[str, str], ...],
+    ) -> None:
+        """暂存全部 stable 插件并发布一个完整运行时快照。"""
+
+        staged: list[PluginGeneration] = []
+        snapshot: RuntimeSnapshot | None = None
+        catalog_id: str | None = None
+        published_count = self._legacy_publication_counts()
+        try:
+            # 1. 只导入、校验并准备声明，不开放任何 stable snapshot。
+            for mod in mods:
+                generation = await self._load_one(mod, stage_stable=True)
+                if generation is not None:
+                    staged.append(generation)
+            if not staged:
+                return
+            snapshot, catalog_id = await self._compile_stable_batch_snapshot(staged)
+            for generation in staged:
+                generation.runtime_snapshot = snapshot
+
+            # 2. legacy v2 只作为待迁移参与者在事务内 prepare/activate；
+            #    v3 lifecycle 已由完整 CompositionRoot mount。
+            await self._activate_stable_batch(staged)
+
+            # 3. 全部准备成功后才登记 stable owner，并一次安装快照。
+            assert catalog_id is not None
+            await self._publish_stable_batch(staged, snapshot, catalog_id)
+        except BaseException as error:
+            # 4. 未发布事务失败时恢复所有进程内 owner，并反向释放资源。
+            _, cleanup_cancelled = await _complete_critical(
+                self._discard_stable_batch(
+                    staged,
+                    snapshot=snapshot,
+                    catalog_id=catalog_id,
+                    published_count=published_count,
+                )
+            )
+            if cleanup_cancelled:
+                raise asyncio.CancelledError
+            if isinstance(error, _StablePluginFailed):
+                await self._retry_stable_batch_without_failed(mods, error)
+                return
+            raise
+
+    async def _compile_stable_batch_snapshot(
+        self,
+        staged: list[PluginGeneration],
+    ) -> tuple[RuntimeSnapshot, str]:
+        """为 stable 启动批次编译一个完整的未发布快照。"""
+
+        try:
+            return await self._compile_topology_snapshot(
+                {item.plugin_id: item for item in staged}
+            )
+        except Exception as error:
+            if len(staged) == 1 and "missing_services=" not in str(error):
+                raise _StablePluginFailed(
+                    staged[0], "runtime_snapshot", error
+                ) from error
+            raise
+
+    async def _activate_stable_batch(
+        self,
+        staged: list[PluginGeneration],
+    ) -> None:
+        """准备 legacy 参与者，但不发布它们的注册项。"""
+
+        for generation in staged:
+            instance = cast(Any, generation.instance)
+            try:
+                await self._prepare_generation(generation)
+                instance.context.data_dir = generation.data_dir
+                instance.context.session_manager = self._session_manager
+                instance.context.memory_engine = self._memory_engine
+                instance.context.llm = self._llm
+                generation.state = "activating"
+                if not isinstance(instance, ComposablePlugin):
+                    instance.activate()
+            except Exception as error:
+                raise _StablePluginFailed(generation, "prepare", error) from error
+
+    async def _publish_stable_batch(
+        self,
+        staged: list[PluginGeneration],
+        snapshot: RuntimeSnapshot,
+        catalog_id: str,
+    ) -> None:
+        """登记全部 stable owner 并一次安装批次快照。"""
+
+        for generation in staged:
+            instance = cast(Any, generation.instance)
+            try:
+                self._register_tools(instance, generation.module_path, [])
+                self._bind_tool_hooks(instance, generation.module_path)
+                self._publish_contributions(generation.contributions)
+                self._channels.extend(generation.contributions.channels)
+                if generation.staged_event_bus is not None:
+                    generation.staged_event_bus.publish()
+                generation.minimum_resource_count = generation.scope.resource_count
+                self._scopes[generation.module_path] = generation.scope
+                self._loaded.add(generation.module_path)
+                generation.state = "active"
+                self._active_generations[generation.plugin_id] = generation
+                self._activate_published_generation(generation, None)
+            except Exception as error:
+                raise _StablePluginFailed(generation, "publish", error) from error
+        self._compile_snapshot_event_handlers(snapshot)
+        self._commit_stable_kv(staged)
+        self._snapshot_skill_catalogs[snapshot.snapshot_id] = catalog_id
+        await self._publish_committed_snapshot(snapshot)
+        for generation in staged:
+            generation.boot_created_data_dir = False
+            if generation.mcp_catalog is not None:
+                self._mcp_host.mark_active(generation.generation_id)
+            logger.info("插件已加载: %s", generation.plugin_id)
+
+    async def _discard_stable_batch(
+        self,
+        staged: list[PluginGeneration],
+        *,
+        snapshot: RuntimeSnapshot | None,
+        catalog_id: str | None,
+        published_count: tuple[int, ...],
+    ) -> None:
+        """释放只归属于未发布启动批次的全部资源。"""
+
+        self._restore_legacy_publication_counts(published_count)
+        if snapshot is not None:
+            _ = self._snapshot_skill_catalogs.pop(snapshot.snapshot_id, None)
+        for generation in reversed(staged):
+            _ = self._active_generations.pop(generation.plugin_id, None)
+            generation.runtime_snapshot = None
+            await self._dispose_generation(generation, state="discarded")
+            if generation.boot_created_data_dir:
+                _remove_validation_data_dir(generation.data_dir)
+                generation.boot_created_data_dir = False
+        self._rollback_stable_kv(staged)
+        if snapshot is not None and snapshot.composition_root is not None:
+            await snapshot.composition_root.dispose()
+        if catalog_id is not None:
+            self._skill_host.close(catalog_id)
+
+    async def _retry_stable_batch_without_failed(
+        self,
+        mods: tuple[dict[str, str], ...],
+        failure: _StablePluginFailed,
+    ) -> None:
+        """记录被拒绝的 stable 参与者并重建剩余批次。"""
+
+        generation = failure.generation
+        self._record_failed_gate(
+            plugin_id=generation.plugin_id,
+            revision=generation.source_revision,
+            check_id=failure.phase,
+            reason=str(failure.cause) or type(failure.cause).__name__,
+        )
+        logger.warning(
+            "插件 %s 加载失败，回滚整个未发布批次: %s",
+            generation.plugin_id,
+            failure.cause,
+        )
+        remaining = tuple(
+            mod for mod in mods if _resolve_plugin_id(mod) != generation.plugin_id
+        )
+        await self._load_stable_batch(remaining)
+
+    @staticmethod
+    def _commit_stable_kv(staged: list[PluginGeneration]) -> None:
+        """在快照安装前提交全部已准备的 v2 KV。"""
+
+        from agent.plugins.context import PreparedPluginKVStore
+
+        for generation in staged:
+            kv_store = cast(Any, generation.instance).context.kv_store
+            try:
+                if isinstance(kv_store, PreparedPluginKVStore):
+                    kv_store.commit()
+            except Exception as error:
+                raise _StablePluginFailed(generation, "publish", error) from error
+
+    @staticmethod
+    def _rollback_stable_kv(staged: list[PluginGeneration]) -> None:
+        """失败批次全部任务停止后恢复 v2 KV 文件。"""
+
+        from agent.plugins.context import PreparedPluginKVStore
+
+        for generation in reversed(staged):
+            kv_store = cast(Any, generation.instance).context.kv_store
+            if isinstance(kv_store, PreparedPluginKVStore):
+                kv_store.rollback_commit()
+
+    def _legacy_publication_counts(self) -> tuple[int, ...]:
+        """记录启动回滚可移除的 v2 发布尾部。"""
+
+        return (
+            len(self._tool_hooks),
+            len(self._before_turn_modules),
+            len(self._before_reasoning_modules),
+            len(self._prompt_render_modules),
+            len(self._before_step_modules),
+            len(self._after_step_modules),
+            len(self._after_reasoning_modules),
+            len(self._after_turn_modules),
+            len(self._proactive_modules),
+            len(self._proactive_lifecycles),
+            len(self._proactive_module_factories),
+            len(self._proactive_runtime_factories),
+            len(self._proactive_sources),
+            len(self._jobs),
+            len(self._channels),
+        )
+
+    def _restore_legacy_publication_counts(self, counts: tuple[int, ...]) -> None:
+        """只移除失败启动批次发布的 v2 兼容尾部。"""
+
+        collections = (
+            self._tool_hooks,
+            self._before_turn_modules,
+            self._before_reasoning_modules,
+            self._prompt_render_modules,
+            self._before_step_modules,
+            self._after_step_modules,
+            self._after_reasoning_modules,
+            self._after_turn_modules,
+            self._proactive_modules,
+            self._proactive_lifecycles,
+            self._proactive_module_factories,
+            self._proactive_runtime_factories,
+            self._proactive_sources,
+            self._jobs,
+            self._channels,
+        )
+        for collection, count in zip(collections, counts, strict=True):
+            del collection[count:]
 
     @staticmethod
     def _require_unique_recovery_plugins(
@@ -3043,6 +3278,7 @@ class PluginManager:
         mod: dict[str, str],
         *,
         activate: bool = True,
+        stage_stable: bool = False,
     ) -> PluginGeneration | None:
         stable_module_path = mod["import_path"]
         plugin_dir = Path(mod["plugin_root"])
@@ -3109,7 +3345,8 @@ class PluginManager:
             mod,
             self._workspace,
         )
-        ensure_workspace_plugin_data_dir(data_dir, self._workspace)
+        if not stage_stable:
+            ensure_workspace_plugin_data_dir(data_dir, self._workspace)
         config_revision = _file_revision(data_dir / "config.local.toml")
         generation_id = (
             f"{initial_plugin_id}:{source_revision[:12]}:{generation_sequence}"
@@ -3266,6 +3503,9 @@ class PluginManager:
                         )
                     )
             self._cleanup_failures.extend(await scope.aclose())
+            if generation is not None and generation.boot_created_data_dir:
+                _remove_validation_data_dir(generation.data_dir)
+                generation.boot_created_data_dir = False
             self._remove_module_tree(mp)
             for tool_name in tool_names:
                 if self._tool_registry is not None:
@@ -3325,6 +3565,9 @@ class PluginManager:
                 state="prepared",
                 reload_tx_id=reload_tx_id,
             )
+            if stage_stable:
+                generation.boot_created_data_dir = not data_dir.exists()
+                ensure_workspace_plugin_data_dir(data_dir, self._workspace)
             catalog_generations = [
                 active_generation
                 for active_generation in self._active_generations.values()
@@ -3559,6 +3802,8 @@ class PluginManager:
                     generation.minimum_resource_count = scope.resource_count
                     self._prepared_generations[plugin_id] = generation
                     return generation
+            if stage_stable:
+                return generation
             generation.runtime_snapshot = await self._compile_generation_snapshot(
                 generation,
                 allow_pending_composition=True,
@@ -3742,27 +3987,29 @@ class PluginManager:
                 )
             receipt = root.receipt()
             if not receipt.ready:
+                missing_services = tuple(
+                    sorted(
+                        {
+                            service
+                            for fiber in receipt.fibers
+                            if fiber.name in receipt.required_pending
+                            for service in fiber.missing_services
+                        }
+                    )
+                )
                 if (
                     allow_pending
                     and receipt.required_pending
                     and not receipt.errors
                     and not receipt.external_effects
                 ):
-                    self._composition_pending = tuple(
-                        sorted(
-                            {
-                                service
-                                for fiber in receipt.fibers
-                                if fiber.name in receipt.required_pending
-                                for service in fiber.missing_services
-                            }
-                        )
-                    )
+                    self._composition_pending = missing_services
                     await root.dispose()
                     return None, False
                 raise RuntimeError(
                     "v3 插件组合拓扑未就绪: "
                     f"required_pending={receipt.required_pending}, "
+                    f"missing_services={missing_services}, "
                     f"errors={receipt.errors}, "
                     f"external_effects={receipt.external_effects}"
                 )
@@ -4509,6 +4756,21 @@ class _CandidateRejected(Exception):
     def __init__(self, gate: GateResult) -> None:
         super().__init__(gate.failure_reason)
         self.gate = gate
+
+
+class _StablePluginFailed(Exception):
+    """标识一个可以排除后重试的 legacy stable 参与者。"""
+
+    def __init__(
+        self,
+        generation: PluginGeneration,
+        phase: str,
+        cause: Exception,
+    ) -> None:
+        super().__init__(str(cause))
+        self.generation = generation
+        self.phase = phase
+        self.cause = cause
 
 
 def _gate_failure_details(gate: GateResult) -> str:
