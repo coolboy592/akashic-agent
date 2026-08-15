@@ -89,4 +89,5 @@ def test_ci_fetches_protocol_source_history() -> None:
         1,
     )[0]
 
+    assert "  workflow_dispatch:\n" in workflow
     assert "fetch-depth: 0" in job
