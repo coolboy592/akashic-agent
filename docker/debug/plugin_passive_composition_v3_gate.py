@@ -49,7 +49,7 @@ DEFAULT_REPORT = (
 COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}")
 GATE_VERSION = 1
 PROTOCOL_SOURCE_REPOSITORY = "https://github.com/kachofugetsu09/akashic-agent.git"
-PROTOCOL_SOURCE_COMMIT = "a047470a39d4f7d2e6be1d2a8e2824916d52fad1"
+PROTOCOL_SOURCE_COMMIT = "dbbd82b56fe39cc37d3c866048605bf82e3755b0"
 PROTOCOL_SOURCE_PATHS = (
     "agent/lifecycle/composition.py",
     "agent/lifecycle/types.py",

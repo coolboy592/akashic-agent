@@ -66,7 +66,7 @@ def test_gate_freezes_listener_order_and_scenario_digest() -> None:
 
 def test_gate_pins_protocol_source_and_version() -> None:
     assert gate.GATE_VERSION == 1
-    assert gate.PROTOCOL_SOURCE_COMMIT == ("a047470a39d4f7d2e6be1d2a8e2824916d52fad1")
+    assert gate.PROTOCOL_SOURCE_COMMIT == ("dbbd82b56fe39cc37d3c866048605bf82e3755b0")
     evidence = gate._protocol_source_evidence()
     assert evidence["commit"] == gate.PROTOCOL_SOURCE_COMMIT
     assert [item["path"] for item in evidence["files"]] == list(
