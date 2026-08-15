@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -71,6 +72,29 @@ def test_message_oracle_requires_citation_and_meme_persistence() -> None:
     assistant[1]["cited_memory_ids"] = []
     with pytest.raises(gate.GateFailure, match="citation metadata"):
         gate._assert_messages(payload, session_id)  # pyright: ignore[reportPrivateUsage]
+
+
+def test_final_frame_must_belong_to_created_session() -> None:
+    class WebSocket:
+        def recv(self, *, timeout: float) -> str:
+            _ = timeout
+            return json.dumps(
+                {
+                    "type": "message.final",
+                    "session_id": "web:other",
+                    "content": "答复正文",
+                    "media": ["/sandbox/workspace/memes/shy/001.png"],
+                }
+            )
+
+    frames: list[dict[str, object]] = []
+    with pytest.raises(gate.GateFailure, match="final session"):
+        gate._receive_final(  # pyright: ignore[reportPrivateUsage]
+            WebSocket(),
+            frames,
+            "web:expected",
+        )
+    assert frames[0]["session_id"] == "web:other"
 
 
 def test_webui_only_config_rejects_another_enabled_channel() -> None:

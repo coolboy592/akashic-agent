@@ -281,7 +281,7 @@ def _run_inside() -> dict[str, object]:
                 ensure_ascii=False,
             )
         )
-        final = _receive_final(websocket, frames)
+        final = _receive_final(websocket, frames, session_id)
 
     # 3. Read the same committed facts through public HTTP surfaces.
     encoded_session = quote(session_id, safe="")
@@ -431,7 +431,9 @@ def _assert_capabilities(payload: dict[str, object]) -> None:
 
 
 def _receive_final(
-    websocket: Any, frames: list[dict[str, object]]
+    websocket: Any,
+    frames: list[dict[str, object]],
+    expected_session_id: str,
 ) -> dict[str, object]:
     deadline = time.monotonic() + SCENARIO_TIMEOUT_S
     while time.monotonic() < deadline:
@@ -442,6 +444,8 @@ def _receive_final(
         frames.append(frame)
         if frame.get("type") != "message.final":
             continue
+        if frame.get("session_id") != expected_session_id:
+            raise GateFailure(f"WebUI final session 错误: {frame}")
         if frame.get("content") != "答复正文":
             raise GateFailure(f"WebUI final 正文错误: {frame}")
         media = frame.get("media")
