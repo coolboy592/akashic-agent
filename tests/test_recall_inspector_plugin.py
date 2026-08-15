@@ -22,7 +22,7 @@ from agent.plugins.manifest import write_plugin_manifest
 from agent.plugins.registry import plugin_registry
 from agent.plugins.snapshot import bind_runtime_snapshot, reset_runtime_snapshot
 from agent.tool_hooks.executor import ToolExecutor
-from agent.tool_hooks.types import ToolExecutionRequest, ToolExecutionResult
+from agent.tool_hooks.types import ToolExecutionRequest, ToolExecutionResult, ToolSource
 from agent.tools.events import ToolResult
 from bus.event_bus import EventBus
 from plugins.default_memory.dashboard import RecallInspectorDashboardReader
@@ -128,7 +128,7 @@ async def test_recall_inspector_records_context_and_recall(tmp_path: Path) -> No
 @pytest.mark.asyncio
 async def test_recall_inspector_keeps_v2_passive_source_boundary(
     tmp_path: Path,
-    source: str,
+    source: ToolSource,
 ) -> None:
     data_path = tmp_path / "recall_inspector.jsonl"
     inspector = DefaultMemoryInspector(data_path)

@@ -161,11 +161,15 @@ async def test_parallel_sync_cancellation_drops_queued_task() -> None:
         _ = release.wait(timeout=2)
         return "running"
 
+    def queued() -> str:
+        queued_ran.set()
+        return "queued"
+
     call = asyncio.create_task(
         executor.parallel_sync(
             (
                 SyncTask("running", running),
-                SyncTask("queued", lambda: queued_ran.set()),
+                SyncTask("queued", queued),
             )
         )
     )

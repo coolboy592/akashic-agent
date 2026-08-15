@@ -1788,7 +1788,7 @@ async def test_session_manager_adopts_pending_rows_before_post_commit_cancel(
 ) -> None:
     manager = SessionManager(tmp_path / "workspace")
     session = manager.get_or_create("telegram:commit-cancel")
-    pending = [
+    pending: list[dict[str, object]] = [
         {"role": "user", "content": "hello"},
         {"role": "assistant", "content": "reply"},
     ]
