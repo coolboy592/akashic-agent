@@ -1,4 +1,10 @@
-from agent.plugin_composition.context import CompositionRoot, Context, Fiber, Plugin
+from agent.plugin_composition.context import (
+    CompositionRoot,
+    Context,
+    Fiber,
+    FiberHandle,
+    Plugin,
+)
 from agent.plugin_composition.access import (
     CompositionAudit,
     ExternalEffectGate,
@@ -44,6 +50,7 @@ __all__ = [
     "EXECUTOR_SERVICE",
     "ExecutorService",
     "Fiber",
+    "FiberHandle",
     "FiberState",
     "FiberView",
     "Plugin",

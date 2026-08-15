@@ -58,11 +58,12 @@ class Context:
     def __init__(self, root: CompositionRoot, fiber: Fiber) -> None:
         self._root = root
         self._fiber = fiber
+        self._fiber_handle = FiberHandle(fiber)
 
     @property
-    def fiber(self) -> Fiber:
+    def fiber(self) -> FiberHandle:
         reject_executor_context_access()
-        return self._fiber
+        return self._fiber_handle
 
     @property
     def generation_id(self) -> str:
@@ -89,9 +90,9 @@ class Context:
         name: str | None = None,
         inject: Iterable[ServiceKey[object]] | None = None,
         required_for_readiness: bool = True,
-    ) -> Fiber:
+    ) -> FiberHandle:
         reject_executor_context_access()
-        return await self._root._mount(
+        fiber = await self._root._mount(
             parent=self._fiber,
             plugin=plugin,
             name=name,
@@ -99,6 +100,7 @@ class Context:
             required_for_readiness=required_for_readiness,
             runtime=self._fiber.runtime,
         )
+        return FiberHandle(fiber)
 
     async def inject(
         self,
@@ -106,7 +108,7 @@ class Context:
         apply: PluginApply,
         *,
         name: str | None = None,
-    ) -> Fiber:
+    ) -> FiberHandle:
         """Mount an optional child that activates only while deps exist."""
 
         reject_executor_context_access()
@@ -228,6 +230,33 @@ class Context:
         _ = await self.effect(setup, label=f"task:{name}")
         assert task is not None
         return task
+
+
+class FiberHandle:
+    """暴露生命周期控制，但不暴露 Core-owned 可变集合。"""
+
+    __slots__ = ("_fiber",)
+
+    def __init__(self, fiber: Fiber) -> None:
+        self._fiber = fiber
+
+    @property
+    def fiber_id(self) -> int:
+        return self._fiber.fiber_id
+
+    @property
+    def name(self) -> str:
+        return self._fiber.name
+
+    @property
+    def state(self) -> FiberState:
+        return self._fiber.state
+
+    async def restart(self) -> None:
+        await self._fiber.restart()
+
+    async def dispose(self) -> None:
+        await self._fiber.dispose()
 
 
 class Fiber:
@@ -469,6 +498,7 @@ class CompositionRoot:
         self.generation_id = generation_id
         self._next_fiber_id = 1
         self._next_provider_revision = 1
+        self._composition_revision = 0
         self._fibers: dict[int, Fiber] = {}
         self._providers: dict[ServiceKey[object], _Provider] = {}
         self._mount_observers: list[FiberObserver] = []
@@ -476,7 +506,7 @@ class CompositionRoot:
         self._dispose_observers: list[FiberObserver] = []
         self._errors: list[str] = []
         self._audit = audit or CompositionAudit()
-        self._events = EventRegistry()
+        self._events = EventRegistry(self._bump_composition_revision)
         self._internal_cleanups: list[tuple[str, Callable[[], object]]] = []
         self._dispose_task: asyncio.Task[None] | None = None
         self.root_fiber = Fiber(
@@ -604,14 +634,13 @@ class CompositionRoot:
     def topology_view(self) -> TopologyView:
         """Freeze the current logical topology as a content-addressed value."""
 
-        # 1. Exclude transient Fiber ids and error receipts from topology identity.
+        # 1. 结构身份排除 Fiber 状态、错误和普通 Effect。
         receipt = self.receipt()
         fibers = tuple(
             sorted(
                 (
                     TopologyFiberView(
                         name=fiber.name,
-                        state=fiber.state,
                         required_for_readiness=fiber.required_for_readiness,
                         dependencies=tuple(
                             sorted(key.name for key in fiber.dependencies)
@@ -625,20 +654,17 @@ class CompositionRoot:
         effects = tuple(sorted(receipt.effects))
         listeners = self._events.registrations()
 
-        # 2. The hash is the revision identity; no durable counter is introduced.
-        identity_payload = {
-            "generation": self.generation_id,
+        # 2. 内容 hash 与单调 revision 分别回答“是什么”和“是否变过”。
+        identity_payload: dict[str, object] = {
             "fibers": [
                 {
                     "name": fiber.name,
-                    "state": fiber.state.value,
                     "required": fiber.required_for_readiness,
                     "dependencies": fiber.dependencies,
                 }
                 for fiber in fibers
             ],
             "services": receipt.services,
-            "effects": effects,
             "listeners": listeners,
         }
         encoded = json.dumps(
@@ -651,6 +677,7 @@ class CompositionRoot:
         return TopologyView(
             generation_id=self.generation_id,
             identity=identity,
+            composition_revision=self._composition_revision,
             fibers=fibers,
             services=receipt.services,
             effects=effects,
@@ -675,6 +702,7 @@ class CompositionRoot:
         return "|".join(
             (
                 self.topology_identity(),
+                f"revision:{self._composition_revision}",
                 f"required:{','.join(receipt.required_pending)}",
                 f"optional:{','.join(receipt.optional_pending)}",
                 f"errors:{','.join(receipt.errors)}",
@@ -726,6 +754,7 @@ class CompositionRoot:
         self._next_fiber_id += 1
         parent.children.append(fiber)
         self._fibers[fiber.fiber_id] = fiber
+        self._bump_composition_revision()
         try:
             await self._notify_mount(fiber)
         except BaseException:
@@ -784,6 +813,7 @@ class CompositionRoot:
             revision=self._next_provider_revision,
         )
         self._next_provider_revision += 1
+        self._bump_composition_revision()
 
     async def _remove_provider(
         self,
@@ -799,6 +829,7 @@ class CompositionRoot:
                 f"{owner.name} 不能移除 {provider.owner.name} 的 Service {key.name}",
             )
         del self._providers[key]
+        self._bump_composition_revision()
         await self._reconcile_dependents((key,), exclude=owner)
 
     def _active_provider(self, key: ServiceKey[object]) -> _Provider | None:
@@ -921,7 +952,15 @@ class CompositionRoot:
             self._record_error(fiber, error)
 
     def _remove_fiber(self, fiber: Fiber) -> None:
-        _ = self._fibers.pop(fiber.fiber_id, None)
+        if self._fibers.pop(fiber.fiber_id, None) is not None:
+            self._bump_composition_revision()
+
+    def _bump_composition_revision(self) -> None:
+        self._composition_revision += 1
+
+    @property
+    def composition_revision(self) -> int:
+        return self._composition_revision
 
     def _fiber_view(self, fiber: Fiber) -> FiberView:
         return FiberView(

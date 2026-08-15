@@ -593,6 +593,139 @@ async def test_snapshot_store_rejects_topology_drift_after_compile() -> None:
 
 
 @pytest.mark.asyncio
+async def test_topology_identity_excludes_mutable_state_and_generic_effects() -> None:
+    root = CompositionRoot("immutable-topology")
+    fiber = await root.mount(lambda _: None, name="optional")
+    compiled = root.topology_view()
+    compiled_snapshot = RuntimeSnapshotCompiler().compile(
+        {},
+        snapshot_revision="immutable-topology",
+        composition_root=root,
+    )
+
+    fiber.state = FiberState.PENDING
+    effect = await root.context.effect(lambda: None, label="diagnostic")
+    observed = root.topology_view()
+
+    assert observed.identity == compiled.identity
+    assert observed.composition_revision == compiled.composition_revision
+    assert observed.effects != compiled.effects
+
+    await effect.aclose()
+    fiber.state = FiberState.ACTIVE
+    assert root.topology_identity() == compiled.identity
+    assert root.composition_revision == compiled.composition_revision
+    rebuilt_snapshot = RuntimeSnapshotCompiler().compile(
+        {},
+        snapshot_revision="immutable-topology",
+        composition_root=root,
+    )
+    assert rebuilt_snapshot.snapshot_id == compiled_snapshot.snapshot_id
+    await root.dispose()
+
+
+@pytest.mark.asyncio
+async def test_plugin_fiber_handle_hides_core_owned_mutable_state() -> None:
+    root = CompositionRoot("fiber-handle")
+    handles: list[object] = []
+
+    async def apply(ctx) -> None:
+        handles.append(ctx.fiber)
+        handles.append(await ctx.mount(lambda _: None, name="child"))
+
+    await root.mount(apply, name="owner")
+
+    for handle in handles:
+        assert not hasattr(handle, "effects")
+        assert not hasattr(handle, "children")
+        assert not hasattr(handle, "dependencies")
+        with pytest.raises(AttributeError):
+            setattr(handle, "state", FiberState.DISPOSED)
+
+    await root.dispose()
+
+
+@pytest.mark.asyncio
+async def test_provider_restart_alone_invalidates_sealed_revision() -> None:
+    root = CompositionRoot("service-revision")
+    provider = await root.mount(GreetingProvider())
+    compiler = RuntimeSnapshotCompiler()
+    candidate = compiler.compile({}, composition_root=root)
+    compiled = candidate.composition_topology
+    assert compiled is not None
+    store = RuntimeSnapshotStore()
+    store.install(compiler.compile({}))
+    transaction = store.begin_publish(candidate)
+    await store.commit_latest(transaction)
+
+    await provider.restart()
+
+    restored = root.topology_view()
+    assert restored.identity == compiled.identity
+    assert restored.composition_revision == compiled.composition_revision + 2
+    store.pause_candidate_admission(candidate)
+    with pytest.raises(RuntimeError, match="发生过结构变化"):
+        store.seal_candidate_validation(candidate)
+    _ = await store.discard_latest(candidate)
+    await store.close()
+    await root.dispose()
+
+
+@pytest.mark.asyncio
+async def test_fiber_replace_alone_invalidates_sealed_revision() -> None:
+    root = CompositionRoot("fiber-revision")
+    fiber = await root.mount(lambda _: None, name="plain")
+    compiler = RuntimeSnapshotCompiler()
+    candidate = compiler.compile({}, composition_root=root)
+    compiled = candidate.composition_topology
+    assert compiled is not None
+    store = RuntimeSnapshotStore()
+    store.install(compiler.compile({}))
+    transaction = store.begin_publish(candidate)
+    await store.commit_latest(transaction)
+
+    await fiber.dispose()
+    _ = await root.mount(lambda _: None, name="plain")
+
+    restored = root.topology_view()
+    assert restored.identity == compiled.identity
+    assert restored.composition_revision == compiled.composition_revision + 2
+    store.pause_candidate_admission(candidate)
+    with pytest.raises(RuntimeError, match="发生过结构变化"):
+        store.seal_candidate_validation(candidate)
+    _ = await store.discard_latest(candidate)
+    await store.close()
+    await root.dispose()
+
+
+@pytest.mark.asyncio
+async def test_isomorphic_roots_ignore_generation_identity() -> None:
+    async def build(generation_id: str) -> CompositionRoot:
+        root = CompositionRoot(generation_id)
+        _ = await root.mount(lambda _: None, name="same-plugin")
+        return root
+
+    first = await build("candidate-generation")
+    second = await build("production-generation")
+    compiler = RuntimeSnapshotCompiler()
+    first_snapshot = compiler.compile(
+        {},
+        snapshot_revision="same-input",
+        composition_root=first,
+    )
+    second_snapshot = compiler.compile(
+        {},
+        snapshot_revision="same-input",
+        composition_root=second,
+    )
+
+    assert first.topology_identity() == second.topology_identity()
+    assert first_snapshot.snapshot_id == second_snapshot.snapshot_id
+    await first.dispose()
+    await second.dispose()
+
+
+@pytest.mark.asyncio
 async def test_topology_view_identity_includes_declared_dependencies() -> None:
     async def build(dependency: ServiceKey[object]) -> str:
         root = CompositionRoot("dependency-view")
@@ -641,9 +774,18 @@ async def test_promotion_rechecks_candidate_topology_after_behavior_probe() -> N
         await store.promote_latest()
 
     _ = await root.mount(GreetingProvider())
-    store.seal_candidate_validation(candidate)
+    assert root.topology_identity() == candidate.composition_topology.identity  # type: ignore[union-attr]
+    with pytest.raises(RuntimeError, match="发生过结构变化"):
+        store.seal_candidate_validation(candidate)
+
+    _ = await store.discard_latest(candidate)
+    rebuilt = compiler.compile({}, composition_root=root)
+    transaction = store.begin_publish(rebuilt)
+    await store.commit_latest(transaction)
+    store.pause_candidate_admission(rebuilt)
+    store.seal_candidate_validation(rebuilt)
     _ = await store.promote_latest()
-    assert store.stable is candidate
+    assert store.stable is rebuilt
     await store.close()
     await root.dispose()
 

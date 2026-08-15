@@ -8,6 +8,7 @@ from agent.plugin_composition import (
     Bail,
     CompositionError,
     CompositionRoot,
+    Effect,
     EmitEventKey,
     FiberState,
     ParallelEventKey,
@@ -78,6 +79,28 @@ async def test_topology_view_exposes_ordered_listener_revision() -> None:
         "emit:notice:second",
     )
     assert len(view.identity) == 64
+
+
+@pytest.mark.asyncio
+async def test_listener_remove_and_restore_keeps_hash_but_advances_revision() -> None:
+    root = CompositionRoot("event-revision")
+    effects: list[Effect] = []
+
+    async def plugin(ctx) -> None:
+        effects.append(await ctx.on(NOTICE, lambda _: None))
+
+    fiber = await root.mount(plugin, name="listener")
+    compiled = root.topology_view()
+
+    await effects.pop().aclose()
+    removed = root.topology_view()
+    effects.append(await fiber.context.on(NOTICE, lambda _: None))
+    restored = root.topology_view()
+
+    assert removed.identity != compiled.identity
+    assert restored.identity == compiled.identity
+    assert restored.composition_revision == compiled.composition_revision + 2
+    await root.dispose()
 
 
 @pytest.mark.asyncio

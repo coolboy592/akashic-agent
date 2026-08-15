@@ -45,7 +45,6 @@ class FiberView:
 @dataclass(frozen=True, slots=True)
 class TopologyFiberView:
     name: str
-    state: FiberState
     required_for_readiness: bool
     dependencies: tuple[str, ...]
 
@@ -54,6 +53,7 @@ class TopologyFiberView:
 class TopologyView:
     generation_id: str
     identity: str
+    composition_revision: int
     fibers: tuple[TopologyFiberView, ...]
     services: tuple[str, ...]
     effects: tuple[str, ...]

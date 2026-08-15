@@ -62,9 +62,10 @@ class _Listener:
 class EventRegistry:
     """Own typed listeners and execute one frozen listener list per dispatch."""
 
-    def __init__(self) -> None:
+    def __init__(self, on_structure_changed: Callable[[], None]) -> None:
         self._listeners: dict[EventKey, list[_Listener]] = {}
         self._modes: dict[str, type[object]] = {}
+        self._on_structure_changed = on_structure_changed
 
     def register(
         self,
@@ -98,12 +99,14 @@ class EventRegistry:
         listener = _Listener(owner=owner, callback=callback)
         listeners = self._listeners.setdefault(key, [])
         listeners.append(listener)
+        self._on_structure_changed()
 
         def remove() -> None:
             current = self._listeners.get(key)
             if current is None or listener not in current:
                 return
             current.remove(listener)
+            self._on_structure_changed()
             if current:
                 return
             del self._listeners[key]

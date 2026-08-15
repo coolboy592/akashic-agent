@@ -922,6 +922,8 @@ class RuntimeSnapshotStore:
             )
         if root.topology_identity() != topology.identity:
             raise RuntimeError("RuntimeSnapshot 插件组合拓扑在编译后发生变化")
+        if root.composition_revision != topology.composition_revision:
+            raise RuntimeError("RuntimeSnapshot 插件组合拓扑在编译后发生过结构变化")
         if require_validation:
             if snapshot.composition_validation_identity is None:
                 raise RuntimeError("RuntimeSnapshot 插件组合候选缺少 Core 验证回执")
