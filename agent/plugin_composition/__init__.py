@@ -8,9 +8,6 @@ from agent.plugin_composition.context import (
 )
 from agent.plugin_composition.access import (
     CompositionAudit,
-    ExternalEffectGate,
-    PluginDataAccess,
-    ScopedPluginData,
 )
 from agent.plugin_composition.effect import Effect
 from agent.plugin_composition.events import (
@@ -50,7 +47,6 @@ __all__ = [
     "Bail",
     "EmitEventKey",
     "Effect",
-    "ExternalEffectGate",
     "ExternalEffectObservation",
     "EXECUTOR_SERVICE",
     "ExecutorService",
@@ -63,10 +59,8 @@ __all__ = [
     "IncidentView",
     "ObserveEventKey",
     "Plugin",
-    "PluginDataAccess",
     "PluginRuntime",
     "ParallelEventKey",
-    "ScopedPluginData",
     "ServiceKey",
     "SerialEventKey",
     "SyncTask",

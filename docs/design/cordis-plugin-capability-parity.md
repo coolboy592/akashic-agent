@@ -27,7 +27,7 @@ Akashic 可以采用 Cordis 的 service、typed event、effect、fiber 和配置
 
 第一阶段转译 Cordis 的 Context、Service、Inject、Fiber 与 Effect，并让 Root/Fiber 直接拥有 scope 生命周期；它吸收 DeepSeek Harness 对重入卸载、owner 先登记、UNLOADING 禁止新 Effect、child 先归属后发布、epoch 防陈旧激活和 observer 隔离的加固。它不移植独立 service isolation scope、Loader、Include、HMR、Timer、Logger、Schemastery 或 CosmoKit：Akashic 已有 artifact、安装、generation、热重载和晋升 owner；Timer 与 Logger 可以像 Job 一样成为普通 Service；配置继续使用 Python 类型和现有 Pydantic 边界。
 
-实现后的 publication seam 在候选 lease 排空后由 Core 封存拓扑、写集和外部效果回执；晋升前再次复核。Service 实例本身仍可承载运行时可变状态，不能为了消除 TOCTOU 而把 Cordis 的动态服务错误冻结成序列化值。任何被 `ExternalEffectGate` 拒绝的尝试即使被插件捕获，也会令候选不再 ready。
+实现后的 publication seam 在候选 lease 排空后由 Core 封存拓扑、当前 Health、Incident 上界和已接入 capability boundary 的观察回执；晋升前再次复核。任意 plugin-data 写入不要求经过万能 writer，而是由 Core 分配 candidate/formal 不同的数据根并在封存后停止候选 Root。插件自有外部 client 也不经过通用 `ExternalEffectGate`；每个插件通过自己的 fake/controlled seam 产出行为等价证据。Service 实例本身仍可承载运行时可变状态，不能为了消除 TOCTOU 而把 Cordis 的动态服务错误冻结成序列化值。
 
 因此本文后续出现的“Cordis 候选”表示采用上述组合语义的 Python 候选拓扑，不表示逐包、逐 API 或 TypeScript ABI 完整兼容。能力等价仍以可观察行为为准。
 

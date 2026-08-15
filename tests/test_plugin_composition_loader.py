@@ -457,7 +457,7 @@ async def test_direct_v3_invariant_failure_never_applies_to_formal_data(
         "name = 'isolated_reload'\n"
         "version = '2.0.0'\n"
         "async def apply(ctx, config):\n"
-        "    Path(ctx.runtime.data_dir, 'apply-probe').write_text('candidate')\n",
+        "    Path(ctx.data_root, 'apply-probe').write_text('candidate')\n",
         encoding="utf-8",
     )
     candidate = await manager.prepare_candidate("isolated_reload")
@@ -880,7 +880,7 @@ async def test_v2_only_candidate_clones_stable_v3_root_and_data(
         "    global health\n"
         "    applied.append(str(ctx.runtime.workspace))\n"
         "    health = await ctx.health('worker', required=True)\n"
-        "    Path(ctx.runtime.data_dir, 'composition-probe').write_text('ready')\n",
+        "    Path(ctx.data_root, 'composition-probe').write_text('ready')\n",
     )
     plugin_base = tmp_path / "home" / "cache" / "lab" / "legacy"
     stable_artifact = plugin_base / ".artifacts" / "1.0.0-aaaa"

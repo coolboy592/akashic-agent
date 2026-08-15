@@ -38,9 +38,13 @@ def test_experiment_runs_full_candidate_promotion_in_isolated_workspace(
     assert evidence["receipts"]["promoted"]["ready"] is True
     assert evidence["receipts"]["disposed"]["ready"] is False
     assert evidence["receipts"]["restored"]["external_effects"] == []
-    assert [
-        item["operation"] for item in evidence["receipts"]["restored"]["writes"]
-    ] == ["create", "replace"]
+    assert evidence["receipts"]["restored"]["writes"] == []
+    state = json.loads(
+        (workspace / "plugin-data/probe-provider/state.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert state["value"] == "second"
 
 
 def test_experiment_refuses_an_existing_workspace(tmp_path: Path) -> None:

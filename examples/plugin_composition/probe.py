@@ -4,9 +4,8 @@ import json
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from agent.plugin_composition import Context, PluginDataAccess, ServiceKey
+from agent.plugin_composition import Context, ServiceKey
 
-PLUGIN_DATA = ServiceKey[PluginDataAccess]("core.plugin-data")
 PROBE_SIGNAL = ServiceKey["ProbeSignal"]("probe.signal")
 PROBE_FORMATTER = ServiceKey[Callable[[str], str]]("probe.formatter")
 
@@ -23,7 +22,7 @@ class ProbeTrace:
 
 class ProbeProvider:
     name = "probe-provider"
-    inject = (PLUGIN_DATA,)
+    inject = ()
 
     def __init__(self, value: str, trace: ProbeTrace) -> None:
         self.value = value
@@ -32,16 +31,15 @@ class ProbeProvider:
     async def apply(self, ctx: Context) -> None:
         """Persist plugin-owned state and provide the probe signal."""
 
-        # 1. The plugin owns its JSON shape; Core owns only the scoped writer.
-        data = ctx.require(PLUGIN_DATA).for_plugin(self.name)
-        _ = data.write_text(
-            "state.json",
+        # 1. Core assigns the generation-scoped root; the plugin owns its schema.
+        _ = (ctx.data_root / "state.json").write_text(
             json.dumps(
                 {"generation": ctx.generation_id, "value": self.value},
                 ensure_ascii=False,
                 sort_keys=True,
             )
             + "\n",
+            encoding="utf-8",
         )
 
         # 2. Service and cleanup are both owned by this Fiber.

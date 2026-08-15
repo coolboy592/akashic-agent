@@ -10,6 +10,7 @@ from collections import deque
 from collections.abc import Awaitable, Callable, Coroutine, Iterable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, AsyncGenerator, Protocol, TypeVar, cast
 
 from agent.plugin_composition.effect import Effect, EffectSetup
@@ -96,6 +97,12 @@ class Context:
                 f"{self._fiber.name} 没有绑定插件运行环境",
             )
         return runtime
+
+    @property
+    def data_root(self) -> Path:
+        """返回 Core 为当前插件 generation 分配的数据根。"""
+
+        return self.runtime.data_dir
 
     async def mount(
         self,

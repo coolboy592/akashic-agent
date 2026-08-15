@@ -24,8 +24,9 @@ if TYPE_CHECKING:
     from agent.plugins.scope import Cleanup, PluginScope, ScopedEventBus
 
 
-# 插件兼容接口：现有插件直接读取这些字段并通过这里登记任务、进程和清理。
-# 核心重构可以改变内部装配方式，但迁移插件前不得删除字段或改变阶段权限。
+# V2_REMOVAL(plugin-context-api)：v2 插件直接读取这些字段并登记资源。
+# v3 loader 暂借此 DTO 保存 Core-private generation metadata；先迁出该 metadata，
+# 再随 v2 Manager 分支物理删除整个 DTO，不保留兼容壳。
 @dataclass
 class PluginContext:
     event_bus: "ScopedEventBus"

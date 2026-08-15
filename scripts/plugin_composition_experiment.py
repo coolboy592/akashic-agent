@@ -21,9 +21,7 @@ if str(SOURCE_ROOT) not in sys.path:
 from agent.plugin_composition import (  # noqa: E402
     CompositionAudit,
     CompositionRoot,
-    ExternalEffectGate,
-    PluginDataAccess,
-    ServiceKey,
+    PluginRuntime,
 )
 from agent.plugins.snapshot import (  # noqa: E402
     RuntimeSnapshot,
@@ -31,7 +29,6 @@ from agent.plugins.snapshot import (  # noqa: E402
     RuntimeSnapshotStore,
 )
 from examples.plugin_composition.probe import (  # noqa: E402
-    PLUGIN_DATA,
     PROBE_SIGNAL,
     ProbeConsumer,
     ProbeFormatterProvider,
@@ -39,8 +36,6 @@ from examples.plugin_composition.probe import (  # noqa: E402
     ProbeTrace,
 )
 from infra.persistence.json_store import atomic_write_text  # noqa: E402
-
-EXTERNAL_EFFECTS = ServiceKey[ExternalEffectGate]("core.external-effects")
 
 
 def _parse_args() -> argparse.Namespace:
@@ -101,7 +96,7 @@ async def _drain_snapshot(snapshot: RuntimeSnapshot) -> None:
 async def _run(workspace: Path) -> dict[str, object]:
     """Build, validate, promote, lease, and drain one candidate topology."""
 
-    # 1. Core establishes the run identity and protected access points.
+    # 1. Core establishes the run identity and generation-scoped data root.
     run_id = str(uuid.uuid4())
     runtime_dir = workspace / "runtime"
     runtime_dir.mkdir()
@@ -117,17 +112,24 @@ async def _run(workspace: Path) -> dict[str, object]:
     )
     audit = CompositionAudit()
     root = CompositionRoot(f"experiment:{run_id}", audit=audit)
-    _ = await root.context.provide(PLUGIN_DATA, PluginDataAccess(workspace, audit))
-    _ = await root.context.provide(
-        EXTERNAL_EFFECTS,
-        ExternalEffectGate(audit),
+    provider_data_root = workspace / "plugin-data" / "probe-provider"
+    provider_data_root.mkdir(parents=True)
+    provider_runtime = PluginRuntime(
+        plugin_id="probe-provider",
+        plugin_dir=SOURCE_ROOT / "examples" / "plugin_composition",
+        data_dir=provider_data_root,
+        workspace=workspace,
+        config=None,
     )
 
     # 2. New plugins prove required waiting and optional nested injection.
     trace = ProbeTrace()
     consumer = await root.mount(ProbeConsumer(trace))
     pending_receipt = root.receipt()
-    provider = await root.mount(ProbeProvider("first", trace))
+    provider = await root.mount(
+        ProbeProvider("first", trace),
+        runtime=provider_runtime,
+    )
     optional_receipt = root.receipt()
     _ = await root.mount(ProbeFormatterProvider())
     ready_receipt = root.receipt()
@@ -142,7 +144,10 @@ async def _run(workspace: Path) -> dict[str, object]:
     )
     await provider.dispose()
     removed_receipt = root.receipt()
-    _ = await root.mount(ProbeProvider("second", trace))
+    _ = await root.mount(
+        ProbeProvider("second", trace),
+        runtime=provider_runtime,
+    )
     restored_receipt = root.receipt()
     candidate = compiler.compile(
         {},

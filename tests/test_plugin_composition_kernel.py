@@ -6,16 +6,18 @@ from dataclasses import asdict
 
 import pytest
 
+import agent.plugin_composition as plugin_composition
+
 from agent.plugin_composition import (
     CompositionAudit,
     CompositionError,
     CompositionRoot,
-    ExternalEffectGate,
     FiberState,
     HealthHandle,
-    PluginDataAccess,
+    PluginRuntime,
     ServiceKey,
 )
+from agent.plugin_composition.access import ExternalEffectGate, PluginDataAccess
 from agent.plugins.snapshot import RuntimeSnapshotCompiler, RuntimeSnapshotStore
 from agent.plugins.manager import PluginManager
 
@@ -32,6 +34,47 @@ class GreetingProvider:
 
     async def apply(self, ctx) -> None:
         await ctx.provide(GREETING, self.value)
+
+
+def test_internal_access_helpers_are_not_v3_public_exports() -> None:
+    assert not hasattr(plugin_composition, "ExternalEffectGate")
+    assert not hasattr(plugin_composition, "PluginDataAccess")
+    assert not hasattr(plugin_composition, "ScopedPluginData")
+
+
+@pytest.mark.asyncio
+async def test_data_root_is_core_assigned_and_shared_by_nested_fibers(tmp_path) -> None:
+    data_root = tmp_path / "plugin-data" / "probe-builtin"
+    data_root.mkdir(parents=True)
+    runtime = PluginRuntime(
+        plugin_id="probe@builtin",
+        plugin_dir=tmp_path / "plugin",
+        data_dir=data_root,
+        workspace=tmp_path,
+        config=None,
+    )
+    observed = []
+
+    async def child(ctx) -> None:
+        observed.append(ctx.data_root)
+
+    async def parent(ctx) -> None:
+        observed.append(ctx.data_root)
+        _ = await ctx.mount(child, name="child")
+
+    root = CompositionRoot("data-root")
+    _ = await root.mount(parent, name="parent", runtime=runtime)
+
+    assert observed == [data_root, data_root]
+
+
+def test_data_root_requires_core_assigned_plugin_runtime() -> None:
+    root = CompositionRoot("missing-data-root")
+
+    with pytest.raises(CompositionError) as caught:
+        _ = root.context.data_root
+
+    assert caught.value.code == "PLUGIN_RUNTIME_UNAVAILABLE"
 
 
 @pytest.mark.asyncio
