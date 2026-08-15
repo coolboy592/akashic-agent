@@ -3,9 +3,9 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 from contextlib import asynccontextmanager
+import importlib.util
 import inspect
 from pathlib import Path, PureWindowsPath
-import importlib.util
 import logging
 import json
 import sqlite3
@@ -15,8 +15,10 @@ import os
 import shutil
 from types import ModuleType
 from typing import Any, Protocol, cast, runtime_checkable
+from uuid import uuid4
 
 import subprocess
+import hashlib
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Query
@@ -28,6 +30,7 @@ from agent.plugins.manifest import (
     load_plugin_manifest,
     plugins_root as resolve_plugins_root,
 )
+from agent.plugins.importer import FreshPluginImporter
 from agent.plugins.packages import enabled_plugin_packages
 from agent.plugins.source_resolver import resolve_plugin_sources
 from bootstrap.cleanup import run_cleanup_steps
@@ -46,6 +49,22 @@ from session.store import (
 logger = logging.getLogger(__name__)
 
 _DASHBOARD_ACCESS_PREFIXES = ("/api/dashboard", "/assets", "/plugins/")
+_PANEL_BUNDLE_SUFFIXES = {
+    ".cjs",
+    ".css",
+    ".js",
+    ".json",
+    ".jsx",
+    ".mjs",
+    ".ts",
+    ".tsx",
+}
+_PANEL_IDENTITY_IGNORED_DIRS = {
+    ".git",
+    ".pytest_cache",
+    ".venv",
+    "__pycache__",
+}
 
 
 def _dashboard_plugin_dirs(project_root: Path) -> dict[str, Path]:
@@ -54,10 +73,7 @@ def _dashboard_plugin_dirs(project_root: Path) -> dict[str, Path]:
     builtin_root = project_root / "plugins"
     if builtin_root.is_dir():
         for plugin_dir in sorted(builtin_root.iterdir()):
-            if (
-                not plugin_dir.is_dir()
-                or manifest.get(plugin_dir.name, True) is False
-            ):
+            if not plugin_dir.is_dir() or manifest.get(plugin_dir.name, True) is False:
                 continue
             result[plugin_dir.name] = plugin_dir
 
@@ -556,8 +572,24 @@ class ProactiveDashboardReader:
         return raw.strip()
 
 
-_pending_plugins: set[tuple[Path, Path]] = set()
-_pending_plugins_lock = threading.Lock()
+class _PluginPanelBuildQueue:
+    """Own deferred panel builds for exactly one Dashboard app lifecycle."""
+
+    def __init__(self) -> None:
+        self._pending: set[tuple[Path, Path, Path]] = set()
+        self._lock = threading.Lock()
+
+    def add(self, project_root: Path, plugin_dir: Path, output_dir: Path) -> None:
+        with self._lock:
+            self._pending.add((project_root, plugin_dir, output_dir))
+
+    def take_all(self) -> tuple[tuple[Path, Path, Path], ...]:
+        with self._lock:
+            pending = tuple(
+                sorted(self._pending, key=lambda item: tuple(map(str, item)))
+            )
+            self._pending.clear()
+        return pending
 
 
 def _esbuild_command(project_root: Path) -> list[str] | None:
@@ -577,19 +609,44 @@ def _esbuild_command(project_root: Path) -> list[str] | None:
     return None
 
 
-def _build_plugin_panels_js(project_root: Path, plugin_dir: Path) -> None:
+def _build_plugin_panels_js(
+    project_root: Path,
+    plugin_dir: Path,
+    output_dir: Path,
+    pending_builds: _PluginPanelBuildQueue,
+) -> dict[str, Path]:
+    """Resolve panel modules without writing into the plugin generation."""
+
+    # 1. Keep already-published JavaScript when it is not older than its source.
+    resolved = {
+        path.stem: path for path in sorted(plugin_dir.glob("dashboard_panel*.js"))
+    }
     esbuild_cmd: list[str] | None = None
     for ts_path in _iter_plugin_panel_sources(plugin_dir):
-        js_path = ts_path.with_suffix(".js")
-        if js_path.exists() and js_path.stat().st_mtime >= ts_path.stat().st_mtime:
+        published_js = ts_path.with_suffix(".js")
+        if (
+            published_js.exists()
+            and published_js.stat().st_mtime >= ts_path.stat().st_mtime
+        ):
+            resolved[ts_path.stem] = published_js
+            continue
+
+        # 2. Compile missing/stale modules into the Core-owned runtime cache.
+        resolved.pop(ts_path.stem, None)
+        js_path = output_dir / f"{ts_path.stem}.js"
+        if js_path.is_file():
+            resolved[ts_path.stem] = js_path
             continue
         if esbuild_cmd is None:
             esbuild_cmd = _esbuild_command(project_root)
         if esbuild_cmd is None:
-            with _pending_plugins_lock:
-                _pending_plugins.add((project_root, plugin_dir))
-            return
+            pending_builds.add(project_root, plugin_dir, output_dir)
+            continue
+        output_dir.mkdir(parents=True, exist_ok=True)
         _run_esbuild(esbuild_cmd, ts_path, js_path, f"{plugin_dir.name}/{ts_path.stem}")
+        if js_path.is_file():
+            resolved[ts_path.stem] = js_path
+    return resolved
 
 
 def _iter_plugin_panel_sources(plugin_dir: Path) -> list[Path]:
@@ -601,12 +658,13 @@ def _iter_plugin_panel_sources(plugin_dir: Path) -> list[Path]:
 
 
 def _run_esbuild(cmd: list[str], ts_path: Path, js_path: Path, name: str) -> None:
+    staging = js_path.with_name(f".{js_path.name}.{uuid4().hex}.tmp")
     try:
         result = subprocess.run(
             [
                 *cmd,
                 str(ts_path),
-                f"--outfile={js_path}",
+                f"--outfile={staging}",
                 "--bundle",
                 "--platform=browser",
                 "--target=es2020",
@@ -623,11 +681,14 @@ def _run_esbuild(cmd: list[str], ts_path: Path, js_path: Path, name: str) -> Non
             timeout=30,
         )
         if result.returncode == 0:
+            os.replace(staging, js_path)
             logger.info("插件面板已编译: %s", name)
         else:
             logger.warning("插件面板编译失败 (%s):\n%s", name, result.stderr)
     except Exception as exc:
         logger.warning("插件面板编译异常 (%s): %s", name, exc)
+    finally:
+        staging.unlink(missing_ok=True)
 
 
 def _resolve_plugin_dir(
@@ -656,14 +717,12 @@ def _validate_panel_name(panel_name: str, detail: str) -> None:
         raise HTTPException(status_code=400, detail="invalid plugin panel name")
 
 
-async def _compile_pending_plugins_async() -> None:
-    with _pending_plugins_lock:
-        if not _pending_plugins:
-            return
-        pending = tuple(
-            sorted(_pending_plugins, key=lambda item: (str(item[0]), str(item[1])))
-        )
-        _pending_plugins.clear()
+async def _compile_pending_plugins_async(
+    pending_builds: _PluginPanelBuildQueue,
+) -> None:
+    pending = pending_builds.take_all()
+    if not pending:
+        return
     first_root = pending[0][0]
 
     logger.info("正在安装前端构建工具 (npx esbuild)...")
@@ -678,7 +737,11 @@ async def _compile_pending_plugins_async() -> None:
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, stderr = await proc.communicate()
+    try:
+        stdout, stderr = await proc.communicate()
+    except asyncio.CancelledError:
+        await _finish_panel_compiler_termination(proc)
+        raise
     if proc.returncode != 0:
         logger.warning(
             "npx esbuild 不可用 (%d)，插件面板未编译:\n%s",
@@ -688,16 +751,134 @@ async def _compile_pending_plugins_async() -> None:
         return
     version = stdout.decode("utf-8", errors="replace").strip()
     logger.info("npx esbuild 就绪 (%s)，开始编译插件面板...", version)
-    for root, pdir in pending:
+    for root, pdir, output_dir in pending:
         for ts_path in _iter_plugin_panel_sources(pdir):
-            js_path = ts_path.with_suffix(".js")
-            if not (js_path.exists() and js_path.stat().st_mtime >= ts_path.stat().st_mtime):
-                _run_esbuild(esbuild_cmd, ts_path, js_path, f"{pdir.name}/{ts_path.stem}")
+            published_js = ts_path.with_suffix(".js")
+            if (
+                published_js.exists()
+                and published_js.stat().st_mtime >= ts_path.stat().st_mtime
+            ):
+                continue
+            js_path = output_dir / f"{ts_path.stem}.js"
+            if not js_path.is_file():
+                output_dir.mkdir(parents=True, exist_ok=True)
+                _run_esbuild(
+                    esbuild_cmd, ts_path, js_path, f"{pdir.name}/{ts_path.stem}"
+                )
 
 
-def _load_plugin_dashboard(app: FastAPI, plugin_dir: Path, workspace: Path) -> list[object]:
+async def _finish_panel_compiler_termination(
+    process: asyncio.subprocess.Process,
+) -> None:
+    """Finish child-process cleanup even if the caller is cancelled again."""
+
+    task = asyncio.create_task(_terminate_panel_compiler(process))
+    while not task.done():
+        try:
+            _ = await asyncio.shield(task)
+        except asyncio.CancelledError:
+            continue
+    await task
+
+
+async def _terminate_panel_compiler(
+    process: asyncio.subprocess.Process,
+    *,
+    timeout: float = 5,
+) -> None:
+    """Terminate the npx probe, then kill it if graceful shutdown times out."""
+
+    # 1. Ask a live child to exit and tolerate an exit racing the signal.
+    if process.returncode is None:
+        try:
+            process.terminate()
+        except ProcessLookupError:
+            pass
+
+    # 2. Bound graceful drain, then force a bounded final wait.
     try:
-        mod = _load_plugin_dashboard_module(plugin_dir)
+        _ = await asyncio.wait_for(process.wait(), timeout=timeout)
+    except TimeoutError:
+        if process.returncode is None:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+        _ = await asyncio.wait_for(process.wait(), timeout=timeout)
+
+
+def _plugin_panel_output_dir(
+    cache_root: Path,
+    plugin_id: str,
+    plugin_dir: Path,
+) -> Path:
+    digest = hashlib.sha256(f"{plugin_id}\0{plugin_dir.resolve(strict=False)}".encode())
+    for source in _iter_plugin_panel_identity_inputs(plugin_dir):
+        digest.update(b"\0")
+        digest.update(source.relative_to(plugin_dir).as_posix().encode())
+        digest.update(b"\0")
+        if source.is_symlink():
+            digest.update(b"symlink\0")
+            digest.update(os.readlink(source).encode())
+        else:
+            digest.update(source.read_bytes())
+    return cache_root / digest.hexdigest()
+
+
+def _iter_plugin_panel_identity_inputs(plugin_dir: Path) -> list[Path]:
+    """Return source types esbuild can consume while excluding runtime trees."""
+
+    return sorted(
+        source
+        for source in plugin_dir.rglob("*")
+        if not any(part in _PANEL_IDENTITY_IGNORED_DIRS for part in source.parts)
+        and source.suffix.lower() in _PANEL_BUNDLE_SUFFIXES
+        and (source.is_file() or source.is_symlink())
+    )
+
+
+def _plugin_panel_cache_root(workspace: Path) -> Path:
+    """Resolve the owned cache root and reject existing symlink traversal."""
+
+    root = workspace.resolve(strict=False)
+    current = root
+    for part in ("runtime", "dashboard-panels"):
+        current /= part
+        if current.is_symlink():
+            raise RuntimeError(
+                f"Dashboard panel cache 不能穿过符号链接: {current}"
+            )
+    return current
+
+
+def _reset_plugin_panel_cache(cache_root: Path, workspace: Path) -> None:
+    """Remove only the validated Dashboard-owned derived cache."""
+
+    if cache_root != _plugin_panel_cache_root(workspace):
+        raise RuntimeError(f"Dashboard panel cache 不属于当前 workspace: {cache_root}")
+    if cache_root.exists():
+        shutil.rmtree(cache_root)
+
+
+async def _close_plugin_panel_cache(cache_root: Path, workspace: Path) -> None:
+    _reset_plugin_panel_cache(cache_root, workspace)
+
+
+def _load_plugin_dashboard(
+    app: FastAPI,
+    plugin_dir: Path,
+    workspace: Path,
+    importer: FreshPluginImporter,
+    module_names: set[str],
+    import_namespace: str,
+) -> list[object]:
+    try:
+        mod = _load_plugin_dashboard_module(
+            plugin_dir,
+            importer,
+            module_names,
+            import_namespace,
+        )
         if hasattr(mod, "register"):
             result = mod.register(app, plugin_dir, workspace)
             logger.info("插件 dashboard 已挂载: %s", plugin_dir.name)
@@ -707,12 +888,23 @@ def _load_plugin_dashboard(app: FastAPI, plugin_dir: Path, workspace: Path) -> l
     return []
 
 
-def _plugin_dashboard_enabled(app: FastAPI, plugin_dir: Path) -> bool:
+def _plugin_dashboard_enabled(
+    app: FastAPI,
+    plugin_dir: Path,
+    importer: FreshPluginImporter,
+    module_names: set[str],
+    import_namespace: str,
+) -> bool:
     dash_path = plugin_dir / "dashboard.py"
     if not dash_path.exists():
         return False
     try:
-        mod = _load_plugin_dashboard_module(plugin_dir)
+        mod = _load_plugin_dashboard_module(
+            plugin_dir,
+            importer,
+            module_names,
+            import_namespace,
+        )
     except Exception as e:
         logger.warning("插件 dashboard 检查失败 (%s): %s", plugin_dir.name, e)
         return False
@@ -722,26 +914,45 @@ def _plugin_dashboard_enabled(app: FastAPI, plugin_dir: Path) -> bool:
     return bool(enabled(app))
 
 
-def _load_plugin_dashboard_module(plugin_dir: Path) -> ModuleType:
+def _load_plugin_dashboard_module(
+    plugin_dir: Path,
+    importer: FreshPluginImporter,
+    module_names: set[str],
+    import_namespace: str,
+) -> ModuleType:
     dash_path = plugin_dir / "dashboard.py"
-    module_name = _dashboard_module_name(plugin_dir)
-    spec = importlib.util.spec_from_file_location(
-        module_name,
-        dash_path,
-        submodule_search_locations=[str(plugin_dir)],
-    )
+    module_name = _dashboard_module_name(plugin_dir, import_namespace)
+    importer.register(module_name, plugin_dir)
+    module_names.add(module_name)
+    spec = importer.root_spec(module_name, dash_path)
     if spec is None or spec.loader is None:
+        importer.unregister(module_name)
+        module_names.discard(module_name)
         raise ImportError(f"cannot load {dash_path}")
     mod = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = mod
-    spec.loader.exec_module(mod)  # type: ignore[union-attr]
+    spec.loader.exec_module(mod)
     return mod
 
 
-def _dashboard_module_name(plugin_dir: Path) -> str:
+async def _close_plugin_dashboard_imports(
+    importer: FreshPluginImporter,
+    module_names: set[str],
+) -> None:
+    """Release source-only import ownership after plugin closeables finish."""
+
+    for module_name in sorted(module_names):
+        importer.unregister(module_name)
+        for loaded_name in tuple(sys.modules):
+            if loaded_name == module_name or loaded_name.startswith(f"{module_name}."):
+                sys.modules.pop(loaded_name, None)
+    module_names.clear()
+
+
+def _dashboard_module_name(plugin_dir: Path, import_namespace: str) -> str:
     raw = str(plugin_dir.resolve(strict=False))
     normalized = "".join(ch if ch.isalnum() else "_" for ch in raw)
-    return f"akasic_dashboard_plugin_{normalized}"
+    return f"akasic_dashboard_plugin_{import_namespace}_{normalized}"
 
 
 def _dashboard_closeables(value: object) -> list[object]:
@@ -749,11 +960,7 @@ def _dashboard_closeables(value: object) -> list[object]:
         return []
     if isinstance(value, list):
         items = cast(list[object], value)
-        return [
-            item
-            for item in items
-            if _is_dashboard_closeable(item)
-        ]
+        return [item for item in items if _is_dashboard_closeable(item)]
     if _is_dashboard_closeable(value):
         return [value]
     return []
@@ -786,15 +993,24 @@ def create_dashboard_app(
     optimizer_last_status = "idle"
     optimizer_last_error: str | None = None
     plugin_closeables: list[object] = []
+    pending_panel_builds = _PluginPanelBuildQueue()
+    dashboard_importer = FreshPluginImporter()
+    dashboard_module_names: set[str] = set()
+    dashboard_import_namespace = uuid4().hex
     project_root = Path(__file__).resolve().parent.parent
     static_dir = project_root / "static" / "dashboard"
+    plugin_panel_cache = _plugin_panel_cache_root(workspace)
+    _reset_plugin_panel_cache(plugin_panel_cache, workspace)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
-        compile_task = asyncio.create_task(_compile_pending_plugins_async())
+        compile_task = asyncio.create_task(
+            _compile_pending_plugins_async(pending_panel_builds)
+        )
         try:
             yield
         finally:
+
             async def _cancel_compile_task() -> None:
                 cancelled = compile_task.cancel()
                 if not cancelled:
@@ -807,8 +1023,18 @@ def create_dashboard_app(
 
             await run_cleanup_steps(
                 ("plugin_panel_compile.cancel", _cancel_compile_task),
-                ("dashboard.session_store.close", lambda: _close_dashboard_value(store)),
-                ("dashboard.memory_admin.close", lambda: _close_dashboard_value(memory_admin)),
+                (
+                    "plugin_panel_cache.remove",
+                    lambda: _close_plugin_panel_cache(plugin_panel_cache, workspace),
+                ),
+                (
+                    "dashboard.session_store.close",
+                    lambda: _close_dashboard_value(store),
+                ),
+                (
+                    "dashboard.memory_admin.close",
+                    lambda: _close_dashboard_value(memory_admin),
+                ),
                 *[
                     (
                         f"dashboard.plugin_closeable[{index}].close",
@@ -816,6 +1042,13 @@ def create_dashboard_app(
                     )
                     for index, closeable in enumerate(reversed(plugin_closeables))
                 ],
+                (
+                    "dashboard.plugin_importer.close",
+                    lambda: _close_plugin_dashboard_imports(
+                        dashboard_importer,
+                        dashboard_module_names,
+                    ),
+                ),
             )
 
     app = FastAPI(title="Akashic Dashboard API", lifespan=lifespan)
@@ -834,14 +1067,36 @@ def create_dashboard_app(
 
     # 编译 TypeScript 插件面板并挂载插件路由
     for _plugin_id, _plugin_dir in sorted(plugin_dirs.items()):
-        if plugin_manager is None and not _plugin_dashboard_enabled(app, _plugin_dir):
+        if plugin_manager is None and not _plugin_dashboard_enabled(
+            app,
+            _plugin_dir,
+            dashboard_importer,
+            dashboard_module_names,
+            dashboard_import_namespace,
+        ):
             continue
-        _build_plugin_panels_js(project_root, _plugin_dir)
-        if (
-            plugin_manager is None or (_plugin_dir / "package.toml").exists()
-        ) and (_plugin_dir / "dashboard.py").exists():
+        _ = _build_plugin_panels_js(
+            project_root,
+            _plugin_dir,
+            _plugin_panel_output_dir(
+                plugin_panel_cache,
+                _plugin_id,
+                _plugin_dir,
+            ),
+            pending_panel_builds,
+        )
+        if (plugin_manager is None or (_plugin_dir / "package.toml").exists()) and (
+            _plugin_dir / "dashboard.py"
+        ).exists():
             plugin_closeables.extend(
-                _load_plugin_dashboard(app, _plugin_dir, workspace)
+                _load_plugin_dashboard(
+                    app,
+                    _plugin_dir,
+                    workspace,
+                    dashboard_importer,
+                    dashboard_module_names,
+                    dashboard_import_namespace,
+                )
             )
 
     # Vite 会在 /assets 下生成带内容哈希的资源 URL，因此直接原样提供 index.html；
@@ -861,18 +1116,31 @@ def create_dashboard_app(
     @app.get("/api/dashboard/plugins")
     def list_dashboard_plugins() -> list[dict[str, Any]]:
         result: list[dict[str, Any]] = []
-        for plugin_id, plugin_dir in sorted(_dashboard_plugin_dirs(project_root).items()):
+        for plugin_id, plugin_dir in sorted(
+            _dashboard_plugin_dirs(project_root).items()
+        ):
             if not dashboard_plugin_enabled(plugin_id, plugin_dir):
                 continue
-            _build_plugin_panels_js(project_root, plugin_dir)
+            panels_by_name = _build_plugin_panels_js(
+                project_root,
+                plugin_dir,
+                _plugin_panel_output_dir(
+                    plugin_panel_cache,
+                    plugin_id,
+                    plugin_dir,
+                ),
+                pending_panel_builds,
+            )
             panels: list[dict[str, Any]] = []
-            for js_path in sorted(plugin_dir.glob("dashboard_panel*.js")):
-                css_path = js_path.with_suffix(".css")
-                panels.append({
-                    "name": js_path.stem,
-                    "js_version": str(js_path.stat().st_mtime_ns),
-                    "has_css": css_path.exists(),
-                })
+            for panel_name, js_path in sorted(panels_by_name.items()):
+                css_path = plugin_dir / f"{panel_name}.css"
+                panels.append(
+                    {
+                        "name": panel_name,
+                        "js_version": str(js_path.stat().st_mtime_ns),
+                        "has_css": css_path.exists(),
+                    }
+                )
             if panels:
                 result.append({"id": plugin_id, "panels": panels})
         return result
@@ -889,9 +1157,18 @@ def create_dashboard_app(
             plugin_dir,
         ):
             raise HTTPException(status_code=404, detail="plugin panel not found")
-        _build_plugin_panels_js(project_root, plugin_dir)
-        js_path = plugin_dir / f"{panel_name}.js"
-        if not js_path.exists():
+        panels_by_name = _build_plugin_panels_js(
+            project_root,
+            plugin_dir,
+            _plugin_panel_output_dir(
+                plugin_panel_cache,
+                plugin_id,
+                plugin_dir,
+            ),
+            pending_panel_builds,
+        )
+        js_path = panels_by_name.get(panel_name)
+        if js_path is None or not js_path.is_file():
             raise HTTPException(status_code=404, detail="plugin panel not found")
         return FileResponse(js_path, media_type="application/javascript")
 
@@ -975,9 +1252,7 @@ def create_dashboard_app(
             "active": (
                 _compaction_dashboard_dict(active) if active is not None else None
             ),
-            "history": [
-                _compaction_dashboard_dict(value) for value in history
-            ],
+            "history": [_compaction_dashboard_dict(value) for value in history],
         }
 
     @app.get("/api/dashboard/sessions/{session_key:path}/messages")
@@ -1487,10 +1762,18 @@ def create_dashboard_app(
                 and binding.routes
                 for binding in current.dashboard_bindings
             )
+
     else:
+
         def dashboard_plugin_enabled(plugin_id: str, plugin_dir: Path) -> bool:
             _ = plugin_id
-            return _plugin_dashboard_enabled(app, plugin_dir)
+            return _plugin_dashboard_enabled(
+                app,
+                plugin_dir,
+                dashboard_importer,
+                dashboard_module_names,
+                dashboard_import_namespace,
+            )
 
     return app
 

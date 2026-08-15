@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
+import hashlib
 import json
+import os
 import sqlite3
 import shutil
 import threading
@@ -284,7 +286,9 @@ def _seed_explicit_interaction(
 async def test_dashboard_lifespan_swallows_its_own_compile_cancellation(
     tmp_path, monkeypatch
 ):
-    async def _pending_compile() -> None:
+    async def _pending_compile(
+        _queue: dashboard_api._PluginPanelBuildQueue,
+    ) -> None:
         await asyncio.Event().wait()
 
     monkeypatch.setattr(
@@ -316,7 +320,9 @@ async def test_dashboard_waits_for_async_closeable() -> None:
 async def test_dashboard_lifespan_exposes_unexpected_compile_failure(
     tmp_path, monkeypatch
 ):
-    async def _failed_compile() -> None:
+    async def _failed_compile(
+        _queue: dashboard_api._PluginPanelBuildQueue,
+    ) -> None:
         raise RuntimeError("compile failed")
 
     monkeypatch.setattr(
@@ -329,6 +335,65 @@ async def test_dashboard_lifespan_exposes_unexpected_compile_failure(
     with pytest.raises(RuntimeError, match="compile failed"):
         async with app.router.lifespan_context(app):
             await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_pending_panel_probe_is_terminated_and_drained_on_cancellation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    queue = dashboard_api._PluginPanelBuildQueue()
+    plugin_dir = tmp_path / "plugin"
+    output_dir = tmp_path / "output"
+    plugin_dir.mkdir()
+    queue.add(tmp_path, plugin_dir, output_dir)
+    communicate_started = asyncio.Event()
+    wait_started = asyncio.Event()
+    release_wait = asyncio.Event()
+
+    class Process:
+        returncode: int | None = None
+        terminated = False
+        waited = False
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            communicate_started.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+        def terminate(self) -> None:
+            self.terminated = True
+
+        def kill(self) -> None:
+            raise AssertionError("graceful termination should finish")
+
+        async def wait(self) -> int:
+            self.waited = True
+            wait_started.set()
+            await release_wait.wait()
+            self.returncode = -15
+            return self.returncode
+
+    process = Process()
+
+    async def create_process(*_args: object, **_kwargs: object) -> Process:
+        return process
+
+    monkeypatch.setattr(dashboard_api, "_esbuild_command", lambda _root: ["npx"])
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
+    task = asyncio.create_task(dashboard_api._compile_pending_plugins_async(queue))
+    await communicate_started.wait()
+    task.cancel()
+    await wait_started.wait()
+    task.cancel()
+    await asyncio.sleep(0)
+    assert task.done() is False
+    release_wait.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert process.terminated is True
+    assert process.waited is True
 
 
 class _ManualMemoryOptimizer:
@@ -572,9 +637,7 @@ def _seed_pending_compaction_prepare(
     store = SessionStore(workspace / "sessions.db")
     meta = store.get_session_meta(session_key)
     assert meta is not None
-    rows = {
-        str(row["id"]): row for row in store.fetch_session_messages(session_key)
-    }
+    rows = {str(row["id"]): row for row in store.fetch_session_messages(session_key)}
     selected = [rows[message_id] for message_id in message_ids]
     assert selected
     source_ref = f"test:pending:{session_key}"
@@ -757,9 +820,7 @@ def test_dashboard_rejects_session_delete_with_pending_prepare(
     inspector = SessionStore(tmp_path / "sessions.db")
     assert inspector.session_exists(session_key)
     assert inspector.get_message(message_id) is not None
-    prepare = inspector.get_compaction_prepare(
-        session_key, source_ref=source_ref
-    )
+    prepare = inspector.get_compaction_prepare(session_key, source_ref=source_ref)
     assert prepare is not None
     audit = inspector.get_session_delete_audit(detail["audit_id"])
     assert audit is not None
@@ -856,11 +917,14 @@ def test_list_update_and_batch_delete_messages(tmp_path) -> None:
         assert patch_resp.json()["content"] == "已经睡了"
         assert patch_resp.json()["edited"] is True
         embedding_store = MessageEmbeddingStore(tmp_path / "sessions.db")
-        assert embedding_store.get(
-            message_id=message_id,
-            content="还没睡呢",
-            model="m",
-        ) is None
+        assert (
+            embedding_store.get(
+                message_id=message_id,
+                content="还没睡呢",
+                model="m",
+            )
+            is None
+        )
         embedding_store.upsert(
             message_id=message_id,
             content="已经睡了",
@@ -994,7 +1058,9 @@ def test_delete_interaction_is_atomic_and_repairs_cursor(
     assert backup_path.stat().st_mode & 0o777 == 0o600
     assert list(backup_path.parent.glob(".sessions-*.db.tmp")) == []
     store = SessionStore(tmp_path / "sessions.db")
-    assert [item["content"] for item in store.fetch_session_messages("mobile:review")] == [
+    assert [
+        item["content"] for item in store.fetch_session_messages("mobile:review")
+    ] == [
         "legacy",
         "old",
         "later",
@@ -1004,10 +1070,13 @@ def test_delete_interaction_is_atomic_and_repairs_cursor(
     assert meta is not None
     assert meta["last_consolidated"] == expected_cursor
     with closing(sqlite3.connect(tmp_path / "sessions.db")) as database:
-        assert database.execute(
-            "SELECT COUNT(*) FROM message_embeddings WHERE message_id IN (?, ?, ?, ?)",
-            tuple(message_ids),
-        ).fetchone()[0] == 0
+        assert (
+            database.execute(
+                "SELECT COUNT(*) FROM message_embeddings WHERE message_id IN (?, ?, ?, ?)",
+                tuple(message_ids),
+            ).fetchone()[0]
+            == 0
+        )
     store.close()
 
     restored_path = tmp_path / "restored" / "sessions.db"
@@ -1312,7 +1381,9 @@ def test_wake_package_owns_dashboard_visibility(tmp_path, monkeypatch) -> None:
 def test_dashboard_lists_installed_plugin_panels(tmp_path, monkeypatch) -> None:
     _seed_workspace(tmp_path)
     home = tmp_path / "home"
-    plugin_dir = home / ".akashic-plugin" / "cache" / "github" / "status_commands" / "1.0.0"
+    plugin_dir = (
+        home / ".akashic-plugin" / "cache" / "github" / "status_commands" / "1.0.0"
+    )
     plugin_dir.mkdir(parents=True, exist_ok=True)
     (plugin_dir / "dashboard.py").write_text(
         "from fastapi import FastAPI\n"
@@ -1320,14 +1391,18 @@ def test_dashboard_lists_installed_plugin_panels(tmp_path, monkeypatch) -> None:
         "    return None\n",
         encoding="utf-8",
     )
-    (plugin_dir / "dashboard_panel.js").write_text("export default {};\n", encoding="utf-8")
+    (plugin_dir / "dashboard_panel.js").write_text(
+        "export default {};\n", encoding="utf-8"
+    )
     (plugin_dir / "plugin.py").write_text(
         "from agent.plugins import Plugin\nclass StatusPlugin(Plugin):\n    name='status_commands'\n    version='1.0.0'\n",
         encoding="utf-8",
     )
     manifest_path = home / ".akashic-plugin" / "manifest.toml"
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
-    manifest_path.write_text('[plugins."status_commands@github"]\nenabled = true\n', encoding="utf-8")
+    manifest_path.write_text(
+        '[plugins."status_commands@github"]\nenabled = true\n', encoding="utf-8"
+    )
     monkeypatch.setenv("HOME", str(home))
 
     with TestClient(create_dashboard_app(tmp_path)) as client:
@@ -1338,11 +1413,312 @@ def test_dashboard_lists_installed_plugin_panels(tmp_path, monkeypatch) -> None:
         "panels": [
             {
                 "name": "dashboard_panel",
-                "js_version": str((plugin_dir / "dashboard_panel.js").stat().st_mtime_ns),
+                "js_version": str(
+                    (plugin_dir / "dashboard_panel.js").stat().st_mtime_ns
+                ),
                 "has_css": False,
             }
         ],
     }
+
+
+def test_installed_typescript_panel_uses_runtime_cache_without_source_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _seed_workspace(tmp_path)
+    home = tmp_path / "home"
+    plugin_dir = home / ".akashic-plugin/cache/github/read_only_panel/1.0.0"
+    plugin_dir.mkdir(parents=True)
+    (plugin_dir / "plugin.py").write_text("# installed source\n", encoding="utf-8")
+    (plugin_dir / "db.py").write_text(
+        "def ping(): return 'ok'\n",
+        encoding="utf-8",
+    )
+    (plugin_dir / "dashboard.py").write_text(
+        "def register(app, plugin_dir, workspace):\n"
+        "    from .db import ping\n"
+        "    assert ping() == 'ok'\n",
+        encoding="utf-8",
+    )
+    (plugin_dir / "dashboard_panel.tsx").write_text(
+        "export default function Panel() { return null }\n",
+        encoding="utf-8",
+    )
+    manifest = home / ".akashic-plugin/manifest.toml"
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+    manifest.write_text(
+        '[plugins."read_only_panel@github"]\nenabled = true\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(home))
+    compiled_outputs: list[Path] = []
+    monkeypatch.setattr(
+        dashboard_api,
+        "_dashboard_plugin_dirs",
+        lambda _root: {"read_only_panel@github": plugin_dir},
+    )
+
+    def compile_to_cache(
+        _cmd: list[str],
+        _source: Path,
+        output: Path,
+        _name: str,
+    ) -> None:
+        compiled_outputs.append(output)
+        output.write_text("export default {};\n", encoding="utf-8")
+
+    monkeypatch.setattr(dashboard_api, "_run_esbuild", compile_to_cache)
+    monkeypatch.setattr(dashboard_api, "_esbuild_command", lambda _root: ["esbuild"])
+    source_before = _test_tree_digest(plugin_dir)
+    cache_root = tmp_path / "runtime/dashboard-panels"
+
+    with TestClient(create_dashboard_app(tmp_path)) as client:
+        plugins = client.get("/api/dashboard/plugins").json()
+        installed = next(
+            item for item in plugins if item["id"] == "read_only_panel@github"
+        )
+        assert len(installed["panels"]) == 1
+        assert installed["panels"][0]["name"] == "dashboard_panel"
+        assert installed["panels"][0]["has_css"] is False
+        assert str(installed["panels"][0]["js_version"]).isdigit()
+        response = client.get("/plugins/read_only_panel@github/dashboard_panel.js")
+        assert response.status_code == 200
+        assert response.text == "export default {};\n"
+        assert compiled_outputs
+        assert all(output.is_relative_to(cache_root) for output in compiled_outputs)
+        assert not (plugin_dir / "dashboard_panel.js").exists()
+        assert _test_tree_digest(plugin_dir) == source_before
+
+    assert not cache_root.exists()
+    assert _test_tree_digest(plugin_dir) == source_before
+
+
+def test_installed_fresh_javascript_panel_stays_in_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _seed_workspace(tmp_path)
+    home = tmp_path / "home"
+    plugin_dir = home / ".akashic-plugin/cache/github/published_panel/1.0.0"
+    plugin_dir.mkdir(parents=True)
+    (plugin_dir / "plugin.py").write_text("# installed source\n", encoding="utf-8")
+    (plugin_dir / "dashboard.py").write_text(
+        "def register(app, plugin_dir, workspace): return None\n",
+        encoding="utf-8",
+    )
+    source = plugin_dir / "dashboard_panel.ts"
+    source.write_text("export default 1;\n", encoding="utf-8")
+    published = plugin_dir / "dashboard_panel.js"
+    published.write_text("export default 1;\n", encoding="utf-8")
+    published.touch()
+    manifest = home / ".akashic-plugin/manifest.toml"
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+    manifest.write_text(
+        '[plugins."published_panel@github"]\nenabled = true\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(
+        dashboard_api,
+        "_dashboard_plugin_dirs",
+        lambda _root: {"published_panel@github": plugin_dir},
+    )
+
+    def unexpected_compile(*_args: object) -> None:
+        raise AssertionError("fresh published JavaScript must not compile")
+
+    monkeypatch.setattr(dashboard_api, "_run_esbuild", unexpected_compile)
+    with TestClient(create_dashboard_app(tmp_path)) as client:
+        response = client.get("/plugins/published_panel@github/dashboard_panel.js")
+        assert response.status_code == 200
+        assert response.text == "export default 1;\n"
+    assert not (tmp_path / "runtime/dashboard-panels").exists()
+
+
+def test_panel_cache_identity_tracks_transitive_source_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _seed_workspace(tmp_path)
+    plugin_dir = tmp_path / "plugin"
+    plugin_dir.mkdir()
+    (plugin_dir / "dashboard.py").write_text(
+        "def register(app, plugin_dir, workspace): return None\n",
+        encoding="utf-8",
+    )
+    (plugin_dir / "dashboard_panel.ts").write_text(
+        "import value from './fragment'; export default value;\n",
+        encoding="utf-8",
+    )
+    fragment = plugin_dir / "fragment.ts"
+    fragment.write_text("export default 'first';\n", encoding="utf-8")
+    monkeypatch.setattr(
+        dashboard_api,
+        "_dashboard_plugin_dirs",
+        lambda _root: {"panel": plugin_dir},
+    )
+    outputs: list[Path] = []
+
+    def compile_fragment(
+        _cmd: list[str],
+        _source: Path,
+        output: Path,
+        _name: str,
+    ) -> None:
+        outputs.append(output)
+        output.write_text(fragment.read_text(encoding="utf-8"), encoding="utf-8")
+
+    monkeypatch.setattr(dashboard_api, "_run_esbuild", compile_fragment)
+    monkeypatch.setattr(dashboard_api, "_esbuild_command", lambda _root: ["esbuild"])
+
+    with TestClient(create_dashboard_app(tmp_path)) as client:
+        first = client.get("/plugins/panel/dashboard_panel.js")
+        runtime_metadata = plugin_dir / ".venv/metadata.json"
+        runtime_metadata.parent.mkdir()
+        runtime_metadata.write_text('{"runtime": 1}\n', encoding="utf-8")
+        unrelated = client.get("/plugins/panel/dashboard_panel.js")
+        fragment.write_text("export default 'second';\n", encoding="utf-8")
+        second = client.get("/plugins/panel/dashboard_panel.js")
+
+    assert first.text == "export default 'first';\n"
+    assert unrelated.text == "export default 'first';\n"
+    assert second.text == "export default 'second';\n"
+    assert len(outputs) == 2
+    assert outputs[0].parent != outputs[1].parent
+
+
+def test_stale_published_panel_is_unavailable_when_compile_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _seed_workspace(tmp_path)
+    plugin_dir = tmp_path / "plugin"
+    plugin_dir.mkdir()
+    (plugin_dir / "dashboard.py").write_text(
+        "def register(app, plugin_dir, workspace): return None\n",
+        encoding="utf-8",
+    )
+    published = plugin_dir / "dashboard_panel.js"
+    published.write_text("export default 'stale';\n", encoding="utf-8")
+    source = plugin_dir / "dashboard_panel.ts"
+    source.write_text("export default 'new';\n", encoding="utf-8")
+    published.touch()
+    source.touch()
+    source_mtime = published.stat().st_mtime + 1
+    os.utime(source, (source_mtime, source_mtime))
+    monkeypatch.setattr(
+        dashboard_api,
+        "_dashboard_plugin_dirs",
+        lambda _root: {"panel": plugin_dir},
+    )
+    monkeypatch.setattr(dashboard_api, "_esbuild_command", lambda _root: ["esbuild"])
+    monkeypatch.setattr(dashboard_api, "_run_esbuild", lambda *_args: None)
+
+    with TestClient(create_dashboard_app(tmp_path)) as client:
+        plugins = client.get("/api/dashboard/plugins").json()
+        response = client.get("/plugins/panel/dashboard_panel.js")
+
+    assert plugins == []
+    assert response.status_code == 404
+    assert not list((tmp_path / "runtime/dashboard-panels").rglob("*.js"))
+
+
+def test_dashboard_rejects_symlink_panel_cache(
+    tmp_path: Path,
+) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    cache = tmp_path / "runtime/dashboard-panels"
+    cache.parent.mkdir(parents=True)
+    cache.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(RuntimeError, match="不能穿过符号链接"):
+        create_dashboard_app(tmp_path)
+
+
+def test_dashboard_rejects_symlink_runtime_parent(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    runtime = tmp_path / "runtime"
+    runtime.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(RuntimeError, match="不能穿过符号链接"):
+        create_dashboard_app(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_dashboard_pending_panel_builds_are_app_lifecycle_owned(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin_dir = tmp_path / "plugin"
+    plugin_dir.mkdir()
+    (plugin_dir / "dashboard.py").write_text(
+        "def register(app, plugin_dir, workspace): return None\n",
+        encoding="utf-8",
+    )
+    (plugin_dir / "dashboard_panel.ts").write_text(
+        "export default 1;\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        dashboard_api,
+        "_dashboard_plugin_dirs",
+        lambda _root: {"panel": plugin_dir},
+    )
+    monkeypatch.setattr(dashboard_api, "_esbuild_command", lambda _root: None)
+
+    started = [asyncio.Event(), asyncio.Event()]
+    release_first = asyncio.Event()
+    first_compiled = asyncio.Event()
+    call_count = 0
+
+    async def compile_owned_queue(
+        queue: dashboard_api._PluginPanelBuildQueue,
+    ) -> None:
+        nonlocal call_count
+        call_index = call_count
+        call_count += 1
+        started[call_index].set()
+        if call_index == 1:
+            await asyncio.Event().wait()
+            return
+        await release_first.wait()
+        for _root, _plugin, output_dir in queue.take_all():
+            output_dir.mkdir(parents=True, exist_ok=True)
+            (output_dir / "dashboard_panel.js").write_text(
+                "export default 1;\n",
+                encoding="utf-8",
+            )
+        first_compiled.set()
+
+    monkeypatch.setattr(
+        dashboard_api,
+        "_compile_pending_plugins_async",
+        compile_owned_queue,
+    )
+    workspace_a = tmp_path / "workspace-a"
+    workspace_b = tmp_path / "workspace-b"
+    app_a = create_dashboard_app(workspace_a)
+    app_b = create_dashboard_app(workspace_b)
+
+    async with app_a.router.lifespan_context(app_a):
+        await started[0].wait()
+        async with app_b.router.lifespan_context(app_b):
+            await started[1].wait()
+        release_first.set()
+        await first_compiled.wait()
+        assert list((workspace_a / "runtime/dashboard-panels").rglob("*.js"))
+        assert not (workspace_b / "runtime/dashboard-panels").exists()
+
+
+def _test_tree_digest(root: Path) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(item for item in root.rglob("*") if item.is_file()):
+        digest.update(path.relative_to(root).as_posix().encode())
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
 
 
 def test_standalone_dashboard_honors_builtin_plugin_manifest(
@@ -1352,7 +1728,7 @@ def test_standalone_dashboard_honors_builtin_plugin_manifest(
     manifest_path = home / ".akashic-plugin" / "manifest.toml"
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     manifest_path.write_text(
-        '[plugins.akasha]\nenabled = false\n',
+        "[plugins.akasha]\nenabled = false\n",
         encoding="utf-8",
     )
     monkeypatch.setenv("HOME", str(home))
@@ -1363,9 +1739,7 @@ def test_standalone_dashboard_honors_builtin_plugin_manifest(
     assert "default_memory" in plugins
 
 
-def test_standalone_dashboard_rejects_invalid_manifest(
-    tmp_path, monkeypatch
-) -> None:
+def test_standalone_dashboard_rejects_invalid_manifest(tmp_path, monkeypatch) -> None:
     home = tmp_path / "home"
     manifest_path = home / ".akashic-plugin" / "manifest.toml"
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1376,14 +1750,15 @@ def test_standalone_dashboard_rejects_invalid_manifest(
         _dashboard_plugin_dirs(Path.cwd())
 
 
-def test_installed_plugin_dashboard_supports_relative_imports(tmp_path, monkeypatch) -> None:
+def test_installed_plugin_dashboard_supports_relative_imports(
+    tmp_path, monkeypatch
+) -> None:
     _seed_workspace(tmp_path)
     home = tmp_path / "home"
     plugin_dir = home / ".akashic-plugin" / "cache" / "github" / "observe" / "1.0.0"
     plugin_dir.mkdir(parents=True, exist_ok=True)
     (plugin_dir / "db.py").write_text(
-        "def ping():\n"
-        "    return 'ok'\n",
+        "def ping():\n" "    return 'ok'\n",
         encoding="utf-8",
     )
     (plugin_dir / "dashboard.py").write_text(
@@ -1401,13 +1776,54 @@ def test_installed_plugin_dashboard_supports_relative_imports(tmp_path, monkeypa
     )
     manifest_path = home / ".akashic-plugin" / "manifest.toml"
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
-    manifest_path.write_text('[plugins."observe@github"]\nenabled = true\n', encoding="utf-8")
+    manifest_path.write_text(
+        '[plugins."observe@github"]\nenabled = true\n', encoding="utf-8"
+    )
     monkeypatch.setenv("HOME", str(home))
 
     with TestClient(create_dashboard_app(tmp_path)) as client:
         response = client.get("/api/dashboard/test-relative-import")
     assert response.status_code == 200
     assert response.json() == {"value": "ok"}
+
+
+def test_two_dashboard_apps_isolate_deferred_relative_imports(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin_dir = tmp_path / "plugin"
+    plugin_dir.mkdir()
+    (plugin_dir / "db.py").write_text(
+        "def ping(): return 'ok'\n",
+        encoding="utf-8",
+    )
+    (plugin_dir / "dashboard.py").write_text(
+        "def register(app, plugin_dir, workspace):\n"
+        "    @app.get('/api/dashboard/deferred-relative-import')\n"
+        "    def route():\n"
+        "        from .db import ping\n"
+        "        return {'value': ping()}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        dashboard_api,
+        "_dashboard_plugin_dirs",
+        lambda _root: {"panel": plugin_dir},
+    )
+    source_before = _test_tree_digest(plugin_dir)
+    app_a = create_dashboard_app(tmp_path / "workspace-a")
+    app_b = create_dashboard_app(tmp_path / "workspace-b")
+
+    with TestClient(app_a) as client_a:
+        with TestClient(app_b) as client_b:
+            assert client_b.get(
+                "/api/dashboard/deferred-relative-import"
+            ).json() == {"value": "ok"}
+        assert client_a.get("/api/dashboard/deferred-relative-import").json() == {
+            "value": "ok"
+        }
+
+    assert _test_tree_digest(plugin_dir) == source_before
 
 
 def test_plugin_asset_paths_reject_cross_platform_traversal(tmp_path) -> None:
@@ -1449,8 +1865,16 @@ def test_memory_engine_plugins_only_expose_active_engine_panels(
         assert memory_plugins == {
             "default_memory": ["dashboard_panel", "dashboard_panel_inspector"]
         }
-        assert client.get("/plugins/default_memory/dashboard_panel_inspector.js").status_code == 200
-        assert client.get("/plugins/cross_memory/dashboard_panel_inspector.js").status_code == 404
+        assert (
+            client.get(
+                "/plugins/default_memory/dashboard_panel_inspector.js"
+            ).status_code
+            == 200
+        )
+        assert (
+            client.get("/plugins/cross_memory/dashboard_panel_inspector.js").status_code
+            == 404
+        )
 
 
 def test_akasha_only_exposes_read_only_inspector_panel(
@@ -1474,15 +1898,11 @@ def test_akasha_only_exposes_read_only_inspector_panel(
             "dashboard_panel_inspector"
         ]
         assert (
-            client.get(
-                "/plugins/akasha/dashboard_panel_inspector.js"
-            ).status_code
+            client.get("/plugins/akasha/dashboard_panel_inspector.js").status_code
             == 200
         )
         assert (
-            client.get(
-                "/plugins/akasha/dashboard_panel_inspector.css"
-            ).status_code
+            client.get("/plugins/akasha/dashboard_panel_inspector.css").status_code
             == 200
         )
         assert client.get("/api/dashboard/akasha/graph").status_code == 404
