@@ -15,7 +15,7 @@
 
 ## P0 · 插件组合内核
 
-- 组合内核、事件/同步执行、TopologyView、lifecycle 接入点与[v3 generation loader](design/plugin-v3-loader-task-contract.md)已完成。下一张 PR 只迁移 Citation/Meme 并产出首组差分证据；随后用独立 PR 删除这组已无消费者的 legacy 路径。不得在差分证据出现前删除 legacy host。
+- 按[插件 v3 最终迁移地图](design/plugin-v3-final-migration-map.md)完成 #425～#431 后，Tool lane 合入三个 pure-v3 source 与 #432；被动 lane 合入 #433～#438、Citation/Meme source，再合入 #439～#441，并在 exact heads 上重跑 Tool、Citation/Meme composition 与 WebUI E2E。随后迁移剩余 23 个已跟踪插件；channel command catalog、MCP/process/channel/proactive/mobile seam 只随第一个真实 consumer 建立，不把 v2 固定 `telegram_bot_commands()/jobs()/channels()/mcp_servers()/proactive_*()` 方法复制进 v3。最后一个 consumer 迁走前保留并标注 v2 owner；按 A～I 小批次删除 owner，full-fleet pure-v3 Gate 通过后最后执行 J，删除 v2 lock/Gate。
 
 ## P0 · 独立语义验收
 
