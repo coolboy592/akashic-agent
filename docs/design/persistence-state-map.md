@@ -103,7 +103,7 @@ workspace 仍不是完整运行环境的全部。模型 Provider credential 已�
 | 插件贡献的 Skill/Drift skill | 插件 source 持有 skill 正文；安装把版本化副本发布到 cache，generation 从 `skill_roots` 建 catalog | workspace `skills/` 和 `drift/skills/` 软链接随 active generation 重建 | 禁用/卸载插件可以移除已安装副本、catalog 和软链接；外部 canonical source 不归 workspace 或卸载流程所有 |
 | 插件贡献的 MCP | 插件安装读取 `mcp_servers()` 并准备 runtime，generation readiness 通过后发布 MCP catalog | 插件升级或热重载按 generation 原子替换，旧代随 lease 排空 | 禁用/卸载插件移除 MCP catalog 和 runtime；plugin-data 不级联删除 |
 | `mcp/servers/*.toml` 与手工 skill 目录 | 当前代码仍允许绕过插件直接声明或放置能力 | watcher/loader 可以热加载这些兼容内容 | 目标架构不再扩展这条路径；应迁移成插件并删除第二套 owner，迁移完成前不得把兼容目录写成 canonical 产品资产 |
-| `memes/manifest.json` | workspace 初始化时创建空 manifest | 当前生产代码没有找到后续 reader/writer | 功能归属尚未确认，不能据此增加自动删除，也不能把它当成已工作的长期资产 |
+| `memes/manifest.json` | workspace 初始化时创建空 manifest；Meme 插件和管理 Skill 按显式用户操作增加类别与素材 | Meme 插件按 manifest mtime 重载；Dashboard/Skill 可原位更新 manifest 和类别目录 | 仅明确的 Meme 管理动作可在备份后减少；插件卸载、candidate discard 和 Core 清理不得删除正式素材根 |
 | 诊断 JSONL、`subagent-runs/` | 运行和调查持续追加产物 | 通常不原位改写 | 当前缺少统一 retention；没有策略前不得假装它们会永久存在，也不得擅自 prune 事故证据 |
 | lock、PID、readiness、socket | 进程启动时创建 | 随当前 boot 更新 | 由进程生命周期 owner 在停止或重启时移除；它们不是业务事实；`.app-server-token` 作为持久 secret 单独处理 |
 
@@ -454,9 +454,15 @@ Akasha V2 保存 turn 指针、稀疏特征、engram hub、有向关系、activa
 
 ### 10.5 `memes/manifest.json`
 
-`init_workspace` 会创建 `{"categories": {}}`，prompt budget 仍有 `memes` 区块名称，但本轮全仓生产代码搜索没有找到读取该 manifest 的实现。
+`init_workspace` 会创建 `{"categories": {}}`。canonical `meme` 插件把
+`<workspace>/memes` 作为产品级共享素材根：运行时按 manifest mtime 重载类别，Skill 与
+Dashboard 可按显式用户操作增改 manifest、类别目录和图片。它不是插件私有 data root，
+也不能因卸载插件而删除。
 
-**G-004：** 这是保留接口、暂时未接线功能还是废弃状态，需要维护者确认。当前不能据此建立强保留或自动清理规则。
+v3 candidate 通过插件声明的 `workspace_roots = ("memes",)` 获得隔离副本；candidate
+listener 与 Dashboard 读写同一副本，discard 不改正式素材，promotion 后 formal Root 才解析
+正式目录。正常增改由 Meme 插件和 `meme-manage` Skill 拥有；物理删除只允许明确的用户
+管理动作，并以目录备份、manifest/content hash 与恢复读取为证据。
 
 ## 11. 配置、凭据与控制面
 

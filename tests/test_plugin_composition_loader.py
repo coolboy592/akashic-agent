@@ -368,6 +368,22 @@ async def test_v3_dashboard_rejects_invalid_callable_contracts(
         ("skill_roots = 'skills'", "skill_roots 必须是字符串序列"),
         ("drift_skill_roots = ('',)", "drift_skill_roots 必须只包含非空字符串"),
         ("skill_roots = ('skills', 'skills')", "skill_roots 不得重复"),
+        (
+            "workspace_roots = ('nested/root',)",
+            "workspace_roots 必须是顶层目录名",
+        ),
+        (
+            "workspace_roots = ('memes', 'memes')",
+            "workspace_roots 不得重复",
+        ),
+        (
+            "workspace_roots = ('plugin-data',)",
+            "workspace_roots 不得声明 Core 保留目录 plugin-data",
+        ),
+        (
+            "workspace_roots = ('runtime',)",
+            "workspace_roots 不得声明 Core 保留目录 runtime",
+        ),
         ("dashboard_module = ''", "dashboard_module 必须是非空字符串或 None"),
         ("is_active = 1", "is_active 必须是可调用对象"),
     ],
@@ -404,6 +420,150 @@ def test_v3_namespace_freezes_package_contribution_lists() -> None:
     roots.append("mutated")
 
     assert plugin.skill_roots == ("skills",)
+
+
+@pytest.mark.asyncio
+async def test_v3_loader_rejects_workspace_root_that_is_not_directory(
+    tmp_path: Path,
+) -> None:
+    _write_plugin(
+        tmp_path / "plugins",
+        "invalid_workspace_root",
+        "api_version = 3\n"
+        "name = 'invalid_workspace_root'\n"
+        "version = '1.0.0'\n"
+        "workspace_roots = ('memes',)\n"
+        "def apply(ctx, config): pass\n",
+    )
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "memes").write_text("not a directory", encoding="utf-8")
+    manager = _manager(tmp_path)
+
+    await manager.load_all()
+
+    assert manager.generation("invalid_workspace_root") is None
+    gate = manager.latest_gate("invalid_workspace_root")
+    assert gate is not None
+    assert gate.status == "failed"
+    assert "workspace root 不是目录" in gate.failure_reason
+
+
+@pytest.mark.asyncio
+async def test_v3_loader_rejects_workspace_root_symlink_outside_workspace(
+    tmp_path: Path,
+) -> None:
+    _write_plugin(
+        tmp_path / "plugins",
+        "escaped_workspace_root",
+        "api_version = 3\n"
+        "name = 'escaped_workspace_root'\n"
+        "version = '1.0.0'\n"
+        "workspace_roots = ('memes',)\n"
+        "def apply(ctx, config): pass\n",
+    )
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside-memes"
+    outside.mkdir()
+    (workspace / "memes").symlink_to(outside, target_is_directory=True)
+    manager = _manager(tmp_path)
+
+    await manager.load_all()
+
+    assert manager.generation("escaped_workspace_root") is None
+    gate = manager.latest_gate("escaped_workspace_root")
+    assert gate is not None
+    assert gate.status == "failed"
+    assert "workspace root 不能是符号链接" in gate.failure_reason
+    assert tuple(outside.iterdir()) == ()
+
+
+@pytest.mark.asyncio
+async def test_v3_candidate_never_copies_workspace_root_symlink_target(
+    tmp_path: Path,
+) -> None:
+    plugin_dir = _write_plugin(
+        tmp_path / "plugins",
+        "candidate_workspace_root",
+        "api_version = 3\n"
+        "name = 'candidate_workspace_root'\n"
+        "version = '1.0.0'\n"
+        "workspace_roots = ('memes',)\n"
+        "def apply(ctx, config): pass\n",
+    )
+    manager = _manager(tmp_path)
+    await manager.load_all()
+    stable = manager.current_snapshot
+    assert stable is not None
+    workspace = tmp_path / "workspace"
+    outside = tmp_path / "outside-candidate-memes"
+    outside.mkdir()
+    marker = outside / "must-not-copy.txt"
+    marker.write_text("outside", encoding="utf-8")
+    (workspace / "memes").symlink_to(outside, target_is_directory=True)
+    (plugin_dir / "plugin.py").write_text(
+        "api_version = 3\n"
+        "name = 'candidate_workspace_root'\n"
+        "version = '2.0.0'\n"
+        "workspace_roots = ('memes',)\n"
+        "def apply(ctx, config): pass\n",
+        encoding="utf-8",
+    )
+
+    candidate = await manager.prepare_candidate("candidate_workspace_root")
+
+    assert candidate is None
+    assert manager.current_snapshot is stable
+    assert marker.read_text(encoding="utf-8") == "outside"
+    assert not tuple((workspace / "plugin-data").glob("**/must-not-copy.txt"))
+    await manager.terminate_all()
+
+
+@pytest.mark.asyncio
+async def test_v3_candidate_rejects_workspace_root_declaration_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin_dir = _write_plugin(
+        tmp_path / "plugins",
+        "workspace_root_drift",
+        "api_version = 3\n"
+        "name = 'workspace_root_drift'\n"
+        "version = '1.0.0'\n"
+        "workspace_roots = ('memes',)\n"
+        "def apply(ctx, config): pass\n",
+    )
+    manager = _manager(tmp_path)
+    await manager.load_all()
+    stable = manager.current_snapshot
+    assert stable is not None
+    original_clone = manager._clone_candidate_composable
+
+    def clone_with_drift(*args: object, **kwargs: object):
+        clone, module_path, data_dir = original_clone(*args, **kwargs)  # type: ignore[arg-type]
+        clone.workspace_roots = ("drifted",)
+        return clone, module_path, data_dir
+
+    monkeypatch.setattr(manager, "_clone_candidate_composable", clone_with_drift)
+    (plugin_dir / "plugin.py").write_text(
+        "api_version = 3\n"
+        "name = 'workspace_root_drift'\n"
+        "version = '2.0.0'\n"
+        "workspace_roots = ('memes',)\n"
+        "def apply(ctx, config): pass\n",
+        encoding="utf-8",
+    )
+
+    candidate = await manager.prepare_candidate("workspace_root_drift")
+
+    assert candidate is None
+    assert manager.current_snapshot is stable
+    gate = manager.latest_gate("workspace_root_drift")
+    assert gate is not None
+    assert "workspace_roots 与 generation 冻结声明不一致" in gate.failure_reason
+    assert not any("__candidate_" in name for name in sys.modules)
+    await manager.terminate_all()
 
 
 @pytest.mark.parametrize("value", [None, 1, "active"])
@@ -1167,8 +1327,12 @@ async def test_installed_v3_dashboard_uses_composition_runtime_until_promotion(
         "version = '1.0.0'\n"
         "dashboard_module = 'dashboard.py'\n"
         "drift_skill_roots = ('drift/skills',)\n"
+        "workspace_roots = ('memes',)\n"
         "def is_active(services): return True\n"
-        "def apply(ctx, config): pass\n"
+        "observed_workspace_root = None\n"
+        "def apply(ctx, config):\n"
+        "    global observed_workspace_root\n"
+        "    observed_workspace_root = ctx.workspace_root('memes')\n"
     )
     (stable_root / "plugin.py").write_text(source, encoding="utf-8")
     (latest_root / "plugin.py").write_text(
@@ -1176,13 +1340,17 @@ async def test_installed_v3_dashboard_uses_composition_runtime_until_promotion(
         encoding="utf-8",
     )
     (stable_root / "dashboard.py").write_text(
-        "def register(app, context): return None\n",
+        "def register(app, context):\n"
+        "    assert context.workspace_root('memes').is_dir()\n",
         encoding="utf-8",
     )
     (latest_root / "dashboard.py").write_text(
         "def register(app, context):\n"
         "    marker = 'candidate-registered' if context.validation else 'formal-registered'\n"
         "    (context.data_root / marker).write_text('ready')\n"
+        "    shared = context.workspace_root('memes')\n"
+        "    shared_marker = 'candidate-shared' if context.validation else 'formal-shared'\n"
+        "    (shared / shared_marker).write_text('ready')\n"
         "    class Closeable:\n"
         "        def close(self):\n"
         "            (context.data_root / 'dashboard-v3-closed').write_text('closed')\n"
@@ -1193,6 +1361,9 @@ async def test_installed_v3_dashboard_uses_composition_runtime_until_promotion(
         skill = artifact / "drift" / "skills" / "dashboard-v3-static"
         skill.mkdir(parents=True)
         (skill / "SKILL.md").write_text("# static projection\n", encoding="utf-8")
+    formal_memes = tmp_path / "workspace" / "memes"
+    formal_memes.mkdir(parents=True)
+    (formal_memes / "manifest.json").write_text("{}\n", encoding="utf-8")
     stable_pointer = ArtifactPointer(".artifacts/1.0.0-aaaa")
     latest_pointer = ArtifactPointer(".artifacts/2.0.0-bbbb")
     write_pointers(plugin_base, stable=stable_pointer, latest=stable_pointer)
@@ -1222,7 +1393,12 @@ async def test_installed_v3_dashboard_uses_composition_runtime_until_promotion(
     )
 
     write_pointers(plugin_base, stable=stable_pointer, latest=latest_pointer)
-    assert (await manager.reconcile_changed())[0]["publication_state"] == "latest_ready"
+    first_change = (await manager.reconcile_changed())[0]
+    first_gate = manager.latest_gate("dashboard_v3@lab")
+    assert first_change["publication_state"] == "latest_ready", (
+        first_change,
+        None if first_gate is None else first_gate.failure_reason,
+    )
     candidate = manager.ready_candidate
     assert candidate is not None and candidate.runtime_snapshot is not None
     assert "dashboard_v3@lab" in {
@@ -1242,10 +1418,16 @@ async def test_installed_v3_dashboard_uses_composition_runtime_until_promotion(
     assert candidate_data_root == candidate_runtime.data_dir.resolve()
     assert candidate_data_root.is_relative_to(validation_workspace.parent)
     assert (candidate_data_root / "candidate-registered").is_file()
+    candidate_memes = candidate_runtime.workspace_root("memes")
+    assert candidate_memes != formal_memes.resolve()
+    assert (candidate_memes / "manifest.json").read_text() == "{}\n"
+    assert (candidate_memes / "candidate-shared").is_file()
+    assert not (formal_memes / "candidate-shared").exists()
     assert not (candidate_data_root / "formal-registered").exists()
     production_data_root = tmp_path / "workspace" / "plugin-data" / "dashboard_v3-lab"
     assert not (production_data_root / "candidate-registered").exists()
     assert not (production_data_root / "formal-registered").exists()
+    assert not (formal_memes / "candidate-shared").exists()
     validation_root = validation_workspace.parent
     validation_module = candidate_binding.module_name
 
@@ -1276,9 +1458,56 @@ async def test_installed_v3_dashboard_uses_composition_runtime_until_promotion(
     assert formal_binding.runtime_workspace == (tmp_path / "workspace").resolve()
     assert formal_binding.runtime_data_root == production_data_root.resolve()
     assert (production_data_root / "formal-registered").is_file()
+    assert (formal_memes / "formal-shared").is_file()
+    assert not (formal_memes / "candidate-shared").exists()
     assert not (production_data_root / "candidate-registered").exists()
     assert skill_link.exists()
     assert not promoted_validation_root.exists()
+    promoted_generation = manager.generation("dashboard_v3@lab")
+    assert promoted_generation is not None
+    assert promoted_generation.instance.module.observed_workspace_root == (
+        formal_memes.resolve()
+    )
+    await manager.terminate_all()
+
+
+@pytest.mark.asyncio
+async def test_v3_dashboard_uses_exact_root_workspace_declaration(
+    tmp_path: Path,
+) -> None:
+    plugin_dir = _write_plugin(
+        tmp_path / "plugins",
+        "exact_workspace_root",
+        "api_version = 3\n"
+        "name = 'exact_workspace_root'\n"
+        "version = '1.0.0'\n"
+        "workspace_roots = ('memes',)\n"
+        "dashboard_module = 'dashboard.py'\n"
+        "def apply(ctx, config): pass\n",
+    )
+    (plugin_dir / "dashboard.py").write_text(
+        "def register(app, context):\n"
+        "    assert context.workspace_root('memes').name == 'memes'\n",
+        encoding="utf-8",
+    )
+    memes = tmp_path / "workspace" / "memes"
+    memes.mkdir(parents=True)
+    manager = _manager(tmp_path)
+    await manager.load_all()
+    generation = manager.generation("exact_workspace_root")
+    snapshot = manager.current_snapshot
+    assert generation is not None and snapshot is not None
+    generation.instance.workspace_roots = ("drifted",)
+    dashboard_host = PluginDashboardHost(
+        workspace=tmp_path / "workspace",
+        memory_admin=object(),
+        memory_store=object(),
+        core_routes=(),
+    )
+
+    dashboard_host.prepare_snapshot(snapshot)
+
+    assert len(snapshot.dashboard_bindings) == 1
     await manager.terminate_all()
 
 

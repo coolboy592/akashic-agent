@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 import mimetypes
+from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -545,6 +546,7 @@ class SessionManager:
         messages: list[dict[str, object]],
         *,
         updated_at: datetime,
+        metadata: Mapping[str, Any] | None = None,
     ) -> int:
         """准备待写消息并原子追加 session 元数据和消息。"""
 
@@ -580,7 +582,7 @@ class SessionManager:
             session.key,
             created_at=session.created_at.isoformat(),
             updated_at=updated_at.isoformat(),
-            metadata=session.metadata,
+            metadata=dict(session.metadata if metadata is None else metadata),
             messages=pending_payloads,
         )
         for msg, row in zip(pending_messages, rows):
@@ -610,13 +612,30 @@ class SessionManager:
             self.save(session)
 
     async def append_messages(
-        self, session: Session, messages: list[dict[str, object]]
+        self,
+        session: Session,
+        messages: list[dict[str, object]],
+        *,
+        metadata: Mapping[str, Any] | None = None,
     ) -> None:
         updated_at = datetime.now(UTC)
         msgs_copy = list(messages)
         async with self._lock(session.key):
-            # 1. 原子追加消息并刷新 session 元数据。
-            _ = self._persist_session(session, msgs_copy, updated_at=updated_at)
+            # 1. 原子追加消息并回填稳定 ID。
+            _ = self._persist_session(
+                session,
+                msgs_copy,
+                updated_at=updated_at,
+                metadata=metadata,
+            )
+
+            # 2. 同一无 await 临界段把 pending rows 挂回当前 Session cache。
+            attached = {id(message) for message in session.messages}
+            session.messages.extend(
+                message for message in msgs_copy if id(message) not in attached
+            )
+            if metadata is not None:
+                session.metadata = dict(metadata)
             self._cache[session.key] = session
 
     def invalidate(self, key: str) -> None:

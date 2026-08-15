@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import PurePosixPath
 from types import ModuleType
 from typing import TYPE_CHECKING, cast
 
@@ -11,6 +12,8 @@ from agent.plugin_composition import Context, ServiceKey, ServiceView
 if TYPE_CHECKING:
     from agent.plugins.context import PluginContext
     from agent.plugins.generation import PluginReadinessContext, PluginSemanticCheck
+
+_CORE_RESERVED_WORKSPACE_ROOTS = frozenset({"plugin-data", "runtime"})
 
 
 @dataclass
@@ -25,6 +28,7 @@ class ComposablePlugin:
     inject: tuple[ServiceKey[object], ...]
     skill_roots: tuple[str, ...]
     drift_skill_roots: tuple[str, ...]
+    workspace_roots: tuple[str, ...]
     dashboard_module: str | None
     _apply: Callable[[Context, object], object] = field(repr=False)
     _service_view: ServiceView | None = field(default=None, init=False, repr=False)
@@ -76,6 +80,7 @@ class ComposablePlugin:
             raise ValueError("v3 插件 is_active 必须是可调用对象")
         skill_roots = _string_tuple_export(module, "skill_roots")
         drift_skill_roots = _string_tuple_export(module, "drift_skill_roots")
+        workspace_roots = _workspace_roots_export(module)
         dashboard_module = getattr(module, "dashboard_module", None)
         if dashboard_module is not None and (
             not isinstance(dashboard_module, str)
@@ -92,6 +97,7 @@ class ComposablePlugin:
             inject=inject,
             skill_roots=skill_roots,
             drift_skill_roots=drift_skill_roots,
+            workspace_roots=workspace_roots,
             dashboard_module=cast(str | None, dashboard_module),
             _apply=cast(Callable[[Context, object], object], apply),
         )
@@ -177,3 +183,24 @@ def _string_tuple_export(module: ModuleType, name: str) -> tuple[str, ...]:
     if len(set(typed)) != len(typed):
         raise ValueError(f"v3 插件 {name} 不得重复")
     return typed
+
+
+def _workspace_roots_export(module: ModuleType) -> tuple[str, ...]:
+    roots = _string_tuple_export(module, "workspace_roots")
+    for root in roots:
+        if root in _CORE_RESERVED_WORKSPACE_ROOTS:
+            raise ValueError(
+                f"v3 插件 workspace_roots 不得声明 Core 保留目录 {root}"
+            )
+        path = PurePosixPath(root)
+        if (
+            path.is_absolute()
+            or len(path.parts) != 1
+            or path.name in {".", ".."}
+            or "/" in root
+            or "\\" in root
+        ):
+            raise ValueError(
+                "v3 插件 workspace_roots 必须是顶层目录名"
+            )
+    return roots

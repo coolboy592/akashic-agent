@@ -200,6 +200,7 @@ class AfterReasoningCtx:
     reply: str
     media: list[str] = field(default_factory=_empty_str_list)
     meme_tag: str | None = None
+    persist_assistant_metadata: dict[str, Any] = field(default_factory=_empty_metadata)
     outbound_metadata: dict[str, Any] = field(default_factory=_empty_metadata)
 
 

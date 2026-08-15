@@ -110,6 +110,41 @@ class PluginRuntime:
     data_dir: Path
     workspace: Path
     config: object
+    workspace_roots: tuple[str, ...] = ()
+
+    def workspace_root(self, name: str) -> Path:
+        """解析插件声明过的产品级 workspace 顶层目录。"""
+
+        if name not in self.workspace_roots:
+            raise CompositionError(
+                "WORKSPACE_ROOT_UNDECLARED",
+                f"{self.plugin_id} 未声明 workspace root: {name}",
+            )
+        return resolve_declared_workspace_root(self.workspace, name)
+
+
+def resolve_declared_workspace_root(workspace: Path, name: str) -> Path:
+    """解析 Core 分配的顶层 workspace root，并拒绝符号链接越界。"""
+
+    root = workspace.resolve(strict=False)
+    declared = root / name
+    if declared.is_symlink():
+        raise CompositionError(
+            "WORKSPACE_ROOT_SYMLINK",
+            f"workspace root 不能是符号链接: {declared}",
+        )
+    resolved = declared.resolve(strict=False)
+    if not resolved.is_relative_to(root):
+        raise CompositionError(
+            "WORKSPACE_ROOT_ESCAPE",
+            f"workspace root 越界: {declared}",
+        )
+    if declared.exists() and not declared.is_dir():
+        raise CompositionError(
+            "WORKSPACE_ROOT_NOT_DIRECTORY",
+            f"workspace root 不是目录: {declared}",
+        )
+    return resolved
 
 
 @dataclass(frozen=True, slots=True)

@@ -24,6 +24,7 @@ from starlette.convertors import (
 from starlette.routing import Match
 
 from agent.plugin_composition import DashboardContext
+from agent.plugin_composition.model import resolve_declared_workspace_root
 from agent.plugins.composable import ComposablePlugin
 from agent.plugins.generation import PluginGeneration
 from agent.plugins.scope import PluginScope
@@ -106,6 +107,7 @@ class PluginDashboardHost:
                 runtime = root.plugin_runtime(generation.plugin_id)
                 runtime_workspace = runtime.workspace.resolve(strict=False)
                 data_root = runtime.data_dir.resolve(strict=False)
+                workspace_roots = runtime.workspace_roots
                 validation = data_root != generation.data_dir.resolve(strict=False)
             else:
                 # V2_REMOVAL(dashboard-context)：v2 删除后移除此三参数 workspace 副本。
@@ -121,6 +123,7 @@ class PluginDashboardHost:
                     workspace=runtime_workspace,
                     validation=validation,
                 )
+                workspace_roots = ()
             if validation:
                 runtime_workspace.mkdir(parents=True, exist_ok=True)
             binding_key = (generation_id, runtime_workspace)
@@ -144,6 +147,7 @@ class PluginDashboardHost:
                         occupied=occupied,
                         workspace=runtime_workspace,
                         data_root=data_root,
+                        workspace_roots=workspace_roots,
                         scope=binding_scope,
                         validation=validation,
                     )
@@ -225,6 +229,7 @@ class PluginDashboardHost:
         occupied: list[APIRoute],
         workspace: Path,
         data_root: Path,
+        workspace_roots: tuple[str, ...],
         scope: PluginScope,
         validation: bool,
     ) -> DashboardBinding:
@@ -263,6 +268,12 @@ class PluginDashboardHost:
                 plugin_dir=module_path.parent,
                 data_root=data_root,
                 validation=validation,
+                _workspace_roots=tuple(
+                    (name, resolve_declared_workspace_root(workspace, name))
+                    for name in workspace_roots
+                )
+                if is_v3
+                else (),
             )
             enabled_result = True
             if callable(enabled):

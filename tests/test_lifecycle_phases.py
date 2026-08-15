@@ -53,6 +53,7 @@ from agent.lifecycle.types import (
 )
 from agent.lifecycle.phases.after_reasoning import (
     AfterReasoningFrame,
+    _collect_persist_assistant_metadata,
     default_after_reasoning_modules,
 )
 from agent.lifecycle.phases.after_step import (
@@ -1552,6 +1553,8 @@ async def test_after_reasoning_collects_persist_and_outbound_slots():
         requires = ("after_reasoning.emit", "reasoning:ctx")
 
         async def run(self, frame: AfterReasoningFrame) -> AfterReasoningFrame:
+            ctx = cast(AfterReasoningCtx, frame.slots["reasoning:ctx"])
+            ctx.persist_assistant_metadata["citation_ids"] = ["mem_1"]
             frame.slots["persist:user:user_flag"] = "u"
             frame.slots["persist:assistant:assistant_flag"] = "a"
             frame.slots["outbound:metadata:plugin_flag"] = "m"
@@ -1568,6 +1571,8 @@ async def test_after_reasoning_collects_persist_and_outbound_slots():
     async def append_messages(
         current: _DummySession,
         messages: list[dict[str, object]],
+        *,
+        metadata: dict[str, Any] | None = None,
     ) -> None:
         for index, persisted in enumerate(messages):
             persisted["id"] = f"{current.key}:{index}"
@@ -1599,11 +1604,310 @@ async def test_after_reasoning_collects_persist_and_outbound_slots():
     assert session.messages[0]["user_flag"] == "u"
     assert session.messages[0]["client_message_id"] == "01ARZ3NDEKTSV4RRFFQ69G5FAV"
     assert session.messages[1]["assistant_flag"] == "a"
+    assert session.messages[1]["citation_ids"] == ["mem_1"]
     assert session.messages[1]["media"] == ["/tmp/from-turn.png", "/tmp/a.png"]
     assert result.outbound.metadata["before_turn_flag"] == "bt"
     assert result.outbound.metadata["plugin_flag"] == "m"
     assert result.outbound.media == ["/tmp/from-turn.png", "/tmp/a.png"]
     assert result.outbound.session_message_id == "telegram:123:1"
+
+
+def _assistant_metadata_ctx() -> AfterReasoningCtx:
+    return AfterReasoningCtx(
+        session_key="telegram:123",
+        channel="telegram",
+        chat_id="123",
+        tools_used=(),
+        thinking=None,
+        response_metadata=ResponseMetadata(raw_text="reply"),
+        streamed=False,
+        tool_chain=(),
+        context_retry={},
+        reply="reply",
+    )
+
+
+def test_after_reasoning_rejects_fixed_assistant_metadata_field() -> None:
+    ctx = _assistant_metadata_ctx()
+    ctx.persist_assistant_metadata["tools_used"] = ["spoof"]
+
+    with pytest.raises(ValueError, match="metadata 字段不可写: tools_used"):
+        _ = _collect_persist_assistant_metadata(ctx, {})
+
+
+def test_after_reasoning_rejects_v3_and_legacy_metadata_collision() -> None:
+    ctx = _assistant_metadata_ctx()
+    ctx.persist_assistant_metadata["cited_memory_ids"] = ["v3"]
+
+    with pytest.raises(ValueError, match="metadata 字段重复: cited_memory_ids"):
+        _ = _collect_persist_assistant_metadata(
+            ctx,
+            {"persist:assistant:cited_memory_ids": ["v2"]},
+        )
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "control_turn_id",
+        "turn_terminal",
+        "turn_input_count",
+        "skip_post_memory",
+        "turn_duration_ms",
+    ],
+)
+def test_after_reasoning_rejects_core_owned_assistant_metadata(field: str) -> None:
+    ctx = _assistant_metadata_ctx()
+    ctx.persist_assistant_metadata[field] = "spoof"
+
+    with pytest.raises(ValueError, match=f"metadata 字段不可写: {field}"):
+        _ = _collect_persist_assistant_metadata(ctx, {})
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "tools_used",
+        "role",
+        "control_turn_id",
+        "skip_post_memory",
+        "react_compaction",
+    ],
+)
+def test_after_reasoning_rejects_legacy_core_owned_assistant_metadata(
+    field: str,
+) -> None:
+    ctx = _assistant_metadata_ctx()
+
+    with pytest.raises(
+        ValueError,
+        match=f"legacy assistant plugin metadata 字段不可写: {field}",
+    ):
+        _ = _collect_persist_assistant_metadata(
+            ctx,
+            {f"persist:assistant:{field}": "spoof"},
+        )
+
+
+@pytest.mark.asyncio
+async def test_assistant_metadata_collision_precedes_session_mutation(
+    tmp_path: Path,
+) -> None:
+    class ConflictingMetadataModule:
+        slot = "test.after_reasoning.metadata_collision"
+        requires = ("after_reasoning.emit", "reasoning:ctx")
+
+        async def run(self, frame: AfterReasoningFrame) -> AfterReasoningFrame:
+            ctx = cast(AfterReasoningCtx, frame.slots["reasoning:ctx"])
+            ctx.persist_assistant_metadata["cited_memory_ids"] = ["v3"]
+            frame.slots["persist:assistant:cited_memory_ids"] = ["v2"]
+            return frame
+
+    manager = SessionManager(tmp_path / "workspace")
+    session = manager.get_or_create("telegram:metadata-collision")
+    state = TurnState(
+        msg=_inbound(),
+        session_key=session.key,
+        dispatch_outbound=True,
+        session=session,
+    )
+    phase = Phase(
+        default_after_reasoning_modules(
+            EventBus(),
+            cast(Any, SimpleNamespace(presence=None, session_manager=manager)),
+            plugin_modules=[ConflictingMetadataModule()],
+        ),
+        frame_factory=AfterReasoningFrame,
+    )
+
+    with pytest.raises(ValueError, match="metadata 字段重复: cited_memory_ids"):
+        _ = await phase.run(
+            AfterReasoningInput(
+                state=state,
+                turn_result=TurnRunResult(reply="reply"),
+            )
+        )
+
+    assert session.messages == []
+    manager.save(session)
+    manager.close()
+    reloaded = SessionManager(tmp_path / "workspace")
+    assert reloaded.get_or_create(session.key).messages == []
+    reloaded.close()
+
+
+@pytest.mark.asyncio
+async def test_late_legacy_assistant_metadata_writer_is_sealed_before_commit(
+    tmp_path: Path,
+) -> None:
+    class LateMetadataModule:
+        slot = "test.after_reasoning.late_metadata"
+        requires = ("after_reasoning.persist_user", "reasoning:ctx")
+        async def run(self, frame: AfterReasoningFrame) -> AfterReasoningFrame:
+            frame.slots["persist:assistant:cited_memory_ids"] = ["late"]
+            return frame
+
+    manager = SessionManager(tmp_path / "workspace")
+    session = manager.get_or_create("telegram:late-metadata")
+
+    phase = Phase(
+        default_after_reasoning_modules(
+            EventBus(),
+            cast(Any, SimpleNamespace(presence=None, session_manager=manager)),
+            plugin_modules=[LateMetadataModule()],
+        ),
+        frame_factory=AfterReasoningFrame,
+    )
+
+    _ = await phase.run(
+        AfterReasoningInput(
+            state=TurnState(
+                msg=_inbound(),
+                session_key=session.key,
+                dispatch_outbound=True,
+                session=session,
+            ),
+            turn_result=TurnRunResult(reply="reply"),
+        )
+    )
+
+    assert len(session.messages) == 2
+    assert session.messages[1]["cited_memory_ids"] == ["late"]
+    manager.close()
+    reloaded = SessionManager(tmp_path / "workspace")
+    reloaded_messages = reloaded.get_or_create(session.key).messages
+    assert len(reloaded_messages) == 2
+    assert reloaded_messages[1]["cited_memory_ids"] == ["late"]
+    reloaded.close()
+
+
+@pytest.mark.asyncio
+async def test_session_manager_adopts_pending_rows_before_post_commit_cancel(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = SessionManager(tmp_path / "workspace")
+    session = manager.get_or_create("telegram:commit-cancel")
+    pending = [
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": "reply"},
+    ]
+    pending_metadata = {
+        "sentinel": "committed",
+        "last_turn_tool_calls_count": 1,
+    }
+    original_persist = manager._persist_session
+
+    def persist_then_cancel(*args: Any, **kwargs: Any) -> int:
+        count = original_persist(*args, **kwargs)
+        task = asyncio.current_task()
+        assert task is not None
+        _ = task.cancel()
+        return count
+
+    monkeypatch.setattr(manager, "_persist_session", persist_then_cancel)
+
+    async def append_then_checkpoint() -> None:
+        await manager.append_messages(
+            session,
+            pending,
+            metadata=pending_metadata,
+        )
+        await asyncio.sleep(0)
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.create_task(append_then_checkpoint())
+
+    assert session.messages == pending
+    assert [message["id"] for message in session.messages] == [
+        "telegram:commit-cancel:0",
+        "telegram:commit-cancel:1",
+    ]
+    assert session.metadata == pending_metadata
+    manager.close()
+    reloaded = SessionManager(tmp_path / "workspace")
+    persisted = reloaded.get_or_create(session.key)
+    assert persisted.messages == session.messages
+    assert persisted.metadata == pending_metadata
+    reloaded.close()
+
+
+@pytest.mark.parametrize("failure_type", [RuntimeError, asyncio.CancelledError])
+@pytest.mark.asyncio
+async def test_session_metadata_stays_unchanged_when_pending_append_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_type: type[BaseException],
+) -> None:
+    manager = SessionManager(tmp_path / "workspace")
+    session = manager.get_or_create("telegram:metadata-rollback")
+    session.metadata = {
+        "sentinel": "old",
+        "last_turn_tool_calls_count": 7,
+        "last_turn_ts": "old-ts",
+    }
+    manager.save(session)
+    original_metadata = dict(session.metadata)
+
+    def fail_before_commit(*args: Any, **kwargs: Any) -> int:
+        raise failure_type("injected append failure")
+
+    monkeypatch.setattr(manager, "_persist_session", fail_before_commit)
+    phase = Phase(
+        default_after_reasoning_modules(
+            EventBus(),
+            cast(Any, SimpleNamespace(presence=None, session_manager=manager)),
+        ),
+        frame_factory=AfterReasoningFrame,
+    )
+
+    with pytest.raises(failure_type, match="injected append failure"):
+        _ = await phase.run(
+            AfterReasoningInput(
+                state=TurnState(
+                    msg=_inbound(),
+                    session_key=session.key,
+                    dispatch_outbound=True,
+                    session=session,
+                ),
+                turn_result=TurnRunResult(
+                    reply="reply",
+                    tool_chain=[{"calls": [{"name": "shell"}]}],
+                ),
+            )
+        )
+
+    assert session.messages == []
+    assert session.metadata == original_metadata
+    manager.close()
+    reloaded = SessionManager(tmp_path / "workspace")
+    persisted = reloaded.get_or_create(session.key)
+    assert persisted.messages == []
+    assert persisted.metadata == original_metadata
+    reloaded.close()
+
+
+def test_late_legacy_observer_keeps_existing_phase_dag_contract() -> None:
+    class LateObserverModule:
+        slot = "test.after_reasoning.late_observer"
+        requires = ("after_reasoning.persist_user", "reasoning:persisted_user")
+
+        async def run(self, frame: AfterReasoningFrame) -> AfterReasoningFrame:
+            return frame
+
+    modules = default_after_reasoning_modules(
+        EventBus(),
+        cast(Any, SimpleNamespace(presence=None, session_manager=object())),
+        plugin_modules=[LateObserverModule()],
+    )
+    slots = [module.slot for module in modules]
+
+    assert slots.index("after_reasoning.persist_user") < slots.index(
+        "test.after_reasoning.late_observer"
+    )
+    assert slots.index("test.after_reasoning.late_observer") < slots.index(
+        "after_reasoning.seal_metadata"
+    )
 
 
 @pytest.mark.asyncio
@@ -1965,6 +2269,8 @@ async def test_after_reasoning_append_records_success_milestones(
     async def append_messages(
         current: _DummySession,
         messages: list[dict[str, object]],
+        *,
+        metadata: dict[str, Any] | None = None,
     ) -> None:
         appended.append((current.key, messages))
 
@@ -2043,6 +2349,8 @@ async def test_after_reasoning_append_records_error_milestones(
     async def append_messages(
         current: _DummySession,
         messages: list[dict[str, object]],
+        *,
+        metadata: dict[str, Any] | None = None,
     ) -> None:
         raise RuntimeError("append exploded")
 
@@ -2114,6 +2422,8 @@ async def test_after_reasoning_append_records_cancelled_milestone(
     async def append_messages(
         current: _DummySession,
         messages: list[dict[str, object]],
+        *,
+        metadata: dict[str, Any] | None = None,
     ) -> None:
         raise asyncio.CancelledError()
 

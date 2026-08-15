@@ -30,6 +30,7 @@ from agent.plugin_composition import (
     PluginRuntime,
     ServiceView,
 )
+from agent.plugin_composition.model import resolve_declared_workspace_root
 from agent.plugins.composable import ComposablePlugin
 
 from agent.plugins.manifest import (
@@ -4243,8 +4244,11 @@ class PluginManager:
             raise RuntimeError(
                 f"v3 插件缺少 Core 分配的 workspace: {generation.plugin_id}"
             )
+        plugin = cast(ComposablePlugin, generation.instance)
+        for name in plugin.workspace_roots:
+            _ = resolve_declared_workspace_root(self._workspace, name)
         _ = await root.mount(
-            cast(ComposablePlugin, generation.instance),
+            plugin,
             name=generation.plugin_id,
             runtime=PluginRuntime(
                 plugin_id=generation.plugin_id,
@@ -4252,6 +4256,7 @@ class PluginManager:
                 data_dir=generation.data_dir,
                 workspace=workspace,
                 config=context.config,
+                workspace_roots=plugin.workspace_roots,
             ),
         )
 
@@ -4277,6 +4282,7 @@ class PluginManager:
             "candidate_attempt_data",
             lambda: _remove_validation_data_dir(attempt_root),
         )
+        clones: list[tuple[PluginGeneration, ComposablePlugin, str, Path]] = []
         for generation in ordered:
             clone, module_path, data_dir = self._clone_candidate_composable(
                 generation,
@@ -4287,6 +4293,18 @@ class PluginManager:
                 f"candidate_module:{module_path}",
                 lambda module_path=module_path: self._remove_module_tree(module_path),
             )
+            original = cast(ComposablePlugin, generation.instance)
+            if clone.workspace_roots != original.workspace_roots:
+                raise RuntimeError(
+                    "candidate workspace_roots 与 generation 冻结声明不一致: "
+                    f"{generation.plugin_id}"
+                )
+            clones.append((generation, clone, module_path, data_dir))
+        self._project_candidate_workspace_roots(
+            tuple(item[1] for item in clones),
+            attempt_workspace,
+        )
+        for generation, clone, _module_path, data_dir in clones:
             _ = await root.mount(
                 clone,
                 name=generation.plugin_id,
@@ -4296,8 +4314,28 @@ class PluginManager:
                     data_dir=data_dir,
                     workspace=attempt_workspace,
                     config=clone.context.config,
+                    workspace_roots=clone.workspace_roots,
                 ),
             )
+
+    def _project_candidate_workspace_roots(
+        self,
+        plugins: tuple[ComposablePlugin, ...],
+        attempt_workspace: Path,
+    ) -> None:
+        """把声明式共享目录复制到一次 candidate attempt。"""
+
+        # 1. 全部 generation 由同一个 Manager workspace 发布。
+        names: set[str] = set()
+        for plugin in plugins:
+            names.update(plugin.workspace_roots)
+
+        # 2. 缺失目录保持缺失；已有目录获得独立副本。
+        for name in sorted(names):
+            source = resolve_declared_workspace_root(self._workspace, name)
+            if not source.exists():
+                continue
+            _ = shutil.copytree(source, attempt_workspace / name)
 
     def _clone_candidate_composable(
         self,

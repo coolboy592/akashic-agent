@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from datetime import UTC, datetime
 import logging
 from time import perf_counter
 from typing import TYPE_CHECKING, Any, TypeAlias, cast
 
 from agent.control.context import running_turn_id
-from agent.core.passive_support import update_session_runtime_metadata
+from agent.core.passive_support import build_session_runtime_metadata
 from agent.control.ports import InputLock, TurnUserInput
 from agent.core.response_parser import parse_response
 from agent.lifecycle.phase import (
@@ -75,6 +76,8 @@ _CTX_SLOT = "reasoning:ctx"
 _OUTBOUND_SLOT = "reasoning:outbound"
 _PERSISTED_USER_SLOT = "reasoning:persisted_user"
 _PERSISTED_ASSISTANT_SLOT = "reasoning:persisted_assistant"
+_SEALED_ASSISTANT_METADATA_SLOT = "reasoning:assistant_metadata"
+_PENDING_SESSION_METADATA_SLOT = "reasoning:session_metadata"
 _PERSIST_USER_PREFIX = "persist:user:"
 _PERSIST_ASSISTANT_PREFIX = "persist:assistant:"
 _OUTBOUND_METADATA_PREFIX = "outbound:metadata:"
@@ -85,7 +88,28 @@ _ASSISTANT_FIXED_FIELDS = {
     "reasoning_content",
     "model_state",
 }
+_ASSISTANT_MESSAGE_FIELDS = {
+    "role",
+    "content",
+    "timestamp",
+    "media",
+    "id",
+    "seq",
+}
+_ASSISTANT_CORE_METADATA_FIELDS = {
+    "turn_duration_ms",
+    "control_turn_id",
+    "turn_terminal",
+    "turn_input_count",
+    "skip_post_memory",
+}
 _RETIRED_ASSISTANT_FIELDS = frozenset({"react_compaction"})
+_ASSISTANT_FORBIDDEN_PLUGIN_FIELDS = frozenset(
+    _ASSISTANT_FIXED_FIELDS
+    | _ASSISTANT_MESSAGE_FIELDS
+    | _ASSISTANT_CORE_METADATA_FIELDS
+    | _RETIRED_ASSISTANT_FIELDS
+)
 _USER_FIXED_FIELDS = {
     "media",
     "timestamp",
@@ -224,7 +248,7 @@ class _PersistUserMessageModule:
                     input_kwargs[field] = value
             display_content = turn_input.metadata.get("display_content")
             persisted_users.append(
-                session.add_message(
+                _pending_message(
                     "user",
                     (
                         display_content
@@ -241,7 +265,11 @@ class _PersistUserMessageModule:
 
 class _PersistAssistantMessageModule:
     slot = "after_reasoning.persist_asst"
-    requires = ("after_reasoning.persist_user", _CTX_SLOT)
+    requires = (
+        "after_reasoning.persist_user",
+        _CTX_SLOT,
+        _SEALED_ASSISTANT_METADATA_SLOT,
+    )
     produces = (_PERSISTED_ASSISTANT_SLOT,)
 
     async def run(self, frame: AfterReasoningFrame) -> AfterReasoningFrame:
@@ -261,7 +289,9 @@ class _PersistAssistantMessageModule:
             assistant_kwargs["reasoning_content"] = ctx.thinking
         if frame.input.turn_result.model_state is not None:
             assistant_kwargs["model_state"] = frame.input.turn_result.model_state
-        assistant_kwargs.update(_collect_persist_assistant_slots(frame.slots))
+        assistant_kwargs.update(
+            cast(dict[str, object], frame.slots[_SEALED_ASSISTANT_METADATA_SLOT])
+        )
         turn_inputs = _turn_user_inputs(frame.input.state.msg)
         control_turn_id = str(
             frame.input.state.msg.metadata.get("control_turn_id") or ""
@@ -281,7 +311,7 @@ class _PersistAssistantMessageModule:
                 media,
                 collect_prefixed_slots(frame.slots, _OUTBOUND_MEDIA_PREFIX),
             )
-            frame.slots[_PERSISTED_ASSISTANT_SLOT] = session.add_message(
+            frame.slots[_PERSISTED_ASSISTANT_SLOT] = _pending_message(
                 "assistant",
                 ctx.reply,
                 media=media if media else None,
@@ -293,6 +323,7 @@ class _PersistAssistantMessageModule:
 class _UpdateSessionMetadataModule:
     slot = "after_reasoning.update_meta"
     requires = ("after_reasoning.persist_asst", _CTX_SLOT)
+    produces = (_PENDING_SESSION_METADATA_SLOT,)
 
     async def run(self, frame: AfterReasoningFrame) -> AfterReasoningFrame:
         ctx = cast(AfterReasoningCtx, frame.slots[_CTX_SLOT])
@@ -300,8 +331,8 @@ class _UpdateSessionMetadataModule:
         if raw_session is None:
             raise RuntimeError("AfterReasoning requires TurnState.session")
         session = cast("Session", raw_session)
-        update_session_runtime_metadata(
-            session,
+        frame.slots[_PENDING_SESSION_METADATA_SLOT] = build_session_runtime_metadata(
+            session.metadata,
             tools_used=list(ctx.tools_used),
             tool_chain=list(ctx.tool_chain),
         )
@@ -310,7 +341,7 @@ class _UpdateSessionMetadataModule:
 
 class _AppendMessagesModule:
     slot = "after_reasoning.append_messages"
-    requires = ("after_reasoning.update_meta",)
+    requires = ("after_reasoning.update_meta", _PENDING_SESSION_METADATA_SLOT)
 
     def __init__(self, session_services: SessionServices) -> None:
         self._session_services = session_services
@@ -338,6 +369,10 @@ class _AppendMessagesModule:
             await self._session_services.session_manager.append_messages(
                 session,
                 messages,
+                metadata=cast(
+                    dict[str, Any],
+                    frame.slots[_PENDING_SESSION_METADATA_SLOT],
+                ),
             )
         except asyncio.CancelledError:
             _milestone(
@@ -357,6 +392,13 @@ class _AppendMessagesModule:
                 level=logging.ERROR,
             )
             raise
+        attached = {id(message) for message in session.messages}
+        session.messages.extend(
+            message for message in messages if id(message) not in attached
+        )
+        session.metadata = dict(
+            cast(dict[str, Any], frame.slots[_PENDING_SESSION_METADATA_SLOT])
+        )
         _milestone(
             logger,
             "after_reasoning.append.done",
@@ -471,11 +513,13 @@ def default_after_reasoning_modules(
     session_services: SessionServices,
     plugin_modules: AfterReasoningModules | None = None,
 ) -> AfterReasoningModules:
+    legacy_modules = list(plugin_modules or [])
     builtins: AfterReasoningModules = [
         _BuildAfterReasoningCtxModule(),
         _EmitAfterReasoningCtxModule(bus),
         _RunCompositionAfterReasoningCleanupModule(),
         _PersistUserMessageModule(session_services),
+        _SealAssistantMetadataModule(),
         _PersistAssistantMessageModule(),
         _UpdateSessionMetadataModule(),
         _AppendMessagesModule(session_services),
@@ -484,25 +528,82 @@ def default_after_reasoning_modules(
     ]
     return cast(
         AfterReasoningModules,
-        topo_sort_modules(builtins + list(plugin_modules or [])),
+        topo_sort_modules(builtins + legacy_modules),
     )
+
+
+class _SealAssistantMetadataModule:
+    slot = "after_reasoning.seal_metadata"
+    requires = ("after_reasoning.persist_user", _CTX_SLOT)
+    produces = (_SEALED_ASSISTANT_METADATA_SLOT,)
+
+    async def run(self, frame: AfterReasoningFrame) -> AfterReasoningFrame:
+        ctx = cast(AfterReasoningCtx, frame.slots[_CTX_SLOT])
+        frame.slots[_SEALED_ASSISTANT_METADATA_SLOT] = (
+            _collect_persist_assistant_metadata(ctx, frame.slots)
+        )
+        return frame
+
+
+def _pending_message(
+    role: str,
+    content: str,
+    media: list[str] | None = None,
+    **kwargs: object,
+) -> dict[str, object]:
+    """构造尚未挂入 Session 的 append-only message。"""
+
+    message: dict[str, object] = {
+        "role": role,
+        "content": content,
+        "timestamp": datetime.now(UTC).isoformat(),
+        **kwargs,
+    }
+    if media:
+        message["media"] = list(media)
+    return message
 
 
 def _collect_persist_assistant_slots(slots: dict[str, object]) -> dict[str, object]:
-    retired = {
+    # V2_REMOVAL(assistant-metadata-slots)：所有 phase 插件迁到
+    # AfterReasoningCtx.persist_assistant_metadata 后删除 legacy slot 收集。
+    forbidden = {
         key.removeprefix(_PERSIST_ASSISTANT_PREFIX)
         for key in slots
         if key.startswith(_PERSIST_ASSISTANT_PREFIX)
-        and key.removeprefix(_PERSIST_ASSISTANT_PREFIX) in _RETIRED_ASSISTANT_FIELDS
+        and key.removeprefix(_PERSIST_ASSISTANT_PREFIX)
+        in _ASSISTANT_FORBIDDEN_PLUGIN_FIELDS
     }
-    if retired:
-        fields = ", ".join(sorted(retired))
-        raise ValueError(f"assistant extra 字段已退役: {fields}")
+    if forbidden:
+        fields = ", ".join(sorted(forbidden))
+        raise ValueError(f"legacy assistant plugin metadata 字段不可写: {fields}")
     return collect_prefixed_slots(
         slots,
         _PERSIST_ASSISTANT_PREFIX,
-        reserved=_ASSISTANT_FIXED_FIELDS,
     )
+
+
+def _collect_persist_assistant_metadata(
+    ctx: AfterReasoningCtx,
+    slots: dict[str, object],
+) -> dict[str, object]:
+    """合并 v3 metadata 与 legacy slot，并拒绝所有字段所有权冲突。"""
+
+    # 1. 固定字段与退役字段只由 Core 拥有。
+    metadata = dict(ctx.persist_assistant_metadata)
+    forbidden = set(metadata) & _ASSISTANT_FORBIDDEN_PLUGIN_FIELDS
+    if forbidden:
+        fields = ", ".join(sorted(forbidden))
+        raise ValueError(f"assistant plugin metadata 字段不可写: {fields}")
+
+    # 2. 迁移期间两套插件出口不能静默覆盖同一事实。
+    legacy = _collect_persist_assistant_slots(slots)
+    duplicated = set(metadata) & set(legacy)
+    if duplicated:
+        fields = ", ".join(sorted(duplicated))
+        raise ValueError(f"assistant plugin metadata 字段重复: {fields}")
+    metadata.update(legacy)
+    return metadata
 
 
 def _collect_persist_user_slots(slots: dict[str, object]) -> dict[str, object]:

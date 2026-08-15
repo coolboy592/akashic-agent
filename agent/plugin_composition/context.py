@@ -104,6 +104,12 @@ class Context:
 
         return self.runtime.data_dir
 
+    def workspace_root(self, name: str) -> Path:
+        """返回 Core 为当前 generation 投影的声明式 workspace root。"""
+
+        reject_executor_context_access()
+        return self.runtime.workspace_root(name)
+
     def _set_static_active(self, active: bool) -> None:
         """把 adapter 决定的静态贡献状态冻结在当前 Fiber。"""
 

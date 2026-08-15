@@ -68,6 +68,36 @@ async def test_data_root_is_core_assigned_and_shared_by_nested_fibers(tmp_path) 
     assert observed == [data_root, data_root]
 
 
+@pytest.mark.asyncio
+async def test_workspace_root_is_declared_and_shared_by_nested_fibers(tmp_path) -> None:
+    memes = tmp_path / "memes"
+    memes.mkdir()
+    runtime = PluginRuntime(
+        plugin_id="probe@builtin",
+        plugin_dir=tmp_path / "plugin",
+        data_dir=tmp_path / "plugin-data" / "probe-builtin",
+        workspace=tmp_path,
+        config=None,
+        workspace_roots=("memes",),
+    )
+    observed = []
+
+    async def child(ctx) -> None:
+        observed.append(ctx.workspace_root("memes"))
+
+    async def parent(ctx) -> None:
+        observed.append(ctx.workspace_root("memes"))
+        with pytest.raises(CompositionError) as caught:
+            _ = ctx.workspace_root("attachments")
+        assert caught.value.code == "WORKSPACE_ROOT_UNDECLARED"
+        _ = await ctx.mount(child, name="child")
+
+    root = CompositionRoot("workspace-root")
+    _ = await root.mount(parent, name="parent", runtime=runtime)
+
+    assert observed == [memes.resolve(), memes.resolve()]
+
+
 def test_data_root_requires_core_assigned_plugin_runtime() -> None:
     root = CompositionRoot("missing-data-root")
 

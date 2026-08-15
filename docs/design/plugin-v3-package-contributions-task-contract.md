@@ -7,7 +7,7 @@
 
 ## 1. 目标
 
-让 v3 namespace 插件以无副作用的模块常量声明安装期必须读取的包级能力：`skill_roots`、`drift_skill_roots` 与 `dashboard_module`。Loader 在插件 `apply()` 前冻结并校验这些声明，复用现有 generation contribution、Skill catalog 和 Dashboard snapshot 发布链。
+让 v3 namespace 插件以无副作用的模块常量声明安装期必须读取的包级能力：`skill_roots`、`drift_skill_roots` 与 `dashboard_module`。Loader 在插件 `apply()` 前冻结并校验这些声明，复用现有 generation contribution、Skill catalog 和 Dashboard snapshot 发布链。后续[被动回复组合接入点合同](plugin-v3-passive-response-seams-task-contract.md)在同一冻结 namespace 上增加 `workspace_roots`，但其 candidate 复制与运行路径由该后续合同拥有。
 
 这不是新的固定 runtime lifecycle 表。Tool、Prompt、Turn、Job、Channel、MCP 和外部效果仍通过 Context、Service、typed event 与 Effect 组合；本 PR 不为它们增加 namespace 特判。
 
