@@ -425,8 +425,9 @@ def _assert_capabilities(payload: dict[str, object]) -> None:
     if plugin_ids != EXPECTED_PLUGIN_IDS:
         raise GateFailure(f"active plugin 集合错误: {plugin_ids}")
     skills = cast(list[dict[str, object]], payload.get("skills"))
-    if {str(item.get("name")) for item in skills} != {"meme-manage"}:
-        raise GateFailure(f"Skill 投影错误: {skills}")
+    plugin_skills = [item for item in skills if item.get("source") != "builtin"]
+    if [str(item.get("name")) for item in plugin_skills] != ["meme-manage"]:
+        raise GateFailure(f"插件 Skill 投影错误: {plugin_skills}")
 
 
 def _receive_final(

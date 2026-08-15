@@ -82,12 +82,17 @@ jobs:
       - name: Verify locked Citation and Meme v3 composition
         run: python docker/debug/plugin_passive_composition_v3_gate.py --require-clean-core
 
+      - name: Verify Citation and Meme through public WebUI
+        run: python docker/debug/plugin_passive_webui_v3_e2e.py --require-clean-core
+
       - name: Upload passive v3 composition evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: plugin-passive-composition-v3-gate
-          path: docker/debug/reports/plugin-passive-composition-v3/
+          path: |
+            docker/debug/reports/plugin-passive-composition-v3/
+            docker/debug/reports/plugin-passive-webui-v3/
 
   check-and-test:
     runs-on: ubuntu-latest

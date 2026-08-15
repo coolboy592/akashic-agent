@@ -60,6 +60,18 @@ python docker/debug/plugin_passive_composition_v3_gate.py --require-clean-core
 证据写入 `docker/debug/reports/plugin-passive-composition-v3/gate.json`。运行期间只写
 临时 checkout、临时 workspace 与被 Git 忽略的报告目录，不读取或修改正式 workspace。
 
+同一组 exact commits 还必须通过完整 WebUI runtime：Gate 用 installed stable artifact
+布局启动 supervised Gateway，只保留 WebUI channel，经公开 WebSocket 完成一轮回复，再从
+公开 HTTP 读取消息、媒体、Dashboard 与 capability。它同时核对模型 prompt 中
+Citation→Meme 顺序、SessionDB、artifact 前后摘要以及 Compose 零残留。
+
+```bash
+python docker/debug/plugin_passive_webui_v3_e2e.py --require-clean-core
+```
+
+证据写入 `docker/debug/reports/plugin-passive-webui-v3/gate.json`；模型响应由 Compose 私网内
+的 deterministic model-gate 提供，不调用外部生产 provider。
+
 ### Shell execution 固定 Runtime 场景
 
 `shell_execution_contract` 在 change-gate 的只读 Arch Linux runtime 中运行，不读取
