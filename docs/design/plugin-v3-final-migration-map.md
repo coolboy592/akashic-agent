@@ -4,6 +4,8 @@
 这一轮 Cordis 风格插件改造的目标结构、当前实现栈、剩余迁移范围和 v2 物理删除顺序。
 它是 2026-08-16 的实施接手点，不替代
 [Cordis 插件迁移能力等价验收](cordis-plugin-capability-parity.md)中的长期能力合同。
+逐项执行状态、生产替代门槛和集中 E2E 批次由
+[插件 v3 生产替代清单](plugin-v3-production-readiness-checklist.md)唯一记录；本文不承担进度账本。
 
 ## 1. 结论
 
@@ -216,12 +218,14 @@ PR 只按图中的依赖边合并。#432 在 #431 后可以独立 review/merge�
 
 | 族群 | 插件 | 迁移时需要的首要 v3 seam |
 |---|---|---|
-| lifecycle/metadata | `context_pressure`、`daynight_gate`、`emotion`、`plugin_undo` | 现有 typed lifecycle；缺 seam 时由第一个真实 consumer 建立 |
-| command/lifecycle | `observe`、`setup_helper`、`status_commands` | committed channel command catalog + typed lifecycle；一次声明后由 channel 投影 |
-| MCP/process | `calendar-mcp`、`computer-use-linux`、`feed-mcp`、`feishu`、`fitbit-mcp`、`steam-mcp` | scoped MCP/process provider、readiness、Effect cleanup |
-| channel | `qqbot` | inbound/outbound channel capability 与发送提交边界 |
-| proactive | `proactive_feedback` | proactive source 作为能力/事件，而不是新固定 Manager 方法 |
-| mixed | `huayue-skills` | 先按真实 Skill/MCP/channel consumer 拆分，不整体套壳 |
+| lifecycle | `context_pressure` | 现有 typed lifecycle；缺 seam 时由第一个真实 consumer 建立 |
+| proactive/job/mobile | `daynight_gate`、`emotion` | timer/proactive source、generation job/LLM、mobile query；不复制旧固定方法 |
+| command/lifecycle/mobile | `plugin_undo`、`setup_helper`、`status_commands` | committed channel command catalog + typed lifecycle；一次声明后由 channel 投影 |
+| Dashboard/mobile/event | `observe`、`proactive_feedback` | committed event observer、Dashboard 和窄 mobile query capability |
+| MCP/process/proactive | `calendar-mcp`、`feed-mcp`、`fitbit-mcp`、`steam-mcp` | scoped MCP/process provider、readiness、Effect cleanup、proactive source |
+| Skill/MCP | `computer-use-linux` | 包级 Skill 与 scoped MCP provider |
+| channel | `feishu`、`qqbot` | inbound/outbound channel capability 与发送提交边界 |
+| Skill | `huayue-skills` | 只迁移包级 `skill_roots`，不引入不存在的 MCP/channel seam |
 
 ### 5.2 In-tree 插件：7 个
 
@@ -256,9 +260,11 @@ repository、确认凭证边界、公开性与真实 installed artifact，再加
    调度逻辑；不把 `jobs()`、`proactive_*()` 原样翻译成 v3 namespace 方法。
 6. **Mobile UI/query capability**：把移动投影建成窄 typed capability，与 Dashboard 类似；
    不保留 `mobile_ui()/mobile_query()` 的 Manager 特判。
-7. **v3 generation metadata**：把 `ComposablePlugin` 暂借的 `PluginContext` 数据迁入
+7. **Generation job/LLM capability**：Core 拥有 committed trigger/interval catalog、执行期模型
+   generation lease 和取消/drain；插件只实现 job handler，不取得整个 legacy `PluginContext`。
+8. **v3 generation metadata**：把 `ComposablePlugin` 暂借的 `PluginContext` 数据迁入
    Core-private v3 generation record，才可删除整个 v2 context DTO。
-8. **Full-fleet inspection/Gate**：Runtime Inspection 展示 Fiber/Health/Incident；全量 Gate
+9. **Full-fleet inspection/Gate**：Runtime Inspection 展示 Fiber/Health/Incident；全量 Gate
    覆盖 cold boot、reload、candidate discard/promote、restart、WebUI/channel、MCP/process、
    proactive 与 cleanup。
 
