@@ -115,6 +115,36 @@ def _host(**kwargs: Any) -> ChannelGenerationHost:
     return ChannelGenerationHost(**kwargs)
 
 
+class _FakeSnapshotLease:
+    def __init__(
+        self,
+        snapshot: Any,
+        *,
+        release_gate: asyncio.Event | None = None,
+    ) -> None:
+        self.snapshot = snapshot
+        self.active = True
+        self.release_gate = release_gate
+        self.forks: list[_FakeSnapshotLease] = []
+
+    def fork(self) -> _FakeSnapshotLease:
+        if not self.active:
+            raise RuntimeError("lease closed")
+        child = _FakeSnapshotLease(
+            self.snapshot,
+            release_gate=self.release_gate,
+        )
+        self.forks.append(child)
+        return child
+
+    async def release(self) -> None:
+        if not self.active:
+            return
+        if self.release_gate is not None:
+            await self.release_gate.wait()
+        self.active = False
+
+
 def _module(
     *,
     name: str = "feishu",
@@ -280,6 +310,53 @@ async def test_formal_binding_starts_closed_and_delivers_after_open() -> None:
     assert receipt.delivery_id == "d1"
     await generation.stop()
     assert factories["feishu"].closed == 1
+
+
+@pytest.mark.asyncio
+async def test_exact_binding_lease_blocks_stop_until_snapshot_fork_closes() -> None:
+    snapshot, factories, _ = await _make_snapshot()
+    host = _host()
+    generation = await host.start(snapshot, factories)
+    generation.open_admission()
+    source = _FakeSnapshotLease(snapshot)
+
+    owner = host.acquire_binding(cast(Any, source), "feishu")
+    assert owner.snapshot_id == snapshot.snapshot_id
+    assert owner.generation_id == "gen-1"
+    assert owner.channel_name == "feishu"
+    assert owner.active
+    stop = asyncio.create_task(generation.stop())
+    await asyncio.sleep(0)
+    assert not stop.done()
+
+    await owner.aclose()
+    assert not owner.active
+    assert source.active
+    assert len(source.forks) == 1 and not source.forks[0].active
+    await stop
+
+
+@pytest.mark.asyncio
+async def test_binding_lease_cancel_waits_for_exact_snapshot_release() -> None:
+    snapshot, factories, _ = await _make_snapshot()
+    host = _host()
+    generation = await host.start(snapshot, factories)
+    generation.open_admission()
+    release_gate = asyncio.Event()
+    source = _FakeSnapshotLease(snapshot, release_gate=release_gate)
+    owner = host.acquire_binding(cast(Any, source), "feishu")
+
+    closing = asyncio.create_task(owner.aclose())
+    await asyncio.sleep(0)
+    closing.cancel()
+    await asyncio.sleep(0)
+    assert not closing.done()
+    release_gate.set()
+    with pytest.raises(asyncio.CancelledError):
+        await closing
+    assert not owner.active
+    assert len(source.forks) == 1 and not source.forks[0].active
+    await generation.stop()
 
 
 @pytest.mark.asyncio

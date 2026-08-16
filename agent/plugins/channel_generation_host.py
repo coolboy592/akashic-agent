@@ -14,7 +14,7 @@ import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from types import ModuleType
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from agent.plugin_composition.channels import (
     ChannelAdapter,
@@ -30,6 +30,9 @@ from agent.plugin_composition.channels import (
     channel_config_revision,
 )
 from agent.plugins.composable import ComposablePlugin
+
+if TYPE_CHECKING:
+    from agent.plugins.snapshot import RuntimeSnapshotLease
 
 BeforeStartCallback = Callable[["ChannelStartRecord"], Awaitable[None]]
 ConfigRevisionChecker = Callable[["ChannelStartRecord"], Awaitable[None]]
@@ -209,6 +212,60 @@ class ChannelBinding:
         """Close admission, drain and stop this binding."""
 
         return await self._host._stop_binding_critical(self._key)
+
+
+class ChannelBindingLease:
+    """Own one forked snapshot lease and one exact Host in-flight claim."""
+
+    def __init__(
+        self,
+        host: ChannelGenerationHost,
+        key: tuple[str, str],
+        snapshot_lease: RuntimeSnapshotLease,
+    ) -> None:
+        self._host = host
+        self._key = key
+        self.snapshot_lease = snapshot_lease
+        self._binding_released = False
+        self._closed = False
+
+    @property
+    def snapshot_id(self) -> str:
+        return self._key[0]
+
+    @property
+    def generation_id(self) -> str:
+        return self._host._binding(self._key).generation_id
+
+    @property
+    def channel_name(self) -> str:
+        return self._key[1]
+
+    @property
+    def binding_token(self) -> str:
+        return self._host._binding(self._key).binding_token
+
+    @property
+    def active(self) -> bool:
+        return not self._closed
+
+    async def aclose(self) -> None:
+        """Release both owners completely before propagating caller cancellation."""
+
+        if self._closed:
+            return
+        task = asyncio.create_task(
+            self._close(),
+            name=f"channel_binding_lease_close:{self.snapshot_id}:{self.channel_name}",
+        )
+        await _await_task_after_cancellation(task)
+
+    async def _close(self) -> None:
+        if not self._binding_released:
+            self._host._release_binding_lease(self._key)
+            self._binding_released = True
+        await self.snapshot_lease.release()
+        self._closed = True
 
 
 class ChannelGeneration:
@@ -536,6 +593,36 @@ class ChannelGenerationHost:
             return None
         return ChannelGeneration(self, snapshot_id, keys)
 
+    def acquire_binding(
+        self,
+        snapshot_lease: RuntimeSnapshotLease,
+        channel_name: str,
+    ) -> ChannelBindingLease:
+        """Fork one exact stable lease and retain its live Channel binding."""
+
+        snapshot = snapshot_lease.snapshot
+        if not snapshot_lease.active:
+            raise RuntimeError("RuntimeSnapshot lease 已关闭")
+        snapshot_id = _text(snapshot.snapshot_id, "snapshot_id")
+        key = (snapshot_id, _text(channel_name, "channel_name"))
+        state = self._binding(key)
+        generation = snapshot.generations.get(state.plugin_id)
+        if generation is None or generation.generation_id != state.generation_id:
+            raise RuntimeError("Channel binding 与 RuntimeSnapshot generation 不一致")
+        registry = snapshot.channel_registry
+        if registry is None or not any(
+            descriptor.name == state.channel_name
+            and descriptor.owner == state.plugin_id
+            for descriptor in registry.descriptors
+        ):
+            raise RuntimeError("Channel binding 不属于 exact RuntimeSnapshot catalog")
+        if not state.admission_open or state.stopping or state.stopped:
+            raise RuntimeError("channel admission 已关闭")
+        forked = snapshot_lease.fork()
+        state.in_flight += 1
+        state.drain_event.clear()
+        return ChannelBindingLease(self, key, forked)
+
     async def _materialize_binding(
         self,
         snapshot: Any,
@@ -699,6 +786,14 @@ class ChannelGenerationHost:
     async def _drain(self, key: tuple[str, str]) -> None:
         state = self._binding(key)
         await state.drain_event.wait()
+
+    def _release_binding_lease(self, key: tuple[str, str]) -> None:
+        state = self._binding(key)
+        if state.in_flight <= 0:
+            raise RuntimeError("channel binding lease 计数下溢")
+        state.in_flight -= 1
+        if state.in_flight == 0:
+            state.drain_event.set()
 
     async def _stop_binding(self, key: tuple[str, str]) -> StopReceipt:
         state = self._binding(key)
@@ -1098,6 +1193,7 @@ def _task_succeeded(task: asyncio.Task[Any]) -> bool:
 
 __all__ = [
     "ChannelBinding",
+    "ChannelBindingLease",
     "ChannelCleanupTombstone",
     "ChannelGeneration",
     "ChannelGenerationHost",
