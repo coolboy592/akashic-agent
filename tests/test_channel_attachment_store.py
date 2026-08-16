@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import threading
 from pathlib import Path
@@ -213,6 +214,95 @@ async def test_adopted_file_remains_readable_after_source_is_deleted(stores) -> 
     lease = await artifact_store.acquire(ref)
     assert await lease.read_bytes(max_bytes=1024) == b"legacy provider bytes"
     await lease.aclose()
+
+
+@pytest.mark.asyncio
+async def test_fixed_artifact_identity_is_idempotent_and_rejects_source_drift(
+    stores,
+) -> None:
+    session_store, artifact_store = stores
+    workspace = Path(session_store.db_path).parent
+    source_root = workspace / "uploads" / "mobile"
+    source_root.mkdir(parents=True)
+    source = source_root / "upload.bin"
+    source.write_bytes(b"mobile finalized bytes")
+
+    first = await artifact_store.adopt_file_with_artifact_id(
+        source,
+        allowed_root=source_root,
+        artifact_id="mobile-fixed-artifact",
+        kind=AttachmentKind.FILE,
+        filename="upload.bin",
+        media_type="application/octet-stream",
+    )
+    second = await artifact_store.adopt_file_with_artifact_id(
+        source,
+        allowed_root=source_root,
+        artifact_id="mobile-fixed-artifact",
+        kind=AttachmentKind.FILE,
+        filename="upload.bin",
+        media_type="application/octet-stream",
+    )
+    assert second == first
+    assert len(session_store.list_attachments()) == 1
+
+    source.write_bytes(b"different finalized bytes")
+    with pytest.raises(RuntimeError, match="identity 已漂移"):
+        await artifact_store.adopt_file_with_artifact_id(
+            source,
+            allowed_root=source_root,
+            artifact_id="mobile-fixed-artifact",
+            kind=AttachmentKind.FILE,
+            filename="upload.bin",
+            media_type="application/octet-stream",
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["prepared", "file_published"])
+async def test_fixed_artifact_identity_recovers_published_bytes_before_ready_row(
+    stores,
+    phase: str,
+) -> None:
+    session_store, artifact_store = stores
+    workspace = Path(session_store.db_path).parent
+    source_root = workspace / "uploads" / "mobile"
+    source_root.mkdir(parents=True)
+    source = source_root / "recover.bin"
+    payload = b"published before database ready"
+    source.write_bytes(payload)
+    artifact_id = f"recover-{phase}"
+    storage_key = f"uploads/artifacts/{artifact_id}.bin"
+    created_at = "2026-08-17T00:00:00+00:00"
+    _ = session_store.begin_attachment_import(
+        artifact_id=artifact_id,
+        storage_key=storage_key,
+        expected_size_bytes=len(payload),
+        expected_sha256=hashlib.sha256(payload).hexdigest(),
+        created_at=created_at,
+    )
+    artifact_root = workspace / "uploads" / "artifacts"
+    artifact_root.mkdir(parents=True, exist_ok=True)
+    (artifact_root / f"{artifact_id}.bin").write_bytes(payload)
+    if phase == "file_published":
+        session_store.mark_attachment_import_file_published(
+            artifact_id,
+            updated_at=created_at,
+        )
+
+    ref = await artifact_store.adopt_file_with_artifact_id(
+        source,
+        allowed_root=source_root,
+        artifact_id=artifact_id,
+        kind=AttachmentKind.FILE,
+        filename="recover.bin",
+        media_type="application/octet-stream",
+    )
+
+    assert ref.artifact_id == artifact_id
+    intent = session_store.attachment_import(artifact_id)
+    assert intent is not None and intent.phase == "artifact_committed"
+    assert session_store.get_attachment(artifact_id) is not None
 
 
 @pytest.mark.asyncio

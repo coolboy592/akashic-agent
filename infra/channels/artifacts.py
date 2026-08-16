@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import os
 import stat
+import threading
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -102,6 +103,7 @@ class ChannelAttachmentArtifactStore:
         self._workspace = workspace
         self._session_store = session_store
         self._max_import_bytes = max_import_bytes
+        self._publish_locks = tuple(threading.Lock() for _ in range(64))
 
     async def import_bytes(
         self,
@@ -154,6 +156,34 @@ class ChannelAttachmentArtifactStore:
                 kind,
                 filename,
                 media_type,
+                None,
+            )
+        )
+        if cancelled:
+            raise asyncio.CancelledError
+        return result
+
+    async def adopt_file_with_artifact_id(
+        self,
+        source: Path,
+        *,
+        allowed_root: Path,
+        artifact_id: str,
+        kind: AttachmentKind,
+        filename: str | None,
+        media_type: str | None,
+    ) -> AttachmentRef:
+        """以调用方预分配的 opaque identity 幂等导入一个 finalized file。"""
+
+        result, cancelled = await _complete_critical(
+            asyncio.to_thread(
+                self._adopt_file,
+                source,
+                allowed_root,
+                kind,
+                filename,
+                media_type,
+                artifact_id,
             )
         )
         if cancelled:
@@ -251,12 +281,13 @@ class ChannelAttachmentArtifactStore:
         kind: AttachmentKind,
         filename: str | None,
         media_type: str | None,
+        artifact_id: str | None,
     ) -> AttachmentRef:
         """两次核对 source identity，并把内容复制进 Core artifact root。"""
 
         source_path, fingerprint = self._inspect_source(source, allowed_root)
         ref = AttachmentRef(
-            artifact_id=uuid4().hex,
+            artifact_id=uuid4().hex if artifact_id is None else artifact_id,
             kind=kind,
             filename=filename,
             media_type=media_type,
@@ -299,6 +330,17 @@ class ChannelAttachmentArtifactStore:
     ) -> AttachmentRef:
         """在一个同步临界段完成 file publish 与 ready-row publication。"""
 
+        lock = self._publish_locks[hash(ref.artifact_id) % len(self._publish_locks)]
+        with lock:
+            return self._publish_content_locked(ref, write_content)
+
+    def _publish_content_locked(
+        self,
+        ref: AttachmentRef,
+        write_content: Callable[[int], None],
+    ) -> AttachmentRef:
+        """串行恢复或发布同一 artifact identity。"""
+
         # 1. staging 只在 Core artifact root 内创建。
         root = self._resolve_artifact_root(create=True)
         assert root is not None
@@ -309,7 +351,7 @@ class ChannelAttachmentArtifactStore:
         intent_started = False
         published = False
         try:
-            self._session_store.begin_attachment_import(
+            intent = self._session_store.begin_attachment_import(
                 artifact_id=ref.artifact_id,
                 storage_key=storage_key,
                 expected_size_bytes=ref.size_bytes,
@@ -317,6 +359,28 @@ class ChannelAttachmentArtifactStore:
                 created_at=created_at,
             )
             intent_started = True
+            if intent.phase == "artifact_committed":
+                return self._require_existing_ready(ref)
+            if intent.phase == "file_published":
+                self._verify_unregistered_file(final, ref)
+                return self._register_ready(ref, storage_key)
+            if intent.phase != "prepared":
+                raise RuntimeError(
+                    f"attachment import phase 非法: {ref.artifact_id}:{intent.phase}"
+                )
+            if final.exists() or final.is_symlink():
+                self._verify_unregistered_file(final, ref)
+                self._session_store.mark_attachment_import_file_published(
+                    ref.artifact_id,
+                    updated_at=datetime.now(UTC).isoformat(),
+                )
+                return self._register_ready(ref, storage_key)
+            if staging.exists() or staging.is_symlink():
+                if staging.is_symlink() or not staging.is_file():
+                    raise ValueError(
+                        f"attachment staging 不是安全 regular file: {ref.artifact_id}"
+                    )
+                staging.unlink()
             fd = os.open(
                 staging,
                 os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
@@ -343,17 +407,7 @@ class ChannelAttachmentArtifactStore:
             )
 
             # 3. ready row 是唯一可见性 owner；失败时保留可审计 orphan。
-            record = self._session_store.register_ready_attachment(
-                artifact_id=ref.artifact_id,
-                storage_key=storage_key,
-                kind=ref.kind.value,
-                filename=ref.filename,
-                media_type=ref.media_type,
-                size_bytes=ref.size_bytes,
-                sha256=ref.sha256,
-                created_at=datetime.now(UTC).isoformat(),
-            )
-            return self._ref_from_record(record)
+            return self._register_ready(ref, storage_key)
         except BaseException as exc:
             failures: list[BaseException] = [exc]
             if intent_started:
@@ -382,6 +436,60 @@ class ChannelAttachmentArtifactStore:
                 "attachment import 与清理同时失败",
                 failures,
             ) from exc
+
+    def _register_ready(self, ref: AttachmentRef, storage_key: str) -> AttachmentRef:
+        """把已验证的 published bytes 提交为唯一 ready artifact。"""
+
+        record = self._session_store.register_ready_attachment(
+            artifact_id=ref.artifact_id,
+            storage_key=storage_key,
+            kind=ref.kind.value,
+            filename=ref.filename,
+            media_type=ref.media_type,
+            size_bytes=ref.size_bytes,
+            sha256=ref.sha256,
+            created_at=datetime.now(UTC).isoformat(),
+        )
+        return self._ref_from_record(record)
+
+    def _require_existing_ready(self, ref: AttachmentRef) -> AttachmentRef:
+        """验证幂等重试命中的 ready row、metadata 与物理 bytes。"""
+
+        record = self._session_store.get_attachment(ref.artifact_id)
+        if record is None or record.state != "ready":
+            raise RuntimeError(
+                f"attachment committed intent 缺少 ready row: {ref.artifact_id}"
+            )
+        canonical = self._ref_from_record(record)
+        if canonical != ref:
+            raise RuntimeError(f"attachment ready identity 已漂移: {ref.artifact_id}")
+        fd = self._open_verified(record)
+        os.close(fd)
+        return canonical
+
+    @staticmethod
+    def _verify_unregistered_file(path: Path, ref: AttachmentRef) -> None:
+        """验证 durable intent 已发布但尚未登记 ready 的 exact bytes。"""
+
+        fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        try:
+            file_stat = os.fstat(fd)
+            if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_size != ref.size_bytes:
+                raise ValueError(
+                    f"attachment published file metadata 已漂移: {ref.artifact_id}"
+                )
+            digest = hashlib.sha256()
+            while True:
+                chunk = os.read(fd, 1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+            if digest.hexdigest() != ref.sha256:
+                raise ValueError(
+                    f"attachment published file hash 已漂移: {ref.artifact_id}"
+                )
+        finally:
+            os.close(fd)
 
     def _inspect_source(
         self,

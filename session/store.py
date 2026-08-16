@@ -3799,8 +3799,8 @@ class SessionStore:
         expected_size_bytes: int,
         expected_sha256: str,
         created_at: str,
-    ) -> None:
-        """在写文件前持久化唯一 attachment import intent。"""
+    ) -> AttachmentImportRecord:
+        """在写文件前持久化或复用完全相同的 attachment import intent。"""
 
         if _ATTACHMENT_ID_RE.fullmatch(artifact_id) is None:
             raise ValueError("attachment artifact_id 必须是 1..256 字符安全 identity")
@@ -3817,6 +3817,39 @@ class SessionStore:
             raise ValueError("attachment import created_at 不得为空")
         with self._lock:
             with self._conn:
+                existing = self._conn.execute(
+                    """
+                    SELECT artifact_id, storage_key, expected_size_bytes,
+                           expected_sha256, phase, created_at, updated_at, error
+                    FROM attachment_imports
+                    WHERE artifact_id = ?
+                    """,
+                    (artifact_id,),
+                ).fetchone()
+                if existing is not None:
+                    if (
+                        str(existing["storage_key"]) != storage_key
+                        or int(existing["expected_size_bytes"])
+                        != expected_size_bytes
+                        or str(existing["expected_sha256"]) != expected_sha256
+                    ):
+                        raise RuntimeError(
+                            f"attachment import identity 已漂移: {artifact_id}"
+                        )
+                    return AttachmentImportRecord(
+                        artifact_id=str(existing["artifact_id"]),
+                        storage_key=str(existing["storage_key"]),
+                        expected_size_bytes=int(existing["expected_size_bytes"]),
+                        expected_sha256=str(existing["expected_sha256"]),
+                        phase=str(existing["phase"]),
+                        created_at=str(existing["created_at"]),
+                        updated_at=str(existing["updated_at"]),
+                        error=(
+                            None
+                            if existing["error"] is None
+                            else str(existing["error"])
+                        ),
+                    )
                 self._conn.execute(
                     """
                     INSERT INTO attachment_imports (
@@ -3833,6 +3866,10 @@ class SessionStore:
                         created_at,
                     ),
                 )
+        record = self.attachment_import(artifact_id)
+        if record is None:
+            raise RuntimeError(f"attachment import 未返回记录: {artifact_id}")
+        return record
 
     def mark_attachment_import_file_published(
         self,
