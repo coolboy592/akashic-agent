@@ -123,6 +123,7 @@ Gate 报告。分支名、PR 号和浮动 ref 不能代替 commit。
 | C20 | Proactive 私有兼容岛 | `OPEN` | Core-private registry 只接收六个内建 module identity；外部 v2 manifest/import/discovery fail-loud | Default/Wake Proactive |
 | C21 | generation-scoped background job / LLM capability | `OPEN` | committed catalog、trigger/interval、LLM generation lease、cancel/drain、candidate 不调模型 | Emotion |
 | C22 | static v3 artifact manifest / install staging | `CANDIDATE` | 集成 head `3e1f5c10`（独立复审 head `b6967d13`）已在 import 前校验 identity/runtime/validation、custom entrypoint 与 C12/C13 descriptor，不成功 staging 不创建正式 data/artifact/pointer；candidate 缺正式 data 时只建隔离空副本，Python argv 冻结为 exact artifact `.venv`；final focused 42、累计相关回归 440、Basedpyright/compileall/diff-check 通过，Terra xhigh 无 P0/P1。C12b/C13b Host 真消费该 argv 前不宣称 runtime activation 完成 | Calendar MCP / 全部 external v3 |
+| C23 | Core-owned Channel attachment artifact / Session binding | `OPEN` | opaque artifact、原子 import/adopt、SessionDB message binding、exact read lease、legacy media readback、无自动 GC、复制 workspace restore；详见 Channel 附件持久化合同 | Feishu / QQBot / Core channels |
 
 实现原则：C11～C17、C21～C22 只由表中的首个真实 consumer 拉动，不提前复制
 `commands()/mcp_servers()/managed_services()/channels()/jobs()/proactive_*()/mobile_ui()` 旧方法。
