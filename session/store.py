@@ -9,7 +9,7 @@ import threading
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Sequence, cast
 from uuid import uuid4
 
@@ -26,6 +26,11 @@ from agent.control.models import (
 logger = logging.getLogger(__name__)
 
 _SOURCE_PLAN_DIGEST_RE = re.compile(r"[0-9a-f]{64}")
+_ATTACHMENT_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}")
+_ATTACHMENT_SHA256_RE = re.compile(r"[0-9a-f]{64}")
+_ATTACHMENT_MEDIA_TYPE_RE = re.compile(
+    r"[A-Za-z0-9!#$&^_.+-]+/[A-Za-z0-9!#$&^_.+-]+"
+)
 
 
 class InteractionDeleteRequiredError(ValueError):
@@ -110,6 +115,45 @@ class SourceMutationAudit:
     action_source: str
     backup_path: str | None
     completed_at: str
+
+
+@dataclass(frozen=True)
+class AttachmentArtifactRecord:
+    """描述一个已发布且不可变的附件 artifact。"""
+
+    artifact_id: str
+    storage_key: str
+    kind: str
+    filename: str | None
+    media_type: str | None
+    size_bytes: int
+    sha256: str
+    state: str
+    created_at: str
+
+
+@dataclass(frozen=True)
+class AttachmentImportRecord:
+    """记录一次 attachment 文件发布与 metadata commit 的恢复状态。"""
+
+    artifact_id: str
+    storage_key: str
+    expected_size_bytes: int
+    expected_sha256: str
+    phase: str
+    created_at: str
+    updated_at: str
+    error: str | None
+
+
+@dataclass(frozen=True)
+class AttachmentIntegrityReport:
+    """汇总 SessionDB attachment authority 的只读完整性证据。"""
+
+    artifact_count: int
+    binding_count: int
+    bound_message_count: int
+    incomplete_import_ids: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -245,6 +289,7 @@ def _decode_message_extra(
         or not all(isinstance(item, str) for item in cast(list[object], media))
     ):
         raise ValueError(f"message media 必须是字符串数组: {message_id}")
+    _message_attachment_ids(extra_dict, message_id)
     source_refs: object = extra_dict.get("source_refs")
     if "source_refs" in extra_dict and (
         not isinstance(source_refs, list)
@@ -275,12 +320,79 @@ def _validate_new_message_extra(
 ) -> None:
     """Reject retired assistant metadata on newly persisted messages."""
 
-    if role != "assistant" or not isinstance(extra, dict):
+    if not isinstance(extra, dict):
+        return
+    _message_attachment_ids(extra, message_id)
+    if role != "assistant":
         return
     retired = _RETIRED_ASSISTANT_EXTRA_FIELDS.intersection(extra)
     if retired:
         fields = ", ".join(sorted(retired))
         raise ValueError(f"assistant extra 字段已退役: {fields}: {message_id}")
+
+
+def _message_attachment_ids(
+    extra: Mapping[str, object],
+    message_id: str,
+) -> tuple[str, ...]:
+    """校验并返回消息声明的有序 artifact identity。"""
+
+    raw_ids = extra.get("attachment_ids")
+    if raw_ids is None:
+        return ()
+    if not isinstance(raw_ids, list):
+        raise ValueError(f"message attachment_ids 必须是字符串数组: {message_id}")
+    artifact_ids = tuple(raw_ids)
+    if any(
+        not isinstance(artifact_id, str)
+        or _ATTACHMENT_ID_RE.fullmatch(artifact_id) is None
+        for artifact_id in artifact_ids
+    ):
+        raise ValueError(
+            f"message attachment_ids 必须是 1..256 字符安全 identity: {message_id}"
+        )
+    normalized = cast(tuple[str, ...], artifact_ids)
+    if len(set(normalized)) != len(normalized):
+        raise ValueError(f"message attachment_ids 不得重复: {message_id}")
+    return normalized
+
+
+def _message_attachment_binding_rows(
+    *,
+    message_id: str,
+    role: object,
+    extra: Mapping[str, object],
+) -> list[tuple[str, int, str, str]]:
+    """构造一条消息的有序 attachment binding rows。"""
+
+    artifact_ids = _message_attachment_ids(extra, message_id)
+    if not artifact_ids:
+        return []
+    if role == "user":
+        direction = "inbound"
+    elif role == "assistant":
+        direction = "outbound"
+    else:
+        raise ValueError(f"只有 user/assistant message 可以绑定 attachment: {message_id}")
+    return [
+        (message_id, ordinal, artifact_id, direction)
+        for ordinal, artifact_id in enumerate(artifact_ids)
+    ]
+
+
+def _attachment_storage_key(artifact_id: str, storage_key: str) -> PurePosixPath:
+    """校验 Core artifact 的唯一 workspace-relative storage identity。"""
+
+    storage_path = PurePosixPath(storage_key)
+    if storage_path.parts != (
+        "uploads",
+        "artifacts",
+        f"{artifact_id}.bin",
+    ):
+        raise ValueError(
+            "attachment storage_key 必须是 uploads/artifacts/<artifact_id>.bin"
+        )
+    return storage_path
 
 
 def _message_control_turn_id(
@@ -541,6 +653,10 @@ class SessionStore:
         self._lock = threading.Lock()
         self._closed = False
         self._has_fts = False
+        self._conn.execute("PRAGMA foreign_keys = ON")
+        foreign_keys = self._conn.execute("PRAGMA foreign_keys").fetchone()
+        if foreign_keys is None or int(foreign_keys[0]) != 1:
+            raise RuntimeError("SessionStore 无法启用 SQLite foreign key enforcement")
         self._init_schema()
 
     def __del__(self) -> None:
@@ -696,6 +812,60 @@ class SessionStore:
                     ts          TEXT NOT NULL,
                     UNIQUE (session_key, seq)
                 )
+                """)
+            self._conn.execute("""
+                CREATE TABLE IF NOT EXISTS attachments (
+                    artifact_id TEXT PRIMARY KEY,
+                    storage_key TEXT NOT NULL UNIQUE,
+                    kind TEXT NOT NULL CHECK (kind IN ('image', 'file')),
+                    filename TEXT,
+                    media_type TEXT,
+                    size_bytes INTEGER NOT NULL CHECK (size_bytes >= 0),
+                    sha256 TEXT NOT NULL CHECK (
+                        length(sha256) = 64
+                        AND sha256 NOT GLOB '*[^0-9a-f]*'
+                    ),
+                    state TEXT NOT NULL CHECK (state = 'ready'),
+                    created_at TEXT NOT NULL
+                )
+                """)
+            self._conn.execute("""
+                CREATE TABLE IF NOT EXISTS attachment_imports (
+                    artifact_id TEXT PRIMARY KEY,
+                    storage_key TEXT NOT NULL UNIQUE,
+                    expected_size_bytes INTEGER NOT NULL
+                        CHECK (expected_size_bytes >= 0),
+                    expected_sha256 TEXT NOT NULL CHECK (
+                        length(expected_sha256) = 64
+                        AND expected_sha256 NOT GLOB '*[^0-9a-f]*'
+                    ),
+                    phase TEXT NOT NULL CHECK (
+                        phase IN (
+                            'prepared', 'file_published', 'artifact_committed'
+                        )
+                    ),
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    error TEXT
+                )
+                """)
+            self._conn.execute("""
+                CREATE TABLE IF NOT EXISTS message_attachments (
+                    message_id TEXT NOT NULL,
+                    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+                    artifact_id TEXT NOT NULL,
+                    direction TEXT NOT NULL
+                        CHECK (direction IN ('inbound', 'outbound')),
+                    PRIMARY KEY (message_id, ordinal),
+                    FOREIGN KEY (message_id)
+                        REFERENCES messages(id) ON DELETE CASCADE,
+                    FOREIGN KEY (artifact_id)
+                        REFERENCES attachments(artifact_id)
+                )
+                """)
+            self._conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_message_attachments_artifact
+                ON message_attachments(artifact_id, message_id, ordinal)
                 """)
             self._conn.execute("""
                 CREATE TABLE IF NOT EXISTS session_compactions (
@@ -3215,6 +3385,7 @@ class SessionStore:
                             targets,
                         )
                     if cascade:
+                        self._delete_message_attachment_bindings_locked(message_ids)
                         self._conn.execute(
                             f"DELETE FROM messages WHERE session_key IN ({placeholders})",
                             targets,
@@ -3620,6 +3791,488 @@ class SessionStore:
             ).fetchone()
         return int((row["c"] if row else 0) or 0)
 
+    def begin_attachment_import(
+        self,
+        *,
+        artifact_id: str,
+        storage_key: str,
+        expected_size_bytes: int,
+        expected_sha256: str,
+        created_at: str,
+    ) -> None:
+        """在写文件前持久化唯一 attachment import intent。"""
+
+        if _ATTACHMENT_ID_RE.fullmatch(artifact_id) is None:
+            raise ValueError("attachment artifact_id 必须是 1..256 字符安全 identity")
+        _attachment_storage_key(artifact_id, storage_key)
+        if (
+            not isinstance(expected_size_bytes, int)
+            or isinstance(expected_size_bytes, bool)
+            or expected_size_bytes < 0
+        ):
+            raise ValueError("attachment expected_size_bytes 必须是非负整数")
+        if _ATTACHMENT_SHA256_RE.fullmatch(expected_sha256) is None:
+            raise ValueError("attachment expected_sha256 必须是 64 位小写十六进制")
+        if not isinstance(created_at, str) or not created_at:
+            raise ValueError("attachment import created_at 不得为空")
+        with self._lock:
+            with self._conn:
+                self._conn.execute(
+                    """
+                    INSERT INTO attachment_imports (
+                        artifact_id, storage_key, expected_size_bytes,
+                        expected_sha256, phase, created_at, updated_at, error
+                    ) VALUES (?, ?, ?, ?, 'prepared', ?, ?, NULL)
+                    """,
+                    (
+                        artifact_id,
+                        storage_key,
+                        expected_size_bytes,
+                        expected_sha256,
+                        created_at,
+                        created_at,
+                    ),
+                )
+
+    def mark_attachment_import_file_published(
+        self,
+        artifact_id: str,
+        *,
+        updated_at: str,
+    ) -> None:
+        """在目录 fsync 后持久化 file_published 恢复边界。"""
+
+        if not isinstance(updated_at, str) or not updated_at:
+            raise ValueError("attachment import updated_at 不得为空")
+        with self._lock:
+            with self._conn:
+                cur = self._conn.execute(
+                    """
+                    UPDATE attachment_imports
+                    SET phase = 'file_published', updated_at = ?, error = NULL
+                    WHERE artifact_id = ? AND phase = 'prepared'
+                    """,
+                    (updated_at, artifact_id),
+                )
+        if cur.rowcount != 1:
+            raise RuntimeError(
+                f"attachment import 不在 prepared: {artifact_id}"
+            )
+
+    def record_attachment_import_error(
+        self,
+        artifact_id: str,
+        *,
+        error: str,
+        updated_at: str,
+    ) -> None:
+        """记录非终态 import 错误，不删除或伪终结已有 bytes。"""
+
+        if not isinstance(error, str) or not error:
+            raise ValueError("attachment import error 不得为空")
+        if not isinstance(updated_at, str) or not updated_at:
+            raise ValueError("attachment import updated_at 不得为空")
+        with self._lock:
+            with self._conn:
+                cur = self._conn.execute(
+                    """
+                    UPDATE attachment_imports
+                    SET updated_at = ?, error = ?
+                    WHERE artifact_id = ? AND phase != 'artifact_committed'
+                    """,
+                    (updated_at, error, artifact_id),
+                )
+        if cur.rowcount != 1:
+            raise RuntimeError(
+                f"attachment import 不存在或已经 committed: {artifact_id}"
+            )
+
+    def attachment_import(self, artifact_id: str) -> AttachmentImportRecord | None:
+        """读取一个 attachment import 的 durable 恢复状态。"""
+
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT artifact_id, storage_key, expected_size_bytes,
+                       expected_sha256, phase, created_at, updated_at, error
+                FROM attachment_imports
+                WHERE artifact_id = ?
+                """,
+                (artifact_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return AttachmentImportRecord(
+            artifact_id=str(row["artifact_id"]),
+            storage_key=str(row["storage_key"]),
+            expected_size_bytes=int(row["expected_size_bytes"]),
+            expected_sha256=str(row["expected_sha256"]),
+            phase=str(row["phase"]),
+            created_at=str(row["created_at"]),
+            updated_at=str(row["updated_at"]),
+            error=None if row["error"] is None else str(row["error"]),
+        )
+
+    def incomplete_attachment_imports(self) -> tuple[AttachmentImportRecord, ...]:
+        """列出所有不能自动删除或自动重绑的未完成 import。"""
+
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT artifact_id
+                FROM attachment_imports
+                WHERE phase != 'artifact_committed'
+                ORDER BY created_at, artifact_id
+                """
+            ).fetchall()
+        records = tuple(
+            self.attachment_import(str(row["artifact_id"])) for row in rows
+        )
+        return tuple(record for record in records if record is not None)
+
+    def validate_attachment_metadata_integrity(self) -> AttachmentIntegrityReport:
+        """验证 FK、message projection、binding 顺序与 import terminal state。"""
+
+        with self._lock:
+            # 1. SQLite FK 与 ready artifact metadata 必须自洽。
+            foreign_key_errors = self._conn.execute(
+                "PRAGMA foreign_key_check"
+            ).fetchall()
+            if foreign_key_errors:
+                raise ValueError(
+                    f"attachment foreign key check 失败: {len(foreign_key_errors)}"
+                )
+            artifacts = self._conn.execute(
+                """
+                SELECT artifact_id, storage_key, size_bytes, sha256, state
+                FROM attachments
+                ORDER BY artifact_id
+                """
+            ).fetchall()
+            for artifact in artifacts:
+                if (
+                    str(artifact["state"]) != "ready"
+                ):
+                    raise ValueError(
+                        "attachment metadata 非法: " + str(artifact["artifact_id"])
+                    )
+                _attachment_storage_key(
+                    str(artifact["artifact_id"]),
+                    str(artifact["storage_key"]),
+                )
+            import_rows = self._conn.execute(
+                """
+                SELECT artifact_id, storage_key, expected_size_bytes,
+                       expected_sha256, phase
+                FROM attachment_imports
+                ORDER BY artifact_id
+                """
+            ).fetchall()
+            imports = {str(row["artifact_id"]): row for row in import_rows}
+            artifact_ids = {str(row["artifact_id"]) for row in artifacts}
+            for artifact in artifacts:
+                artifact_id = str(artifact["artifact_id"])
+                intent = imports.get(artifact_id)
+                if (
+                    intent is None
+                    or str(intent["phase"]) != "artifact_committed"
+                    or str(intent["storage_key"]) != str(artifact["storage_key"])
+                    or int(intent["expected_size_bytes"])
+                    != int(artifact["size_bytes"])
+                    or str(intent["expected_sha256"]) != str(artifact["sha256"])
+                ):
+                    raise ValueError(
+                        f"attachment committed intent 已漂移: {artifact_id}"
+                    )
+            terminal_without_artifact = sorted(
+                artifact_id
+                for artifact_id, intent in imports.items()
+                if str(intent["phase"]) == "artifact_committed"
+                and artifact_id not in artifact_ids
+            )
+            if terminal_without_artifact:
+                raise ValueError(
+                    "attachment committed intent 缺少 artifact: "
+                    + ", ".join(terminal_without_artifact)
+                )
+
+            # 2. durable binding 是 owner；message extra 只能是完全一致的投影。
+            messages = self._conn.execute(
+                """
+                SELECT id, role, extra
+                FROM messages
+                ORDER BY session_key, seq
+                """
+            ).fetchall()
+            binding_rows = self._conn.execute(
+                """
+                SELECT message_id, ordinal, artifact_id, direction
+                FROM message_attachments
+                ORDER BY message_id, ordinal
+                """
+            ).fetchall()
+            bindings: dict[str, list[sqlite3.Row]] = {}
+            for binding in binding_rows:
+                bindings.setdefault(str(binding["message_id"]), []).append(binding)
+            bound_message_count = 0
+            for message in messages:
+                message_id = str(message["id"])
+                projection = _message_attachment_ids(
+                    _decode_message_extra(message["extra"], message_id),
+                    message_id,
+                )
+                durable = tuple(
+                    str(binding["artifact_id"])
+                    for binding in bindings.get(message_id, [])
+                )
+                if projection != durable:
+                    raise ValueError(
+                        f"message attachment projection 已漂移: {message_id}"
+                    )
+                if durable:
+                    bound_message_count += 1
+                    if message["role"] not in {"user", "assistant"}:
+                        raise ValueError(
+                            f"带 attachment 的 message role 无效: {message_id}"
+                        )
+                    expected_direction = (
+                        "inbound" if message["role"] == "user" else "outbound"
+                    )
+                    if any(
+                        str(binding["direction"]) != expected_direction
+                        for binding in bindings[message_id]
+                    ):
+                        raise ValueError(
+                            f"message attachment direction 已漂移: {message_id}"
+                        )
+            incomplete_rows = self._conn.execute(
+                """
+                SELECT artifact_id
+                FROM attachment_imports
+                WHERE phase != 'artifact_committed'
+                ORDER BY created_at, artifact_id
+                """
+            ).fetchall()
+        return AttachmentIntegrityReport(
+            artifact_count=len(artifacts),
+            binding_count=len(binding_rows),
+            bound_message_count=bound_message_count,
+            incomplete_import_ids=tuple(
+                str(row["artifact_id"]) for row in incomplete_rows
+            ),
+        )
+
+    def register_ready_attachment(
+        self,
+        *,
+        artifact_id: str,
+        storage_key: str,
+        kind: str,
+        filename: str | None,
+        media_type: str | None,
+        size_bytes: int,
+        sha256: str,
+        created_at: str,
+    ) -> AttachmentArtifactRecord:
+        """登记一个已原子发布且不可变的附件 artifact。"""
+
+        # 1. SessionDB 只接受 Core artifact namespace 的稳定元数据。
+        if _ATTACHMENT_ID_RE.fullmatch(artifact_id) is None:
+            raise ValueError("attachment artifact_id 必须是 1..256 字符安全 identity")
+        _attachment_storage_key(artifact_id, storage_key)
+        if kind not in {"image", "file"}:
+            raise ValueError("attachment kind 必须是 image 或 file")
+        if not isinstance(size_bytes, int) or isinstance(size_bytes, bool) or size_bytes < 0:
+            raise ValueError("attachment size_bytes 必须是非负整数")
+        if _ATTACHMENT_SHA256_RE.fullmatch(sha256) is None:
+            raise ValueError("attachment sha256 必须是 64 位小写十六进制")
+        if filename is not None and (
+            not isinstance(filename, str)
+            or not filename
+            or filename != filename.strip()
+            or len(filename) > 255
+            or "/" in filename
+            or "\\" in filename
+            or "\x00" in filename
+            or any(ord(char) < 32 or ord(char) == 127 for char in filename)
+        ):
+            raise ValueError("attachment filename 必须是 1..255 字符的纯文件名或 None")
+        if media_type is not None and (
+            not isinstance(media_type, str)
+            or len(media_type) > 255
+            or _ATTACHMENT_MEDIA_TYPE_RE.fullmatch(media_type) is None
+        ):
+            raise ValueError("attachment media_type 必须是合法 MIME type 或 None")
+        if not isinstance(created_at, str) or not created_at:
+            raise ValueError("attachment created_at 不得为空")
+
+        # 2. INSERT-only publication 禁止复用 identity 或 storage path。
+        with self._lock:
+            with self._conn:
+                intent = self._conn.execute(
+                    """
+                    SELECT storage_key, expected_size_bytes, expected_sha256, phase
+                    FROM attachment_imports
+                    WHERE artifact_id = ?
+                    """,
+                    (artifact_id,),
+                ).fetchone()
+                if intent is None:
+                    raise RuntimeError(
+                        f"attachment 缺少 durable import intent: {artifact_id}"
+                    )
+                if str(intent["phase"]) != "file_published":
+                    raise RuntimeError(
+                        f"attachment file 尚未发布: {artifact_id}:{intent['phase']}"
+                    )
+                if (
+                    str(intent["storage_key"]) != storage_key
+                    or int(intent["expected_size_bytes"]) != size_bytes
+                    or str(intent["expected_sha256"]) != sha256
+                ):
+                    raise RuntimeError(
+                        f"attachment publication 与 durable intent 不一致: {artifact_id}"
+                    )
+                self._conn.execute(
+                    """
+                    INSERT INTO attachments (
+                        artifact_id, storage_key, kind, filename, media_type,
+                        size_bytes, sha256, state, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'ready', ?)
+                    """,
+                    (
+                        artifact_id,
+                        storage_key,
+                        kind,
+                        filename,
+                        media_type,
+                        size_bytes,
+                        sha256,
+                        created_at,
+                    ),
+                )
+                self._conn.execute(
+                    """
+                    UPDATE attachment_imports
+                    SET phase = 'artifact_committed', updated_at = ?, error = NULL
+                    WHERE artifact_id = ? AND phase = 'file_published'
+                    """,
+                    (created_at, artifact_id),
+                )
+        record = self.get_attachment(artifact_id)
+        if record is None:
+            raise RuntimeError(f"attachment publication 未返回记录: {artifact_id}")
+        return record
+
+    def get_attachment(self, artifact_id: str) -> AttachmentArtifactRecord | None:
+        """读取一个 artifact 的权威 metadata。"""
+
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT artifact_id, storage_key, kind, filename, media_type,
+                       size_bytes, sha256, state, created_at
+                FROM attachments
+                WHERE artifact_id = ?
+                """,
+                (artifact_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return AttachmentArtifactRecord(
+            artifact_id=str(row["artifact_id"]),
+            storage_key=str(row["storage_key"]),
+            kind=str(row["kind"]),
+            filename=None if row["filename"] is None else str(row["filename"]),
+            media_type=None if row["media_type"] is None else str(row["media_type"]),
+            size_bytes=int(row["size_bytes"]),
+            sha256=str(row["sha256"]),
+            state=str(row["state"]),
+            created_at=str(row["created_at"]),
+        )
+
+    def list_attachments(self) -> tuple[AttachmentArtifactRecord, ...]:
+        """按 identity 列出 ready artifact metadata，不暴露任意 SQL。"""
+
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT artifact_id, storage_key, kind, filename, media_type,
+                       size_bytes, sha256, state, created_at
+                FROM attachments
+                ORDER BY artifact_id
+                """
+            ).fetchall()
+        return tuple(
+            AttachmentArtifactRecord(
+                artifact_id=str(row["artifact_id"]),
+                storage_key=str(row["storage_key"]),
+                kind=str(row["kind"]),
+                filename=(
+                    None if row["filename"] is None else str(row["filename"])
+                ),
+                media_type=(
+                    None if row["media_type"] is None else str(row["media_type"])
+                ),
+                size_bytes=int(row["size_bytes"]),
+                sha256=str(row["sha256"]),
+                state=str(row["state"]),
+                created_at=str(row["created_at"]),
+            )
+            for row in rows
+        )
+
+    def message_attachment_ids(self, message_id: str) -> tuple[str, ...]:
+        """按消息内顺序读取 durable attachment bindings。"""
+
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT artifact_id
+                FROM message_attachments
+                WHERE message_id = ?
+                ORDER BY ordinal
+                """,
+                (message_id,),
+            ).fetchall()
+        return tuple(str(row["artifact_id"]) for row in rows)
+
+    def _require_ready_attachments_locked(
+        self,
+        artifact_ids: set[str],
+    ) -> None:
+        """在当前消息事务内确认全部 artifact 已发布。"""
+
+        if not artifact_ids:
+            return
+        placeholders = ",".join("?" for _ in artifact_ids)
+        rows = self._conn.execute(
+            f"""
+            SELECT artifact_id
+            FROM attachments
+            WHERE artifact_id IN ({placeholders}) AND state = 'ready'
+            """,
+            tuple(sorted(artifact_ids)),
+        ).fetchall()
+        ready = {str(row["artifact_id"]) for row in rows}
+        missing = sorted(artifact_ids - ready)
+        if missing:
+            raise ValueError("message 引用了未发布的 attachment: " + ", ".join(missing))
+
+    def _delete_message_attachment_bindings_locked(
+        self,
+        message_ids: Sequence[str],
+    ) -> None:
+        """只删除消息绑定，永不删除 artifact metadata 或 bytes。"""
+
+        if not message_ids:
+            return
+        placeholders = ",".join("?" for _ in message_ids)
+        self._conn.execute(
+            f"DELETE FROM message_attachments WHERE message_id IN ({placeholders})",
+            tuple(message_ids),
+        )
+
     def _next_seq_locked(self, session_key: str) -> int:
         meta = self._conn.execute(
             "SELECT next_seq FROM sessions WHERE key = ?",
@@ -3650,39 +4303,59 @@ class SessionStore:
         extra: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         message_id = f"{session_key}:{seq}"
-        _validate_new_message_extra(role, extra or {}, message_id)
+        normalized_extra = extra or {}
+        _validate_new_message_extra(role, normalized_extra, message_id)
+        binding_rows = _message_attachment_binding_rows(
+            message_id=message_id,
+            role=role,
+            extra=normalized_extra,
+        )
         tool_chain_payload = (
             json.dumps(tool_chain, ensure_ascii=False)
             if tool_chain is not None
             else None
         )
-        extra_payload = json.dumps(extra or {}, ensure_ascii=False)
+        extra_payload = json.dumps(normalized_extra, ensure_ascii=False)
         with self._lock:
-            self._conn.execute(
-                """
-                INSERT INTO messages (id, session_key, seq, role, content, tool_chain, extra, ts)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    message_id,
-                    session_key,
-                    seq,
-                    role,
-                    content,
-                    tool_chain_payload,
-                    extra_payload,
-                    ts,
-                ),
-            )
-            self._conn.execute(
-                """
-                UPDATE sessions
-                SET next_seq = CASE WHEN next_seq < ? THEN ? ELSE next_seq END
-                WHERE key = ?
-                """,
-                (int(seq) + 1, int(seq) + 1, session_key),
-            )
-            self._conn.commit()
+            with self._conn:
+                self._conn.execute("BEGIN IMMEDIATE")
+                self._require_ready_attachments_locked(
+                    {row[2] for row in binding_rows}
+                )
+                self._conn.execute(
+                    """
+                    INSERT INTO messages (
+                        id, session_key, seq, role, content, tool_chain, extra, ts
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        message_id,
+                        session_key,
+                        seq,
+                        role,
+                        content,
+                        tool_chain_payload,
+                        extra_payload,
+                        ts,
+                    ),
+                )
+                if binding_rows:
+                    self._conn.executemany(
+                        """
+                        INSERT INTO message_attachments (
+                            message_id, ordinal, artifact_id, direction
+                        ) VALUES (?, ?, ?, ?)
+                        """,
+                        binding_rows,
+                    )
+                self._conn.execute(
+                    """
+                    UPDATE sessions
+                    SET next_seq = CASE WHEN next_seq < ? THEN ? ELSE next_seq END
+                    WHERE key = ?
+                    """,
+                    (int(seq) + 1, int(seq) + 1, session_key),
+                )
         row = {
             "id": message_id,
             "session_key": session_key,
@@ -3693,8 +4366,8 @@ class SessionStore:
         }
         if tool_chain is not None:
             row["tool_chain"] = tool_chain
-        if extra:
-            row.update(extra)
+        if normalized_extra:
+            row.update(normalized_extra)
         return row
 
     def _prepare_message_batch(
@@ -3703,11 +4376,16 @@ class SessionStore:
         *,
         start_seq: int,
         messages: list[dict[str, Any]],
-    ) -> tuple[list[tuple[Any, ...]], list[dict[str, Any]]]:
+    ) -> tuple[
+        list[tuple[Any, ...]],
+        list[dict[str, Any]],
+        list[tuple[str, int, str, str]],
+    ]:
         """序列化待写消息并构造提交成功后的内存行。"""
 
         insert_rows: list[tuple[Any, ...]] = []
         result_rows: list[dict[str, Any]] = []
+        binding_rows: list[tuple[str, int, str, str]] = []
 
         # 1. 先完成序列化，失败时不改变数据库和内存消息。
         for offset, message in enumerate(messages):
@@ -3716,6 +4394,13 @@ class SessionStore:
             tool_chain = message.get("tool_chain")
             extra = message["extra"]
             _validate_new_message_extra(message.get("role"), extra, message_id)
+            binding_rows.extend(
+                _message_attachment_binding_rows(
+                    message_id=message_id,
+                    role=message.get("role"),
+                    extra=extra,
+                )
+            )
             tool_chain_payload = (
                 json.dumps(tool_chain, ensure_ascii=False)
                 if tool_chain is not None
@@ -3745,7 +4430,7 @@ class SessionStore:
                 row["tool_chain"] = tool_chain
             row.update(extra)
             result_rows.append(row)
-        return insert_rows, result_rows
+        return insert_rows, result_rows, binding_rows
 
     def persist_session(
         self,
@@ -3777,10 +4462,13 @@ class SessionStore:
                 )
                 if messages:
                     start_seq = self._next_seq_locked(key)
-                    insert_rows, result_rows = self._prepare_message_batch(
+                    insert_rows, result_rows, binding_rows = self._prepare_message_batch(
                         key,
                         start_seq=start_seq,
                         messages=messages,
+                    )
+                    self._require_ready_attachments_locked(
+                        {row[2] for row in binding_rows}
                     )
                     self._conn.executemany(
                         """
@@ -3789,6 +4477,15 @@ class SessionStore:
                         """,
                         insert_rows,
                     )
+                    if binding_rows:
+                        self._conn.executemany(
+                            """
+                            INSERT INTO message_attachments (
+                                message_id, ordinal, artifact_id, direction
+                            ) VALUES (?, ?, ?, ?)
+                            """,
+                            binding_rows,
+                        )
                     next_seq = start_seq + len(insert_rows)
                     self._conn.execute(
                         """
@@ -4126,6 +4823,47 @@ class SessionStore:
                         extra,
                         message_id,
                     )
+                    attachment_rows = self._conn.execute(
+                        """
+                        SELECT artifact_id
+                        FROM message_attachments
+                        WHERE message_id = ?
+                        ORDER BY ordinal
+                        """,
+                        (message_id,),
+                    ).fetchall()
+                    durable_ids = tuple(
+                        str(attachment_row["artifact_id"])
+                        for attachment_row in attachment_rows
+                    )
+                    if _message_attachment_ids(extra, message_id) != durable_ids:
+                        raise ValueError(
+                            "message attachment binding 不允许由 message_edit 改写: "
+                            f"{message_id}"
+                        )
+                if role is not None:
+                    attachment_count = self._conn.execute(
+                        """
+                        SELECT COUNT(1) AS c
+                        FROM message_attachments
+                        WHERE message_id = ?
+                        """,
+                        (message_id,),
+                    ).fetchone()
+                    if int(attachment_count["c"] if attachment_count else 0) > 0:
+                        if role not in {"user", "assistant"}:
+                            raise ValueError(
+                                "带 attachment 的 message role 只能是 user/assistant: "
+                                f"{message_id}"
+                            )
+                        self._conn.execute(
+                            """
+                            UPDATE message_attachments
+                            SET direction = ?
+                            WHERE message_id = ?
+                            """,
+                            ("inbound" if role == "user" else "outbound", message_id),
+                        )
                 params.append(message_id)
                 cur = self._conn.execute(
                     f"UPDATE messages SET {', '.join(set_parts)} WHERE id = ?",
@@ -4176,6 +4914,7 @@ class SessionStore:
                     raise InteractionDeleteRequiredError(message_id, control_turn_id)
                 self._require_sessions_not_admitted_locked([session_key])
                 backup_path = self._backup_before_delete_locked("message-deletions")
+                self._delete_message_attachment_bindings_locked([message_id])
                 cur = self._conn.execute(
                     "DELETE FROM messages WHERE id = ?",
                     (message_id,),
@@ -4243,6 +4982,7 @@ class SessionStore:
                         )
                 self._require_sessions_not_admitted_locked(list(grouped))
                 backup_path = self._backup_before_delete_locked("message-deletions")
+                self._delete_message_attachment_bindings_locked(clean_ids)
                 cur = self._conn.execute(
                     f"DELETE FROM messages WHERE id IN ({placeholders})",
                     tuple(clean_ids),
@@ -4346,6 +5086,7 @@ class SessionStore:
 
                 # 3. 正文、逐消息 embedding 与游标在同一事务中提交。
                 placeholders = ",".join("?" for _ in message_ids)
+                self._delete_message_attachment_bindings_locked(message_ids)
                 self._conn.execute(
                     f"DELETE FROM messages WHERE id IN ({placeholders})",
                     message_ids,
