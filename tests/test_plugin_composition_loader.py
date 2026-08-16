@@ -469,6 +469,29 @@ def test_v3_namespace_accepts_canonical_apply_signature(declaration: str) -> Non
 
 
 @pytest.mark.asyncio
+async def test_v3_manager_rejects_invalid_apply_before_plugin_data_creation(
+    tmp_path: Path,
+) -> None:
+    _write_plugin(
+        tmp_path / "plugins",
+        "invalid_apply",
+        "api_version = 3\n"
+        "name = 'invalid_apply'\n"
+        "version = '1.0.0'\n"
+        "def apply(ctx): pass\n",
+    )
+    manager = _manager(tmp_path)
+
+    await manager.load_all()
+
+    assert manager.generation("invalid_apply") is None
+    assert not (
+        tmp_path / "workspace" / "plugin-data" / "invalid_apply-builtin"
+    ).exists()
+    await manager.terminate_all()
+
+
+@pytest.mark.asyncio
 async def test_v3_loader_rejects_workspace_root_that_is_not_directory(
     tmp_path: Path,
 ) -> None:

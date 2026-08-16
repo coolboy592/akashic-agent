@@ -3481,8 +3481,6 @@ class PluginManager:
             mod,
             self._workspace,
         )
-        if not stage_stable:
-            ensure_workspace_plugin_data_dir(data_dir, self._workspace)
         config_revision = _file_revision(data_dir / "config.local.toml")
         generation_id = (
             f"{initial_plugin_id}:{source_revision[:12]}:{generation_sequence}"
@@ -3587,6 +3585,8 @@ class PluginManager:
                 error=f"{check_id}: {error_text}",
             )
             return None
+        if not stage_stable:
+            ensure_workspace_plugin_data_dir(data_dir, self._workspace)
         from agent.plugins.context import PluginContext, PluginKVStore
 
         scope = PluginScope(plugin_id)
