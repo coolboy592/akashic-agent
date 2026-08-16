@@ -1,8 +1,9 @@
 # 插件 v3 admission 与 lifecycle 收口任务合同
 
-- 状态：implemented / verified
+- 状态：candidate / independently reviewed
 - 日期：2026-08-16
-- 实现基线：`677bedd6`
+- 实现基线：`33fd3542`
+- 精确实现：`4ba266ad`
 - 关联条款：PLG-001～PLG-004、PLG-008～PLG-010、PLG-014、TST-001～TST-008
 - 上游：[v3 production readiness checklist](plugin-v3-production-readiness-checklist.md)、[v3 loader 合同](plugin-v3-loader-task-contract.md)
 
@@ -41,6 +42,7 @@ request task lease ── strict lifecycle binding ──► frozen CompositionR
 - event 五种 dispatch mode 参数化验证 non-callable 在零 mutation 状态失败；
 - disposed Fiber 保存的 Context 调用 `spawn()` 后 coroutine 已关闭、Effect/task 为空且无 warning；
 - malformed/valid sync/async `apply` 签名 admission matrix；
+- Manager admission 在任何 config 读取前校验 plugin-data 路径，并在成功后才创建目录；
 - lifecycle unbound/no Root no-op、same-task dispatch、wrong-task/inactive lease fail-loud；
 - composition events/kernel/lifecycle/loader 定向回归、Basedpyright error-level、compileall、`git diff --check`。
 
