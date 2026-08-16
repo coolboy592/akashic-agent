@@ -108,6 +108,17 @@ async def test_capabilities_project_bounded_v3_composition_facts(
         "class InspectedLegacyPlugin(Plugin):\n"
         "    name = 'inspected_v2'\n",
     )
+    _write_plugin(
+        tmp_path / "plugins",
+        "inactive_v3",
+        "api_version = 3\n"
+        "name = 'inactive_v3'\n"
+        "version = '1.0.0'\n"
+        "def is_active(services): return False\n"
+        "async def worker(ctx): pass\n"
+        "async def apply(ctx, config):\n"
+        "    await ctx.mount(worker, name='inactive_worker')\n",
+    )
     workspace = tmp_path / "workspace"
     manager = PluginManager(
         plugin_dirs=[tmp_path / "plugins"],
@@ -134,6 +145,7 @@ async def test_capabilities_project_bounded_v3_composition_facts(
         cast(str, item["id"]): item
         for item in cast(list[dict[str, object]], payload["plugins"])
     }
+    assert "inactive_v3" not in plugins
     legacy = plugins["inspected_v2"]
     assert legacy["api_version"] == 2
     assert legacy["composition"] is None

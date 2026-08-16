@@ -247,21 +247,31 @@ def _plugin_composition_items(
         raise RuntimeError("stable snapshot 的 composition Root 与 Topology 必须成对存在")
 
     # 1. Frozen parent edges assign every nested Fiber to one top-level plugin.
-    v3_plugin_ids = {
+    all_v3_plugin_ids = {
+        generation.plugin_id
+        for generation in snapshot.generations.values()
+        if getattr(generation.instance, "api_version", 2) == 3
+    }
+    active_v3_plugin_ids = {
         generation.plugin_id
         for generation in snapshot.active_generations()
         if getattr(generation.instance, "api_version", 2) == 3
     }
-    owner_by_fiber = _top_level_plugin_owners(topology.fibers, v3_plugin_ids)
+    all_owners = _top_level_plugin_owners(topology.fibers, all_v3_plugin_ids)
     receipt = root.receipt()
     current_fibers = {fiber.name: fiber for fiber in receipt.fibers}
-    if current_fibers.keys() != owner_by_fiber.keys():
+    if current_fibers.keys() != all_owners.keys():
         raise RuntimeError("stable snapshot 的 current Fiber 与冻结 Topology 不一致")
+    owner_by_fiber = {
+        name: owner
+        for name, owner in all_owners.items()
+        if owner in active_v3_plugin_ids
+    }
     incident_counts = dict(receipt.incident_counts)
 
     # 2. Current Health/Incident state is bounded; cumulative counts remain exact.
     result: dict[str, dict[str, object]] = {}
-    for plugin_id in sorted(v3_plugin_ids):
+    for plugin_id in sorted(active_v3_plugin_ids):
         owned_names = {
             name for name, owner in owner_by_fiber.items() if owner == plugin_id
         }

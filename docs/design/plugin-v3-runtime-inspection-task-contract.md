@@ -1,6 +1,6 @@
 # 插件 v3 Runtime Inspection 任务合同
 
-- 状态：implemented / verified
+- 状态：candidate / independently reviewed
 - 日期：2026-08-16
 - 实现基线：`2d9fb408`
 - 关联条款：PLG-008～PLG-010、PLG-014、CTRL-003、MOB-006、TST-001～TST-008
@@ -31,6 +31,7 @@ stable RuntimeSnapshot lease
 2. v3 plugin item 同时返回 generation identity、当前 Fiber 状态、required/optional Health、累计 Incident 数、
    有界最近 Incident 和冻结 Topology identity/revision。nested Fiber 通过 parent edge 归到顶层插件 owner。
 3. v2 plugin item 明确标记 `api_version = 2` 且 `composition = null`；不得从 legacy context 或日志推断假状态。
+   静态 inactive 的 v3 generation 保留在冻结 Topology 中，但不属于 stable capability 投影，也不得阻断其他插件查询。
 4. Incident 累计数由 CompositionRoot 在记录时按直接 Fiber owner 单调计数；最近详情继续受 Root buffer 与查询上限
    约束，不反向影响 readiness、snapshot identity 或 publication。
 5. 查询期间 Root 被替换或 drain 时，lease 保持本次回答来自同一 snapshot；释放 lease 后不保存 Root 引用。
