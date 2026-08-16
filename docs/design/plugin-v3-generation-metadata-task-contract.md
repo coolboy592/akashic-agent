@@ -1,8 +1,9 @@
 # 插件 v3 generation metadata 收口任务合同
 
-- 状态：implemented / verified
+- 状态：candidate / independently reviewed
 - 日期：2026-08-16
 - 实现基线：`6d6b0d97`
+- 精确实现：`2d9fb408`
 - 关联条款：PLG-001～PLG-004、PLG-008～PLG-010、PLG-014、TST-001～TST-008
 - 上游：[v3 production readiness checklist](plugin-v3-production-readiness-checklist.md)、[v3 data root 合同](plugin-data-root-task-contract.md)
 

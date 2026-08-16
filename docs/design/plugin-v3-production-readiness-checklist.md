@@ -118,7 +118,7 @@ Gate 报告。分支名、PR 号和浮动 ref 不能代替 commit。
 | C15 | timer / proactive source / turn enqueue capability | `OPEN` | skip/failure 可区分、timer 回收、turn owner、无候选发送 | Calendar MCP |
 | C16 | v3 admission/lifecycle 收口 | `CANDIDATE` | `4ba266ad` 已通过独立 review；non-callable listener、spawn coroutine、apply signature、wrong-task lifecycle 全部 fail-loud，malformed admission 零 data-dir 写入 | Core |
 | C17 | mobile UI/query capability | `OPEN` | committed catalog、lease、bounded query、candidate 不发布 | Akasha / Observe |
-| C18 | Core-private v3 generation metadata | `IMPLEMENTED` | v3 stable load、candidate clone 与 formal rebuild 不再构造或读取 `PluginContext`；59 loader + 208 Manager/hot-reload 回归通过，待独立 review | Core |
+| C18 | Core-private v3 generation metadata | `CANDIDATE` | `2d9fb408` 已通过独立 review；v3 stable load、candidate clone 与 formal rebuild 不再构造或读取 `PluginContext`，59 loader + 208 Manager/hot-reload 回归通过 | Core |
 | C19 | full-fleet Health/Incident/Topology inspection | `OPEN` | 每插件可查询 current health、incident、generation、cleanup | 全量 runtime |
 | C20 | Proactive 私有兼容岛 | `OPEN` | Core-private registry 只接收六个内建 module identity；外部 v2 manifest/import/discovery fail-loud | Default/Wake Proactive |
 | C21 | generation-scoped background job / LLM capability | `OPEN` | committed catalog、trigger/interval、LLM generation lease、cancel/drain、candidate 不调模型 | Emotion |
