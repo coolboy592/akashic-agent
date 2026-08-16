@@ -1,8 +1,9 @@
 # 插件 v3 Mobile UI/query capability 任务合同
 
-- 状态：approved / implementing
+- 状态：implemented / independent review passed
 - 日期：2026-08-16
-- 实现基线：`03f6e862`
+- 实现基线：`19f2cca2`
+- 实现提交：`2c6e4f71`、`b173f551`
 - 关联条款：PLG-001～PLG-004、PLG-008、PLG-011、PLG-014、MOB-006、TST-001～TST-008
 - 上游：[v3 production readiness checklist](plugin-v3-production-readiness-checklist.md)、[v3 package contributions](plugin-v3-package-contributions-task-contract.md)
 - 参考但不直接合并：旧 capability lane `6214af1c`、`c828b31d`
@@ -37,12 +38,16 @@ workspace 或 plugin-data，不把 Dashboard backend 重做成动态 slot，也�
 3. `MobileUiRegistry` 是 snapshot-owned immutable value，descriptor 覆盖 owner、asset hashes/bytes、
    navigation 与 slots，并进入 snapshot identity。handler 只存在 exact snapshot binding，不进入内容 hash；
    generation source revision 继续绑定其代码身份。
+   每个 live handler 还绑定 Fiber activation token；Fiber dispose/restart 后旧 binding 立即不可解析，cleanup
+   不能重新打开已经 freeze 的 registry。
 4. candidate registry 只存在 candidate snapshot，不得写回 stable `PluginGeneration.contributions`。这是对旧
    capability lane 的明确修订：candidate clone handler 不能替换 stable generation 的 query callback。
    formal rebuild 必须重新登记正式 Root handler，payload replacement 复制正式 registry。
 5. `PluginMobileUiProvider` 的 catalog/asset 只读 current stable snapshot；query 取得 exact stable lease 后，
    从同一 snapshot registry 解析 handler。timeout 或 caller cancellation 后 lease 持有到同步 worker 真正退出。
    worker/queue/结果大小和 `MobileUiRpcInvalidRequest` 的现有错误映射保持不变。
+   query 结果由 Core 做递归 JSON 校验：mapping key 必须是字符串，拒绝 cycle、非有限浮点和非 JSON 值；
+   校验后才允许进入 Mobile transport。
 6. 迁移期 v2 Mobile UI 先在 generation contribution 中冻结 asset/query/available 三元组；provider 不再把任意
    generation instance cast 成 `Plugin`。v2 与 v3 同名 contribution 在 snapshot compile 阶段 fail-loud；
    最后一个 v2 consumer 迁走后删除 legacy 三元组与 Manager 固定收集。
@@ -69,6 +74,10 @@ workspace 或 plugin-data，不把 Dashboard backend 重做成动态 slot，也�
 任何 candidate asset/handler 提前公开、query 脱离 exact lease、超时提前释放 generation、非法 asset 写入
 artifact/workspace、或 v2 provider 行为漂移都停止交付。
 
+实现 head 的独立复核未发现 P0/P1。集成分支已运行 Mobile UI、Manager、lifecycle、loader、kernel 与
+hot-reload 累计回归 `372 passed`；相关 Basedpyright 为 `0 errors`，compileall 与 `git diff --check` 通过。
+完整 E1/E4 仍由最终 exact plugin lock 统一执行，本合同不把定向回归写成生产替换证据。
+
 ## 5. 回滚
 
-代码恢复点为 `03f6e862`。本任务没有正式运行数据变化；回滚只撤销该能力源码、测试和合同。
+代码恢复点为 `19f2cca2`。本任务没有正式运行数据变化；回滚只撤销该能力源码、测试和合同。
