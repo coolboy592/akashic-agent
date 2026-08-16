@@ -7,13 +7,20 @@ import pytest
 from agent.plugin_composition import (
     CHANNELS,
     ChannelCapability,
+    ChannelCleanupFailure,
     ChannelDefinition,
+    ChannelFactoryContext,
+    ChannelReady,
     CompositionError,
     CompositionRoot,
     CredentialRef,
+    DeliveryStatus,
     InboundIdentity,
     PluginChannels,
     PluginRuntime,
+    ProviderDeliveryReceipt,
+    ProviderDeliveryRequest,
+    StopReceipt,
 )
 from agent.plugin_composition.channels import (
     ChannelDescriptor,
@@ -279,3 +286,69 @@ def test_channel_snapshot_identity_is_content_addressed() -> None:
             identity="unused",
             root_instance_token=object(),
         )
+
+
+def test_channel_factory_context_freezes_config_and_credential_refs() -> None:
+    class ProviderFactory:
+        async def create(self, credentials):  # type: ignore[no-untyped-def]
+            raise AssertionError(credentials)
+
+        async def aclose(self) -> None:
+            return None
+
+    raw = {"options": {"retry": [1, 2]}, "token": CredentialRef(("token",))}
+    context = ChannelFactoryContext(
+        snapshot_id="snapshot",
+        generation_id="generation",
+        binding_token="binding",
+        config=raw,
+        credentials={"token": CredentialRef(("token",))},
+        provider_client_factory=ProviderFactory(),
+    )
+
+    raw["options"] = {"retry": [99]}
+    assert context.config["options"]["retry"] == (1, 2)  # type: ignore[index]
+    assert context.credentials["token"] == CredentialRef(("token",))
+    with pytest.raises(TypeError):
+        context.config["new"] = "value"  # type: ignore[index]
+    with pytest.raises(ValueError, match="path 与 ref"):
+        _ = ChannelFactoryContext(
+            snapshot_id="snapshot",
+            generation_id="generation",
+            binding_token="binding",
+            config={},
+            credentials={"token": CredentialRef(("other",))},
+            provider_client_factory=ProviderFactory(),
+        )
+
+
+def test_channel_provider_delivery_and_cleanup_receipts_are_typed() -> None:
+    request = ProviderDeliveryRequest(
+        binding_token="binding",
+        delivery_id="delivery",
+        recipient="recipient",
+        body="",
+    )
+    receipt = ProviderDeliveryReceipt(
+        delivery_id=request.delivery_id,
+        status=DeliveryStatus.DELIVERED,
+        provider_ids=("remote-1",),
+    )
+    failure = ChannelCleanupFailure(
+        stage="stop",
+        plugin_id="plugin",
+        generation_id="generation",
+        binding_token=request.binding_token,
+        resource="adapter",
+        error_type="RuntimeError",
+        message="stop failed",
+        retry_action="retry_generation_cleanup",
+    )
+
+    assert ChannelReady(request.binding_token).admission_open is False
+    assert receipt.status is DeliveryStatus.DELIVERED
+    assert StopReceipt(
+        request.binding_token,
+        resources_closed=False,
+        failures=(failure,),
+    ).failures == (failure,)

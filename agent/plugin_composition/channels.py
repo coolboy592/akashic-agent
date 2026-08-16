@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
+from types import MappingProxyType
+from typing import Protocol
 
 from agent.plugin_composition.context import Context, FiberHandle, HealthHandle
 from agent.plugin_composition.model import CompositionError, IncidentView, ServiceKey
@@ -24,6 +27,12 @@ class ChannelCapability(StrEnum):
 
 class InboundIdentity(StrEnum):
     PROVIDER_MESSAGE_ID = "provider_message_id"
+
+
+class DeliveryStatus(StrEnum):
+    DELIVERED = "delivered"
+    REJECTED = "rejected"
+    UNKNOWN = "unknown"
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,6 +55,133 @@ class CredentialRef:
                 or "\x00" in segment
             ):
                 raise ValueError("CredentialRef.path 包含非法段")
+
+
+class ProviderClient(Protocol):
+    async def aclose(self) -> None: ...
+
+
+class ProviderClientFactory(Protocol):
+    async def create(
+        self,
+        credentials: Mapping[str, CredentialRef],
+    ) -> ProviderClient: ...
+
+    async def aclose(self) -> None: ...
+
+
+@dataclass(frozen=True, slots=True)
+class ChannelFactoryContext:
+    snapshot_id: str
+    generation_id: str
+    binding_token: str
+    config: Mapping[str, object]
+    credentials: Mapping[str, CredentialRef]
+    provider_client_factory: ProviderClientFactory
+
+    def __post_init__(self) -> None:
+        _text(self.snapshot_id, "snapshot_id")
+        _text(self.generation_id, "generation_id")
+        _text(self.binding_token, "binding_token")
+        config = _freeze_channel_config(self.config)
+        if not isinstance(config, Mapping):
+            raise TypeError("channel factory config 必须是 mapping")
+        credentials = _credential_refs(self.credentials)
+        object.__setattr__(self, "config", config)
+        object.__setattr__(self, "credentials", credentials)
+
+
+@dataclass(frozen=True, slots=True)
+class ChannelReady:
+    binding_token: str
+    subscriptions: tuple[str, ...] = ()
+    admission_open: bool = False
+
+    def __post_init__(self) -> None:
+        _text(self.binding_token, "binding_token")
+        object.__setattr__(self, "subscriptions", _text_tuple(self.subscriptions, "subscriptions"))
+        if not isinstance(self.admission_open, bool):
+            raise TypeError("admission_open 必须是 bool")
+
+
+@dataclass(frozen=True, slots=True)
+class ChannelCleanupFailure:
+    stage: str
+    plugin_id: str
+    generation_id: str
+    binding_token: str
+    resource: str
+    error_type: str
+    message: str
+    retry_action: str
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "stage",
+            "plugin_id",
+            "generation_id",
+            "binding_token",
+            "resource",
+            "error_type",
+            "message",
+            "retry_action",
+        ):
+            _text(getattr(self, field_name), field_name)
+
+
+@dataclass(frozen=True, slots=True)
+class StopReceipt:
+    binding_token: str
+    resources_closed: bool
+    failures: tuple[ChannelCleanupFailure, ...] = ()
+
+    def __post_init__(self) -> None:
+        _text(self.binding_token, "binding_token")
+        if not isinstance(self.resources_closed, bool):
+            raise TypeError("resources_closed 必须是 bool")
+        if not isinstance(self.failures, tuple) or any(
+            not isinstance(item, ChannelCleanupFailure) for item in self.failures
+        ):
+            raise TypeError("failures 必须是 ChannelCleanupFailure tuple")
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderDeliveryRequest:
+    binding_token: str
+    delivery_id: str
+    recipient: str
+    body: str
+
+    def __post_init__(self) -> None:
+        _text(self.binding_token, "binding_token")
+        _text(self.delivery_id, "delivery_id")
+        _text(self.recipient, "recipient")
+        if not isinstance(self.body, str):
+            raise TypeError("body 必须是 str")
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderDeliveryReceipt:
+    delivery_id: str
+    status: DeliveryStatus
+    provider_ids: tuple[str, ...] = ()
+    error: str | None = None
+
+    def __post_init__(self) -> None:
+        _text(self.delivery_id, "delivery_id")
+        if not isinstance(self.status, DeliveryStatus):
+            raise TypeError("status 必须是 DeliveryStatus")
+        object.__setattr__(self, "provider_ids", _text_tuple(self.provider_ids, "provider_ids"))
+        if self.error is not None:
+            _text(self.error, "error")
+
+
+class ChannelAdapter(Protocol):
+    async def start(self) -> ChannelReady: ...
+
+    async def deliver(self, request: ProviderDeliveryRequest) -> ProviderDeliveryReceipt: ...
+
+    async def stop(self) -> StopReceipt: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -484,6 +620,58 @@ def _credential_paths(value: object) -> tuple[str, ...]:
     return tuple(result)
 
 
+def _credential_refs(
+    value: Mapping[str, CredentialRef],
+) -> Mapping[str, CredentialRef]:
+    if not isinstance(value, Mapping):
+        raise TypeError("credentials 必须是 mapping")
+    result: dict[str, CredentialRef] = {}
+    for path in sorted(value):
+        ref = value[path]
+        if not isinstance(path, str) or not isinstance(ref, CredentialRef):
+            raise TypeError("credentials 必须映射到 CredentialRef")
+        if path != ".".join(ref.path):
+            raise ValueError(f"credential path 与 ref 不一致: {path}")
+        result[path] = ref
+    return MappingProxyType(result)
+
+
+def _freeze_channel_config(value: object, *, seen: frozenset[int] = frozenset()) -> object:
+    if value is None or isinstance(value, (bool, int, str, CredentialRef)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("channel factory config 不接受非有限 float")
+        return value
+    if isinstance(value, Mapping):
+        marker = id(value)
+        if marker in seen:
+            raise ValueError("channel factory config 不接受 cycle")
+        next_seen = seen | {marker}
+        result: dict[str, object] = {}
+        for key in sorted(value):
+            if not isinstance(key, str):
+                raise TypeError("channel factory config mapping key 必须是 str")
+            result[key] = _freeze_channel_config(value[key], seen=next_seen)
+        return MappingProxyType(result)
+    if isinstance(value, (list, tuple)):
+        marker = id(value)
+        if marker in seen:
+            raise ValueError("channel factory config 不接受 cycle")
+        next_seen = seen | {marker}
+        return tuple(_freeze_channel_config(item, seen=next_seen) for item in value)
+    raise TypeError(f"channel factory config 值类型无效: {type(value).__name__}")
+
+
+def _text_tuple(value: object, field_name: str) -> tuple[str, ...]:
+    if not isinstance(value, tuple):
+        raise TypeError(f"{field_name} 必须是 tuple")
+    result = tuple(_text(item, field_name) for item in value)
+    if len(set(result)) != len(result):
+        raise ValueError(f"{field_name} 不能重复")
+    return result
+
+
 def _text(value: object, field_name: str) -> str:
     if not isinstance(value, str) or not value or value.strip() != value:
         raise ValueError(f"{field_name} 必须是非空且无首尾空白的字符串")
@@ -494,8 +682,13 @@ def _text(value: object, field_name: str) -> str:
 
 __all__ = [
     "CHANNELS",
+    "ChannelAdapter",
     "ChannelCapability",
+    "ChannelCleanupFailure",
+    "ChannelFactoryContext",
+    "ChannelReady",
     "CredentialRef",
+    "DeliveryStatus",
     "ChannelDefinition",
     "ChannelDescriptor",
     "ChannelFactoryFreezeInput",
@@ -503,5 +696,10 @@ __all__ = [
     "ChannelRegistrySnapshot",
     "InboundIdentity",
     "PluginChannels",
+    "ProviderClient",
+    "ProviderClientFactory",
+    "ProviderDeliveryReceipt",
+    "ProviderDeliveryRequest",
+    "StopReceipt",
     "_freeze_plugin_channels",
 ]
