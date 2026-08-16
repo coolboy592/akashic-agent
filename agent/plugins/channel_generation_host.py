@@ -10,7 +10,6 @@ import asyncio
 import hashlib
 import inspect
 import json
-import logging
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
@@ -28,10 +27,9 @@ from agent.plugin_composition.channels import (
     ProviderDeliveryReceipt,
     ProviderDeliveryRequest,
     StopReceipt,
+    channel_config_revision,
 )
 from agent.plugins.composable import ComposablePlugin
-
-logger = logging.getLogger(__name__)
 
 BeforeStartCallback = Callable[["ChannelStartRecord"], Awaitable[None]]
 ConfigRevisionChecker = Callable[["ChannelStartRecord"], Awaitable[None]]
@@ -53,6 +51,7 @@ class ChannelStartRecord:
     factory_export: str
     source_revision: str
     config_revision: str
+    raw_config_revision: str
     descriptor_digest: str
     target: str
     boot_owner: str
@@ -70,7 +69,7 @@ class ChannelCleanupTombstone:
     channel_name: str
     module: ModuleType
     adapter: ChannelAdapter | None
-    factory: Callable[[ChannelFactoryContext], ChannelAdapter]
+    factory: Callable[[ChannelFactoryContext], ChannelAdapter] | None
     factory_context: ChannelFactoryContext | None
     provider_client_factory: ProviderClientFactory
     binding_token: str
@@ -78,6 +77,7 @@ class ChannelCleanupTombstone:
     factory_export: str
     source_revision: str
     config_revision: str
+    raw_config_revision: str
     descriptor_digest: str
     target: str
     boot_owner: str
@@ -107,7 +107,7 @@ class _ChannelBindingState:
     channel_name: str
     module: ModuleType
     artifact_pointer: str
-    factory: Callable[[ChannelFactoryContext], ChannelAdapter]
+    factory: Callable[[ChannelFactoryContext], ChannelAdapter] | None
     adapter: ChannelAdapter | None
     provider_client_factory: ProviderClientFactory
     binding_token: str
@@ -117,6 +117,7 @@ class _ChannelBindingState:
     factory_export: str
     source_revision: str
     config_revision: str
+    raw_config_revision: str
     descriptor_digest: str
     target: str
     boot_owner: str
@@ -268,12 +269,14 @@ class ChannelGenerationHost:
         *,
         on_before_start: BeforeStartCallback,
         config_revision_checker: ConfigRevisionChecker,
-        on_failure: FailureCallback | None = None,
+        on_failure: FailureCallback,
     ) -> None:
         if not callable(on_before_start):
             raise TypeError("on_before_start 必须是 async callback")
         if not callable(config_revision_checker):
             raise TypeError("config_revision_checker 必须是 async callback")
+        if not callable(on_failure):
+            raise TypeError("on_failure 必须可调用")
         self._on_before_start = on_before_start
         self._config_revision_checker = config_revision_checker
         self._on_failure = on_failure
@@ -555,11 +558,11 @@ class ChannelGenerationHost:
         provenance = _find_provenance(registry, descriptor.owner, generation.generation_id, descriptor.name)
         if (
             provenance.source_revision != generation.source_revision
-            or provenance.config_revision != generation.config_revision
+            or provenance.config_revision
+            != channel_config_revision(generation.config_projection)
             or provenance.factory_export != descriptor.factory_export
         ):
             raise RuntimeError(f"channel factory provenance drift: {descriptor.name}")
-        factory = _resolve_sync_factory(module, descriptor.factory_export)
         config = generation.config_projection
         if not isinstance(config, Mapping):
             raise RuntimeError(f"channel generation config projection 无效: {descriptor.owner}")
@@ -574,7 +577,7 @@ class ChannelGenerationHost:
             channel_name=descriptor.name,
             module=module,
             artifact_pointer=str(generation.plugin_dir),
-            factory=factory,
+            factory=None,
             adapter=None,
             provider_client_factory=provider_client_factory,
             binding_token=binding_token,
@@ -583,7 +586,8 @@ class ChannelGenerationHost:
             factory_context=None,
             factory_export=descriptor.factory_export,
             source_revision=generation.source_revision,
-            config_revision=generation.config_revision,
+            config_revision=provenance.config_revision,
+            raw_config_revision=generation.config_revision,
             descriptor_digest=descriptor_digest,
             target=target,
             boot_owner=boot_owner,
@@ -604,6 +608,7 @@ class ChannelGenerationHost:
             factory_export=state.factory_export,
             source_revision=state.source_revision,
             config_revision=state.config_revision,
+            raw_config_revision=state.raw_config_revision,
             descriptor_digest=state.descriptor_digest,
             target=state.target,
             boot_owner=state.boot_owner,
@@ -613,6 +618,10 @@ class ChannelGenerationHost:
         await _require_awaitable(
             self._config_revision_checker(record),
             "config_revision_checker",
+        )
+        state.factory = _resolve_sync_factory(
+            state.module,
+            state.factory_export,
         )
         credentials = _resolve_credentials(state.config, state.credential_paths)
         state.factory_context = ChannelFactoryContext(
@@ -862,6 +871,7 @@ class ChannelGenerationHost:
             factory_export=state.factory_export,
             source_revision=state.source_revision,
             config_revision=state.config_revision,
+            raw_config_revision=state.raw_config_revision,
             descriptor_digest=state.descriptor_digest,
             target=state.target,
             boot_owner=state.boot_owner,
@@ -876,18 +886,9 @@ class ChannelGenerationHost:
             attempt_count=1 if previous is None else previous.attempt_count + 1,
         )
         self._tombstones[key] = tombstone
-        if self._on_failure is not None:
-            try:
-                result = self._on_failure(tombstone)
-                if inspect.isawaitable(result):
-                    await result
-            except BaseException as callback_error:
-                logger.error(
-                    "channel cleanup failure callback failed snapshot=%s channel=%s: %s",
-                    state.snapshot_id,
-                    state.channel_name,
-                    callback_error,
-                )
+        result = self._on_failure(tombstone)
+        if inspect.isawaitable(result):
+            await result
 
     def _binding(self, key: tuple[str, str]) -> _ChannelBindingState:
         state = self._bindings.get(key)
@@ -910,9 +911,6 @@ class ChannelGenerationHost:
                 self._bindings.pop(key, None)
         if not any(key[0] == generation_id for key in self._tombstones):
             self._locks.pop(generation_id, None)
-
-
-ChannelHost = ChannelGenerationHost
 
 
 def _require_committed_snapshot(snapshot: object) -> Any:
@@ -993,13 +991,19 @@ def _resolve_credentials(
     result: dict[str, CredentialRef] = {}
     for path in paths:
         current: object = config
+        found = True
         for segment in path.split("."):
             if not isinstance(current, Mapping) or segment not in current:
-                raise RuntimeError(f"channel credential path 缺失: {path}")
+                found = False
+                break
             current = current[segment]
+        if not found:
+            continue
         if not isinstance(current, CredentialRef):
             raise RuntimeError(f"channel credential path 未被 redacted: {path}")
         result[path] = current
+    if paths and not result:
+        raise RuntimeError("channel credential paths 均未出现在正式配置投影")
     return result
 
 
@@ -1097,6 +1101,5 @@ __all__ = [
     "ChannelCleanupTombstone",
     "ChannelGeneration",
     "ChannelGenerationHost",
-    "ChannelHost",
     "ChannelStartRecord",
 ]

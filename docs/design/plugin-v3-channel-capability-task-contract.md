@@ -206,6 +206,7 @@ class ProviderClientFactory(Protocol):
         self,
         credentials: Mapping[str, CredentialRef],
     ) -> ProviderClient: ...  # Core resolves refs inside this formal-only call
+    async def aclose(self) -> None: ...  # Host-owned client/secret lease scope
 
 @dataclass(frozen=True, slots=True)
 class ControlReceipt:
@@ -289,10 +290,10 @@ class ChannelReady:
 class StopReceipt:
     binding_token: str
     resources_closed: bool
-    failures: tuple[CleanupFailure, ...] = ()
+    failures: tuple[ChannelCleanupFailure, ...] = ()
 
 @dataclass(frozen=True, slots=True)
-class CleanupFailure:
+class ChannelCleanupFailure:
     stage: str
     plugin_id: str
     generation_id: str
@@ -361,9 +362,9 @@ identity 成对替换。
 `agent.plugin_composition.__init__` 只重导出 `CHANNELS/PluginChannels/ChannelDefinition/ChannelCapability/
 InboundIdentity/CredentialRef/RawInbound/ChannelAdapter` 与 factory 所需窄 Protocol。
 外部 Feishu/QQBot 只能从这两个入口 import，不得复制 DTO。`ChannelRegistry` 与 freeze helper 留在同模块私有面；
-`CommittedChannelCatalog/ChannelBindingLease/ChannelHost` 的实现与 live binding 只属于
-`agent/plugins/channel_host.py`，不从插件 public package 导出。插件注入面只有 `PluginChannels.register()`，不能提前
-freeze/unregister；`CommittedChannelCatalog` 也是 Host/inspection 的 Core-owned committed value。
+committed catalog 是 exact `RuntimeSnapshot.channel_registry`；`ChannelBindingLease/ChannelGenerationHost` 的实现与
+live binding 只属于 `agent/plugins/channel_generation_host.py`，不从插件 public package 导出。插件注入面只有
+`PluginChannels.register()`，不能提前 freeze/unregister；inspection 也只能读取公开 stable snapshot 的 frozen catalog。
 
 `InboundEnvelope.handoff()` 只有当前 owner 与 `expected_owner` 相同、转移符合
 `INGRESS/ADMITTED→BUS/BUS_QUEUED→LANE/LANE_QUEUED→LOOP/RUNNING` 时才原位更新 owner/state并返回同一 envelope；
@@ -381,6 +382,9 @@ metadata 只保留兼容诊断，迁移后不再是 identity owner。
 object、cycle 与非有限 float。provenance 的 `config_revision` 对该 canonical projection 做 digest；candidate/formal
 Definition 必须得到完全相同的 immutable config。这样 Feishu `list[str]` 与 QQBot `list[QQBotGroupConfigModel]` 分别
 变成 tuple 与 tuple-of-mapping，不把 mutable/Pydantic object 跨 Root 携带。
+`ChannelStartRecord.config_revision` 记录这份脱敏投影摘要；另有只进入 Core journal 的
+`raw_config_revision` 记录 `config.local.toml` 原始字节摘要。前者参与 catalog identity，后者只用于 formal
+start fence，二者不能混用，raw 摘要不进入公开 registry。
 
 `ChannelFactoryContext` 不含已构造的 HTTP/SDK client 或 secret bytes；`provider_client_factory.create(refs)` 只能由
 formal adapter 的 `start()` 调用，Core-owned factory 在内部解析 raw credential 并把 client 纳入 Host binding。
@@ -391,8 +395,9 @@ candidate、factory 调用与 `start()` 之前的 credential resolution/client c
 2. `capabilities` 是 frozen typed enum set；unknown、重复或非 canonical 顺序在 admission fail-loud，canonical
    descriptor 以 enum value 排序后进入 snapshot identity。
    含 `INBOUND` 时 `inbound_identity` 必填；不含 `INBOUND` 时必须为 `None`，outbound-only adapter 不填写无意义 identity。
-3. registry 保存 `factory_export`，不保存 callable/closure。candidate 与 formal Root 分别注册 blueprint；Host 只从
-   exact committed generation/module 解析 formal export，candidate module 卸载后 stable channel 不得引用它。
+3. registry 保存 `factory_export`，不保存 callable/closure。candidate 与 formal Root 分别注册 blueprint；Host 先完成
+   durable binding reservation 与 raw config fence，之后才从 exact committed generation/module 解析 formal export；
+   module `__getattr__` 或错误 export 不能先于 durable boundary 执行。candidate module 卸载后 stable channel 不得引用它。
 4. factory 必须是同步、side-effect-free 的 `factory(ChannelFactoryContext) -> ChannelAdapter`。Context 只含
    generation identity、无副作用 provider client factory、credential view、只读非敏感 config 与 Core 窄端口；
    不暴露 PluginManager、Session repository、EventBus、MessagePush 或任意 workspace/data root。
@@ -419,7 +424,7 @@ candidate、factory 调用与 `start()` 之前的 credential resolution/client c
    start 前没有 raw config read，credential 只经 Core resolver 进入 provider client factory。
 6. factory 构造无副作用；网络、subscription、callback 与后台 task 只能在 `start()` 获取。新 channel start 返回
    `ChannelReady(admission_open=False)`；Host 校验 binding token/订阅 ready 后才允许 finalize。`stop()` 返回
-   `StopReceipt`，只有 `resources_closed=True` 且 failures 为空才算 cleanup 完成；每个 `CleanupFailure` 固定
+   `StopReceipt`，只有 `resources_closed=True` 且 failures 为空才算 cleanup 完成；每个 `ChannelCleanupFailure` 固定
    generation/module/binding/resource/retry identity，否则保留 cleanup-pending owner。
 7. `PluginChannels.register(ctx, definition) -> None` 在内部建立调用 Fiber 的 registration Effect，不返回可由插件
    提前 dispose 的 token，也不提供 public unregister。Fiber dispose 逆序注销 descriptor；formal Host runtime binding
@@ -475,10 +480,13 @@ provider network。promotion 本身只切 endpoint/registration，不发送业�
    C14b 的 channel cleanup 复用 reload journal 的 exact runtime owner，而不是只留内存错误：adapter 启动前先 durable
    记录 `binding_token/snapshot_id/catalog identity/plugin generation/artifact pointer/descriptor/factory export/target/
    boot owner/attempt`；journal 写入失败时 `start_count == 0`。`stop()` 或 rollback 失败后保留 admission-closed binding 与
-   tombstone；显式 retry 只按 exact token 和 Core 保存的 artifact pointer 重建/清理，Root dispose 后不得回调 plugin Fiber。
-   tombstone 未收束前不能删除 generation/module/closeables，也不能按当前同名 channel 猜测旧 owner。
-   formal Host 在解析任何 `CredentialRef`、构造 provider client 前，还必须重读原始配置的完整 revision 并与 generation
-   冻结的 `config_revision` 完全相等；candidate seal 后即使只轮换 secret，也必须 fail-closed、rollback 并要求 reprepare，
+   tombstone；同进程显式 retry 只按 exact token 清理 retained adapter/factory，Root dispose 后不得回调 plugin Fiber。
+   tombstone 未收束前不能删除 generation/module/closeables，也不能按当前同名 channel 猜测旧 owner。跨进程时 live Python
+   object 已不存在，Core 只能先由 supervised BootGuardian 收束旧 boot，再按 journal 的 exact artifact/target 重建权威
+   stable Channel runtime 并写 recovery receipt；不得伪称能跨进程调用旧 adapter。
+   formal Host 在解析任何 `CredentialRef`、构造 provider client 前，还必须重读原始配置的完整 revision并与 generation
+   冻结的 Core-only `raw_config_revision` 完全相等；脱敏 `config_revision` 只证明 catalog/projection identity。candidate seal
+   后即使只轮换 secret，也必须 fail-closed、rollback 并要求 reprepare，
    不能用新 secret 启动旧 snapshot。secret bytes 不进入 snapshot、registry 或 journal。
 6. Host 为每个 committed binding 提供 admission/in-flight counter。`ChannelIngress.admit(RawInbound)` 获取 exact
    `ChannelBindingLease` 并以 keyword-only constructor 创建进程内 envelope。所有权只转移一次：

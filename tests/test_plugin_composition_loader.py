@@ -4,6 +4,7 @@ import asyncio
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
+from typing import Any, cast
 
 import pytest
 from pydantic import BaseModel
@@ -68,11 +69,17 @@ def _manager(
     )
 
 
-def _channel_plugin_source(version: str) -> str:
+def _channel_plugin_source(
+    version: str,
+    *,
+    fail_start: bool = False,
+    fail_stop: bool = False,
+) -> str:
     return (
         "from pydantic import AliasChoices, BaseModel, Field\n"
         "from agent.plugin_composition import (\n"
-        "    CHANNELS, ChannelCapability, ChannelDefinition, CredentialRef, InboundIdentity,\n"
+        "    CHANNELS, ChannelCapability, ChannelDefinition, ChannelReady, CredentialRef,\n"
+        "    DeliveryStatus, InboundIdentity, ProviderDeliveryReceipt, StopReceipt,\n"
         ")\n"
         "api_version = 3\n"
         "name = 'channel_probe'\n"
@@ -91,6 +98,20 @@ def _channel_plugin_source(version: str) -> str:
         "        inbound_identity=InboundIdentity.PROVIDER_MESSAGE_ID,\n"
         "        credential_paths=('appSecret', 'app_secret'),\n"
         "    ))\n"
+        "class Adapter:\n"
+        "    def __init__(self, context):\n"
+        "        self.context = context\n"
+        f"        self.fail_start = {fail_start!r}\n"
+        f"        self.fail_stop = {fail_stop!r}\n"
+        "    async def start(self):\n"
+        "        if self.fail_start: raise RuntimeError('channel start failed')\n"
+        "        return ChannelReady(self.context.binding_token)\n"
+        "    async def deliver(self, request):\n"
+        "        return ProviderDeliveryReceipt(request.delivery_id, DeliveryStatus.DELIVERED)\n"
+        "    async def stop(self):\n"
+        "        if self.fail_stop: raise RuntimeError('channel stop failed')\n"
+        "        return StopReceipt(self.context.binding_token, True)\n"
+        "def build_adapter(context): return Adapter(context)\n"
     )
 
 
@@ -127,6 +148,20 @@ async def test_v3_channel_registry_redacts_candidate_credentials_before_import(
     config_path.write_bytes(original_config)
     manager = _manager(tmp_path)
 
+    class ProviderFactory:
+        async def create(self, credentials: Any) -> object:
+            return object()
+
+        async def aclose(self) -> None:
+            return None
+
+    manager.bind_channel_provider_factory_resolver(
+        lambda snapshot: {
+            descriptor.name: ProviderFactory()
+            for descriptor in cast(Any, snapshot.channel_registry).descriptors
+        }
+    )
+
     await manager.load_all()
 
     stable = manager.current_snapshot
@@ -140,6 +175,16 @@ async def test_v3_channel_registry_redacts_candidate_credentials_before_import(
     )
     assert isinstance(generation.config.app_secret, CredentialRef)  # type: ignore[union-attr]
     assert config_path.read_bytes() == original_config
+    runtime = manager.active_channel_generation
+    assert runtime is not None and runtime.snapshot_id == stable.snapshot_id
+    binding = runtime.channel("feishu")
+    assert binding.admission_open is True
+    assert generation.reload_tx_id is not None
+    record = manager.reload_journal.get(generation.reload_tx_id)
+    assert record.phase == "complete"
+    evidence = repr(manager.reload_journal.events(generation.reload_tx_id))
+    assert "channel_binding_reserved" in evidence
+    assert secret not in evidence
 
     other_root = CompositionRoot("other-channel-root")
     await other_root.context.provide(
@@ -207,6 +252,492 @@ async def test_v3_channel_registry_redacts_candidate_credentials_before_import(
     assert not validation_root.exists()
     assert manager.current_snapshot is stable
     assert config_path.read_bytes() == original_config
+
+    promoted = await manager.prepare_candidate("channel_probe")
+    assert promoted is not None
+    held_stable = manager.snapshot_store.lease()
+    publication = asyncio.create_task(manager.publish_prepared("channel_probe"))
+    await asyncio.sleep(0)
+    assert not publication.done()
+    assert runtime.channel("feishu").admission_open
+    await held_stable.release()
+    result = await publication
+    assert result["publication_state"] == "committed"
+    current = manager.current_snapshot
+    active_runtime = manager.active_channel_generation
+    assert current is not None and current is not stable
+    assert active_runtime is not None
+    assert active_runtime.snapshot_id == current.snapshot_id
+    assert active_runtime.channel("feishu").admission_open
+    assert config_path.read_bytes() == original_config
+    await manager.terminate_all()
+    assert manager.active_channel_generation is None
+
+
+@pytest.mark.asyncio
+async def test_v3_channel_formal_start_rejects_raw_config_drift_before_factory(
+    tmp_path: Path,
+) -> None:
+    plugin_dir = _write_plugin(
+        tmp_path / "plugins",
+        "channel_probe",
+        _channel_plugin_source("1.0.0"),
+    )
+    (plugin_dir / "akashic.plugin.toml").write_text(
+        _channel_static_manifest("1.0.0"),
+        encoding="utf-8",
+    )
+    data_dir = tmp_path / "workspace" / "plugin-data" / "channel_probe-builtin"
+    data_dir.mkdir(parents=True)
+    config_path = data_dir / "config.local.toml"
+    config_path.write_text(
+        "app_id = 'app-1'\napp_secret = 'secret-before-seal'\n",
+        encoding="utf-8",
+    )
+    manager = _manager(tmp_path)
+
+    class ProviderFactory:
+        closed = 0
+
+        async def create(self, credentials: Any) -> object:
+            raise AssertionError("config drift 后不得创建 provider client")
+
+        async def aclose(self) -> None:
+            self.closed += 1
+
+    provider = ProviderFactory()
+
+    def drift_after_snapshot(snapshot: Any) -> dict[str, ProviderFactory]:
+        config_path.write_text(
+            "app_id = 'app-1'\napp_secret = 'secret-after-seal'\n",
+            encoding="utf-8",
+        )
+        return {"feishu": provider}
+
+    manager.bind_channel_provider_factory_resolver(drift_after_snapshot)
+    with pytest.raises(RuntimeError, match="config revision 已漂移"):
+        await manager.load_all()
+
+    assert provider.closed == 1
+    assert manager.current_snapshot is None
+    assert manager.active_channel_generation is None
+    record = manager.reload_journal.latest(plugin_id="channel_probe")
+    assert record is not None and record.phase == "aborted"
+
+
+@pytest.mark.asyncio
+async def test_v3_channel_candidate_start_failure_restores_closed_stable_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin_dir = _write_plugin(
+        tmp_path / "plugins",
+        "channel_probe",
+        _channel_plugin_source("1.0.0"),
+    )
+    manifest_path = plugin_dir / "akashic.plugin.toml"
+    manifest_path.write_text(_channel_static_manifest("1.0.0"), encoding="utf-8")
+    data_dir = tmp_path / "workspace" / "plugin-data" / "channel_probe-builtin"
+    data_dir.mkdir(parents=True)
+    config_path = data_dir / "config.local.toml"
+    config_path.write_text(
+        "app_id = 'app-1'\napp_secret = 'formal-secret'\n",
+        encoding="utf-8",
+    )
+    manager = _manager(tmp_path)
+
+    class ProviderFactory:
+        async def create(self, credentials: Any) -> object:
+            return object()
+
+        async def aclose(self) -> None:
+            return None
+
+    manager.bind_channel_provider_factory_resolver(
+        lambda snapshot: {
+            descriptor.name: ProviderFactory()
+            for descriptor in cast(Any, snapshot.channel_registry).descriptors
+        }
+    )
+    await manager.load_all()
+    stable = manager.current_snapshot
+    stable_runtime = manager.active_channel_generation
+    assert stable is not None and stable_runtime is not None
+    stable_token = stable_runtime.channel("feishu").binding_token
+
+    (plugin_dir / "plugin.py").write_text(
+        _channel_plugin_source("2.0.0"),
+        encoding="utf-8",
+    )
+    manifest_path.write_text(_channel_static_manifest("2.0.0"), encoding="utf-8")
+    candidate = await manager.prepare_candidate("channel_probe")
+    assert candidate is not None
+    original_start = manager.channel_generation_host.start_formal
+    failed = False
+
+    async def fail_candidate_once(snapshot: Any, factories: Any, **kwargs: Any):
+        nonlocal failed
+        if snapshot is not stable and not failed:
+            failed = True
+            assert manager.current_snapshot is stable
+            assert manager.latest_snapshot is snapshot
+            assert not stable.accepting_leases
+            assert not snapshot.accepting_leases
+            raise RuntimeError("candidate channel start failed")
+        return await original_start(snapshot, factories, **kwargs)
+
+    monkeypatch.setattr(
+        manager.channel_generation_host,
+        "start_formal",
+        fail_candidate_once,
+    )
+    with pytest.raises(RuntimeError, match="candidate channel start failed"):
+        await manager.publish_prepared("channel_probe")
+
+    assert failed
+    assert manager.current_snapshot is stable
+    assert stable.accepting_leases
+    restored = manager.active_channel_generation
+    assert restored is not None and restored.snapshot_id == stable.snapshot_id
+    assert restored.channel("feishu").admission_open
+    assert restored.channel("feishu").binding_token != stable_token
+    assert config_path.read_text(encoding="utf-8").endswith("formal-secret'\n")
+    await manager.terminate_all()
+
+
+@pytest.mark.asyncio
+async def test_v3_channel_old_restart_failure_keeps_durable_recovery_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin_dir = _write_plugin(
+        tmp_path / "plugins",
+        "channel_probe",
+        _channel_plugin_source("1.0.0"),
+    )
+    manifest_path = plugin_dir / "akashic.plugin.toml"
+    manifest_path.write_text(_channel_static_manifest("1.0.0"), encoding="utf-8")
+    data_dir = tmp_path / "workspace" / "plugin-data" / "channel_probe-builtin"
+    data_dir.mkdir(parents=True)
+    (data_dir / "config.local.toml").write_text(
+        "app_id = 'app-1'\napp_secret = 'formal-secret'\n",
+        encoding="utf-8",
+    )
+    manager = _manager(tmp_path)
+    endpoint_resume_calls = 0
+
+    async def quiesce_endpoints() -> None:
+        return None
+
+    async def reject_unowned_resume() -> None:
+        nonlocal endpoint_resume_calls
+        endpoint_resume_calls += 1
+        raise AssertionError("pure v3 Channel recovery 不拥有 endpoint admission")
+
+    manager.bind_endpoint_admission(
+        quiesce=quiesce_endpoints,
+        resume=reject_unowned_resume,
+    )
+
+    class ProviderFactory:
+        async def create(self, credentials: Any) -> object:
+            return object()
+
+        async def aclose(self) -> None:
+            return None
+
+    manager.bind_channel_provider_factory_resolver(
+        lambda snapshot: {
+            descriptor.name: ProviderFactory()
+            for descriptor in cast(Any, snapshot.channel_registry).descriptors
+        }
+    )
+    await manager.load_all()
+    stable = manager.current_snapshot
+    assert stable is not None
+
+    (plugin_dir / "plugin.py").write_text(
+        _channel_plugin_source("2.0.0"),
+        encoding="utf-8",
+    )
+    manifest_path.write_text(_channel_static_manifest("2.0.0"), encoding="utf-8")
+    candidate = await manager.prepare_candidate("channel_probe")
+    assert candidate is not None and candidate.reload_tx_id is not None
+    original_start = manager.channel_generation_host.start_formal
+    candidate_failed = False
+
+    async def fail_candidate_and_rollback(
+        snapshot: Any,
+        factories: Any,
+        **kwargs: Any,
+    ):
+        nonlocal candidate_failed
+        if snapshot is not stable and not candidate_failed:
+            candidate_failed = True
+            raise RuntimeError("candidate channel start failed")
+        if kwargs.get("boot_owner") == "plugin-manager-rollback":
+            raise RuntimeError("rollback channel restart failed")
+        return await original_start(snapshot, factories, **kwargs)
+
+    monkeypatch.setattr(
+        manager.channel_generation_host,
+        "start_formal",
+        fail_candidate_and_rollback,
+    )
+    with pytest.raises(RuntimeError, match="旧 owner 恢复失败"):
+        await manager.publish_prepared("channel_probe")
+
+    assert manager.current_snapshot is stable
+    assert not stable.accepting_leases
+    assert manager.active_channel_generation is None
+    record = manager.reload_journal.get(candidate.reload_tx_id)
+    assert record.phase == "degraded"
+    assert record.failure_resource == (
+        f"channel-publication:{candidate.generation_id}"
+    )
+
+    recovered = await manager.retry_runtime_recovery("channel_probe")
+    assert recovered["publication_state"] == "recovered"
+    assert endpoint_resume_calls == 0
+    assert stable.accepting_leases
+    active = manager.active_channel_generation
+    assert active is not None and active.channel("feishu").admission_open
+    await manager.terminate_all()
+
+
+@pytest.mark.asyncio
+async def test_v3_channel_old_stop_failure_keeps_stable_closed_until_exact_retry(
+    tmp_path: Path,
+) -> None:
+    plugin_dir = _write_plugin(
+        tmp_path / "plugins",
+        "channel_probe",
+        _channel_plugin_source("1.0.0", fail_stop=True),
+    )
+    manifest_path = plugin_dir / "akashic.plugin.toml"
+    manifest_path.write_text(_channel_static_manifest("1.0.0"), encoding="utf-8")
+    data_dir = tmp_path / "workspace" / "plugin-data" / "channel_probe-builtin"
+    data_dir.mkdir(parents=True)
+    (data_dir / "config.local.toml").write_text(
+        "app_id = 'app-1'\napp_secret = 'formal-secret'\n",
+        encoding="utf-8",
+    )
+    manager = _manager(tmp_path)
+
+    class ProviderFactory:
+        async def create(self, credentials: Any) -> object:
+            return object()
+
+        async def aclose(self) -> None:
+            return None
+
+    manager.bind_channel_provider_factory_resolver(
+        lambda snapshot: {
+            descriptor.name: ProviderFactory()
+            for descriptor in cast(Any, snapshot.channel_registry).descriptors
+        }
+    )
+    await manager.load_all()
+    stable = manager.current_snapshot
+    runtime = manager.active_channel_generation
+    assert stable is not None and runtime is not None
+
+    (plugin_dir / "plugin.py").write_text(
+        _channel_plugin_source("2.0.0"),
+        encoding="utf-8",
+    )
+    manifest_path.write_text(_channel_static_manifest("2.0.0"), encoding="utf-8")
+    candidate = await manager.prepare_candidate("channel_probe")
+    assert candidate is not None and candidate.reload_tx_id is not None
+    with pytest.raises(RuntimeError, match="旧 owner 恢复失败"):
+        await manager.publish_prepared("channel_probe")
+
+    assert manager.current_snapshot is stable
+    assert not stable.accepting_leases
+    assert not runtime.channel("feishu").admission_open
+    failure = manager.channel_generation_host.failure(
+        runtime.snapshot_id,
+        "feishu",
+    )
+    assert failure is not None
+    record = manager.reload_journal.get(candidate.reload_tx_id)
+    assert record.phase == "degraded"
+    assert record.failure_resource is not None
+    assert set(record.failure_resource.split(",")) == {
+        f"channel-binding:{failure.binding_token}",
+        f"channel-publication:{candidate.generation_id}",
+    }
+
+    state = next(
+        value
+        for key, value in cast(Any, manager.channel_generation_host)._bindings.items()
+        if key[0] == runtime.snapshot_id
+    )
+    state.adapter.fail_stop = False
+    recovered = await manager.retry_runtime_recovery("channel_probe")
+    assert recovered["publication_state"] == "recovered"
+    assert stable.accepting_leases
+    active = manager.active_channel_generation
+    assert active is not None and active.channel("feishu").admission_open
+    assert manager.channel_generation_host.failure(runtime.snapshot_id) is None
+    restored_state = next(
+        value
+        for key, value in cast(Any, manager.channel_generation_host)._bindings.items()
+        if key[0] == active.snapshot_id
+    )
+    restored_state.adapter.fail_stop = False
+    await manager.terminate_all()
+
+
+@pytest.mark.asyncio
+async def test_v3_channel_candidate_cleanup_failure_blocks_old_restore_until_retry(
+    tmp_path: Path,
+) -> None:
+    plugin_dir = _write_plugin(
+        tmp_path / "plugins",
+        "channel_probe",
+        _channel_plugin_source("1.0.0"),
+    )
+    manifest_path = plugin_dir / "akashic.plugin.toml"
+    manifest_path.write_text(_channel_static_manifest("1.0.0"), encoding="utf-8")
+    data_dir = tmp_path / "workspace" / "plugin-data" / "channel_probe-builtin"
+    data_dir.mkdir(parents=True)
+    (data_dir / "config.local.toml").write_text(
+        "app_id = 'app-1'\napp_secret = 'formal-secret'\n",
+        encoding="utf-8",
+    )
+    manager = _manager(tmp_path)
+
+    class ProviderFactory:
+        async def create(self, credentials: Any) -> object:
+            return object()
+
+        async def aclose(self) -> None:
+            return None
+
+    manager.bind_channel_provider_factory_resolver(
+        lambda snapshot: {
+            descriptor.name: ProviderFactory()
+            for descriptor in cast(Any, snapshot.channel_registry).descriptors
+        }
+    )
+    await manager.load_all()
+    stable = manager.current_snapshot
+    assert stable is not None
+
+    (plugin_dir / "plugin.py").write_text(
+        _channel_plugin_source(
+            "2.0.0",
+            fail_start=True,
+            fail_stop=True,
+        ),
+        encoding="utf-8",
+    )
+    manifest_path.write_text(_channel_static_manifest("2.0.0"), encoding="utf-8")
+    candidate = await manager.prepare_candidate("channel_probe")
+    assert (
+        candidate is not None
+        and candidate.reload_tx_id is not None
+        and candidate.runtime_snapshot is not None
+    )
+    with pytest.raises(RuntimeError, match="旧 owner 恢复失败"):
+        await manager.publish_prepared("channel_probe")
+
+    assert manager.current_snapshot is stable
+    assert not stable.accepting_leases
+    assert manager.active_channel_generation is None
+    failure = manager.channel_generation_host.failure(
+        candidate.runtime_snapshot.snapshot_id,
+        "feishu",
+    )
+    assert failure is not None
+    state = next(
+        value
+        for key, value in cast(Any, manager.channel_generation_host)._bindings.items()
+        if key[0] == candidate.runtime_snapshot.snapshot_id
+    )
+    state.adapter.fail_stop = False
+    recovered = await manager.retry_runtime_recovery("channel_probe")
+    assert recovered["publication_state"] == "recovered"
+    assert stable.accepting_leases
+    active = manager.active_channel_generation
+    assert active is not None and active.channel("feishu").admission_open
+    assert (
+        manager.channel_generation_host.failure(
+            candidate.runtime_snapshot.snapshot_id
+        )
+        is None
+    )
+    await manager.terminate_all()
+
+
+@pytest.mark.asyncio
+async def test_v3_channel_terminate_failure_retains_exact_owner_until_retry(
+    tmp_path: Path,
+) -> None:
+    plugin_dir = _write_plugin(
+        tmp_path / "plugins",
+        "channel_probe",
+        _channel_plugin_source("1.0.0", fail_stop=True),
+    )
+    (plugin_dir / "akashic.plugin.toml").write_text(
+        _channel_static_manifest("1.0.0"),
+        encoding="utf-8",
+    )
+    data_dir = tmp_path / "workspace" / "plugin-data" / "channel_probe-builtin"
+    data_dir.mkdir(parents=True)
+    (data_dir / "config.local.toml").write_text(
+        "app_id = 'app-1'\napp_secret = 'formal-secret'\n",
+        encoding="utf-8",
+    )
+    manager = _manager(tmp_path)
+
+    class ProviderFactory:
+        async def create(self, credentials: Any) -> object:
+            return object()
+
+        async def aclose(self) -> None:
+            return None
+
+    manager.bind_channel_provider_factory_resolver(
+        lambda snapshot: {
+            descriptor.name: ProviderFactory()
+            for descriptor in cast(Any, snapshot.channel_registry).descriptors
+        }
+    )
+    await manager.load_all()
+    stable = manager.current_snapshot
+    runtime = manager.active_channel_generation
+    assert stable is not None and runtime is not None
+
+    with pytest.raises(RuntimeError, match="generation owner 已保留"):
+        await manager.terminate_all()
+
+    assert manager.current_snapshot is stable
+    assert not stable.accepting_leases
+    assert manager.generation("channel_probe") is not None
+    failure = manager.channel_generation_host.failure(
+        runtime.snapshot_id,
+        "feishu",
+    )
+    assert failure is not None
+    state = next(
+        value
+        for key, value in cast(Any, manager.channel_generation_host)._bindings.items()
+        if key[0] == runtime.snapshot_id
+    )
+    state.adapter.fail_stop = False
+
+    recovered = await manager.retry_runtime_recovery("channel_probe")
+    assert recovered["publication_state"] == "recovered"
+    active = manager.active_channel_generation
+    assert active is not None and active.channel("feishu").admission_open
+    restored_state = next(
+        value
+        for key, value in cast(Any, manager.channel_generation_host)._bindings.items()
+        if key[0] == active.snapshot_id
+    )
+    restored_state.adapter.fail_stop = False
     await manager.terminate_all()
 
 

@@ -42,7 +42,10 @@ from agent.plugin_composition import (
     resolve_mobile_ui_asset,
     ServiceView,
 )
-from agent.plugin_composition.channels import ChannelRegistrySnapshot
+from agent.plugin_composition.channels import (
+    ChannelRegistrySnapshot,
+    ProviderClientFactory,
+)
 from agent.plugin_composition.mcp_slots import PluginMcpServers
 from agent.plugin_composition.process_slots import PluginManagedProcesses
 from agent.plugin_composition.model import resolve_declared_workspace_root
@@ -51,6 +54,12 @@ from agent.plugins.composition_generation_host import (
     CompositionGenerationHost,
     CompositionRuntimeFailure,
     CompositionRuntimeGeneration,
+)
+from agent.plugins.channel_generation_host import (
+    ChannelCleanupTombstone,
+    ChannelGeneration,
+    ChannelGenerationHost,
+    ChannelStartRecord,
 )
 
 from agent.plugins.manifest import (
@@ -238,6 +247,21 @@ class _PublicationParticipantRestoreError(RuntimeError):
     """Keep the old snapshot closed when an external owner cannot be restored."""
 
 
+@dataclass
+class _ChannelPublicationState:
+    previous: RuntimeSnapshot | None
+    candidate: RuntimeSnapshot
+    previous_identity: str | None
+    candidate_identity: str | None
+    old_runtime: ChannelGeneration | None
+    old_factories: Mapping[str, ProviderClientFactory]
+    new_factories: Mapping[str, ProviderClientFactory]
+    changed: bool
+    old_closed: bool = False
+    old_stopped: bool = False
+    new_runtime: ChannelGeneration | None = None
+
+
 class PluginManager:
     POST_PUBLISH_TIMEOUT_SECONDS = 5.0
 
@@ -351,6 +375,21 @@ class PluginManager:
         self._snapshot_store = RuntimeSnapshotStore(self._on_snapshot_drained)
         self._snapshot_skill_catalogs: dict[str, str] = {}
         self._reload_journal = ReloadJournal(workspace)
+        self._channel_provider_factory_resolver: (
+            Callable[
+                [RuntimeSnapshot],
+                Mapping[str, ProviderClientFactory],
+            ]
+            | None
+        ) = None
+        self._channel_generation_host = ChannelGenerationHost(
+            on_before_start=self._reserve_channel_binding,
+            config_revision_checker=self._check_channel_config_revision,
+            on_failure=self._on_channel_cleanup_failure,
+        )
+        self._active_channel_generation: ChannelGeneration | None = None
+        self._active_channel_catalog_identity: str | None = None
+        self._channel_boot_transactions: set[str] = set()
         self._drain_transactions: dict[str, str] = {}
         self._drained_before_commit: set[str] = set()
         self._event_bus.bind_runtime_snapshot_store(self._snapshot_store)
@@ -772,6 +811,351 @@ class PluginManager:
     ) -> None:
         self._endpoint_switcher = switcher
 
+    def bind_channel_provider_factory_resolver(
+        self,
+        resolver: Callable[
+            [RuntimeSnapshot],
+            Mapping[str, ProviderClientFactory],
+        ],
+    ) -> None:
+        """Bind Core's formal-only provider factory projection."""
+
+        if not callable(resolver):
+            raise TypeError("channel provider factory resolver 必须可调用")
+        self._channel_provider_factory_resolver = resolver
+
+    @property
+    def channel_generation_host(self) -> ChannelGenerationHost:
+        return self._channel_generation_host
+
+    @property
+    def active_channel_generation(self) -> ChannelGeneration | None:
+        """Return the exact committed channel runtime owned by this Manager."""
+
+        return self._active_channel_generation
+
+    @staticmethod
+    def _channel_catalog_identity(snapshot: RuntimeSnapshot | None) -> str | None:
+        registry = None if snapshot is None else snapshot.channel_registry
+        return None if registry is None else registry.identity
+
+    def _channel_provider_factories(
+        self,
+        snapshot: RuntimeSnapshot | None,
+    ) -> Mapping[str, ProviderClientFactory]:
+        """Resolve provider factories only for a non-empty frozen catalog."""
+
+        registry = None if snapshot is None else snapshot.channel_registry
+        if registry is None or not registry.descriptors:
+            return {}
+        resolver = self._channel_provider_factory_resolver
+        if resolver is None:
+            raise RuntimeError("v3 Channel provider factory resolver 尚未绑定")
+        factories = resolver(cast(RuntimeSnapshot, snapshot))
+        if not isinstance(factories, Mapping):
+            raise TypeError("channel provider factory resolver 必须返回 mapping")
+        return factories
+
+    def _prepare_channel_publication(
+        self,
+        previous: RuntimeSnapshot | None,
+        candidate: RuntimeSnapshot,
+    ) -> _ChannelPublicationState:
+        """Freeze the exact old/new channel owners for one provisional switch."""
+
+        previous_identity = self._channel_catalog_identity(previous)
+        candidate_identity = self._channel_catalog_identity(candidate)
+        changed = previous_identity != candidate_identity
+        old_runtime = self._active_channel_generation
+        if changed and previous_identity is not None:
+            if (
+                old_runtime is None
+                or self._active_channel_catalog_identity != previous_identity
+                or previous is None
+            ):
+                raise RuntimeError("旧 stable Channel runtime owner 不一致")
+        return _ChannelPublicationState(
+            previous=previous,
+            candidate=candidate,
+            previous_identity=previous_identity,
+            candidate_identity=candidate_identity,
+            old_runtime=old_runtime,
+            old_factories=(
+                self._channel_provider_factories(previous) if changed else {}
+            ),
+            new_factories=(
+                self._channel_provider_factories(candidate) if changed else {}
+            ),
+            changed=changed,
+        )
+
+    async def _close_channel_publication(
+        self,
+        state: _ChannelPublicationState,
+    ) -> None:
+        """Close, drain, and stop the old runtime before switching endpoints."""
+
+        if not state.changed:
+            return
+        if state.old_runtime is not None:
+            state.old_runtime.close_admission()
+            state.old_closed = True
+            await state.old_runtime.drain()
+            await state.old_runtime.stop()
+            state.old_stopped = True
+            self._active_channel_generation = None
+            self._active_channel_catalog_identity = None
+
+    async def _start_channel_publication(
+        self,
+        state: _ChannelPublicationState,
+    ) -> None:
+        """Start the new exact runtime with admission still closed."""
+
+        if not state.changed:
+            return
+        if state.candidate_identity is not None:
+            state.new_runtime = await self._channel_generation_host.start_formal(
+                state.candidate,
+                state.new_factories,
+            )
+
+    def _open_channel_publication(self, state: _ChannelPublicationState) -> None:
+        """Publish and open the new exact runtime after the stable pointer moved."""
+
+        if not state.changed:
+            return
+        self._active_channel_generation = state.new_runtime
+        self._active_channel_catalog_identity = state.candidate_identity
+        if state.new_runtime is not None:
+            state.new_runtime.open_admission()
+        self._finish_channel_boot_transactions(state.candidate)
+
+    def _finish_channel_boot_transactions(
+        self,
+        snapshot: RuntimeSnapshot,
+    ) -> None:
+        """Finish only journal rows created for a fresh stable Channel boot."""
+
+        registry = snapshot.channel_registry
+        owners = set() if registry is None else {
+            descriptor.owner for descriptor in registry.descriptors
+        }
+        for plugin_id in owners:
+            generation = snapshot.generations[plugin_id]
+            tx_id = generation.reload_tx_id
+            if tx_id is None or tx_id not in self._channel_boot_transactions:
+                continue
+            self._advance_reload(generation, "committed")
+            self._advance_reload(generation, "complete")
+            self._channel_boot_transactions.remove(tx_id)
+
+    def _abort_channel_boot_transactions(
+        self,
+        snapshot: RuntimeSnapshot,
+        error: BaseException,
+    ) -> None:
+        """Abort clean fresh-boot rows while preserving cleanup tombstones."""
+
+        for generation in snapshot.generations.values():
+            tx_id = generation.reload_tx_id
+            if tx_id is None or tx_id not in self._channel_boot_transactions:
+                continue
+            phase = self._reload_journal.get(tx_id).phase
+            if phase not in {"cleanup_failed", "degraded"}:
+                self._abort_reload(
+                    generation,
+                    error=str(error) or type(error).__name__,
+                )
+            self._channel_boot_transactions.remove(tx_id)
+
+    async def _stop_staged_channel_publication(
+        self,
+        state: _ChannelPublicationState,
+    ) -> None:
+        """Stop the staged new runtime before restoring other participants."""
+
+        if not state.changed or state.new_runtime is None:
+            return
+        await state.new_runtime.stop()
+
+    async def _restore_old_channel_publication(
+        self,
+        state: _ChannelPublicationState,
+    ) -> None:
+        """Reconstruct the old runtime after all other owners rolled back."""
+
+        if not state.changed:
+            return
+        restored = state.old_runtime
+        if state.old_stopped and state.previous is not None:
+            try:
+                restored = await self._channel_generation_host.start_formal(
+                    state.previous,
+                    state.old_factories,
+                    boot_owner="plugin-manager-rollback",
+                )
+            except BaseException:
+                self._active_channel_generation = None
+                self._active_channel_catalog_identity = None
+                raise
+        self._active_channel_generation = restored
+        self._active_channel_catalog_identity = state.previous_identity
+
+    def _reopen_restored_channel_publication(
+        self,
+        state: _ChannelPublicationState,
+    ) -> None:
+        """Reopen the restored runtime only after the old snapshot is restored."""
+
+        if not state.changed:
+            return
+        runtime = self._active_channel_generation
+        if runtime is not None:
+            runtime.open_admission()
+        if state.previous is not None:
+            self._finish_channel_boot_transactions(state.previous)
+
+    async def _reserve_channel_binding(self, record: ChannelStartRecord) -> None:
+        """Persist an exact binding reservation before plugin code can run."""
+
+        generation = self._channel_generation(record.plugin_id, record.generation_id)
+        tx_id = self._ensure_runtime_recovery_transaction(generation)
+        if self._reload_journal.get(tx_id).phase == "preparing":
+            self._reload_journal.advance(tx_id, "prepared")
+            self._reload_journal.advance(tx_id, "validating")
+            self._reload_journal.advance(tx_id, "commit_started")
+            self._channel_boot_transactions.add(tx_id)
+        self._reload_journal.annotate(
+            tx_id,
+            {
+                "event": "channel_binding_reserved",
+                "snapshot_id": record.snapshot_id,
+                "catalog_identity": record.catalog_identity,
+                "plugin_id": record.plugin_id,
+                "generation_id": record.generation_id,
+                "channel_name": record.channel_name,
+                "binding_token": record.binding_token,
+                "artifact_pointer": record.artifact_pointer,
+                "factory_export": record.factory_export,
+                "source_revision": record.source_revision,
+                "config_revision": record.config_revision,
+                "raw_config_revision": record.raw_config_revision,
+                "descriptor_digest": record.descriptor_digest,
+                "target": record.target,
+                "boot_owner": record.boot_owner,
+                "attempt": record.attempt,
+            },
+        )
+
+    async def _check_channel_config_revision(
+        self,
+        record: ChannelStartRecord,
+    ) -> None:
+        """Fence formal credential resolution to the frozen raw config bytes."""
+
+        generation = self._channel_generation(record.plugin_id, record.generation_id)
+        if str(generation.plugin_dir) != record.artifact_pointer:
+            raise RuntimeError("channel artifact pointer 已漂移")
+        current_revision = _file_revision(
+            generation.data_dir / "config.local.toml"
+        )
+        if current_revision != record.raw_config_revision:
+            raise RuntimeError("channel credential config revision 已漂移")
+
+    async def _on_channel_cleanup_failure(
+        self,
+        failure: ChannelCleanupTombstone,
+    ) -> None:
+        """Persist one retained channel binding without touching plugin Fiber state."""
+
+        try:
+            generation = self._channel_generation(
+                failure.plugin_id,
+                failure.generation_id,
+            )
+        except RuntimeError:
+            generation = None
+        if generation is None:
+            actions = tuple(
+                action
+                for action in self._reload_journal.pending_recovery()
+                if action.plugin_id == failure.plugin_id
+                and action.failure_resource
+                == f"channel-binding:{failure.binding_token}"
+            )
+            if len(actions) != 1:
+                raise RuntimeError(
+                    "channel cleanup failure 缺少 durable exact owner"
+                )
+            tx_id = actions[0].tx_id
+            recovery_target = actions[0].recovery_target
+        else:
+            tx_id = self._ensure_runtime_recovery_transaction(generation)
+            recovery_target = self._composition_recovery_target(
+                generation,
+                tx_id=tx_id,
+            )
+        self._reload_journal.advance(
+            tx_id,
+            "cleanup_failed",
+            error=failure.error,
+            resource=f"channel-binding:{failure.binding_token}",
+            formal_effects=("channel_binding_cleanup_pending",),
+            recovery_action="retry_generation_cleanup",
+            recovery_target=recovery_target,
+            details={
+                "event": "channel_binding_cleanup_failed",
+                "snapshot_id": failure.snapshot_id,
+                "catalog_identity": failure.catalog_identity,
+                "channel_name": failure.channel_name,
+                "binding_token": failure.binding_token,
+                "artifact_pointer": failure.artifact_pointer,
+                "factory_export": failure.factory_export,
+                "source_revision": failure.source_revision,
+                "config_revision": failure.config_revision,
+                "raw_config_revision": failure.raw_config_revision,
+                "descriptor_digest": failure.descriptor_digest,
+                "target": failure.target,
+                "boot_owner": failure.boot_owner,
+                "attempt": failure.attempt_count,
+            },
+        )
+
+    def _channel_generation(
+        self,
+        plugin_id: str,
+        generation_id: str,
+    ) -> PluginGeneration:
+        """Find one exact retained generation without consulting a same-name replacement."""
+
+        candidates: list[PluginGeneration] = []
+        for snapshot in (self.current_snapshot, self.latest_snapshot):
+            if snapshot is None:
+                continue
+            snapshot_generation = snapshot.generations.get(plugin_id)
+            if snapshot_generation is not None:
+                candidates.append(snapshot_generation)
+        active = self._active_generations.get(plugin_id)
+        if active is not None:
+            candidates.append(active)
+        prepared = self._prepared_generations.get(plugin_id)
+        if prepared is not None:
+            candidates.append(prepared)
+        ready = self._ready_candidate
+        if ready is not None and ready.plugin_id == plugin_id:
+            candidates.append(ready.candidate)
+            if ready.previous is not None:
+                candidates.append(ready.previous)
+        candidates.extend(self._draining_generations.get(plugin_id, ()))
+        for generation in candidates:
+            if generation.generation_id == generation_id:
+                return generation
+        raise RuntimeError(
+            "channel binding 缺少 exact generation owner: "
+            f"{plugin_id}/{generation_id}"
+        )
+
     def job_catalog(self, generation_id: str) -> PreparedJobCatalog | None:
         return self._job_host.get(generation_id)
 
@@ -1175,6 +1559,24 @@ class PluginManager:
                     ) is None:
                         raise RuntimeError(
                             "boot runtime recovery stable Host 未就绪"
+                        )
+                registry = snapshot.channel_registry
+                channel_declared = registry is not None and any(
+                    descriptor.owner == action.plugin_id
+                    for descriptor in registry.descriptors
+                )
+                if channel_declared:
+                    channel_runtime = self._active_channel_generation
+                    if (
+                        channel_runtime is None
+                        or channel_runtime.snapshot_id != snapshot.snapshot_id
+                        or self._channel_generation_host.get(snapshot.snapshot_id)
+                        is None
+                        or self._active_channel_catalog_identity
+                        != registry.identity
+                    ):
+                        raise RuntimeError(
+                            "boot runtime recovery stable Channel Host 未就绪"
                         )
             receipt = receipts.get(action.tx_id)
             if receipt is None:
@@ -2150,10 +2552,20 @@ class PluginManager:
         )
         exclusive_endpoint_changed = bool(old_services or old_channels)
         command_catalog_changed = old_commands != new_commands
-        publication_gated = exclusive_endpoint_changed or command_catalog_changed
+        v3_channel_catalog_changed = (
+            self._channel_catalog_identity(self.current_snapshot)
+            != self._channel_catalog_identity(snapshot)
+        )
+        publication_gated = (
+            exclusive_endpoint_changed
+            or command_catalog_changed
+            or v3_channel_catalog_changed
+        )
         from agent.plugins.snapshot import get_current_runtime_lease
 
-        if exclusive_endpoint_changed and get_current_runtime_lease() is not None:
+        if (
+            exclusive_endpoint_changed or v3_channel_catalog_changed
+        ) and get_current_runtime_lease() is not None:
             self._skill_host.close(catalog_id)
             await self._dispose_unreferenced_composition_root(snapshot)
             raise RuntimeError("持有 RuntimeSnapshot lease 时不能切换独占端点")
@@ -2167,7 +2579,7 @@ class PluginManager:
             if quiesced is not None:
                 if exclusive_endpoint_changed and self._endpoint_quiescer is not None:
                     await self._endpoint_quiescer()
-                if exclusive_endpoint_changed:
+                if exclusive_endpoint_changed or v3_channel_catalog_changed:
                     await self._snapshot_store.wait_for_no_leases(quiesced)
             self._snapshot_skill_catalogs[snapshot.snapshot_id] = catalog_id
             transaction = self._snapshot_store.begin_publish(
@@ -2297,6 +2709,7 @@ class PluginManager:
         new_commands: tuple[tuple[str, str], ...],
         promote_latest: bool,
         force_provisional: bool = False,
+        provisional_started: bool = False,
         before_open: Callable[[], None] | None = None,
         after_open: Callable[[], None] | None = None,
     ) -> SnapshotTransaction:
@@ -2308,7 +2721,16 @@ class PluginManager:
             or old_channels != new_channels
             or old_commands != new_commands
         )
-        if not endpoints_changed and not force_provisional:
+        channel_catalog_changed = (
+            self._channel_catalog_identity(transaction.previous)
+            != self._channel_catalog_identity(transaction.candidate)
+        )
+        if (
+            not endpoints_changed
+            and not channel_catalog_changed
+            and not force_provisional
+            and not provisional_started
+        ):
             if promote_latest:
                 return await self._snapshot_store.promote_latest(
                     before_open=before_open,
@@ -2322,17 +2744,25 @@ class PluginManager:
             return transaction
 
         # 2. Close both snapshots before any service/channel/command side effect.
-        provisional = (
-            await self._snapshot_store.promote_latest_provisional()
-            if promote_latest
-            else transaction
-        )
-        if not promote_latest:
-            await self._snapshot_store.commit_provisional(provisional)
+        provisional = transaction
+        if not provisional_started:
+            provisional = (
+                await self._snapshot_store.promote_latest_provisional()
+                if promote_latest
+                else transaction
+            )
+            if not promote_latest:
+                await self._snapshot_store.commit_provisional(provisional)
 
+        channel_state: _ChannelPublicationState | None = None
         participants_switch_attempted = False
         forward_error: BaseException | None = None
         try:
+            channel_state = self._prepare_channel_publication(
+                provisional.previous,
+                provisional.candidate,
+            )
+            await self._close_channel_publication(channel_state)
             if endpoints_changed:
                 participants_switch_attempted = True
                 try:
@@ -2348,14 +2778,49 @@ class PluginManager:
                 except BaseException as error:
                     forward_error = error
                     raise
+            await self._start_channel_publication(channel_state)
+
+            def open_participants() -> None:
+                if after_open is not None:
+                    after_open()
+                assert channel_state is not None
+                self._open_channel_publication(channel_state)
+
             await self._snapshot_store.finalize_provisional(
                 provisional,
                 before_open=before_open,
-                after_open=after_open,
+                after_open=open_participants,
             )
         except BaseException as publication_error:
-            rollback_error: BaseException | None = None
-            if participants_switch_attempted:
+            rollback_errors: list[BaseException] = []
+            channel_cleanup_failed = False
+            if channel_state is not None:
+                old_snapshot_id = (
+                    None
+                    if channel_state.previous is None
+                    else channel_state.old_runtime.snapshot_id
+                    if channel_state.old_runtime is not None
+                    else None
+                )
+                channel_cleanup_failed = (
+                    self._channel_generation_host.failure(
+                        channel_state.candidate.snapshot_id
+                    )
+                    is not None
+                    or (
+                        old_snapshot_id is not None
+                        and self._channel_generation_host.failure(old_snapshot_id)
+                        is not None
+                    )
+                )
+                try:
+                    await self._stop_staged_channel_publication(channel_state)
+                except BaseException as caught:
+                    rollback_errors.append(caught)
+                    channel_cleanup_failed = True
+                if channel_cleanup_failed and not rollback_errors:
+                    rollback_errors.append(publication_error)
+            if participants_switch_attempted and not channel_cleanup_failed:
                 try:
                     await self._switch_plugin_endpoints(
                         plugin_id,
@@ -2367,16 +2832,31 @@ class PluginManager:
                         old_commands,
                     )
                 except BaseException as caught:
-                    rollback_error = caught
+                    rollback_errors.append(caught)
+            if channel_state is not None and not channel_cleanup_failed:
+                try:
+                    await self._restore_old_channel_publication(channel_state)
+                except BaseException as caught:
+                    rollback_errors.append(caught)
             await self._snapshot_store.rollback_provisional(
                 provisional,
                 keep_candidate_latest=promote_latest,
-                reopen_previous=rollback_error is None,
+                reopen_previous=not rollback_errors,
             )
-            if rollback_error is not None:
+            if not rollback_errors and channel_state is not None:
+                self._reopen_restored_channel_publication(channel_state)
+            self._abort_channel_boot_transactions(
+                provisional.candidate,
+                publication_error,
+            )
+            if rollback_errors:
                 raise _PublicationParticipantRestoreError(
-                    "外部 publication participant 失败后旧 owner 恢复失败"
-                ) from rollback_error
+                    "外部 publication participant 失败后旧 owner 恢复失败: "
+                    + "; ".join(
+                        str(error) or type(error).__name__
+                        for error in rollback_errors
+                    )
+                ) from rollback_errors[0]
             if forward_error is not None:
                 if isinstance(forward_error, asyncio.CancelledError):
                     raise forward_error
@@ -2499,7 +2979,23 @@ class PluginManager:
                 or v3_runtime_handoff
             )
             command_catalog_changed = old_commands != new_commands
-            publication_gated = exclusive_endpoint_changed or command_catalog_changed
+            v3_channel_catalog_changed = (
+                self._channel_catalog_identity(stable_snapshot)
+                != self._channel_catalog_identity(ready.snapshot)
+            )
+            publication_gated = (
+                exclusive_endpoint_changed
+                or command_catalog_changed
+                or v3_channel_catalog_changed
+            )
+            from agent.plugins.snapshot import get_current_runtime_lease
+
+            if (
+                exclusive_endpoint_changed or v3_channel_catalog_changed
+            ) and get_current_runtime_lease() is not None:
+                raise RuntimeError(
+                    "持有 RuntimeSnapshot lease 时不能切换 Channel runtime"
+                )
 
             skill_linker, stable_skill_plugins, target_skill_plugins = (
                 self._prepare_skill_links_for_promotion(generation, ready.snapshot)
@@ -2513,14 +3009,24 @@ class PluginManager:
                 self._snapshot_store.pause_admission() if publication_gated else None
             )
             runtime_restore_started = False
+            provisional_transaction: SnapshotTransaction | None = None
+            provisional_cancelled = False
             if publication_gated:
                 try:
                     if exclusive_endpoint_changed and self._endpoint_quiescer is not None:
                         await self._endpoint_quiescer()
-                    if quiesced_snapshot is not None and exclusive_endpoint_changed:
+                    if quiesced_snapshot is not None and (
+                        exclusive_endpoint_changed or v3_channel_catalog_changed
+                    ):
                         await self._snapshot_store.wait_for_no_leases(quiesced_snapshot)
                     await self._snapshot_store.wait_for_no_leases(ready.snapshot)
                     self._snapshot_store.seal_candidate_validation(ready.snapshot)
+                    (
+                        provisional_transaction,
+                        provisional_cancelled,
+                    ) = await _complete_critical(
+                        self._snapshot_store.promote_latest_provisional()
+                    )
                     runtime_restore_started = True
                     await self._restore_ready_runtime(ready)
                     generation = ready.candidate
@@ -2544,6 +3050,17 @@ class PluginManager:
                             )
                         except BaseException as error:
                             gated_runtime_error = error
+                    if provisional_transaction is not None:
+                        _, rollback_cancelled = await _complete_critical(
+                            self._snapshot_store.rollback_provisional(
+                                provisional_transaction,
+                                keep_candidate_latest=True,
+                                reopen_previous=gated_runtime_error is None,
+                            )
+                        )
+                        provisional_cancelled = (
+                            provisional_cancelled or rollback_cancelled
+                        )
                     if gated_runtime_error is None:
                         await self._snapshot_store.resume(quiesced_snapshot)
                     if (
@@ -2655,9 +3172,10 @@ class PluginManager:
             if previous_snapshot is not None:
                 self._drain_transactions[previous_snapshot.snapshot_id] = tx_id
             try:
-                transaction, cancelled = await _complete_critical(
+                transaction, final_cancelled = await _complete_critical(
                     self._commit_snapshot_with_publication_participants(
-                        SnapshotTransaction(
+                        provisional_transaction
+                        or SnapshotTransaction(
                             previous=previous_snapshot,
                             candidate=ready.snapshot,
                         ),
@@ -2670,10 +3188,12 @@ class PluginManager:
                         new_commands=new_commands,
                         promote_latest=True,
                         force_provisional=exclusive_endpoint_changed,
+                        provisional_started=provisional_transaction is not None,
                         before_open=before_open,
                         after_open=after_open,
                     )
                 )
+                cancelled = provisional_cancelled or final_cancelled
             except BaseException as publication_error:
                 skill_error: BaseException | None = None
                 runtime_error: BaseException | None = None
@@ -2736,8 +3256,15 @@ class PluginManager:
                             )
                         )
                     if participant_restore_error is not None:
-                        recovery_resources.append("plugin-endpoint")
-                        recovery_effects.append("endpoint_restore_uncertain")
+                        recovery_resources.extend(
+                            ("plugin-endpoint", "channel-publication")
+                        )
+                        recovery_effects.extend(
+                            (
+                                "endpoint_restore_uncertain",
+                                "stable_channel_restore_uncertain",
+                            )
+                        )
                     if skill_error is not None:
                         recovery_resources.append("plugin-skill-projection")
                         recovery_effects.append("stable_skill_restore_uncertain")
@@ -2845,6 +3372,18 @@ class PluginManager:
             if "runtime-snapshot-drain" in resource:
                 await self._snapshot_store.retry_drains()
                 receipts.append("runtime-snapshot-drain-complete")
+            channel_tokens = tuple(
+                item.removeprefix("channel-binding:")
+                for item in resource.split(",")
+                if item.startswith("channel-binding:")
+            )
+            for binding_token in channel_tokens:
+                await self._channel_generation_host.retry_generation_cleanup(
+                    binding_token
+                )
+                receipts.append(
+                    f"channel-binding-cleanup-complete:{binding_token}"
+                )
             retained_generation_ids = tuple(
                 dict.fromkeys(
                     generation_id
@@ -2941,7 +3480,7 @@ class PluginManager:
                 _ = linker.sync(stable_plugins)
                 receipts.append("stable-skill-projection-restored")
 
-            # 4. Normalize the exact durable target, then drain its unpublished candidate.
+            # 4. Normalize the exact durable target before acquiring new resources.
             if (
                 action.base_artifact_pointer is not None
                 or action.candidate_artifact_pointer is not None
@@ -2971,12 +3510,56 @@ class PluginManager:
                         "runtime recovery candidate target 尚未成为 stable"
                     )
                 self._ready_candidate = None
+
+            # 5. Rebuild the exact stable Channel owner after identity normalization.
+            restored_channel_runtime: ChannelGeneration | None = None
+            current_channel_identity = self._channel_catalog_identity(current)
+            channel_publication_failed = (
+                bool(channel_tokens) or "channel-publication" in resource
+            )
+            if channel_publication_failed and current is None:
+                self._active_channel_generation = None
+                self._active_channel_catalog_identity = None
+            elif channel_publication_failed and current is not None:
+                active_runtime = self._active_channel_generation
+                if current_channel_identity is None:
+                    self._active_channel_generation = None
+                    self._active_channel_catalog_identity = None
+                elif (
+                    active_runtime is None
+                    or self._channel_generation_host.get(
+                        active_runtime.snapshot_id
+                    )
+                    is None
+                    or self._active_channel_catalog_identity
+                    != current_channel_identity
+                ):
+                    restored_channel_runtime = (
+                        await self._channel_generation_host.start_formal(
+                            current,
+                            self._channel_provider_factories(current),
+                            boot_owner="plugin-manager-recovery",
+                        )
+                    )
+
+            # 6. Open the exact Channel owner before any public admission resumes.
+            if restored_channel_runtime is not None:
+                self._active_channel_generation = restored_channel_runtime
+                self._active_channel_catalog_identity = current_channel_identity
+                restored_channel_runtime.open_admission()
+                receipts.append("stable-channel-runtime-restored")
             receipt = ";".join(receipts) or "runtime-owner-already-clean"
             _, resume_cancelled = await _complete_critical(
                 self._snapshot_store.resume(self.current_snapshot)
             )
             endpoint_resume_cancelled = False
-            if self._endpoint_resumer is not None:
+            channel_only_recovery = all(
+                item.startswith("channel-binding:")
+                or item.startswith("channel-publication:")
+                for item in resource.split(",")
+                if item
+            )
+            if self._endpoint_resumer is not None and not channel_only_recovery:
                 _, endpoint_resume_cancelled = await _complete_critical(
                     self._endpoint_resumer()
                 )
@@ -3446,8 +4029,14 @@ class PluginManager:
             or v3_runtime_handoff
         )
         command_catalog_changed = old_commands != new_commands
+        v3_channel_catalog_changed = (
+            self._channel_catalog_identity(current)
+            != self._channel_catalog_identity(snapshot)
+        )
         publication_gated = not stage_latest and (
-            exclusive_endpoint_changed or command_catalog_changed
+            exclusive_endpoint_changed
+            or command_catalog_changed
+            or v3_channel_catalog_changed
         )
         if stage_latest and production_endpoint_changed:
             self._reload_journal.annotate(
@@ -3494,7 +4083,9 @@ class PluginManager:
         if publication_gated:
             from agent.plugins.snapshot import get_current_runtime_lease
 
-            if exclusive_endpoint_changed and get_current_runtime_lease() is not None:
+            if (
+                exclusive_endpoint_changed or v3_channel_catalog_changed
+            ) and get_current_runtime_lease() is not None:
                 error_text = "持有 RuntimeSnapshot lease 时不能切换独占端点"
                 await self.discard_prepared(
                     plugin_id,
@@ -3505,7 +4096,9 @@ class PluginManager:
             try:
                 if exclusive_endpoint_changed and self._endpoint_quiescer is not None:
                     await self._endpoint_quiescer()
-                if quiesced_snapshot is not None and exclusive_endpoint_changed:
+                if quiesced_snapshot is not None and (
+                    exclusive_endpoint_changed or v3_channel_catalog_changed
+                ):
                     await self._snapshot_store.wait_for_no_leases(quiesced_snapshot)
             except BaseException as error:
                 error_text = str(error) or type(error).__name__
@@ -3543,9 +4136,16 @@ class PluginManager:
                 await self._endpoint_resumer()
             raise
 
+        provisional_started = False
+        provisional_cancelled = False
         if not stage_latest:
             try:
                 self._snapshot_store.seal_pending_validation(snapshot)
+                if publication_gated:
+                    _, provisional_cancelled = await _complete_critical(
+                        self._snapshot_store.commit_provisional(transaction)
+                    )
+                    provisional_started = True
                 _ = await self._restore_direct_candidate_runtime(
                     generation,
                     validation_snapshot=snapshot,
@@ -3578,17 +4178,42 @@ class PluginManager:
                             "old_runtime_restore_uncertain",
                         ),
                     )
+                runtime_restore_uncertain = (
+                    previous_runtime is not None
+                    and self._composition_generation_host.get(
+                        previous_runtime.generation_id
+                    )
+                    is None
+                )
+                if provisional_started:
+                    _, rollback_cancelled = await _complete_critical(
+                        self._snapshot_store.rollback_provisional(
+                            transaction,
+                            keep_candidate_latest=False,
+                            reopen_previous=not runtime_restore_uncertain,
+                        )
+                    )
+                    provisional_cancelled = (
+                        provisional_cancelled or rollback_cancelled
+                    )
                 await self._abort_failed_publication(
                     generation,
                     transaction,
                     error=f"production_rebuild: {error_text}",
+                    reopen_previous=not runtime_restore_uncertain,
                 )
-                if self._endpoint_resumer is not None and exclusive_endpoint_changed:
+                if (
+                    self._endpoint_resumer is not None
+                    and exclusive_endpoint_changed
+                    and not runtime_restore_uncertain
+                    and self.current_snapshot is not None
+                    and self.current_snapshot.accepting_leases
+                ):
                     await self._endpoint_resumer()
                 raise
 
         commit_error: BaseException | None = None
-        commit_cancelled = False
+        commit_cancelled = provisional_cancelled
         from agent.plugins.context import PreparedPluginKVStore
 
         def open_candidate() -> None:
@@ -3634,7 +4259,7 @@ class PluginManager:
                     )
                 )
             else:
-                _, commit_cancelled = await _complete_critical(
+                _, final_commit_cancelled = await _complete_critical(
                     self._commit_snapshot_with_publication_participants(
                         transaction,
                         plugin_id=plugin_id,
@@ -3646,6 +4271,7 @@ class PluginManager:
                         new_commands=new_commands,
                         promote_latest=False,
                         force_provisional=exclusive_endpoint_changed,
+                        provisional_started=provisional_started,
                         before_open=open_candidate,
                         after_open=(
                             None
@@ -3654,6 +4280,7 @@ class PluginManager:
                         ),
                     )
                 )
+                commit_cancelled = commit_cancelled or final_commit_cancelled
         except BaseException as error:
             commit_error = error
 
@@ -3683,6 +4310,10 @@ class PluginManager:
                 await self._restore_replaced_composition_runtime(generation)
             except BaseException as error:
                 runtime_restore_error = error
+            participant_restore_error = isinstance(
+                commit_error,
+                _PublicationParticipantRestoreError,
+            )
             if runtime_restore_error is not None:
                 self._record_composition_runtime_failure(
                     generation,
@@ -3691,6 +4322,26 @@ class PluginManager:
                         "candidate_pointer_restored",
                         "old_runtime_restore_uncertain",
                     ),
+                )
+            elif participant_restore_error:
+                participant_resource = (
+                    "plugin-endpoint,channel-publication"
+                    if exclusive_endpoint_changed
+                    else "channel-publication"
+                )
+                participant_effects = (
+                    (
+                        "endpoint_restore_uncertain",
+                        "stable_channel_restore_uncertain",
+                    )
+                    if exclusive_endpoint_changed
+                    else ("stable_channel_restore_uncertain",)
+                )
+                self._record_composition_runtime_failure(
+                    generation,
+                    cast(BaseException, commit_error),
+                    resource=participant_resource,
+                    formal_effects=participant_effects,
                 )
             else:
                 self._abort_reload(
@@ -6033,6 +6684,21 @@ class PluginManager:
         snapshot: RuntimeSnapshot,
     ) -> None:
         if self._snapshot_store.current is None:
+            registry = snapshot.channel_registry
+            if registry is not None and registry.descriptors:
+                transaction = self._snapshot_store.begin_publish(snapshot)
+                await self._commit_snapshot_with_publication_participants(
+                    transaction,
+                    plugin_id="stable-boot",
+                    old_services={},
+                    new_services={},
+                    old_channels=(),
+                    new_channels=(),
+                    old_commands=(),
+                    new_commands=(),
+                    promote_latest=False,
+                )
+                return
             self._snapshot_store.install(snapshot)
             return
         transaction = self._snapshot_store.begin_publish(snapshot)
@@ -6546,10 +7212,38 @@ class PluginManager:
 
         from agent.plugins.context import allow_plugin_cleanup_writes
 
-        # 1. 先关闭当前 generation admission，再完成快照回收
+        # 1. 先收束正式 Channel owner，再允许对应插件 Root 进入 drain。
+        externally_cancelled = False
+        channel_runtime = self._active_channel_generation
+        if channel_runtime is not None:
+            _ = self._snapshot_store.pause_admission()
+            channel_runtime.close_admission()
+            try:
+                _, cancelled = await _complete_critical(channel_runtime.stop())
+                externally_cancelled = externally_cancelled or cancelled
+            except BaseException as error:
+                current = asyncio.current_task()
+                externally_cancelled = externally_cancelled or (
+                    current is not None and current.cancelling() > 0
+                )
+                self._cleanup_failures.append(
+                    CleanupFailure(
+                        resource=f"channel-generation:{channel_runtime.snapshot_id}",
+                        error=str(error) or type(error).__name__,
+                    )
+                )
+                raise RuntimeError(
+                    "Channel runtime cleanup 未完成，generation owner 已保留"
+                ) from error
+            else:
+                self._active_channel_generation = None
+                self._active_channel_catalog_identity = None
+
+        # 2. 关闭当前 generation admission，再完成快照回收。
         for generation in self._active_generations.values():
             self._retire_generation(generation)
-        _, externally_cancelled = await _complete_critical(self._snapshot_store.close())
+        _, snapshot_cancelled = await _complete_critical(self._snapshot_store.close())
+        externally_cancelled = externally_cancelled or snapshot_cancelled
         self._ready_candidate = None
         for plugin_id in tuple(self._prepared_generations):
             _, cancelled = await _complete_critical(self.discard_prepared(plugin_id))
@@ -6560,7 +7254,7 @@ class PluginManager:
             )
             externally_cancelled = externally_cancelled or cancelled
 
-        # 2. 逐插件终止并消费全部 cleanup failures
+        # 3. 逐插件终止并消费全部 cleanup failures。
         for mp in list(self._loaded):
             active_info = self._active_plugins.get(mp)
             instance = plugin_registry.get_instance(mp)
@@ -6608,7 +7302,7 @@ class PluginManager:
                 self._cleanup_failures.extend(cleanup_failures)
                 externally_cancelled = externally_cancelled or cancelled
 
-            # 3. 注销工具、模块和运行时注册
+            # 4. 注销工具、模块和运行时注册。
             for md in plugin_registry.get_handlers_by_module_path(mp):
                 if md.kind == MetadataKind.TOOL and self._tool_registry is not None:
                     self._tool_registry.unregister(md.tool_name or md.handler_name)

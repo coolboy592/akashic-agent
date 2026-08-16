@@ -545,6 +545,11 @@ async def test_builtin_direct_formal_failure_recovers_stable_runtime_explicitly(
         async def fail_candidate_formal_once(*args, **kwargs):
             nonlocal formal_failed
             if kwargs.get("mode") == "formal" and not formal_failed:
+                assert manager.current_snapshot is stable_snapshot
+                assert not stable_snapshot.accepting_leases
+                provisional = manager.latest_snapshot
+                assert provisional is not None and provisional is not stable_snapshot
+                assert not provisional.accepting_leases
                 formal_failed = True
                 raise RuntimeError("builtin candidate formal start failed")
             return await original_start(*args, **kwargs)
@@ -670,6 +675,11 @@ async def test_installed_runtime_candidate_isolated_and_commit_failure_restores_
         async def fail_candidate_formal_once(*args, **kwargs):
             nonlocal formal_failed
             if kwargs.get("mode") == "formal" and not formal_failed:
+                assert manager.current_snapshot is stable_snapshot
+                assert not stable_snapshot.accepting_leases
+                provisional = manager.latest_snapshot
+                assert provisional is not None and provisional is not stable_snapshot
+                assert not provisional.accepting_leases
                 formal_failed = True
                 raise RuntimeError("candidate formal start failed")
             return await original_host_start(*args, **kwargs)

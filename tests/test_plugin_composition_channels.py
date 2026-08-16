@@ -29,8 +29,8 @@ from agent.plugin_composition.channels import (
     ChannelRegistrySnapshot,
     _freeze_plugin_channels,
     _registry_identity,
+    channel_config_revision,
 )
-from agent.plugins.snapshot import _channel_config_revision
 
 
 def _runtime(plugin_id: str, root: Path, *, generation: str = "plugin-generation") -> PluginRuntime:
@@ -206,8 +206,8 @@ def test_channel_config_revision_uses_redacted_projection() -> None:
     }
     changed = {**first, "app_id": "app-2"}
 
-    assert _channel_config_revision(first) == _channel_config_revision(reordered)
-    assert _channel_config_revision(first) != _channel_config_revision(changed)
+    assert channel_config_revision(first) == channel_config_revision(reordered)
+    assert channel_config_revision(first) != channel_config_revision(changed)
 
 
 def test_channel_declarations_and_provenance_reject_invalid_values() -> None:

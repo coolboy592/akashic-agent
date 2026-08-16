@@ -6,6 +6,7 @@ import math
 import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from datetime import date, datetime, time
 from enum import StrEnum
 from types import MappingProxyType
 from typing import Protocol
@@ -16,6 +17,52 @@ from agent.plugin_composition.model import CompositionError, IncidentView, Servi
 
 _NAME = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 _FACTORY_EXPORT = re.compile(r"^[A-Za-z_][A-Za-z0-9_.:]*$")
+
+
+def channel_config_revision(projection: Mapping[str, object]) -> str:
+    """Hash a redacted config projection without exposing credential bytes."""
+
+    payload = _canonical_channel_config_value(projection)
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _canonical_channel_config_value(value: object) -> object:
+    """Convert TOML values and CredentialRef into deterministic JSON."""
+
+    if isinstance(value, CredentialRef):
+        return {"$credential_ref": list(value.path)}
+    if isinstance(value, Mapping):
+        result: dict[str, object] = {}
+        for key in sorted(value):
+            if not isinstance(key, str):
+                raise TypeError("channel config projection key 必须是字符串")
+            result[key] = _canonical_channel_config_value(value[key])
+        return result
+    if isinstance(value, (list, tuple)):
+        return [_canonical_channel_config_value(item) for item in value]
+    if value is None or isinstance(value, (bool, int, str)):
+        return value
+    if isinstance(value, float):
+        if math.isnan(value):
+            return {"$float": "nan"}
+        if math.isinf(value):
+            return {"$float": "inf" if value > 0 else "-inf"}
+        return {"$float": value.hex()}
+    if isinstance(value, (datetime, date, time)):
+        return {
+            "$toml_type": type(value).__name__,
+            "value": value.isoformat(),
+        }
+    raise TypeError(
+        "channel config projection 包含不受支持的值: "
+        f"{type(value).__name__}"
+    )
 
 
 class ChannelCapability(StrEnum):

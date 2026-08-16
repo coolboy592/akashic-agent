@@ -12,6 +12,7 @@ from agent.plugin_composition.channels import (
     ChannelDefinition,
     ChannelFactoryFreezeInput,
     ChannelReady,
+    CredentialRef,
     DeliveryStatus,
     PluginChannels,
     ProviderClientFactory,
@@ -19,6 +20,7 @@ from agent.plugin_composition.channels import (
     ProviderDeliveryRequest,
     StopReceipt,
     _freeze_plugin_channels,
+    channel_config_revision,
 )
 from agent.plugin_composition.model import CompositionError, ServiceKey
 from agent.plugins.channel_generation_host import (
@@ -102,9 +104,14 @@ async def _noop_record(record: ChannelStartRecord) -> None:
     return None
 
 
+async def _noop_failure(failure: Any) -> None:
+    return None
+
+
 def _host(**kwargs: Any) -> ChannelGenerationHost:
     kwargs.setdefault("on_before_start", _noop_record)
     kwargs.setdefault("config_revision_checker", _noop_record)
+    kwargs.setdefault("on_failure", _noop_failure)
     return ChannelGenerationHost(**kwargs)
 
 
@@ -176,6 +183,7 @@ async def _make_snapshot(
             return SimpleNamespace()
 
     channel_names = tuple(getattr(module, "channel_names", ("feishu",)))
+    config_projection = {"app_secret": CredentialRef(("app_secret",))}
     for channel_name in channel_names:
         await channels.register(
             cast(Any, Context()),
@@ -191,7 +199,11 @@ async def _make_snapshot(
         channels,
         root_token,
         factory_provenance_by_owner={
-            "plugin.feishu": ChannelFactoryFreezeInput("gen-1", "source-1", "config-1")
+            "plugin.feishu": ChannelFactoryFreezeInput(
+                "gen-1",
+                "source-1",
+                channel_config_revision(config_projection),
+            )
         },
     )
     generation = PluginGeneration(
@@ -199,7 +211,7 @@ async def _make_snapshot(
         generation_id="gen-1",
         module_path="plugins/feishu/plugin.py",
         source_revision="source-1",
-        config_revision="config-1",
+        config_revision="raw-config-1",
         plugin_dir=__import__("pathlib").Path("/tmp/plugin"),
         data_dir=__import__("pathlib").Path("/tmp/plugin-data"),
         config={"app_secret": "raw-secret"},
@@ -207,7 +219,7 @@ async def _make_snapshot(
         scope=cast(Any, object()),
         contributions=PluginContributions(manifest={}),
         gate_result=GateResult("test", "plugin.feishu", "rev", "passed", ()),
-        config_projection={"app_secret": CredentialRef(("app_secret",))},
+        config_projection=config_projection,
     )
     snapshot = SimpleNamespace(
         snapshot_id="snapshot-1",
@@ -310,7 +322,10 @@ async def test_journal_callback_happens_before_start_and_failure_keeps_count_zer
     generation = await host.start(snapshot, factories)
     assert events == ["journal", "config-check", "factory"]
     assert records[0].source_revision == "source-1"
-    assert records[0].config_revision == "config-1"
+    assert records[0].config_revision == channel_config_revision(
+        {"app_secret": CredentialRef(("app_secret",))}
+    )
+    assert records[0].raw_config_revision == "raw-config-1"
     assert len(records[0].descriptor_digest) == 64
     assert records[0].factory_export == "make_adapter"
     assert records[0].artifact_pointer == "/tmp/plugin"
@@ -410,7 +425,10 @@ async def test_stop_failure_retains_tombstone_and_retry_cleans_exact_owner() -> 
     assert tombstone.artifact_pointer == "/tmp/plugin"
     assert tombstone.factory_export == "make_adapter"
     assert tombstone.source_revision == "source-1"
-    assert tombstone.config_revision == "config-1"
+    assert tombstone.config_revision == channel_config_revision(
+        {"app_secret": CredentialRef(("app_secret",))}
+    )
+    assert tombstone.raw_config_revision == "raw-config-1"
     assert len(tombstone.descriptor_digest) == 64
     assert tombstone.target == "formal"
     assert tombstone.boot_owner == "plugin-manager"
@@ -459,7 +477,21 @@ async def test_provider_cancel_and_failure_callback_cancel_retain_tombstone() ->
 
     host = _host(on_failure=on_failure)
     generation = await host.start(snapshot, factories)
-    with pytest.raises(RuntimeError, match="cleanup"):
+    with pytest.raises(asyncio.CancelledError):
+        await generation.stop()
+    assert host.failure(snapshot.snapshot_id, "feishu") is not None
+
+
+@pytest.mark.asyncio
+async def test_failure_callback_error_is_not_logged_as_success() -> None:
+    snapshot, factories, _ = await _make_snapshot(fail_stop=True)
+
+    async def on_failure(record: Any) -> None:
+        raise RuntimeError("journal unavailable")
+
+    host = _host(on_failure=on_failure)
+    generation = await host.start(snapshot, factories)
+    with pytest.raises(RuntimeError, match="journal unavailable"):
         await generation.stop()
     assert host.failure(snapshot.snapshot_id, "feishu") is not None
 
@@ -499,12 +531,13 @@ async def test_async_factory_and_noncallable_factory_are_rejected_before_start()
     setattr(snapshot.generations["plugin.feishu"].instance.module, "make_adapter", async_factory)
     with pytest.raises(TypeError, match="async"):
         await _host().start(snapshot, factories)
-    assert factories["feishu"].closed == 0
+    assert factories["feishu"].closed == 1
 
     snapshot, factories, _ = await _make_snapshot()
     setattr(snapshot.generations["plugin.feishu"].instance.module, "make_adapter", None)
     with pytest.raises(TypeError, match="不可调用"):
         await _host().start(snapshot, factories)
+    assert factories["feishu"].closed == 1
 
 
 @pytest.mark.asyncio
