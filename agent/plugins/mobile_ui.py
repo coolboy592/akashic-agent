@@ -8,7 +8,12 @@ from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from typing import Protocol, cast
 
-from agent.plugins.base import Plugin
+from agent.plugin_composition import (
+    MobileUiBinding,
+    MobileUiDescriptor,
+    MobileUiQueryHandler,
+    MobileUiRpcInvalidRequest,
+)
 from agent.plugins.generation import MobileUiAsset, PluginGeneration
 from agent.plugins.manager import PluginManager
 from agent.plugins.snapshot import RuntimeSnapshot
@@ -81,13 +86,14 @@ class PluginMobileUiProvider:
     ) -> dict[str, object]:
         """只在版本和摘要完全匹配时返回单个资源。"""
 
-        generation = self._active_generation(self._require_snapshot(), plugin_id)
+        snapshot = self._require_snapshot()
+        generation = self._active_generation(snapshot, plugin_id)
         if generation.source_revision != plugin_revision:
             raise MobileUiStaleRevision(plugin_id)
-        asset = self._available_asset(generation)
-        if asset is None:
+        binding = self._mobile_ui_binding(snapshot, generation)
+        if binding is None:
             raise MobileUiPluginUnavailable(plugin_id)
-        content, expected_sha256 = _asset_content(asset, kind)
+        content, expected_sha256 = _asset_content(binding.asset, kind)
         if expected_sha256 != sha256:
             raise MobileUiStaleRevision(plugin_id)
         return {
@@ -169,14 +175,14 @@ class PluginMobileUiProvider:
             generation = self._active_generation(snapshot, plugin_id)
             if generation.source_revision != plugin_revision:
                 raise MobileUiStaleRevision(plugin_id)
-            if self._available_asset(generation) is None:
+            binding = self._mobile_ui_binding(snapshot, generation)
+            if binding is None:
                 raise MobileUiPluginUnavailable(plugin_id)
-            plugin = cast(Plugin, generation.instance)
             try:
                 loop = asyncio.get_running_loop()
                 result = await loop.run_in_executor(
                     self._executor,
-                    lambda: plugin.mobile_ui_query(
+                    lambda: binding.query(
                         method,
                         payload,
                         session_id=session_id,
@@ -219,19 +225,66 @@ class PluginMobileUiProvider:
         return generation
 
     @staticmethod
-    def _available_asset(generation: PluginGeneration) -> MobileUiAsset | None:
-        plugin = cast(Plugin, generation.instance)
-        if not plugin.mobile_ui_available():
+    def _mobile_ui_binding(
+        snapshot: RuntimeSnapshot,
+        generation: PluginGeneration,
+    ) -> MobileUiBinding | None:
+        """Resolve v3 handlers from this snapshot, or use the frozen v2 triple."""
+
+        # 1. v3 handlers live only in the exact composition Root registry.
+        registry = getattr(snapshot, "mobile_ui_registry", None)
+        if registry is not None:
+            binding = registry.binding(generation.plugin_id)
+            if binding is not None:
+                if _has_legacy_mobile_ui_contribution(generation):
+                    raise RuntimeError(
+                        "插件同时存在 v2 与 v3 Mobile UI contribution: "
+                        f"{generation.plugin_id}"
+                    )
+                return None if not binding.available() else binding
+
+        # 2. v2 remains a frozen compatibility triple until its consumer moves.
+        contributions = generation.contributions
+        asset = getattr(contributions, "mobile_ui_asset", None)
+        query = getattr(contributions, "mobile_ui_query", None)
+        available = getattr(contributions, "mobile_ui_available", None)
+        legacy_snapshot_shape = not hasattr(
+            contributions,
+            "mobile_ui_query",
+        ) and not hasattr(contributions, "mobile_ui_available")
+        # 仅兼容缺少三元组字段的旧快照；当前 contribution 缺字段视为损坏。
+        if asset is not None and legacy_snapshot_shape:
+            query = getattr(generation.instance, "mobile_ui_query", None)
+            available = getattr(generation.instance, "mobile_ui_available", None)
+        if asset is None:
+            if query is not None or available is not None:
+                raise RuntimeError(
+                    "插件 v2 Mobile UI contribution 状态不一致: "
+                    f"{generation.plugin_id}"
+                )
             return None
-        return generation.contributions.mobile_ui_asset
+        if query is None or available is None:
+            raise RuntimeError(
+                "插件 v2 Mobile UI contribution 缺少 handler: "
+                f"{generation.plugin_id}"
+            )
+        if not available():
+            return None
+        return MobileUiBinding(
+            descriptor=_legacy_descriptor(generation.plugin_id, asset),
+            asset=asset,
+            query=cast(MobileUiQueryHandler, query),
+            available=available,
+        )
 
     @staticmethod
     def _catalog_items(snapshot: RuntimeSnapshot) -> list[dict[str, object]]:
         items: list[dict[str, object]] = []
         for generation in snapshot.active_generations():
-            asset = PluginMobileUiProvider._available_asset(generation)
-            if asset is None:
+            binding = PluginMobileUiProvider._mobile_ui_binding(snapshot, generation)
+            if binding is None:
                 continue
+            asset = binding.asset
             navigation: dict[str, object] | None = None
             if asset.navigation_label is not None:
                 navigation = {
@@ -277,12 +330,33 @@ class MobileUiQueryOverloaded(RuntimeError):
     pass
 
 
-class MobileUiRpcInvalidRequest(ValueError):
-    pass
-
-
 class MobileUiRpcExecutionError(RuntimeError):
     pass
+
+
+def _has_legacy_mobile_ui_contribution(generation: PluginGeneration) -> bool:
+    contributions = generation.contributions
+    return (
+        getattr(contributions, "mobile_ui_asset", None) is not None
+        or getattr(contributions, "mobile_ui_query", None) is not None
+        or getattr(contributions, "mobile_ui_available", None) is not None
+    )
+
+
+def _legacy_descriptor(
+    plugin_id: str,
+    asset: MobileUiAsset,
+) -> MobileUiDescriptor:
+    return MobileUiDescriptor(
+        owner=plugin_id,
+        module_sha256=asset.module_sha256,
+        module_bytes=asset.module_bytes,
+        stylesheet_sha256=asset.stylesheet_sha256,
+        stylesheet_bytes=asset.stylesheet_bytes,
+        navigation_label=asset.navigation_label,
+        navigation_description=asset.navigation_description,
+        slots=asset.slots,
+    )
 
 
 def _normalize_rpc_result(

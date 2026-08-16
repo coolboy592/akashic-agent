@@ -25,12 +25,15 @@ from pydantic import BaseModel, ValidationError
 from agent.plugin_composition import (
     COMMANDS,
     MEMORY_RUNTIME,
+    UI_SLOTS,
     CommandRegistry,
     CompositionRoot,
     FiberState,
     MemoryRuntimeInfo,
+    PluginUiSlots,
     PluginCommands,
     PluginRuntime,
+    resolve_mobile_ui_asset,
     ServiceView,
 )
 from agent.plugin_composition.model import resolve_declared_workspace_root
@@ -4376,6 +4379,11 @@ class PluginManager:
         )
         try:
             _ = await root.context.provide(COMMANDS, PluginCommands())
+            if any(
+                UI_SLOTS in cast(ComposablePlugin, item.instance).inject
+                for item in ordered
+            ):
+                _ = await root.context.provide(UI_SLOTS, PluginUiSlots())
             memory_runtime = self._get_composition_memory_runtime()
             if memory_runtime is not None:
                 _ = await root.context.provide(
@@ -4833,6 +4841,28 @@ class PluginManager:
                     spec=spec,
                 )
             )
+        mobile_ui_asset = _resolve_mobile_ui_asset(
+            plugin_dir,
+            cls.mobile_ui(),
+        )
+        mobile_ui_query = (
+            None
+            if mobile_ui_asset is None
+            else _require_sync_mobile_ui_handler(
+                getattr(instance, "mobile_ui_query", None),
+                "query",
+                plugin_id,
+            )
+        )
+        mobile_ui_available = (
+            None
+            if mobile_ui_asset is None
+            else _require_sync_mobile_ui_handler(
+                getattr(instance, "mobile_ui_available", None),
+                "available",
+                plugin_id,
+            )
+        )
         return PluginContributions(
             manifest={
                 "name": str(instance.name or ""),
@@ -4895,10 +4925,9 @@ class PluginManager:
                 plugin_dir,
                 cls.dashboard_module(),
             ),
-            mobile_ui_asset=_resolve_mobile_ui_asset(
-                plugin_dir,
-                cls.mobile_ui(),
-            ),
+            mobile_ui_asset=mobile_ui_asset,
+            mobile_ui_query=mobile_ui_query,
+            mobile_ui_available=mobile_ui_available,
         )
 
     def _validate_candidate(
@@ -5720,62 +5749,56 @@ def _resolve_mobile_ui_asset(
         return None
     if not isinstance(declared, MobileUiContribution):
         raise RuntimeError("插件 mobile UI 声明必须是 MobileUiContribution")
-    root = plugin_dir.resolve(strict=False)
-    module_path = (plugin_dir / declared.module).resolve(strict=False)
-    if (
-        not module_path.is_relative_to(root)
-        or module_path.suffix != ".js"
-        or not module_path.is_file()
-    ):
-        raise RuntimeError(f"插件 mobile UI module 无效: {declared.module}")
-    allowed_slots = {
-        "turn.before_reasoning",
-        "turn.before_tool",
-        "turn.after_answer",
-        "drawer.panel",
-    }
-    if len(set(declared.slots)) != len(declared.slots) or any(
-        slot not in allowed_slots for slot in declared.slots
-    ):
-        raise RuntimeError("插件 mobile UI slots 无效")
     navigation = declared.navigation
-    if navigation is not None and (
-        not navigation.label.strip()
-        or len(navigation.label) > 64
-        or not navigation.description.strip()
-        or len(navigation.description) > 160
-    ):
-        raise RuntimeError("插件 mobile UI navigation 无效")
-    stylesheet = ""
-    if declared.stylesheet is not None:
-        stylesheet_path = (plugin_dir / declared.stylesheet).resolve(strict=False)
-        if (
-            not stylesheet_path.is_relative_to(root)
-            or stylesheet_path.suffix != ".css"
-            or not stylesheet_path.is_file()
-        ):
-            raise RuntimeError(f"插件 mobile UI stylesheet 无效: {declared.stylesheet}")
-        stylesheet = stylesheet_path.read_text(encoding="utf-8")
-    module = module_path.read_text(encoding="utf-8")
-    module_encoded = module.encode("utf-8")
-    stylesheet_encoded = stylesheet.encode("utf-8")
-    if len(module_encoded) + len(stylesheet_encoded) > 240 * 1024:
-        raise RuntimeError("插件 mobile UI 资产超过协议安全预算")
-    return MobileUiAsset(
-        module=module,
-        module_sha256=hashlib.sha256(module_encoded).hexdigest(),
-        module_bytes=len(module_encoded),
-        stylesheet=stylesheet,
-        stylesheet_sha256=(
-            hashlib.sha256(stylesheet_encoded).hexdigest() if stylesheet else None
-        ),
-        stylesheet_bytes=len(stylesheet_encoded),
-        navigation_label=None if navigation is None else navigation.label.strip(),
+    return _resolve_composable_mobile_ui_asset(
+        plugin_dir,
+        module=declared.module,
+        stylesheet=declared.stylesheet,
+        navigation_label=None if navigation is None else navigation.label,
         navigation_description=(
-            None if navigation is None else navigation.description.strip()
+            None if navigation is None else navigation.description
         ),
         slots=tuple(declared.slots),
     )
+
+
+def _resolve_composable_mobile_ui_asset(
+    plugin_dir: Path,
+    *,
+    module: str,
+    stylesheet: str | None,
+    navigation_label: str | None,
+    navigation_description: str | None,
+    slots: tuple[str, ...],
+) -> MobileUiAsset:
+    """Use the same strict asset boundary for v2 and v3 declarations."""
+
+    return resolve_mobile_ui_asset(
+        plugin_dir,
+        module=module,
+        stylesheet=stylesheet,
+        navigation_label=navigation_label,
+        navigation_description=navigation_description,
+        slots=slots,
+    )
+
+
+def _require_sync_mobile_ui_handler(
+    handler: object,
+    field_name: str,
+    plugin_id: str,
+) -> Any:
+    if not callable(handler):
+        raise RuntimeError(
+            f"插件 {plugin_id} mobile UI {field_name} handler 必须可调用"
+        )
+    if inspect.iscoroutinefunction(handler) or inspect.iscoroutinefunction(
+        getattr(handler, "__call__", None)
+    ):
+        raise RuntimeError(
+            f"插件 {plugin_id} mobile UI {field_name} handler 必须是同步函数"
+        )
+    return handler
 
 
 def _resolve_managed_services(
@@ -6054,6 +6077,8 @@ def _replace_snapshot_payload(
         "workspace_mcp_generation",
         "managed_services",
         "dashboard_bindings",
+        "mobile_ui_registry",
+        "mobile_ui_registry_identity",
         "tool_registry",
         "plugin_skill_index",
         "command_registry",

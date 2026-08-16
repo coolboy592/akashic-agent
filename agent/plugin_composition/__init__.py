@@ -53,6 +53,18 @@ from agent.plugin_composition.runtime_services import (
     MEMORY_RUNTIME,
     MemoryRuntimeInfo,
 )
+from agent.plugin_composition.ui_slots import (
+    UI_SLOTS,
+    MobileUiBinding,
+    MobileUiDefinition,
+    MobileUiDescriptor,
+    MobileUiNavigation,
+    MobileUiQueryHandler,
+    MobileUiRegistry,
+    MobileUiRpcInvalidRequest,
+    PluginUiSlots,
+    resolve_mobile_ui_asset,
+)
 
 __all__ = [
     "CompositionError",
@@ -83,9 +95,18 @@ __all__ = [
     "IncidentView",
     "MEMORY_RUNTIME",
     "MemoryRuntimeInfo",
+    "MobileUiBinding",
+    "MobileUiDefinition",
+    "MobileUiDescriptor",
+    "MobileUiNavigation",
+    "MobileUiQueryHandler",
+    "MobileUiRegistry",
+    "MobileUiRpcInvalidRequest",
     "ObserveEventKey",
     "Plugin",
     "PluginCommands",
+    "PluginUiSlots",
+    "resolve_mobile_ui_asset",
     "PluginRuntime",
     "ParallelEventKey",
     "ServiceKey",
@@ -95,5 +116,6 @@ __all__ = [
     "TopologyFiberView",
     "TopologyView",
     "TransformEventKey",
+    "UI_SLOTS",
     "WriteObservation",
 ]

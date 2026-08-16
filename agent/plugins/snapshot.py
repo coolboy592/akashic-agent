@@ -21,6 +21,8 @@ from agent.plugin_composition import (
     CommandRegistry,
     CompositionError,
     CompositionRoot,
+    MobileUiRegistry,
+    UI_SLOTS,
     TopologyView,
 )
 from bus.event_bus import Handler
@@ -65,6 +67,8 @@ class RuntimeSnapshot:
         default_factory=lambda: MappingProxyType({})
     )
     dashboard_bindings: tuple[object, ...] = ()
+    mobile_ui_registry: MobileUiRegistry | None = None
+    mobile_ui_registry_identity: str | None = None
     tool_registry: ToolRegistry | None = None
     plugin_skill_index: SkillIndex | None = None
     command_registry: CommandRegistry | None = None
@@ -237,6 +241,7 @@ class RuntimeSnapshotCompiler:
         composition_topology: TopologyView | None = None
         composition_active_plugin_ids: frozenset[str] | None = None
         command_registry: CommandRegistry | None = None
+        mobile_ui_registry: MobileUiRegistry | None = None
         if composition_root is not None:
             receipt = composition_root.receipt()
             if require_composition_ready and not receipt.ready:
@@ -250,6 +255,36 @@ class RuntimeSnapshotCompiler:
             composition_topology = composition_root.topology_view()
             composition_active_plugin_ids = composition_root.active_plugin_ids()
             identity += f"|composition:{composition_topology.identity}"
+            ui_slots = composition_root.context.get(UI_SLOTS)
+            if ui_slots is not None:
+                freeze = getattr(ui_slots, "freeze", None)
+                if not callable(freeze):
+                    raise RuntimeError(
+                        "RuntimeSnapshot UI Slots Service 缺少 freeze"
+                    )
+                frozen_registry = freeze()
+                if not isinstance(frozen_registry, MobileUiRegistry):
+                    raise RuntimeError(
+                        "RuntimeSnapshot UI Slots freeze 返回值无效"
+                    )
+                mobile_ui_registry = frozen_registry
+                for owner in mobile_ui_registry:
+                    generation = generations.get(owner)
+                    if generation is None:
+                        raise RuntimeError(
+                            "RuntimeSnapshot Mobile UI owner 不属于 generations: "
+                            f"{owner}"
+                        )
+                    if (
+                        generation.contributions.mobile_ui_asset is not None
+                        or generation.contributions.mobile_ui_query is not None
+                        or generation.contributions.mobile_ui_available is not None
+                    ):
+                        raise RuntimeError(
+                            "RuntimeSnapshot v2/v3 Mobile UI contribution 冲突: "
+                            f"{owner}"
+                        )
+                identity += f"|mobile-ui:{mobile_ui_registry.identity}"
             commands = composition_root.context.get(COMMANDS)
             if commands is not None:
                 command_registry = commands.freeze()
@@ -274,6 +309,10 @@ class RuntimeSnapshotCompiler:
             mcp_catalog_generation_ids=MappingProxyType(mcp_catalogs),
             workspace_mcp_generation=workspace_mcp_generation,
             managed_services=MappingProxyType(managed_services),
+            mobile_ui_registry=mobile_ui_registry,
+            mobile_ui_registry_identity=(
+                None if mobile_ui_registry is None else mobile_ui_registry.identity
+            ),
             plugin_skill_index=(
                 catalog_owner.skill_catalog.normal_plugins
                 if catalog_owner is not None and catalog_owner.skill_catalog is not None
@@ -1110,11 +1149,24 @@ class RuntimeSnapshotStore:
     ) -> None:
         root = snapshot.composition_root
         if root is None:
-            if snapshot.composition_topology is not None:
+            if (
+                snapshot.composition_topology is not None
+                or snapshot.mobile_ui_registry is not None
+                or snapshot.mobile_ui_registry_identity is not None
+            ):
                 raise RuntimeError(
                     "RuntimeSnapshot composition identity 缺少 Root Context"
                 )
             return
+        if (
+            snapshot.mobile_ui_registry_identity
+            != (
+                None
+                if snapshot.mobile_ui_registry is None
+                else snapshot.mobile_ui_registry.identity
+            )
+        ):
+            raise RuntimeError("RuntimeSnapshot Mobile UI descriptor 在编译后发生变化")
         topology = snapshot.composition_topology
         if topology is None:
             raise RuntimeError("RuntimeSnapshot composition Root 缺少 TopologyView")

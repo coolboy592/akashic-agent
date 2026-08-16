@@ -5,6 +5,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from agent.plugin_composition.ui_slots import MobileUiQueryHandler
     from agent.plugins.jobs import RegisteredPluginJob
     from agent.plugins.scope import PluginScope, ScopedEventBus
     from agent.plugins.specs import RegisteredProactiveSource
@@ -89,6 +92,10 @@ class PluginContributions:
     channels: tuple[Channel, ...] = ()
     dashboard_module: Path | None = None
     mobile_ui_asset: MobileUiAsset | None = None
+    # V2_REMOVAL(mobile-ui-contribution-v2)：仅在旧 generation 迁移完成前保留这组三元组；
+    # v3 handler 只存在 RuntimeSnapshot.mobile_ui_registry 的 exact Root binding。
+    mobile_ui_query: MobileUiQueryHandler | None = None
+    mobile_ui_available: Callable[[], bool] | None = None
 
 
 @dataclass
