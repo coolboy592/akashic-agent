@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any, AsyncIterator, cast
@@ -202,6 +203,57 @@ async def test_context_prepared_seam_is_noop_without_composition_root() -> None:
         reset_runtime_snapshot(token)
         await lease.release()
         await store.close()
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_seam_is_noop_without_runtime_binding() -> None:
+    await run_composition_lifecycle(CONTEXT_PREPARED_EVENT, _before_turn_ctx())
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_seam_rejects_inherited_wrong_task_binding() -> None:
+    observed: list[str] = []
+    root = CompositionRoot("wrong-task-lifecycle")
+
+    async def plugin(ctx) -> None:
+        await ctx.on(CONTEXT_PREPARED_EVENT, lambda _: observed.append("called"))
+
+    await root.mount(plugin, name="observer")
+    async with _bound_root(root):
+        task = asyncio.create_task(
+            run_composition_lifecycle(
+                CONTEXT_PREPARED_EVENT,
+                _before_turn_ctx(),
+            )
+        )
+        with pytest.raises(CompositionError) as caught:
+            await task
+
+    assert caught.value.code == "RUNTIME_SNAPSHOT_BINDING_MISMATCH"
+    assert observed == []
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_seam_rejects_released_owner_lease() -> None:
+    root = CompositionRoot("inactive-lifecycle")
+    store = RuntimeSnapshotStore()
+    store.install(RuntimeSnapshotCompiler().compile({}, composition_root=root))
+    lease = store.lease()
+    token = bind_runtime_snapshot(lease)
+    await lease.release()
+
+    try:
+        with pytest.raises(CompositionError) as caught:
+            await run_composition_lifecycle(
+                CONTEXT_PREPARED_EVENT,
+                _before_turn_ctx(),
+            )
+    finally:
+        reset_runtime_snapshot(token)
+        await store.close()
+        await root.dispose()
+
+    assert caught.value.code == "RUNTIME_SNAPSHOT_BINDING_INACTIVE"
 
 
 @pytest.mark.asyncio

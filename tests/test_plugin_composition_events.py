@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from typing import Any, cast
 
 import pytest
 
@@ -32,6 +33,30 @@ class Rewrite:
 
 
 REWRITE = TransformEventKey("rewrite", Rewrite, "test.rewrite.v1")
+
+
+@pytest.mark.parametrize(
+    "key",
+    [NOTICE, TRANSFORM, OBSERVE, REWRITE, FINAL_OBSERVE],
+)
+@pytest.mark.asyncio
+async def test_registration_rejects_non_callable_without_root_mutation(
+    key: object,
+) -> None:
+    root = CompositionRoot("invalid-listener")
+    before = root.topology_view()
+    before_effects = root.receipt().effects
+
+    with pytest.raises(CompositionError) as caught:
+        _ = await root.context.on(cast(Any, key), cast(Any, None))
+
+    after = root.topology_view()
+    assert caught.value.code == "INVALID_EVENT_LISTENER"
+    assert after.identity == before.identity
+    assert after.composition_revision == before.composition_revision
+    assert after.listeners == ()
+    assert root.receipt().effects == before_effects
+    await root.dispose()
 
 
 @pytest.mark.asyncio
@@ -761,6 +786,31 @@ async def test_spawned_task_is_cancelled_with_owning_fiber() -> None:
 
     assert cleaned.is_set()
     assert fiber.effects == []
+
+
+@pytest.mark.asyncio
+async def test_spawn_rejection_closes_unowned_coroutine() -> None:
+    contexts: list[Any] = []
+    root = CompositionRoot("spawn-rejected")
+
+    async def plugin(ctx) -> None:
+        contexts.append(ctx)
+
+    fiber = await root.mount(plugin, name="task-owner")
+    await fiber.dispose()
+
+    async def worker() -> None:
+        await asyncio.sleep(0)
+
+    coroutine = worker()
+    assert coroutine.cr_frame is not None
+    with pytest.raises(CompositionError) as caught:
+        _ = await contexts[0].spawn(coroutine, name="late-worker")
+
+    assert caught.value.code == "INACTIVE_EFFECT"
+    assert coroutine.cr_frame is None
+    assert fiber.effects == []
+    await root.dispose()
 
 
 @pytest.mark.asyncio

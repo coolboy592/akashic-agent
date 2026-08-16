@@ -312,7 +312,12 @@ class Context:
 
             return cleanup
 
-        _ = await self.effect(setup, label=f"task:{name}")
+        try:
+            _ = await self.effect(setup, label=f"task:{name}")
+        except BaseException:
+            if task is None:
+                coroutine.close()
+            raise
         assert task is not None
         return task
 

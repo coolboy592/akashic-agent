@@ -1,6 +1,6 @@
 # 插件 v3 admission 与 lifecycle 收口任务合同
 
-- 状态：implementing
+- 状态：implemented / verified
 - 日期：2026-08-16
 - 实现基线：`677bedd6`
 - 关联条款：PLG-001～PLG-004、PLG-008～PLG-010、PLG-014、TST-001～TST-008

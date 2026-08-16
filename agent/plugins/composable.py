@@ -56,6 +56,7 @@ class ComposablePlugin:
         apply = getattr(module, "apply", None)
         if not callable(apply):
             raise ValueError("v3 插件模块必须导出 apply(ctx, config)")
+        _validate_apply_signature(apply)
 
         # 2. Dependencies are typed ServiceKeys; ordering comes from providers.
         raw_inject = cast(object, getattr(module, "inject", ()))
@@ -143,7 +144,6 @@ class ComposablePlugin:
         if self._static_active is None:
             raise RuntimeError("v3 插件 is_active 尚未绑定 Core static services")
         return self._static_active
-
     @property
     def static_active(self) -> bool:
         return self.is_active()
@@ -165,6 +165,29 @@ class ComposablePlugin:
         if inspect.isawaitable(result):
             result = await result
         return cast(list[PluginSemanticCheck], result)
+
+
+def _validate_apply_signature(apply: Callable[..., object]) -> None:
+    """Reject v3 apply callables that Core cannot invoke as apply(ctx, config)."""
+
+    try:
+        signature = inspect.signature(apply)
+    except (TypeError, ValueError) as error:
+        raise ValueError("v3 插件 apply 必须精确声明 apply(ctx, config)") from error
+    parameters = tuple(signature.parameters.values())
+    positional_kinds = {
+        inspect.Parameter.POSITIONAL_ONLY,
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+    }
+    if (
+        tuple(parameter.name for parameter in parameters) != ("ctx", "config")
+        or any(parameter.kind not in positional_kinds for parameter in parameters)
+        or any(
+            parameter.default is not inspect.Parameter.empty
+            for parameter in parameters
+        )
+    ):
+        raise ValueError("v3 插件 apply 必须精确声明 apply(ctx, config)")
 
 
 def _string_tuple_export(module: ModuleType, name: str) -> tuple[str, ...]:

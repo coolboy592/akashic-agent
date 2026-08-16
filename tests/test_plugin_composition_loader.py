@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import sys
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -406,8 +406,6 @@ def test_v3_namespace_rejects_invalid_package_contributions(
 
 
 def test_v3_namespace_freezes_package_contribution_lists() -> None:
-    from types import ModuleType
-
     roots = ["skills"]
     module = ModuleType("frozen_v3_contribution")
     module.api_version = 3
@@ -420,6 +418,54 @@ def test_v3_namespace_freezes_package_contribution_lists() -> None:
     roots.append("mutated")
 
     assert plugin.skill_roots == ("skills",)
+
+
+@pytest.mark.parametrize(
+    "declaration",
+    [
+        "def apply(ctx): pass",
+        "def apply(): pass",
+        "def apply(ctx, config, extra): pass",
+        "def apply(ctx, config=None): pass",
+        "def apply(*args): pass",
+        "def apply(ctx, *, config): pass",
+        "def apply(config, ctx): pass",
+    ],
+)
+def test_v3_namespace_rejects_noncanonical_apply_signature(
+    declaration: str,
+) -> None:
+    module = ModuleType("invalid_v3_apply")
+    module.api_version = 3
+    module.name = "invalid"
+    module.version = "1.0.0"
+    exec(declaration, module.__dict__)
+
+    with pytest.raises(
+        ValueError,
+        match=r"apply 必须精确声明 apply\(ctx, config\)",
+    ):
+        _ = ComposablePlugin.from_module(module)
+
+
+@pytest.mark.parametrize(
+    "declaration",
+    [
+        "def apply(ctx, config): pass",
+        "async def apply(ctx, config): pass",
+        "def apply(ctx, config, /): pass",
+    ],
+)
+def test_v3_namespace_accepts_canonical_apply_signature(declaration: str) -> None:
+    module = ModuleType("valid_v3_apply")
+    module.api_version = 3
+    module.name = "valid"
+    module.version = "1.0.0"
+    exec(declaration, module.__dict__)
+
+    plugin = ComposablePlugin.from_module(module)
+
+    assert plugin.name == "valid"
 
 
 @pytest.mark.asyncio

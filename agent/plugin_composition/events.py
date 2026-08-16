@@ -119,7 +119,14 @@ class EventRegistry:
     ) -> Callable[[], None]:
         """Validate and publish one listener until its owning Effect closes."""
 
-        # 1. One event name has one dispatch contract for the whole Root.
+        # 1. Reject malformed plugin input before publishing any Root state.
+        if not callable(callback):
+            raise CompositionError(
+                "INVALID_EVENT_LISTENER",
+                f"事件 {key.name} 的 listener 必须可调用",
+            )
+
+        # 2. One event name has one dispatch contract for the whole Root.
         existing_contract = self._contracts.get(key.name)
         if existing_contract is not None and existing_contract != key:
             raise CompositionError(
@@ -137,7 +144,7 @@ class EventRegistry:
                 f"并发事件 {key.name} 只能注册异步 listener",
             )
 
-        # 2. Registration order is the only listener order contract.
+        # 3. Registration order is the only listener order contract.
         self._contracts[key.name] = key
         listener = _Listener(owner=owner, callback=callback)
         listeners = self._listeners.setdefault(key, [])

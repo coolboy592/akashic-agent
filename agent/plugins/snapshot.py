@@ -16,7 +16,7 @@ from agent.plugins.specs import RegisteredProactiveSource, proactive_source_key
 from agent.tools.registry import ToolRegistry
 from agent.tool_hooks import ToolHook
 from agent.skills import SkillIndex
-from agent.plugin_composition import CompositionRoot, TopologyView
+from agent.plugin_composition import CompositionError, CompositionRoot, TopologyView
 from bus.event_bus import Handler
 from infra.channels.contract import Channel
 
@@ -401,6 +401,25 @@ def get_current_runtime_snapshot() -> RuntimeSnapshot | None:
         or binding.owner_task is not asyncio.current_task()
     ):
         return None
+    return binding.lease.snapshot
+
+
+def get_lifecycle_runtime_snapshot() -> RuntimeSnapshot | None:
+    """Resolve a lifecycle snapshot while rejecting inherited or stale bindings."""
+
+    binding = _current_runtime_binding.get()
+    if binding is None:
+        return None
+    if binding.owner_task is not asyncio.current_task():
+        raise CompositionError(
+            "RUNTIME_SNAPSHOT_BINDING_MISMATCH",
+            "lifecycle 必须在绑定 RuntimeSnapshot lease 的 owner task 中运行",
+        )
+    if not binding.lease.active:
+        raise CompositionError(
+            "RUNTIME_SNAPSHOT_BINDING_INACTIVE",
+            "lifecycle 不能使用已释放的 RuntimeSnapshot lease",
+        )
     return binding.lease.snapshot
 
 

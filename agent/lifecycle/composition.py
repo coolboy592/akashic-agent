@@ -4,7 +4,7 @@ from typing import TypeVar
 
 from agent.lifecycle.types import AfterReasoningCtx, BeforeTurnCtx, PromptRenderCtx
 from agent.plugin_composition import CompositionError, SerialEventKey
-from agent.plugins.snapshot import get_current_runtime_snapshot
+from agent.plugins.snapshot import get_lifecycle_runtime_snapshot
 
 P = TypeVar("P")
 
@@ -27,7 +27,7 @@ async def run_composition_lifecycle(
     """Run one lifecycle seam from the request's frozen composition Root."""
 
     # 1. Bootstrap and legacy snapshots without a composition Root stay unchanged.
-    snapshot = get_current_runtime_snapshot()
+    snapshot = get_lifecycle_runtime_snapshot()
     if snapshot is None or snapshot.composition_root is None:
         return
 

@@ -116,7 +116,7 @@ Gate 报告。分支名、PR 号和浮动 ref 不能代替 commit。
 | C13 | managed process capability | `OPEN` | start/ready/cancel/terminate/log Effect；同 generation 单实例 | Calendar MCP |
 | C14 | inbound/outbound channel capability | `OPEN` | committed binding、stop/drain/swap、失败恢复旧代、无重复发送 | Feishu / QQBot |
 | C15 | timer / proactive source / turn enqueue capability | `OPEN` | skip/failure 可区分、timer 回收、turn owner、无候选发送 | Calendar MCP |
-| C16 | v3 admission/lifecycle 收口 | `OPEN` | non-callable listener、spawn coroutine、apply signature、wrong-task lifecycle 全部 fail-loud | Core |
+| C16 | v3 admission/lifecycle 收口 | `IMPLEMENTED` | non-callable listener、spawn coroutine、apply signature、wrong-task lifecycle 全部 fail-loud | Core |
 | C17 | mobile UI/query capability | `OPEN` | committed catalog、lease、bounded query、candidate 不发布 | Akasha / Observe |
 | C18 | Core-private v3 generation metadata | `OPEN` | v3 load/clone/formal rebuild 不再读取 `PluginContext` | Core |
 | C19 | full-fleet Health/Incident/Topology inspection | `OPEN` | 每插件可查询 current health、incident、generation、cleanup | 全量 runtime |
