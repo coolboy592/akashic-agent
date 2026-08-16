@@ -18,6 +18,9 @@ from agent.plugin_composition.model import CompositionError, IncidentView, Servi
 
 _NAME = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 _FACTORY_EXPORT = re.compile(r"^[A-Za-z_][A-Za-z0-9_.:]*$")
+_ATTACHMENT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$")
+_MEDIA_TYPE = re.compile(r"^[A-Za-z0-9!#$&^_.+-]+/[A-Za-z0-9!#$&^_.+-]+$")
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
 def channel_config_revision(projection: Mapping[str, object]) -> str:
@@ -83,6 +86,38 @@ class DeliveryStatus(StrEnum):
     UNKNOWN = "unknown"
 
 
+class AttachmentKind(StrEnum):
+    FILE = "file"
+    IMAGE = "image"
+
+
+@dataclass(frozen=True, slots=True)
+class AttachmentRef:
+    """Identify one immutable Core-owned attachment without exposing its path."""
+
+    artifact_id: str
+    kind: AttachmentKind
+    filename: str | None
+    media_type: str | None
+    size_bytes: int
+    sha256: str
+
+    def __post_init__(self) -> None:
+        _attachment_id(self.artifact_id)
+        if not isinstance(self.kind, AttachmentKind):
+            raise TypeError("kind 必须是 AttachmentKind")
+        _attachment_filename(self.filename)
+        _attachment_media_type(self.media_type)
+        if isinstance(self.size_bytes, bool) or not isinstance(self.size_bytes, int):
+            raise TypeError("size_bytes 必须是 int")
+        if self.size_bytes < 0:
+            raise ValueError("size_bytes 不能是负数")
+        if not isinstance(self.sha256, str):
+            raise TypeError("sha256 必须是 str")
+        if _SHA256.fullmatch(self.sha256) is None:
+            raise ValueError("sha256 必须是 64 位小写十六进制字符串")
+
+
 JsonValue: TypeAlias = (
     None
     | bool
@@ -104,6 +139,7 @@ class ChannelInboundMessage:
     content: str
     timestamp: datetime
     metadata: Mapping[str, JsonValue]
+    attachments: tuple[AttachmentRef, ...] = ()
 
     def __post_init__(self) -> None:
         _text(self.channel, "channel")
@@ -115,6 +151,11 @@ class ChannelInboundMessage:
         if self.timestamp.tzinfo is None or self.timestamp.utcoffset() is None:
             raise ValueError("timestamp 必须是 timezone-aware datetime")
         object.__setattr__(self, "metadata", _freeze_json_mapping(self.metadata))
+        object.__setattr__(
+            self,
+            "attachments",
+            _attachment_refs(self.attachments, "attachments"),
+        )
 
 
 class InboundOwner(StrEnum):
@@ -161,6 +202,30 @@ class ChannelIngressPort(Protocol):
 
 class ChannelIdentityPort(Protocol):
     def resolve(self, provider_identity: str) -> str | None: ...
+
+
+class ChannelAttachmentImportPort(Protocol):
+    async def import_bytes(
+        self,
+        data: bytes,
+        *,
+        kind: AttachmentKind,
+        filename: str | None,
+        media_type: str | None,
+    ) -> AttachmentRef: ...
+
+
+class AttachmentReadLease(Protocol):
+    @property
+    def ref(self) -> AttachmentRef: ...
+
+    async def read_bytes(self, *, max_bytes: int) -> bytes: ...
+
+    async def aclose(self) -> None: ...
+
+
+class ChannelAttachmentReadPort(Protocol):
+    async def acquire(self, ref: AttachmentRef) -> AttachmentReadLease: ...
 
 
 @dataclass(slots=True, kw_only=True)
@@ -329,6 +394,7 @@ class OutboundEnvelope:
     recipient: str
     body: str
     metadata: Mapping[str, JsonValue]
+    attachments: tuple[AttachmentRef, ...] = ()
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -351,6 +417,11 @@ class OutboundEnvelope:
         if self.attempt_sequence > 1 and self.logical_delivery_id == self.delivery_id:
             raise ValueError("重试 attempt 必须生成新的 delivery_id")
         object.__setattr__(self, "metadata", _freeze_json_mapping(self.metadata))
+        object.__setattr__(
+            self,
+            "attachments",
+            _attachment_refs(self.attachments, "attachments"),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -392,12 +463,18 @@ class PushToolRequest:
     recipient: str
     body: str
     metadata: Mapping[str, JsonValue]
+    attachments: tuple[AttachmentRef, ...] = ()
 
     def __post_init__(self) -> None:
         _text(self.channel, "channel")
         _text(self.recipient, "recipient")
         _string(self.body, "body")
         object.__setattr__(self, "metadata", _freeze_json_mapping(self.metadata))
+        object.__setattr__(
+            self,
+            "attachments",
+            _attachment_refs(self.attachments, "attachments"),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -447,6 +524,8 @@ class ChannelFactoryContext:
     provider_client_factory: ProviderClientFactory
     ingress: ChannelIngressPort | None
     identity: ChannelIdentityPort | None
+    attachment_import: ChannelAttachmentImportPort | None = None
+    attachment_read: ChannelAttachmentReadPort | None = None
 
     def __post_init__(self) -> None:
         _text(self.snapshot_id, "snapshot_id")
@@ -464,6 +543,18 @@ class ChannelFactoryContext:
             getattr(self.identity, "resolve", None)
         ):
             raise TypeError("channel factory identity 必须提供 resolve(identity)")
+        if self.attachment_import is not None and not callable(
+            getattr(self.attachment_import, "import_bytes", None)
+        ):
+            raise TypeError(
+                "channel factory attachment_import 必须提供 import_bytes(data, ...)"
+            )
+        if self.attachment_read is not None and not callable(
+            getattr(self.attachment_read, "acquire", None)
+        ):
+            raise TypeError(
+                "channel factory attachment_read 必须提供 acquire(ref)"
+            )
         object.__setattr__(self, "config", config)
         object.__setattr__(self, "credentials", credentials)
 
@@ -528,6 +619,7 @@ class ProviderDeliveryRequest:
     delivery_id: str
     recipient: str
     body: str
+    attachments: tuple[AttachmentRef, ...] = ()
 
     def __post_init__(self) -> None:
         _text(self.binding_token, "binding_token")
@@ -535,6 +627,11 @@ class ProviderDeliveryRequest:
         _text(self.recipient, "recipient")
         if not isinstance(self.body, str):
             raise TypeError("body 必须是 str")
+        object.__setattr__(
+            self,
+            "attachments",
+            _attachment_refs(self.attachments, "attachments"),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1139,6 +1236,51 @@ def _freeze_json_value(
     raise TypeError(f"metadata 值类型无效: {type(value).__name__}")
 
 
+def _attachment_refs(value: object, field_name: str) -> tuple[AttachmentRef, ...]:
+    if not isinstance(value, tuple):
+        raise TypeError(f"{field_name} 必须是 tuple")
+    result = tuple(value)
+    if any(not isinstance(item, AttachmentRef) for item in result):
+        raise TypeError(f"{field_name} 必须只包含 AttachmentRef")
+    return result
+
+
+def _attachment_id(value: object) -> str:
+    if not isinstance(value, str):
+        raise TypeError("artifact_id 必须是 str")
+    if _ATTACHMENT_ID.fullmatch(value) is None:
+        raise ValueError("artifact_id 必须是安全的 opaque id")
+    return value
+
+
+def _attachment_filename(value: object) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise TypeError("filename 必须是 str 或 None")
+    if (
+        not value
+        or value != value.strip()
+        or len(value) > 255
+        or "/" in value
+        or "\\" in value
+        or "\x00" in value
+        or any(ord(char) < 32 or ord(char) == 127 for char in value)
+    ):
+        raise ValueError("filename 必须是 1..255 字符的纯文件名")
+    return value
+
+
+def _attachment_media_type(value: object) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise TypeError("media_type 必须是 str 或 None")
+    if len(value) > 255 or _MEDIA_TYPE.fullmatch(value) is None:
+        raise ValueError("media_type 必须是合法 MIME type")
+    return value
+
+
 def _text_tuple(value: object, field_name: str) -> tuple[str, ...]:
     if not isinstance(value, tuple):
         raise TypeError(f"{field_name} 必须是 tuple")
@@ -1175,6 +1317,8 @@ __all__ = [
     "CHANNELS",
     "ChannelAdapter",
     "ChannelCapability",
+    "ChannelAttachmentImportPort",
+    "ChannelAttachmentReadPort",
     "ChannelCleanupFailure",
     "ChannelDeliveryReceipt",
     "ChannelFactoryContext",
@@ -1182,6 +1326,9 @@ __all__ = [
     "ChannelIdentityPort",
     "ChannelReady",
     "ChannelInboundMessage",
+    "AttachmentKind",
+    "AttachmentReadLease",
+    "AttachmentRef",
     "CredentialRef",
     "DeliveryStatus",
     "ChannelDefinition",

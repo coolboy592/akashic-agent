@@ -10,6 +10,11 @@ import pytest
 
 from agent.plugin_composition import (
     CHANNELS,
+    AttachmentKind,
+    AttachmentReadLease,
+    AttachmentRef,
+    ChannelAttachmentImportPort,
+    ChannelAttachmentReadPort,
     ChannelCapability,
     ChannelDeliveryReceipt,
     ChannelInboundMessage,
@@ -77,6 +82,25 @@ def _provenance(name: str, *, generation: str = "plugin-generation") -> ChannelF
         source_revision="source-1",
         config_revision="config-1",
         factory_export=definition.factory_export,
+    )
+
+
+def _attachment(
+    *,
+    artifact_id: str = "artifact-1",
+    kind: AttachmentKind = AttachmentKind.FILE,
+    filename: str | None = "report.txt",
+    media_type: str | None = "text/plain",
+    size_bytes: int = 3,
+    sha256: str = "a" * 64,
+) -> AttachmentRef:
+    return AttachmentRef(
+        artifact_id=artifact_id,
+        kind=kind,
+        filename=filename,
+        media_type=media_type,
+        size_bytes=size_bytes,
+        sha256=sha256,
     )
 
 
@@ -407,6 +431,157 @@ def test_channel_provider_delivery_and_cleanup_receipts_are_typed() -> None:
         resources_closed=False,
         failures=(failure,),
     ).failures == (failure,)
+
+
+def test_attachment_ref_and_channel_payloads_are_frozen_and_typed() -> None:
+    attachment = _attachment(
+        kind=AttachmentKind.IMAGE,
+        filename=None,
+        media_type="image/png",
+    )
+    message = ChannelInboundMessage(
+        channel="feishu",
+        sender="sender",
+        chat_id="chat",
+        content="hello",
+        timestamp=datetime.now(timezone.utc),
+        metadata={},
+        attachments=(attachment,),
+    )
+    outbound = OutboundEnvelope(
+        logical_delivery_id="delivery",
+        delivery_id="delivery",
+        attempt_sequence=1,
+        snapshot_id="snapshot",
+        generation_id="generation",
+        binding_token="binding",
+        channel="feishu",
+        recipient="chat",
+        body="hello",
+        metadata={},
+        attachments=(attachment,),
+    )
+    request = ProviderDeliveryRequest(
+        binding_token="binding",
+        delivery_id="delivery",
+        recipient="chat",
+        body="hello",
+        attachments=(attachment,),
+    )
+    push = PushToolRequest(
+        channel="feishu",
+        recipient="chat",
+        body="hello",
+        metadata={},
+        attachments=(attachment,),
+    )
+
+    assert message.attachments == (attachment,)
+    assert outbound.attachments == (attachment,)
+    assert request.attachments == (attachment,)
+    assert push.attachments == (attachment,)
+    with pytest.raises((AttributeError, TypeError)):
+        attachment.artifact_id = "changed"  # type: ignore[misc]
+    with pytest.raises(TypeError, match="attachments 必须是 tuple"):
+        _ = PushToolRequest(
+            channel="feishu",
+            recipient="chat",
+            body="hello",
+            metadata={},
+            attachments=[attachment],  # type: ignore[arg-type]
+        )
+    with pytest.raises(TypeError, match="AttachmentRef"):
+        _ = ProviderDeliveryRequest(
+            binding_token="binding",
+            delivery_id="delivery",
+            recipient="chat",
+            body="hello",
+            attachments=("not-a-ref",),  # type: ignore[arg-type]
+        )
+
+
+def test_attachment_ref_rejects_unsafe_identity_metadata_and_digest() -> None:
+    cases = (
+        {"artifact_id": "../escape"},
+        {"artifact_id": "/absolute"},
+        {"kind": "file"},
+        {"filename": "../report.txt"},
+        {"filename": ""},
+        {"media_type": "text"},
+        {"size_bytes": -1},
+        {"size_bytes": True},
+        {"sha256": "A" * 64},
+        {"sha256": "a" * 63},
+    )
+    for overrides in cases:
+        values = {
+            "artifact_id": "artifact-1",
+            "kind": AttachmentKind.FILE,
+            "filename": "report.txt",
+            "media_type": "text/plain",
+            "size_bytes": 3,
+            "sha256": "a" * 64,
+        }
+        values.update(overrides)
+        with pytest.raises((TypeError, ValueError)):
+            _ = AttachmentRef(**values)  # type: ignore[arg-type]
+
+
+def test_attachment_ports_are_exported_and_factory_context_validates_them() -> None:
+    class ImportPort:
+        async def import_bytes(
+            self,
+            data,
+            *,
+            kind,
+            filename,
+            media_type,
+        ):  # type: ignore[no-untyped-def]
+            raise AssertionError((data, kind, filename, media_type))
+
+    class ReadPort:
+        async def acquire(self, ref):  # type: ignore[no-untyped-def]
+            raise AssertionError(ref)
+
+    class ProviderFactory:
+        async def create(self, credentials):  # type: ignore[no-untyped-def]
+            raise AssertionError(credentials)
+
+        async def aclose(self) -> None:
+            return None
+
+    context = ChannelFactoryContext(
+        snapshot_id="snapshot",
+        generation_id="generation",
+        binding_token="binding",
+        config={},
+        credentials={},
+        provider_client_factory=ProviderFactory(),
+        ingress=None,
+        identity=None,
+        attachment_import=ImportPort(),
+        attachment_read=ReadPort(),
+    )
+    assert context.attachment_import is not None
+    assert callable(context.attachment_import.import_bytes)
+    assert context.attachment_read is not None
+    assert callable(context.attachment_read.acquire)
+    assert ChannelAttachmentImportPort
+    assert ChannelAttachmentReadPort
+    assert AttachmentReadLease
+
+    with pytest.raises(TypeError, match="attachment_import"):
+        _ = ChannelFactoryContext(
+            snapshot_id="snapshot",
+            generation_id="generation",
+            binding_token="binding",
+            config={},
+            credentials={},
+            provider_client_factory=ProviderFactory(),
+            ingress=None,
+            identity=None,
+            attachment_import=object(),  # type: ignore[arg-type]
+        )
 
 
 def test_c14c_metadata_is_recursively_frozen_and_rejects_unsafe_values() -> None:
