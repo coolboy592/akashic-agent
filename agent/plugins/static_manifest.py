@@ -18,6 +18,7 @@ from urllib.parse import urlsplit
 STATIC_MANIFEST_FILENAME = "akashic.plugin.toml"
 
 _NAME = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
+_CONFIG_KEY = re.compile(r"^[a-z][A-Za-z0-9_-]{0,63}$")
 _VERSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _ENV_NAME = re.compile(r"^[A-Z_][A-Z0-9_]{0,127}$")
 _RESERVED_ENV = frozenset(
@@ -41,6 +42,7 @@ _TOP_LEVEL_KEYS = frozenset(
         "process",
         "processes",
         "managed_processes",
+        "channel_credentials",
     }
 )
 _PYTHON_COMMAND = re.compile(r"python(?:\d+(?:\.\d+)*)?(?:\.exe)?")
@@ -97,6 +99,7 @@ class StaticPluginManifest:
     exclude_data_paths: tuple[str, ...]
     mcp_servers: tuple[StaticMcpDeclaration, ...]
     managed_processes: tuple[StaticManagedProcessDeclaration, ...]
+    channel_credentials: tuple[tuple[str, tuple[str, ...]], ...]
     identity_digest: str
 
     @property
@@ -242,6 +245,7 @@ def _validate_manifest(root: Path, raw: Mapping[str, object]) -> StaticPluginMan
     # 3. Optional declarations are checked statically and kept immutable.
     mcp_servers = _mcp_declarations(root, raw, python)
     managed_processes = _process_declarations(root, raw, python)
+    channel_credentials = _channel_credentials(raw.get("channel_credentials", {}))
     _validate_endpoint_process_refs(mcp_servers, managed_processes)
     identity = {
         "schema_version": schema_version,
@@ -260,6 +264,10 @@ def _validate_manifest(root: Path, raw: Mapping[str, object]) -> StaticPluginMan
         "mcp_servers": [_mcp_identity(item) for item in mcp_servers],
         "managed_processes": [
             _process_identity(item) for item in managed_processes
+        ],
+        "channel_credentials": [
+            {"channel": channel, "paths": list(paths)}
+            for channel, paths in channel_credentials
         ],
     }
     identity_digest = hashlib.sha256(
@@ -280,8 +288,53 @@ def _validate_manifest(root: Path, raw: Mapping[str, object]) -> StaticPluginMan
         exclude_data_paths=exclude_data_paths,
         mcp_servers=mcp_servers,
         managed_processes=managed_processes,
+        channel_credentials=channel_credentials,
         identity_digest=identity_digest,
     )
+
+
+def _channel_credentials(
+    raw: object,
+) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    """Validate import-free channel credential paths from the artifact manifest."""
+
+    # 1. Each channel owns one sorted set of dotted config paths.
+    table = _table(raw, "channel_credentials")
+    result: list[tuple[str, tuple[str, ...]]] = []
+    for channel, paths in sorted(table.items()):
+        name = _name(channel, f"channel_credentials.{channel}")
+        values = _string_list(paths, f"channel_credentials.{name}")
+        normalized: list[str] = []
+        for value in values:
+            parts = value.split(".")
+            if any(_CONFIG_KEY.fullmatch(part) is None for part in parts):
+                raise ValueError(
+                    f"channel_credentials.{name} 包含无效 config path: {value}"
+                )
+            normalized.append(".".join(parts))
+
+        # 2. Prefix overlap would make redaction order observable.
+        path_set = set(normalized)
+        for value in normalized:
+            parts = value.split(".")
+            if any(".".join(parts[:index]) in path_set for index in range(1, len(parts))):
+                raise ValueError(
+                    f"channel_credentials.{name} 路径重叠: {value}"
+                )
+        result.append((name, tuple(sorted(normalized))))
+
+    # 3. Two channels may reuse one exact credential, but not overlapping paths.
+    all_paths = {path for _channel, paths in result for path in paths}
+    for value in all_paths:
+        parts = value.split(".")
+        if any(
+            ".".join(parts[:index]) in all_paths
+            for index in range(1, len(parts))
+        ):
+            raise ValueError(
+                f"channel_credentials 跨 channel 路径重叠: {value}"
+            )
+    return tuple(result)
 
 
 def _python_runtimes(

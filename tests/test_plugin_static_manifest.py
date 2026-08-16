@@ -79,6 +79,85 @@ def test_static_manifest_is_import_free_and_exposes_runtime_policy(
     assert len(manifest.identity_digest) == 64
 
 
+def test_static_manifest_freezes_channel_credential_paths_before_import(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "feishu"
+    root.mkdir()
+    (root / "plugin.py").write_text(
+        "raise RuntimeError('candidate must not import during static parse')\n",
+        encoding="utf-8",
+    )
+    (root / "akashic.plugin.toml").write_text(
+        "schema_version = 1\n"
+        "name = 'feishu'\n"
+        "version = '3.0.0'\n"
+        "api_version = 3\n"
+        "entrypoint = 'plugin.py'\n\n"
+        "[channel_credentials]\n"
+        "feishu = ['app_secret', 'oauth.token']\n",
+        encoding="utf-8",
+    )
+
+    manifest = load_static_plugin_manifest(root)
+
+    assert manifest.channel_credentials == (
+        ("feishu", ("app_secret", "oauth.token")),
+    )
+
+
+@pytest.mark.parametrize(
+    "paths",
+    (
+        "['oauth', 'oauth.token']",
+        "['bad..path']",
+        "['UPPER']",
+    ),
+)
+def test_static_manifest_rejects_ambiguous_channel_credential_paths(
+    tmp_path: Path,
+    paths: str,
+) -> None:
+    root = tmp_path / "feishu"
+    root.mkdir()
+    (root / "plugin.py").write_text("", encoding="utf-8")
+    (root / "akashic.plugin.toml").write_text(
+        "schema_version = 1\n"
+        "name = 'feishu'\n"
+        "version = '3.0.0'\n"
+        "api_version = 3\n"
+        "entrypoint = 'plugin.py'\n\n"
+        "[channel_credentials]\n"
+        f"feishu = {paths}\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="channel_credentials"):
+        load_static_plugin_manifest(root)
+
+
+def test_static_manifest_rejects_cross_channel_credential_path_overlap(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "channels"
+    root.mkdir()
+    (root / "plugin.py").write_text("", encoding="utf-8")
+    (root / "akashic.plugin.toml").write_text(
+        "schema_version = 1\n"
+        "name = 'channels'\n"
+        "version = '3.0.0'\n"
+        "api_version = 3\n"
+        "entrypoint = 'plugin.py'\n\n"
+        "[channel_credentials]\n"
+        "feishu = ['oauth']\n"
+        "qqbot = ['oauth.token']\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="跨 channel 路径重叠"):
+        load_static_plugin_manifest(root)
+
+
 def test_static_manifest_validates_mcp_and_process_declarations(
     tmp_path: Path,
 ) -> None:

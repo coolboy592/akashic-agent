@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
+import math
 from contextvars import ContextVar, Token
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
+from datetime import date, datetime, time
 from types import MappingProxyType
 from typing import Literal, cast
 
@@ -17,6 +20,7 @@ from agent.tools.registry import ToolRegistry
 from agent.tool_hooks import ToolHook
 from agent.skills import SkillIndex
 from agent.plugin_composition import (
+    CHANNELS,
     COMMANDS,
     MANAGED_PROCESSES,
     MCP_SERVERS,
@@ -26,6 +30,12 @@ from agent.plugin_composition import (
     MobileUiRegistry,
     UI_SLOTS,
     TopologyView,
+)
+from agent.plugin_composition.channels import (
+    ChannelFactoryFreezeInput,
+    ChannelRegistrySnapshot,
+    CredentialRef,
+    _freeze_plugin_channels,
 )
 from agent.plugin_composition.mcp_slots import (
     McpServerRegistry,
@@ -46,6 +56,52 @@ SnapshotState = Literal[
     "retired",
 ]
 RuntimeSelector = Literal["stable", "latest"]
+
+
+def _channel_config_revision(projection: Mapping[str, object]) -> str:
+    """Hash the redacted config projection without exposing credential bytes."""
+
+    payload = _canonical_channel_config_value(projection)
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _canonical_channel_config_value(value: object) -> object:
+    """Convert TOML values and CredentialRef into a deterministic JSON value."""
+
+    if isinstance(value, CredentialRef):
+        return {"$credential_ref": list(value.path)}
+    if isinstance(value, Mapping):
+        result: dict[str, object] = {}
+        for key in sorted(value):
+            if not isinstance(key, str):
+                raise TypeError("channel config projection key 必须是字符串")
+            result[key] = _canonical_channel_config_value(value[key])
+        return result
+    if isinstance(value, (list, tuple)):
+        return [_canonical_channel_config_value(item) for item in value]
+    if value is None or isinstance(value, (bool, int, str)):
+        return value
+    if isinstance(value, float):
+        if math.isnan(value):
+            return {"$float": "nan"}
+        if math.isinf(value):
+            return {"$float": "inf" if value > 0 else "-inf"}
+        return {"$float": value.hex()}
+    if isinstance(value, (datetime, date, time)):
+        return {
+            "$toml_type": type(value).__name__,
+            "value": value.isoformat(),
+        }
+    raise TypeError(
+        "channel config projection 包含不受支持的值: "
+        f"{type(value).__name__}"
+    )
 
 @dataclass
 class RuntimeSnapshot:
@@ -79,6 +135,8 @@ class RuntimeSnapshot:
     dashboard_bindings: tuple[object, ...] = ()
     mobile_ui_registry: MobileUiRegistry | None = None
     mobile_ui_registry_identity: str | None = None
+    channel_registry: ChannelRegistrySnapshot | None = None
+    channel_registry_identity: str | None = None
     mcp_server_registry: McpServerRegistry | None = None
     mcp_server_registry_identity: str | None = None
     managed_process_registry: ManagedProcessRegistry | None = None
@@ -256,6 +314,7 @@ class RuntimeSnapshotCompiler:
         composition_active_plugin_ids: frozenset[str] | None = None
         command_registry: CommandRegistry | None = None
         mobile_ui_registry: MobileUiRegistry | None = None
+        channel_registry: ChannelRegistrySnapshot | None = None
         mcp_server_registry: McpServerRegistry | None = None
         managed_process_registry: ManagedProcessRegistry | None = None
         if composition_root is not None:
@@ -305,6 +364,81 @@ class RuntimeSnapshotCompiler:
             if commands is not None:
                 command_registry = commands.freeze()
                 identity += f"|commands:{command_registry.catalog_digest}"
+            channel_declarations = composition_root.context.get(CHANNELS)
+            if channel_declarations is not None:
+                channel_registry = _freeze_plugin_channels(
+                    channel_declarations,
+                    composition_root.instance_token,
+                    factory_provenance_by_owner={
+                        generation.plugin_id: ChannelFactoryFreezeInput(
+                            generation_id=generation.generation_id,
+                            source_revision=generation.source_revision,
+                            config_revision=_channel_config_revision(
+                                generation.config_projection
+                            ),
+                        )
+                        for generation in ordered
+                    },
+                )
+                collisions = set(channels).intersection(
+                    descriptor.name for descriptor in channel_registry.descriptors
+                )
+                if collisions:
+                    raise RuntimeError(
+                        "RuntimeSnapshot v2/v3 Channel 名称冲突: "
+                        + ", ".join(sorted(collisions))
+                    )
+                frozen_channels: set[tuple[str, str]] = set()
+                for descriptor in channel_registry.descriptors:
+                    generation = generations.get(descriptor.owner)
+                    if generation is None:
+                        raise RuntimeError(
+                            "RuntimeSnapshot channel owner 不属于 generations: "
+                            f"{descriptor.owner}"
+                        )
+                    manifest = generation.static_manifest
+                    if manifest is None:
+                        if descriptor.credential_paths:
+                            raise RuntimeError(
+                                "RuntimeSnapshot channel credential 缺少静态 manifest 声明: "
+                                f"{descriptor.owner}:{descriptor.name}"
+                            )
+                        continue
+                    declared = dict(manifest.channel_credentials).get(
+                        descriptor.name,
+                        (),
+                    )
+                    if declared != descriptor.credential_paths:
+                        raise RuntimeError(
+                            "RuntimeSnapshot channel credential 声明与静态 manifest 不一致: "
+                            f"{descriptor.owner}:{descriptor.name}"
+                        )
+                    frozen_channels.add((descriptor.owner, descriptor.name))
+                assert composition_active_plugin_ids is not None
+                for generation in ordered:
+                    manifest = generation.static_manifest
+                    if (
+                        manifest is None
+                        or generation.plugin_id not in composition_active_plugin_ids
+                    ):
+                        continue
+                    for channel_name, _paths in manifest.channel_credentials:
+                        if (generation.plugin_id, channel_name) not in frozen_channels:
+                            raise RuntimeError(
+                                "RuntimeSnapshot 静态 channel credential 没有对应 Root 声明: "
+                                f"{generation.plugin_id}:{channel_name}"
+                            )
+                identity += f"|channels-v3:{channel_registry.identity}"
+            elif any(
+                generation.static_manifest is not None
+                and generation.static_manifest.channel_credentials
+                and composition_active_plugin_ids is not None
+                and generation.plugin_id in composition_active_plugin_ids
+                for generation in ordered
+            ):
+                raise RuntimeError(
+                    "RuntimeSnapshot 静态 channel credential 缺少 Root channel registry"
+                )
             process_declarations = composition_root.context.get(MANAGED_PROCESSES)
             if process_declarations is not None:
                 frozen_processes = _freeze_plugin_managed_processes(
@@ -397,6 +531,10 @@ class RuntimeSnapshotCompiler:
             mobile_ui_registry_identity=(
                 None if mobile_ui_registry is None else mobile_ui_registry.identity
             ),
+            channel_registry=channel_registry,
+            channel_registry_identity=(
+                None if channel_registry is None else channel_registry.identity
+            ),
             mcp_server_registry=mcp_server_registry,
             mcp_server_registry_identity=(
                 None
@@ -426,7 +564,6 @@ class RuntimeSnapshotCompiler:
             composition_topology=composition_topology,
             composition_active_plugin_ids=composition_active_plugin_ids,
         )
-
     @staticmethod
     def order_plugin_modules(modules: tuple[object, ...]) -> tuple[object, ...]:
         slots = {
@@ -1249,6 +1386,8 @@ class RuntimeSnapshotStore:
                 snapshot.composition_topology is not None
                 or snapshot.mobile_ui_registry is not None
                 or snapshot.mobile_ui_registry_identity is not None
+                or snapshot.channel_registry is not None
+                or snapshot.channel_registry_identity is not None
                 or snapshot.mcp_server_registry is not None
                 or snapshot.mcp_server_registry_identity is not None
                 or snapshot.managed_process_registry is not None
@@ -1267,6 +1406,21 @@ class RuntimeSnapshotStore:
             )
         ):
             raise RuntimeError("RuntimeSnapshot Mobile UI descriptor 在编译后发生变化")
+        if (
+            snapshot.channel_registry_identity
+            != (
+                None
+                if snapshot.channel_registry is None
+                else snapshot.channel_registry.identity
+            )
+        ):
+            raise RuntimeError("RuntimeSnapshot channel descriptor 在编译后发生变化")
+        if (
+            snapshot.channel_registry is not None
+            and snapshot.channel_registry.root_instance_token
+            is not root.instance_token
+        ):
+            raise RuntimeError("RuntimeSnapshot channel registry 不属于 exact Root")
         if (
             snapshot.mcp_server_registry_identity
             != (

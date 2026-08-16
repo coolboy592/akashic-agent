@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import functools
 import hashlib
 import importlib.util
@@ -15,14 +16,15 @@ import sys
 import tomllib
 from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from types import MappingProxyType, ModuleType
+from types import MappingProxyType, ModuleType, UnionType
 from collections.abc import Awaitable, Callable, Mapping
-from typing import Any, Literal, TypeVar, cast
+from typing import Any, Literal, TypeVar, Union, cast, get_args, get_origin
 from urllib.parse import urlsplit, urlunsplit
 
-from pydantic import BaseModel, ValidationError
+from pydantic import AliasChoices, AliasPath, BaseModel, ValidationError
 
 from agent.plugin_composition import (
+    CHANNELS,
     COMMANDS,
     MANAGED_PROCESSES,
     MCP_SERVERS,
@@ -30,14 +32,17 @@ from agent.plugin_composition import (
     UI_SLOTS,
     CommandRegistry,
     CompositionRoot,
+    CredentialRef,
     FiberState,
     MemoryRuntimeInfo,
+    PluginChannels,
     PluginUiSlots,
     PluginCommands,
     PluginRuntime,
     resolve_mobile_ui_asset,
     ServiceView,
 )
+from agent.plugin_composition.channels import ChannelRegistrySnapshot
 from agent.plugin_composition.mcp_slots import PluginMcpServers
 from agent.plugin_composition.process_slots import PluginManagedProcesses
 from agent.plugin_composition.model import resolve_declared_workspace_root
@@ -872,6 +877,12 @@ class PluginManager:
             self.current_snapshot,
             "mobile_bot_commands",
         )
+
+    def stable_channel_catalog(self) -> ChannelRegistrySnapshot | None:
+        """Return the exact committed stable channel declaration catalog."""
+
+        snapshot = self.current_snapshot
+        return None if snapshot is None else snapshot.channel_registry
 
     def _declared_bot_commands(self, getter_name: str) -> list[tuple[str, str]]:
         """聚合当前插件代际为指定渠道显式声明的命令。"""
@@ -4616,8 +4627,26 @@ class PluginManager:
                 raise RuntimeError(
                     f"插件目录身份与声明不一致: directory={initial_plugin_id} declared={plugin_id}"
                 )
-            plugin_config = _load_plugin_config(
+            credential_paths = (
+                _static_channel_credential_paths(static_manifest)
+                if is_v3 and static_manifest is not None
+                else ()
+            )
+            credential_alias_groups = (
+                _validate_channel_credential_schema(
+                    config_model,
+                    credential_paths=credential_paths,
+                )
+                if is_v3
+                else ()
+            )
+            config_projection = _read_plugin_config_projection(
                 data_dir,
+                credential_paths=credential_paths,
+                credential_alias_groups=credential_alias_groups,
+            )
+            plugin_config = _validate_plugin_config_projection(
+                config_projection,
                 config_model,
             )
         except Exception as error:
@@ -4748,6 +4777,11 @@ class PluginManager:
                     plugin_config
                     if isinstance(instance, ComposablePlugin)
                     else None
+                ),
+                config_projection=(
+                    config_projection
+                    if isinstance(instance, ComposablePlugin)
+                    else {}
                 ),
                 instance=instance,
                 scope=scope,
@@ -4902,11 +4936,7 @@ class PluginManager:
                 generation.validation_data_inventory = _copy_validation_data(
                     generation.data_dir,
                     validation_data_dir,
-                    (
-                        generation.static_manifest.exclude_data_paths
-                        if generation.static_manifest is not None
-                        else ()
-                    ),
+                    _candidate_data_exclude_paths(generation),
                 )
                 generation.data_dir = validation_data_dir
                 generation.contributions = _validation_contributions(
@@ -5211,6 +5241,14 @@ class PluginManager:
         try:
             _ = await root.context.provide(COMMANDS, PluginCommands())
             if any(
+                CHANNELS in cast(ComposablePlugin, item.instance).inject
+                for item in ordered
+            ):
+                _ = await root.context.provide(
+                    CHANNELS,
+                    PluginChannels(root.instance_token),
+                )
+            if any(
                 MCP_SERVERS in cast(ComposablePlugin, item.instance).inject
                 for item in ordered
             ):
@@ -5465,11 +5503,7 @@ class PluginManager:
         inventory = _copy_validation_data(
             generation.data_dir,
             data_dir,
-            (
-                generation.static_manifest.exclude_data_paths
-                if generation.static_manifest is not None
-                else ()
-            ),
+            _candidate_data_exclude_paths(generation),
         )
         if generation is candidate_owner:
             generation.validation_data_inventory = inventory
@@ -5489,8 +5523,17 @@ class PluginManager:
                     plugin_root=plugin_dir,
                 )
             clone = ComposablePlugin.from_module(module)
-            config = _load_plugin_config(
-                data_dir,
+            credential_paths = (
+                _static_channel_credential_paths(generation.static_manifest)
+                if generation.static_manifest is not None
+                else ()
+            )
+            _validate_channel_credential_schema(
+                cast(type[BaseModel] | None, clone.ConfigModel),
+                credential_paths=credential_paths,
+            )
+            config = _validate_plugin_config_projection(
+                generation.config_projection,
                 cast(type[BaseModel] | None, clone.ConfigModel),
             )
             clone.bind_static_services(self._composition_service_view())
@@ -6737,6 +6780,19 @@ def _load_plugin_config(
     data_dir: Path,
     config_model: type[BaseModel] | None = None,
 ) -> Any:
+    projection = _read_plugin_config_projection(data_dir)
+    return _validate_plugin_config_projection(projection, config_model)
+
+
+def _read_plugin_config_projection(
+    data_dir: Path,
+    *,
+    credential_paths: tuple[str, ...] = (),
+    credential_alias_groups: tuple[tuple[str, ...], ...] = (),
+) -> dict[str, object]:
+    """Read plugin config and replace declared secret values with opaque refs."""
+
+    # 1. Core alone reads the formal file before plugin config validation.
     config_path = data_dir / "config.local.toml"
     raw_config: dict[str, Any] = {}
     if config_path.exists():
@@ -6744,6 +6800,172 @@ def _load_plugin_config(
             raw_config = tomllib.loads(config_path.read_text(encoding="utf-8"))
         except (OSError, tomllib.TOMLDecodeError) as e:
             raise _PluginConfigError(str(e)) from e
+    for aliases in credential_alias_groups:
+        present = tuple(path for path in aliases if _config_path_exists(raw_config, path))
+        if len(present) > 1:
+            raise _PluginConfigError(
+                "同一 channel credential 不得同时声明多个 physical alias: "
+                + ", ".join(present)
+            )
+    projected = cast(dict[str, object], copy.deepcopy(raw_config))
+    for path in credential_paths:
+        _redact_plugin_config_path(projected, path)
+    return projected
+
+
+def _validate_channel_credential_schema(
+    config_model: type[BaseModel] | None,
+    *,
+    credential_paths: tuple[str, ...],
+) -> tuple[tuple[str, ...], ...]:
+    """Bind every opaque credential field to its complete physical alias set."""
+
+    # 1. Discover opaque credential fields from the validated Pydantic schema.
+    groups = _collect_channel_credential_aliases(config_model)
+    schema_paths = tuple(sorted(path for group in groups for path in group))
+
+    # 2. Static admission owns the complete raw-path declaration.
+    expected = tuple(sorted(credential_paths))
+    if schema_paths != expected:
+        raise _PluginConfigError(
+            "ConfigModel credential aliases 与静态 manifest 不一致: "
+            f"schema={schema_paths} manifest={expected}"
+        )
+    return groups
+
+
+def _collect_channel_credential_aliases(
+    config_model: type[BaseModel] | None,
+    *,
+    prefix: tuple[str, ...] = (),
+    seen: frozenset[type[BaseModel]] = frozenset(),
+) -> tuple[tuple[str, ...], ...]:
+    """Collect physical input paths for direct CredentialRef fields."""
+
+    if config_model is None:
+        return ()
+    if not isinstance(config_model, type) or not issubclass(config_model, BaseModel):
+        raise _PluginConfigError("ConfigModel 必须继承 pydantic.BaseModel")
+    if config_model in seen:
+        return ()
+
+    groups: list[tuple[str, ...]] = []
+    next_seen = seen | {config_model}
+    validate_by_name = bool(
+        config_model.model_config.get("validate_by_name")
+        or config_model.model_config.get("populate_by_name")
+    )
+    validate_by_alias = config_model.model_config.get("validate_by_alias") is not False
+    for name, field_info in config_model.model_fields.items():
+        aliases = _pydantic_input_aliases(
+            name,
+            field_info.validation_alias,
+            field_info.alias,
+            validate_by_name=validate_by_name,
+            validate_by_alias=validate_by_alias,
+        )
+        annotation = field_info.annotation
+        if _annotation_contains_credential_ref(annotation):
+            if not _is_opaque_credential_annotation(annotation):
+                raise _PluginConfigError(
+                    f"channel credential 字段只能是 CredentialRef 或 None: {name}"
+                )
+            groups.append(
+                tuple(sorted(".".join((*prefix, *alias)) for alias in aliases))
+            )
+            continue
+        nested_model = _optional_basemodel_type(annotation)
+        if nested_model is None:
+            continue
+        for alias in aliases:
+            groups.extend(
+                _collect_channel_credential_aliases(
+                    nested_model,
+                    prefix=(*prefix, *alias),
+                    seen=next_seen,
+                )
+            )
+
+    paths = [path for group in groups for path in group]
+    if len(paths) != len(set(paths)):
+        raise _PluginConfigError("ConfigModel credential physical alias 重复")
+    return tuple(sorted(groups))
+
+
+def _pydantic_input_aliases(
+    field_name: str,
+    validation_alias: str | AliasPath | AliasChoices | None,
+    alias: str | None,
+    *,
+    validate_by_name: bool,
+    validate_by_alias: bool,
+) -> tuple[tuple[str, ...], ...]:
+    """Normalize one Pydantic field's accepted mapping paths."""
+
+    configured_alias = validation_alias or alias
+    if configured_alias is None:
+        choices: tuple[str | AliasPath, ...] = (field_name,)
+    elif validate_by_alias:
+        choices = (
+            tuple(configured_alias.choices)
+            if isinstance(configured_alias, AliasChoices)
+            else (configured_alias,)
+        )
+        if validate_by_name:
+            choices = (*choices, field_name)
+    else:
+        choices = (field_name,)
+    paths: list[tuple[str, ...]] = []
+    for choice in choices:
+        raw_path = choice.path if isinstance(choice, AliasPath) else (choice,)
+        if not raw_path or any(not isinstance(part, str) or not part for part in raw_path):
+            raise _PluginConfigError(
+                f"channel credential alias 只支持对象字符串路径: {field_name}"
+            )
+        paths.append(tuple(cast(tuple[str, ...], raw_path)))
+    return tuple(sorted(set(paths)))
+
+
+def _annotation_contains_credential_ref(annotation: object) -> bool:
+    if annotation is CredentialRef:
+        return True
+    return any(_annotation_contains_credential_ref(item) for item in get_args(annotation))
+
+
+def _is_opaque_credential_annotation(annotation: object) -> bool:
+    if annotation is CredentialRef:
+        return True
+    origin = get_origin(annotation)
+    return origin in {Union, UnionType} and all(
+        item is CredentialRef or item is type(None) for item in get_args(annotation)
+    )
+
+
+def _optional_basemodel_type(annotation: object) -> type[BaseModel] | None:
+    candidates = tuple(item for item in get_args(annotation) if item is not type(None))
+    value = candidates[0] if len(candidates) == 1 else annotation
+    if isinstance(value, type) and issubclass(value, BaseModel):
+        return value
+    return None
+
+
+def _config_path_exists(config: Mapping[str, object], path: str) -> bool:
+    current: object = config
+    for part in path.split("."):
+        if not isinstance(current, Mapping) or part not in current:
+            return False
+        current = current[part]
+    return True
+
+
+def _validate_plugin_config_projection(
+    projection: Mapping[str, object],
+    config_model: type[BaseModel] | None,
+) -> Any:
+    """Validate an already redacted config projection through plugin schema."""
+
+    # 1. Each candidate clone receives a fresh value owned by its module class.
+    raw_config = cast(dict[str, Any], copy.deepcopy(dict(projection)))
     if config_model is not None:
         if not isinstance(config_model, type) or not issubclass(
             config_model, BaseModel
@@ -6756,6 +6978,45 @@ def _load_plugin_config(
     from agent.plugins.config import PluginConfig
 
     return PluginConfig(raw_config) if raw_config else None
+
+
+def _redact_plugin_config_path(config: dict[str, object], path: str) -> None:
+    """Replace one present non-empty config leaf with an opaque credential ref."""
+
+    parts = tuple(path.split("."))
+    current: dict[str, object] = config
+    for part in parts[:-1]:
+        value = current.get(part)
+        if value is None:
+            return
+        if not isinstance(value, dict):
+            raise _PluginConfigError(
+                f"channel credential path 不是对象路径: {path}"
+            )
+        current = cast(dict[str, object], value)
+    leaf = parts[-1]
+    if leaf not in current:
+        return
+    value = current[leaf]
+    if value is None or value == "":
+        return
+    current[leaf] = CredentialRef(parts)
+
+
+def _static_channel_credential_paths(
+    manifest: StaticPluginManifest,
+) -> tuple[str, ...]:
+    """Flatten manifest channel credential declarations without ambiguity."""
+
+    return tuple(
+        sorted(
+            {
+                path
+                for _channel, paths in manifest.channel_credentials
+                for path in paths
+            }
+        )
+    )
 
 
 def _format_validation_error(error: ValidationError) -> str:
@@ -7303,6 +7564,20 @@ def _remove_validation_data_dir(path: Path) -> None:
         shutil.rmtree(path)
 
 
+def _candidate_data_exclude_paths(
+    generation: PluginGeneration,
+) -> tuple[str, ...]:
+    """Return candidate-copy exclusions owned by static validation policy."""
+
+    manifest = generation.static_manifest
+    if manifest is None:
+        return ()
+    excluded = set(manifest.exclude_data_paths)
+    if manifest.channel_credentials:
+        excluded.add("config.local.toml")
+    return tuple(sorted(excluded))
+
+
 def _copy_validation_data(
     source: Path,
     target: Path,
@@ -7398,6 +7673,8 @@ def _replace_snapshot_payload(
         "dashboard_bindings",
         "mobile_ui_registry",
         "mobile_ui_registry_identity",
+        "channel_registry",
+        "channel_registry_identity",
         "mcp_server_registry",
         "mcp_server_registry_identity",
         "managed_process_registry",

@@ -6,9 +6,20 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
+from pydantic import BaseModel
 
 import agent.plugins.manager as plugin_manager_module
-from agent.plugin_composition import ServiceView
+from agent.plugin_composition import (
+    CHANNELS,
+    ChannelCapability,
+    ChannelDefinition,
+    CompositionRoot,
+    CredentialRef,
+    InboundIdentity,
+    PluginChannels,
+    PluginRuntime,
+    ServiceView,
+)
 from agent.plugins.composable import ComposablePlugin
 from agent.plugins.artifacts import ArtifactPointer, read_pointer, write_pointers
 from agent.plugins.dashboard_host import DashboardBinding, PluginDashboardHost
@@ -16,7 +27,11 @@ from agent.plugins.generation import PluginGeneration
 from agent.plugins.manager import PluginManager
 from agent.plugins.manifest import write_plugin_manifest
 from agent.plugins.registry import plugin_registry
-from agent.plugins.snapshot import plugin_is_active
+from agent.plugins.snapshot import (
+    RuntimeSnapshotCompiler,
+    RuntimeSnapshotStore,
+    plugin_is_active,
+)
 from bus.event_bus import EventBus
 
 
@@ -51,6 +66,320 @@ def _manager(
         installed_cache_root=tmp_path / "home" / "cache",
         memory_engine=memory_engine,
     )
+
+
+def _channel_plugin_source(version: str) -> str:
+    return (
+        "from pydantic import AliasChoices, BaseModel, Field\n"
+        "from agent.plugin_composition import (\n"
+        "    CHANNELS, ChannelCapability, ChannelDefinition, CredentialRef, InboundIdentity,\n"
+        ")\n"
+        "api_version = 3\n"
+        "name = 'channel_probe'\n"
+        f"version = {version!r}\n"
+        "inject = (CHANNELS,)\n"
+        "class Config(BaseModel):\n"
+        "    app_id: str\n"
+        "    app_secret: CredentialRef = Field(\n"
+        "        validation_alias=AliasChoices('app_secret', 'appSecret'),\n"
+        "    )\n"
+        "async def apply(ctx, config):\n"
+        "    await ctx.require(CHANNELS).register(ctx, ChannelDefinition(\n"
+        "        name='feishu',\n"
+        "        capabilities=frozenset({ChannelCapability.INBOUND, ChannelCapability.OUTBOUND}),\n"
+        "        factory_export='build_adapter',\n"
+        "        inbound_identity=InboundIdentity.PROVIDER_MESSAGE_ID,\n"
+        "        credential_paths=('appSecret', 'app_secret'),\n"
+        "    ))\n"
+    )
+
+
+def _channel_static_manifest(version: str) -> str:
+    return (
+        "schema_version = 1\n"
+        "name = 'channel_probe'\n"
+        f"version = {version!r}\n"
+        "api_version = 3\n"
+        "entrypoint = 'plugin.py'\n\n"
+        "[channel_credentials]\n"
+        "feishu = ['app_secret', 'appSecret']\n"
+    )
+
+
+@pytest.mark.asyncio
+async def test_v3_channel_registry_redacts_candidate_credentials_before_import(
+    tmp_path: Path,
+) -> None:
+    plugin_dir = _write_plugin(
+        tmp_path / "plugins",
+        "channel_probe",
+        _channel_plugin_source("1.0.0"),
+    )
+    manifest_path = plugin_dir / "akashic.plugin.toml"
+    manifest_path.write_text(_channel_static_manifest("1.0.0"), encoding="utf-8")
+    data_dir = (
+        tmp_path / "workspace" / "plugin-data" / "channel_probe-builtin"
+    )
+    data_dir.mkdir(parents=True)
+    config_path = data_dir / "config.local.toml"
+    secret = "candidate-must-never-read-this-secret"
+    original_config = f"app_id = 'app-1'\nappSecret = '{secret}'\n".encode()
+    config_path.write_bytes(original_config)
+    manager = _manager(tmp_path)
+
+    await manager.load_all()
+
+    stable = manager.current_snapshot
+    generation = manager.generation("channel_probe")
+    assert stable is not None and generation is not None
+    assert stable.channel_registry is not None
+    assert manager.stable_channel_catalog() is stable.channel_registry
+    assert stable.channel_registry.descriptors[0].credential_paths == (
+        "appSecret",
+        "app_secret",
+    )
+    assert isinstance(generation.config.app_secret, CredentialRef)  # type: ignore[union-attr]
+    assert config_path.read_bytes() == original_config
+
+    other_root = CompositionRoot("other-channel-root")
+    await other_root.context.provide(
+        CHANNELS,
+        PluginChannels(other_root.instance_token),
+    )
+
+    async def register_other(ctx) -> None:
+        await ctx.require(CHANNELS).register(
+            ctx,
+            ChannelDefinition(
+                name="feishu",
+                capabilities=frozenset(
+                    {ChannelCapability.INBOUND, ChannelCapability.OUTBOUND}
+                ),
+                factory_export="build_adapter",
+                inbound_identity=InboundIdentity.PROVIDER_MESSAGE_ID,
+                credential_paths=("appSecret", "app_secret"),
+            ),
+        )
+
+    _ = await other_root.mount(
+        register_other,
+        name="channel_probe",
+        runtime=PluginRuntime(
+            plugin_id="channel_probe",
+            plugin_dir=plugin_dir,
+            data_dir=data_dir,
+            workspace=tmp_path / "workspace",
+            config=generation.config,
+        ),
+        inject=(CHANNELS,),
+    )
+    other_snapshot = RuntimeSnapshotCompiler().compile(
+        {"channel_probe": generation},
+        composition_root=other_root,
+    )
+    assert other_snapshot.channel_registry_identity == stable.channel_registry_identity
+    other_snapshot.channel_registry = stable.channel_registry
+    with pytest.raises(RuntimeError, match="不属于 exact Root"):
+        RuntimeSnapshotStore().install(other_snapshot)
+    await other_root.dispose()
+
+    (plugin_dir / "plugin.py").write_text(
+        _channel_plugin_source("2.0.0"),
+        encoding="utf-8",
+    )
+    manifest_path.write_text(_channel_static_manifest("2.0.0"), encoding="utf-8")
+    candidate = await manager.prepare_candidate("channel_probe")
+    assert candidate is not None and candidate.runtime_snapshot is not None
+    assert candidate.validation_workspace is not None
+    candidate_root = candidate.runtime_snapshot.composition_root
+    assert candidate_root is not None
+    candidate_runtime = candidate_root.root_fiber.children[0].runtime
+    assert candidate_runtime is not None
+    assert isinstance(candidate_runtime.config.app_secret, CredentialRef)
+    assert "config.local.toml" not in candidate.validation_data_inventory
+    validation_root = candidate.validation_workspace.parent
+    for path in validation_root.rglob("*"):
+        if path.is_file() and not path.is_symlink():
+            assert secret.encode() not in path.read_bytes()
+    assert config_path.read_bytes() == original_config
+
+    await manager.discard_prepared("channel_probe")
+    assert not validation_root.exists()
+    assert manager.current_snapshot is stable
+    assert config_path.read_bytes() == original_config
+    await manager.terminate_all()
+
+
+def test_v3_channel_secret_rejects_legacy_string_only_config_schema() -> None:
+    class LegacyConfig(BaseModel):
+        app_secret: str
+
+    with pytest.raises(
+        plugin_manager_module._PluginConfigError,  # pyright: ignore[reportPrivateUsage]
+        match="app_secret",
+    ):
+        plugin_manager_module._validate_plugin_config_projection(  # pyright: ignore[reportPrivateUsage]
+            {"app_secret": CredentialRef(("app_secret",))},
+            LegacyConfig,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("manifest_paths", "config_text"),
+    (
+        (("app_secret",), "app_id = 'app-1'\nappSecret = 'secret'\n"),
+        (
+            ("app_secret", "appSecret"),
+            "app_id = 'app-1'\napp_secret = 'one'\nappSecret = 'two'\n",
+        ),
+    ),
+)
+async def test_v3_channel_credential_aliases_fail_before_apply(
+    tmp_path: Path,
+    manifest_paths: tuple[str, ...],
+    config_text: str,
+) -> None:
+    marker = tmp_path / "candidate-apply-ran"
+    source = _channel_plugin_source("1.0.0").replace(
+        "async def apply(ctx, config):\n",
+        "async def apply(ctx, config):\n"
+        f"    __import__('pathlib').Path({str(marker)!r}).write_text('bad')\n",
+    )
+    plugin_dir = _write_plugin(tmp_path / "plugins", "channel_probe", source)
+    manifest = _channel_static_manifest("1.0.0").replace(
+        "feishu = ['app_secret', 'appSecret']",
+        f"feishu = {list(manifest_paths)!r}",
+    )
+    (plugin_dir / "akashic.plugin.toml").write_text(manifest, encoding="utf-8")
+    data_dir = tmp_path / "workspace" / "plugin-data" / "channel_probe-builtin"
+    data_dir.mkdir(parents=True)
+    config_path = data_dir / "config.local.toml"
+    original = config_text.encode()
+    config_path.write_bytes(original)
+    manager = _manager(tmp_path)
+
+    await manager.load_all()
+
+    assert manager.current_snapshot is None
+    assert manager.generation("channel_probe") is None
+    assert not marker.exists()
+    assert config_path.read_bytes() == original
+    assert not (tmp_path / "workspace" / "runtime" / "plugin-validation").exists()
+    await manager.terminate_all()
+
+
+@pytest.mark.asyncio
+async def test_v3_channel_credential_field_name_is_part_of_alias_admission(
+    tmp_path: Path,
+) -> None:
+    validator_marker = tmp_path / "credential-before-validator-ran"
+    apply_marker = tmp_path / "candidate-apply-ran"
+    source = (
+        "from pydantic import BaseModel, ConfigDict, Field, field_validator\n"
+        "from agent.plugin_composition import (\n"
+        "    CHANNELS, ChannelCapability, ChannelDefinition, CredentialRef, InboundIdentity,\n"
+        ")\n"
+        "api_version = 3\n"
+        "name = 'channel_probe'\n"
+        "version = '1.0.0'\n"
+        "inject = (CHANNELS,)\n"
+        "class Config(BaseModel):\n"
+        "    model_config = ConfigDict(validate_by_name=True)\n"
+        "    secret: CredentialRef = Field(validation_alias='appSecret')\n"
+        "    @field_validator('secret', mode='before')\n"
+        "    @classmethod\n"
+        "    def observe_secret(cls, value):\n"
+        f"        __import__('pathlib').Path({str(validator_marker)!r}).write_text(str(value))\n"
+        "        return value\n"
+        "async def apply(ctx, config):\n"
+        f"    __import__('pathlib').Path({str(apply_marker)!r}).write_text('bad')\n"
+        "    await ctx.require(CHANNELS).register(ctx, ChannelDefinition(\n"
+        "        name='feishu',\n"
+        "        capabilities=frozenset({ChannelCapability.OUTBOUND}),\n"
+        "        factory_export='build_adapter',\n"
+        "        inbound_identity=None,\n"
+        "        credential_paths=('appSecret',),\n"
+        "    ))\n"
+    )
+    plugin_dir = _write_plugin(tmp_path / "plugins", "channel_probe", source)
+    manifest = _channel_static_manifest("1.0.0").replace(
+        "feishu = ['app_secret', 'appSecret']",
+        "feishu = ['appSecret']",
+    )
+    (plugin_dir / "akashic.plugin.toml").write_text(manifest, encoding="utf-8")
+    data_dir = tmp_path / "workspace" / "plugin-data" / "channel_probe-builtin"
+    data_dir.mkdir(parents=True)
+    config_path = data_dir / "config.local.toml"
+    original = b"secret = 'candidate-must-never-see-this'\n"
+    config_path.write_bytes(original)
+    manager = _manager(tmp_path)
+
+    await manager.load_all()
+
+    assert manager.current_snapshot is None
+    assert manager.generation("channel_probe") is None
+    assert not validator_marker.exists()
+    assert not apply_marker.exists()
+    assert config_path.read_bytes() == original
+    assert not (tmp_path / "workspace" / "runtime" / "plugin-validation").exists()
+    await manager.terminate_all()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "source_mutation,error",
+    (
+        (
+            (
+                "credential_paths=('appSecret', 'app_secret')",
+                "credential_paths=('app_id',)",
+            ),
+            "credential 声明与静态 manifest 不一致",
+        ),
+        (
+            ("inject = (CHANNELS,)", "inject = ()"),
+            "缺少 Root channel registry",
+        ),
+    ),
+)
+async def test_v3_channel_manifest_and_root_declaration_must_match(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    source_mutation: tuple[str, str],
+    error: str,
+) -> None:
+    source = _channel_plugin_source("1.0.0")
+    if source_mutation[0] == "inject = (CHANNELS,)":
+        source = source[: source.index("async def apply")] + (
+            "async def apply(ctx, config):\n"
+            "    pass\n"
+        )
+    source = source.replace(*source_mutation)
+    plugin_dir = _write_plugin(
+        tmp_path / "plugins",
+        "channel_probe",
+        source,
+    )
+    (plugin_dir / "akashic.plugin.toml").write_text(
+        _channel_static_manifest("1.0.0"),
+        encoding="utf-8",
+    )
+    data_dir = (
+        tmp_path / "workspace" / "plugin-data" / "channel_probe-builtin"
+    )
+    data_dir.mkdir(parents=True)
+    config_path = data_dir / "config.local.toml"
+    original_config = b"app_id = 'app-1'\nappSecret = 'secret'\n"
+    config_path.write_bytes(original_config)
+    manager = _manager(tmp_path)
+
+    await manager.load_all()
+
+    assert error in caplog.text
+    assert manager.current_snapshot is None
+    assert manager.generation("channel_probe") is None
+    assert config_path.read_bytes() == original_config
 
 
 @pytest.mark.asyncio

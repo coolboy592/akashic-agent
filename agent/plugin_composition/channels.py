@@ -55,7 +55,7 @@ class ChannelDefinition:
     name: str
     capabilities: frozenset[ChannelCapability]
     factory_export: str
-    inbound_identity: InboundIdentity
+    inbound_identity: InboundIdentity | None
     credential_paths: tuple[str, ...]
 
     def __post_init__(self) -> None:
@@ -72,8 +72,11 @@ class ChannelDefinition:
             or self.factory_export.endswith((".", ":"))
         ):
             raise ValueError(f"channel factory_export 无效: {self.factory_export}")
-        if not isinstance(self.inbound_identity, InboundIdentity):
-            raise ValueError("channel inbound_identity 类型无效")
+        has_inbound = ChannelCapability.INBOUND in self.capabilities
+        if has_inbound and not isinstance(self.inbound_identity, InboundIdentity):
+            raise ValueError("inbound channel 必须声明 inbound_identity")
+        if not has_inbound and self.inbound_identity is not None:
+            raise ValueError("非 inbound channel 不得声明 inbound_identity")
         object.__setattr__(self, "credential_paths", _credential_paths(self.credential_paths))
 
 
@@ -83,7 +86,7 @@ class ChannelDescriptor:
     name: str
     capabilities: tuple[ChannelCapability, ...]
     factory_export: str
-    inbound_identity: InboundIdentity
+    inbound_identity: InboundIdentity | None
     credential_paths: tuple[str, ...]
 
     def __post_init__(self) -> None:
@@ -103,8 +106,11 @@ class ChannelDescriptor:
             or self.factory_export.endswith((".", ":"))
         ):
             raise ValueError("channel descriptor factory_export 无效")
-        if not isinstance(self.inbound_identity, InboundIdentity):
-            raise ValueError("channel descriptor inbound_identity 类型无效")
+        has_inbound = ChannelCapability.INBOUND in self.capabilities
+        if has_inbound and not isinstance(self.inbound_identity, InboundIdentity):
+            raise ValueError("inbound channel descriptor 必须声明 inbound_identity")
+        if not has_inbound and self.inbound_identity is not None:
+            raise ValueError("非 inbound channel descriptor 不得声明 inbound_identity")
         object.__setattr__(self, "credential_paths", _credential_paths(self.credential_paths))
 
 
@@ -238,9 +244,9 @@ class _ChannelDeclarations:
         self,
         root_instance_token: object,
         *,
-        factory_provenance: Mapping[
+        factory_provenance_by_owner: Mapping[
             str,
-            ChannelFactoryProvenance | ChannelFactoryFreezeInput | tuple[str, str, str],
+            ChannelFactoryFreezeInput | tuple[str, str, str],
         ]
         | None = None,
     ) -> ChannelRegistrySnapshot:
@@ -250,13 +256,7 @@ class _ChannelDeclarations:
             if self._frozen.root_instance_token is not root_instance_token:
                 raise RuntimeError("channel declaration registry 属于另一棵 Root")
             return self._frozen
-        provenance = factory_provenance or {}
-        unknown = set(provenance) - self._registrations.keys()
-        if unknown:
-            raise CompositionError(
-                "UNKNOWN_CHANNEL_PROVENANCE",
-                f"factory provenance 指向未知 channel: {sorted(unknown)}",
-            )
+        provenance = factory_provenance_by_owner or {}
         registrations = tuple(
             sorted(self._registrations.values(), key=lambda item: item.definition.name)
         )
@@ -264,7 +264,7 @@ class _ChannelDeclarations:
         factories = tuple(
             sorted(
                 (
-                    _make_provenance(item, provenance.get(item.definition.name))
+                    _make_provenance(item, provenance.get(item.owner))
                     for item in registrations
                 ),
                 key=_factory_sort_key,
@@ -349,9 +349,9 @@ def _freeze_plugin_channels(
     value: object,
     root_instance_token: object,
     *,
-    factory_provenance: Mapping[
+    factory_provenance_by_owner: Mapping[
         str,
-        ChannelFactoryProvenance | ChannelFactoryFreezeInput | tuple[str, str, str],
+        ChannelFactoryFreezeInput | tuple[str, str, str],
     ]
     | None = None,
 ) -> ChannelRegistrySnapshot:
@@ -363,7 +363,7 @@ def _freeze_plugin_channels(
         raise RuntimeError("RuntimeSnapshot channel Service 不属于 exact Root")
     return value._declarations.freeze(
         root_instance_token,
-        factory_provenance=factory_provenance,
+        factory_provenance_by_owner=factory_provenance_by_owner,
     )
 
 
@@ -381,7 +381,7 @@ def _normalize_definition(definition: ChannelDefinition) -> ChannelDefinition:
 
 def _make_provenance(
     registration: _ChannelRegistration,
-    supplied: ChannelFactoryProvenance | ChannelFactoryFreezeInput | tuple[str, str, str] | None,
+    supplied: ChannelFactoryFreezeInput | tuple[str, str, str] | None,
 ) -> ChannelFactoryProvenance:
     if supplied is None:
         source = ChannelFactoryFreezeInput(registration.generation_id)
@@ -393,9 +393,7 @@ def _make_provenance(
             config_revision=source.config_revision,
             factory_export=registration.definition.factory_export,
         )
-    if isinstance(supplied, ChannelFactoryProvenance):
-        result = supplied
-    elif isinstance(supplied, ChannelFactoryFreezeInput):
+    if isinstance(supplied, ChannelFactoryFreezeInput):
         result = ChannelFactoryProvenance(
             plugin_id=registration.owner,
             generation_id=supplied.generation_id,
@@ -415,15 +413,6 @@ def _make_provenance(
         )
     else:
         raise TypeError("channel factory provenance 输入类型无效")
-    if (
-        result.plugin_id != registration.owner
-        or result.channel_name != registration.definition.name
-        or result.factory_export != registration.definition.factory_export
-    ):
-        raise CompositionError(
-            "CHANNEL_PROVENANCE_MISMATCH",
-            f"channel factory provenance 与声明不匹配: {registration.definition.name}",
-        )
     return result
 
 
@@ -449,7 +438,11 @@ def _registry_identity(
                 "name": item.name,
                 "capabilities": [capability.value for capability in item.capabilities],
                 "factory_export": item.factory_export,
-                "inbound_identity": item.inbound_identity.value,
+                "inbound_identity": (
+                    None
+                    if item.inbound_identity is None
+                    else item.inbound_identity.value
+                ),
                 "credential_paths": list(item.credential_paths),
             }
             for item in descriptors

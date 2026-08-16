@@ -23,6 +23,7 @@ from agent.plugin_composition.channels import (
     _freeze_plugin_channels,
     _registry_identity,
 )
+from agent.plugins.snapshot import _channel_config_revision
 
 
 def _runtime(plugin_id: str, root: Path, *, generation: str = "plugin-generation") -> PluginRuntime:
@@ -79,8 +80,8 @@ async def test_channel_registry_registration_health_freeze_and_effect_cleanup(
     snapshot = _freeze_plugin_channels(
         channels,
         root.instance_token,
-        factory_provenance={
-            "feishu": ChannelFactoryFreezeInput(
+        factory_provenance_by_owner={
+            "plugin": ChannelFactoryFreezeInput(
                 "plugin-generation",
                 source_revision="source-1",
                 config_revision="config-1",
@@ -166,22 +167,40 @@ async def test_channel_registry_identity_is_root_independent_and_ordered(
         snapshot = _freeze_plugin_channels(
             channels,
             root.instance_token,
-            factory_provenance={
-                name: ChannelFactoryProvenance(
-                    plugin_id="plugin",
+            factory_provenance_by_owner={
+                "plugin": ChannelFactoryFreezeInput(
                     generation_id="same-generation",
-                    channel_name=name,
                     source_revision="same-source",
                     config_revision="same-config",
-                    factory_export=_definition(name).factory_export,
                 )
-                for name in names
             },
         )
         identities.append(snapshot.identity)
+        assert tuple(item.channel_name for item in snapshot.factories) == (
+            "feishu",
+            "qqbot",
+        )
+        assert all(item.plugin_id == "plugin" for item in snapshot.factories)
         assert snapshot.root_instance_token is root.instance_token
         await root.dispose()
     assert identities[0] == identities[1]
+
+
+def test_channel_config_revision_uses_redacted_projection() -> None:
+    first = {
+        "app_id": "app-1",
+        "app_secret": CredentialRef(("app_secret",)),
+        "options": {"retry": 2, "delay": 0.25},
+    }
+    reordered = {
+        "options": {"delay": 0.25, "retry": 2},
+        "app_secret": CredentialRef(("app_secret",)),
+        "app_id": "app-1",
+    }
+    changed = {**first, "app_id": "app-2"}
+
+    assert _channel_config_revision(first) == _channel_config_revision(reordered)
+    assert _channel_config_revision(first) != _channel_config_revision(changed)
 
 
 def test_channel_declarations_and_provenance_reject_invalid_values() -> None:
@@ -197,6 +216,34 @@ def test_channel_declarations_and_provenance_reject_invalid_values() -> None:
         )
     with pytest.raises(ValueError):
         _ = CredentialRef(("app_secret", ".."))
+
+
+def test_channel_inbound_identity_matches_declared_capability() -> None:
+    outbound = ChannelDefinition(
+        name="push",
+        capabilities=frozenset({ChannelCapability.OUTBOUND}),
+        factory_export="push:build_channel",
+        inbound_identity=None,
+        credential_paths=("token",),
+    )
+    assert outbound.inbound_identity is None
+
+    with pytest.raises(ValueError, match="必须声明 inbound_identity"):
+        _ = ChannelDefinition(
+            name="inbound",
+            capabilities=frozenset({ChannelCapability.INBOUND}),
+            factory_export="inbound:build_channel",
+            inbound_identity=None,
+            credential_paths=("token",),
+        )
+    with pytest.raises(ValueError, match="不得声明 inbound_identity"):
+        _ = ChannelDefinition(
+            name="push",
+            capabilities=frozenset({ChannelCapability.OUTBOUND}),
+            factory_export="push:build_channel",
+            inbound_identity=InboundIdentity.PROVIDER_MESSAGE_ID,
+            credential_paths=("token",),
+        )
 
 
 def test_channel_snapshot_identity_is_content_addressed() -> None:
