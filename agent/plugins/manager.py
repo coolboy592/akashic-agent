@@ -445,9 +445,7 @@ class PluginManager:
         from agent.plugins.skill_links import PluginSkillLinker
 
         contributions = generation.production_contributions or generation.contributions
-        plugin_dir = Path(cast(Any, generation.instance).context.plugin_dir).resolve(
-            strict=False
-        )
+        plugin_dir = generation.plugin_dir.resolve(strict=False)
         target = ActivePluginInfo(
             plugin_id=generation.plugin_id,
             plugin_dir=plugin_dir,
@@ -1020,12 +1018,12 @@ class PluginManager:
             instance = cast(Any, generation.instance)
             try:
                 await self._prepare_generation(generation)
-                instance.context.data_dir = generation.data_dir
-                instance.context.session_manager = self._session_manager
-                instance.context.memory_engine = self._memory_engine
-                instance.context.llm = self._llm
                 generation.state = "activating"
                 if not isinstance(instance, ComposablePlugin):
+                    instance.context.data_dir = generation.data_dir
+                    instance.context.session_manager = self._session_manager
+                    instance.context.memory_engine = self._memory_engine
+                    instance.context.llm = self._llm
                     instance.activate()
             except Exception as error:
                 raise _StablePluginFailed(generation, "prepare", error) from error
@@ -1122,6 +1120,8 @@ class PluginManager:
         from agent.plugins.context import PreparedPluginKVStore
 
         for generation in staged:
+            if isinstance(generation.instance, ComposablePlugin):
+                continue
             kv_store = cast(Any, generation.instance).context.kv_store
             try:
                 if isinstance(kv_store, PreparedPluginKVStore):
@@ -1136,6 +1136,8 @@ class PluginManager:
         from agent.plugins.context import PreparedPluginKVStore
 
         for generation in reversed(staged):
+            if isinstance(generation.instance, ComposablePlugin):
+                continue
             kv_store = cast(Any, generation.instance).context.kv_store
             if isinstance(kv_store, PreparedPluginKVStore):
                 kv_store.rollback_commit()
@@ -1986,8 +1988,12 @@ class PluginManager:
                 raise RuntimeError("latest candidate 缺少 reload transaction")
             from agent.plugins.context import PreparedPluginKVStore
 
-            context = cast(Any, generation.instance).context
-            kv_store = context.kv_store
+            context = (
+                None
+                if isinstance(generation.instance, ComposablePlugin)
+                else cast(Any, generation.instance).context
+            )
+            kv_store = None if context is None else context.kv_store
             if isinstance(kv_store, PreparedPluginKVStore) and kv_store.dirty:
                 raise RuntimeError("候选插件修改了 KV，read-only 验证不能 promote")
 
@@ -2034,7 +2040,11 @@ class PluginManager:
                     runtime_restore_started = True
                     await self._restore_ready_runtime(ready)
                     generation = ready.candidate
-                    kv_store = cast(Any, generation.instance).context.kv_store
+                    kv_store = (
+                        None
+                        if isinstance(generation.instance, ComposablePlugin)
+                        else cast(Any, generation.instance).context.kv_store
+                    )
                     new_services = generation.contributions.managed_services
                     new_channels = generation.contributions.channels
                     await self._switch_plugin_endpoints(
@@ -2061,7 +2071,11 @@ class PluginManager:
                     runtime_restore_started = True
                     await self._restore_ready_runtime(ready)
                     generation = ready.candidate
-                    kv_store = cast(Any, generation.instance).context.kv_store
+                    kv_store = (
+                        None
+                        if isinstance(generation.instance, ComposablePlugin)
+                        else cast(Any, generation.instance).context.kv_store
+                    )
                 except BaseException:
                     if runtime_restore_started and self._ready_candidate is ready:
                         _ = await self._drop_ready(plugin_id)
@@ -2243,14 +2257,15 @@ class PluginManager:
         generation.data_dir = production_data_dir
         from agent.plugins.context import PreparedPluginKVStore
 
-        context = cast(Any, generation.instance).context
-        context.data_dir = production_data_dir
-        context.workspace = self._workspace
-        context.kv_store = PreparedPluginKVStore(
-            production_data_dir / ".kv.json",
-            can_write=lambda: _generation_can_write(generation),
-            writer_id=generation.generation_id,
-        )
+        if not isinstance(generation.instance, ComposablePlugin):
+            context = cast(Any, generation.instance).context
+            context.data_dir = production_data_dir
+            context.workspace = self._workspace
+            context.kv_store = PreparedPluginKVStore(
+                production_data_dir / ".kv.json",
+                can_write=lambda: _generation_can_write(generation),
+                writer_id=generation.generation_id,
+            )
         if production.mcp_servers or production.proactive_sources:
             generation.mcp_catalog = await self._mcp_host.prepare(
                 generation.generation_id,
@@ -2280,9 +2295,10 @@ class PluginManager:
         self._compile_snapshot_event_handlers(ready.snapshot)
         if self._dashboard_preparer is not None:
             self._dashboard_preparer(ready.snapshot)
-        cast(Any, generation.instance).context.tool_registry = (
-            ready.snapshot.tool_registry
-        )
+        if not isinstance(generation.instance, ComposablePlugin):
+            cast(Any, generation.instance).context.tool_registry = (
+                ready.snapshot.tool_registry
+            )
         generation.production_contributions = None
         generation.validation_managed_services = {}
         generation.production_data_dir = None
@@ -2531,9 +2547,10 @@ class PluginManager:
                     prepared_snapshot
                 )
             snapshot = generation.runtime_snapshot
-            cast(Any, generation.instance).context.tool_registry = (
-                snapshot.tool_registry
-            )
+            if not isinstance(generation.instance, ComposablePlugin):
+                cast(Any, generation.instance).context.tool_registry = (
+                    snapshot.tool_registry
+                )
         except (asyncio.CancelledError, Exception) as error:
             error_text = str(error) or type(error).__name__
             self._record_failed_gate(
@@ -2776,20 +2793,23 @@ class PluginManager:
 
         def open_candidate() -> None:
             self._advance_reload(generation, "commit_started")
-            context = cast(Any, generation.instance).context
-            context.data_dir = generation.data_dir
-            context.session_manager = self._session_manager
-            context.memory_engine = self._memory_engine
-            context.llm = self._llm
             generation.state = "activating"
             if not isinstance(generation.instance, ComposablePlugin):
+                context = cast(Any, generation.instance).context
+                context.data_dir = generation.data_dir
+                context.session_manager = self._session_manager
+                context.memory_engine = self._memory_engine
+                context.llm = self._llm
                 try:
                     cast(Any, generation.instance).activate()
                 except BaseException:
                     context.data_dir = None
                     raise
-            if isinstance(context.kv_store, PreparedPluginKVStore) and not stage_latest:
-                context.kv_store.commit()
+                if (
+                    isinstance(context.kv_store, PreparedPluginKVStore)
+                    and not stage_latest
+                ):
+                    context.kv_store.commit()
             if generation.staged_event_bus is not None:
                 generation.staged_event_bus.publish()
             generation.state = "candidate" if stage_latest else "active"
@@ -2953,9 +2973,10 @@ class PluginManager:
         generation.runtime_snapshot = validation_snapshot
         if validation_workspace is not None:
             _remove_validation_data_dir(validation_workspace.parent)
-        cast(Any, generation.instance).context.tool_registry = (
-            validation_snapshot.tool_registry
-        )
+        if not isinstance(generation.instance, ComposablePlugin):
+            cast(Any, generation.instance).context.tool_registry = (
+                validation_snapshot.tool_registry
+            )
         return validation_snapshot
 
     def _activate_published_generation(
@@ -2963,9 +2984,7 @@ class PluginManager:
         generation: PluginGeneration,
         previous: PluginGeneration | None,
     ) -> None:
-        plugin_dir = Path(cast(Any, generation.instance).context.plugin_dir).resolve(
-            strict=False
-        )
+        plugin_dir = generation.plugin_dir.resolve(strict=False)
         published_module = sys.modules[generation.module_path]
         stable_alias = None
         if previous is not None:
@@ -3013,9 +3032,8 @@ class PluginManager:
         if generation.prepare_started:
             return
         if isinstance(generation.instance, ComposablePlugin):
-            context = generation.instance.context
             assert generation.runtime_snapshot is not None
-            context.tool_registry = generation.runtime_snapshot.tool_registry
+            generation.prepare_started = True
             generation.minimum_resource_count = generation.scope.resource_count
             return
         from agent.plugins.context import PreparedPluginKVStore
@@ -3589,24 +3607,25 @@ class PluginManager:
             return None
         if not stage_stable:
             ensure_workspace_plugin_data_dir(data_dir, self._workspace)
-        from agent.plugins.context import PluginContext, PluginKVStore
-
         scope = PluginScope(plugin_id)
-        instance.context = PluginContext(  # type: ignore[attr-defined]
-            event_bus=None,  # type: ignore[arg-type]
-            tool_registry=None,
-            plugin_id=plugin_id,
-            plugin_dir=plugin_dir,
-            data_dir=None,
-            kv_store=PluginKVStore(data_dir / ".kv.json", writable=False),
-            config=plugin_config,
-            workspace=self._workspace,
-            session_manager=None,
-            memory_engine=None,
-            llm=None,
-            scope=None,
-            generation_id=generation_id,
-        )
+        if not isinstance(instance, ComposablePlugin):
+            from agent.plugins.context import PluginContext, PluginKVStore
+
+            instance.context = PluginContext(
+                event_bus=None,  # type: ignore[arg-type]
+                tool_registry=None,
+                plugin_id=plugin_id,
+                plugin_dir=plugin_dir,
+                data_dir=None,
+                kv_store=PluginKVStore(data_dir / ".kv.json", writable=False),
+                config=plugin_config,
+                workspace=self._workspace,
+                session_manager=None,
+                memory_engine=None,
+                llm=None,
+                scope=None,
+                generation_id=generation_id,
+            )
         plugin_registry.register_instance(mp, instance)
         prepare_started = False
         generation: PluginGeneration | None = None
@@ -3693,7 +3712,13 @@ class PluginManager:
                 module_path=mp,
                 source_revision=source_revision,
                 config_revision=config_revision,
+                plugin_dir=plugin_dir,
                 data_dir=data_dir,
+                config=(
+                    plugin_config
+                    if isinstance(instance, ComposablePlugin)
+                    else None
+                ),
                 instance=instance,
                 scope=scope,
                 contributions=contributions,
@@ -3840,10 +3865,6 @@ class PluginManager:
                 validation_data_dir.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copytree(generation.data_dir, validation_data_dir)
                 generation.data_dir = validation_data_dir
-                if isinstance(generation.instance, ComposablePlugin):
-                    generation.instance.context.workspace = (
-                        generation.validation_workspace
-                    )
                 generation.contributions = _validation_contributions(
                     generation,
                     self._active_generations.get(plugin_id),
@@ -3964,15 +3985,15 @@ class PluginManager:
             load_phase = "prepare"
             prepare_started = not isinstance(instance, ComposablePlugin)
             await self._prepare_generation(generation)
-            instance.context.data_dir = data_dir
-            instance.context.session_manager = self._session_manager
-            instance.context.memory_engine = self._memory_engine
-            instance.context.llm = self._llm
             generation.state = "activating"
             if not isinstance(instance, ComposablePlugin):
+                instance.context.data_dir = data_dir
+                instance.context.session_manager = self._session_manager
+                instance.context.memory_engine = self._memory_engine
+                instance.context.llm = self._llm
                 instance.activate()
-            if isinstance(instance.context.kv_store, PreparedPluginKVStore):
-                instance.context.kv_store.commit()
+                if isinstance(instance.context.kv_store, PreparedPluginKVStore):
+                    instance.context.kv_store.commit()
             load_phase = "publish"
             self._register_tools(instance, mp, tool_names)
             self._bind_tool_hooks(instance, mp)
@@ -4245,12 +4266,6 @@ class PluginManager:
     ) -> None:
         """用 generation 自己的正式 runtime 挂载一个 v3 插件。"""
 
-        context = cast(Any, generation.instance).context
-        workspace = context.workspace
-        if not isinstance(workspace, Path):
-            raise RuntimeError(
-                f"v3 插件缺少 Core 分配的 workspace: {generation.plugin_id}"
-            )
         plugin = cast(ComposablePlugin, generation.instance)
         for name in plugin.workspace_roots:
             _ = resolve_declared_workspace_root(self._workspace, name)
@@ -4259,10 +4274,10 @@ class PluginManager:
             name=generation.plugin_id,
             runtime=PluginRuntime(
                 plugin_id=generation.plugin_id,
-                plugin_dir=Path(context.plugin_dir),
+                plugin_dir=generation.plugin_dir,
                 data_dir=generation.data_dir,
-                workspace=workspace,
-                config=context.config,
+                workspace=self._workspace,
+                config=generation.config,
                 workspace_roots=plugin.workspace_roots,
             ),
         )
@@ -4289,9 +4304,9 @@ class PluginManager:
             "candidate_attempt_data",
             lambda: _remove_validation_data_dir(attempt_root),
         )
-        clones: list[tuple[PluginGeneration, ComposablePlugin, str, Path]] = []
+        clones: list[tuple[PluginGeneration, ComposablePlugin, str, Path, object]] = []
         for generation in ordered:
-            clone, module_path, data_dir = self._clone_candidate_composable(
+            clone, module_path, data_dir, config = self._clone_candidate_composable(
                 generation,
                 candidate_owner=candidate_owner,
                 attempt_workspace=attempt_workspace,
@@ -4306,21 +4321,21 @@ class PluginManager:
                     "candidate workspace_roots 与 generation 冻结声明不一致: "
                     f"{generation.plugin_id}"
                 )
-            clones.append((generation, clone, module_path, data_dir))
+            clones.append((generation, clone, module_path, data_dir, config))
         self._project_candidate_workspace_roots(
             tuple(item[1] for item in clones),
             attempt_workspace,
         )
-        for generation, clone, _module_path, data_dir in clones:
+        for generation, clone, _module_path, data_dir, config in clones:
             _ = await root.mount(
                 clone,
                 name=generation.plugin_id,
                 runtime=PluginRuntime(
                     plugin_id=generation.plugin_id,
-                    plugin_dir=Path(clone.context.plugin_dir),
+                    plugin_dir=generation.plugin_dir,
                     data_dir=data_dir,
                     workspace=attempt_workspace,
-                    config=clone.context.config,
+                    config=config,
                     workspace_roots=clone.workspace_roots,
                 ),
             )
@@ -4350,13 +4365,10 @@ class PluginManager:
         *,
         candidate_owner: PluginGeneration,
         attempt_workspace: Path,
-    ) -> tuple[ComposablePlugin, str, Path]:
+    ) -> tuple[ComposablePlugin, str, Path, object]:
         """重新导入一个 stable v3 插件并绑定 candidate 临时数据。"""
 
-        from agent.plugins.context import PluginContext, PluginKVStore
-
-        source_context = cast(Any, generation.instance).context
-        plugin_dir = Path(source_context.plugin_dir)
+        plugin_dir = generation.plugin_dir
         data_dir = attempt_workspace / "plugin-data" / generation.data_dir.name
         _ = data_dir.parent.mkdir(parents=True, exist_ok=True)
         _ = shutil.copytree(generation.data_dir, data_dir)
@@ -4373,27 +4385,9 @@ class PluginManager:
                 data_dir,
                 cast(type[BaseModel] | None, clone.ConfigModel),
             )
-            clone.context = PluginContext(
-                event_bus=None,  # type: ignore[arg-type]
-                tool_registry=None,
-                plugin_id=generation.plugin_id,
-                plugin_dir=plugin_dir,
-                data_dir=None,
-                kv_store=PluginKVStore(data_dir / ".kv.json", writable=False),
-                config=config,
-                workspace=attempt_workspace,
-                session_manager=None,
-                memory_engine=None,
-                llm=None,
-                scope=None,
-                generation_id=(
-                    f"{candidate_owner.generation_id}:composition:"
-                    f"{generation.plugin_id}"
-                ),
-            )
             clone.bind_static_services(self._composition_service_view())
             plugin_registry.register_instance(module_path, clone)
-            return clone, module_path, data_dir
+            return clone, module_path, data_dir, config
         except BaseException:
             self._remove_module_tree(module_path)
             raise
@@ -5294,7 +5288,7 @@ def _plugins_home(installed_cache_root: Path | None) -> Path:
 def _installed_artifact_base(generation: PluginGeneration) -> Path | None:
     if generation.source_type != "installed":
         return None
-    plugin_dir = Path(cast(Any, generation.instance).context.plugin_dir)
+    plugin_dir = generation.plugin_dir
     plugin_base = (
         plugin_dir.parent.parent
         if plugin_dir.parent.name == ".artifacts"
@@ -5311,14 +5305,14 @@ def _installed_generation_is_candidate(generation: PluginGeneration) -> bool:
 
     if generation.source_type != "installed":
         return False
-    plugin_dir = Path(cast(Any, generation.instance).context.plugin_dir)
+    plugin_dir = generation.plugin_dir
     return _installed_candidate_base_from_root(plugin_dir) is not None
 
 
 def _installed_candidate_base(generation: PluginGeneration) -> Path | None:
     if generation.source_type != "installed":
         return None
-    plugin_dir = Path(cast(Any, generation.instance).context.plugin_dir)
+    plugin_dir = generation.plugin_dir
     return _installed_candidate_base_from_root(plugin_dir)
 
 
@@ -5388,11 +5382,11 @@ def _ready_artifact_pointers(
 ) -> tuple[ArtifactPointer, ArtifactPointer]:
     """解析 ready candidate 事务拥有的前后 artifact pointer。"""
 
-    candidate_root = Path(cast(Any, ready.candidate.instance).context.plugin_dir)
+    candidate_root = ready.candidate.plugin_dir
     candidate = relative_artifact_pointer(plugin_base, candidate_root)
     if ready.previous is None:
         return ArtifactPointer(None), candidate
-    previous_root = Path(cast(Any, ready.previous.instance).context.plugin_dir)
+    previous_root = ready.previous.plugin_dir
     previous_base = _installed_artifact_base_from_root(previous_root)
     if previous_base.resolve() != plugin_base.resolve():
         raise RuntimeError("latest candidate 与 stable 不属于同一插件 artifact")

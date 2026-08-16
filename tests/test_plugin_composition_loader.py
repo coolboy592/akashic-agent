@@ -105,6 +105,9 @@ async def test_v3_namespace_loader_waits_for_service_not_scan_order(
     snapshot = manager.current_snapshot
     assert consumer is not None and snapshot is not None
     assert isinstance(consumer.instance, ComposablePlugin)
+    assert not hasattr(consumer.instance, "context")
+    assert consumer.plugin_dir == tmp_path / "plugins" / "a_consumer"
+    assert consumer.config.suffix == "configured"  # type: ignore[union-attr]
     assert consumer.instance.module.observed == (
         "ready",
         "a_consumer",
@@ -650,9 +653,12 @@ async def test_v3_candidate_rejects_workspace_root_declaration_drift(
     original_clone = manager._clone_candidate_composable
 
     def clone_with_drift(*args: object, **kwargs: object):
-        clone, module_path, data_dir = original_clone(*args, **kwargs)  # type: ignore[arg-type]
+        clone, module_path, data_dir, config = original_clone(  # type: ignore[arg-type]
+            *args,
+            **kwargs,
+        )
         clone.workspace_roots = ("drifted",)
-        return clone, module_path, data_dir
+        return clone, module_path, data_dir, config
 
     monkeypatch.setattr(manager, "_clone_candidate_composable", clone_with_drift)
     (plugin_dir / "plugin.py").write_text(
@@ -1358,6 +1364,7 @@ async def test_installed_v3_candidate_rebuilds_runtime_then_promotes(
     stable_root.mkdir(parents=True)
     latest_root.mkdir(parents=True)
     source = (
+        "from pydantic import BaseModel\n"
         "from agent.plugin_composition import MEMORY_RUNTIME\n"
         "api_version = 3\n"
         "name = 'installed_v3'\n"
@@ -1366,11 +1373,13 @@ async def test_installed_v3_candidate_rebuilds_runtime_then_promotes(
         "drift_skill_roots = ('drift/skills',)\n"
         "dashboard_module = 'dashboard.py'\n"
         "inject = (MEMORY_RUNTIME,)\n"
+        "class Config(BaseModel):\n"
+        "    marker: str = 'default'\n"
         "applied = []\n"
         "disposed = []\n"
         "async def apply(ctx, config):\n"
         "    workspace = str(ctx.runtime.workspace)\n"
-        "    applied.append((workspace, ctx.require(MEMORY_RUNTIME).name))\n"
+        "    applied.append((workspace, ctx.require(MEMORY_RUNTIME).name, config.marker))\n"
         "    def cleanup():\n"
         "        disposed.append(workspace)\n"
         "    await ctx.effect(lambda: cleanup, label='runtime')\n"
@@ -1404,6 +1413,12 @@ async def test_installed_v3_candidate_rebuilds_runtime_then_promotes(
         {"installed_v3@lab": True},
         plugins_home=tmp_path / "home",
     )
+    config_dir = tmp_path / "workspace" / "plugin-data" / "installed_v3-lab"
+    config_dir.mkdir(parents=True)
+    (config_dir / "config.local.toml").write_text(
+        "marker = 'configured'\n",
+        encoding="utf-8",
+    )
     describe_calls = 0
 
     def describe_memory_runtime() -> object:
@@ -1433,6 +1448,9 @@ async def test_installed_v3_candidate_rebuilds_runtime_then_promotes(
 
     assert result["publication_state"] == "latest_ready"
     assert candidate is not None
+    assert not hasattr(candidate.instance, "context")
+    assert candidate.plugin_dir == latest_root
+    assert candidate.config.marker == "configured"  # type: ignore[union-attr]
     candidate_snapshot = candidate.runtime_snapshot
     assert candidate_snapshot is not None
     assert candidate_snapshot.plugin_skill_index is not None
@@ -1449,6 +1467,7 @@ async def test_installed_v3_candidate_rebuilds_runtime_then_promotes(
     candidate_runtime = candidate_root.root_fiber.children[0].runtime
     assert candidate_runtime is not None
     assert "plugin-validation" in str(candidate_runtime.workspace)
+    assert candidate_runtime.config.marker == "configured"  # type: ignore[union-attr]
     assert candidate.validation_workspace is not None
     validation_root = candidate.validation_workspace.parent
     clone_modules = {
@@ -1479,6 +1498,7 @@ async def test_installed_v3_candidate_rebuilds_runtime_then_promotes(
     assert candidate.instance.module.applied[-1] == (
         str(tmp_path / "workspace"),
         "default",
+        "configured",
     )
     assert describe_calls == 1
     assert clone_modules.isdisjoint(sys.modules)

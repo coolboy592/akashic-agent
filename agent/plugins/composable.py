@@ -10,7 +10,6 @@ from typing import TYPE_CHECKING, cast
 from agent.plugin_composition import Context, ServiceKey, ServiceView
 
 if TYPE_CHECKING:
-    from agent.plugins.context import PluginContext
     from agent.plugins.generation import PluginReadinessContext, PluginSemanticCheck
 
 _CORE_RESERVED_WORKSPACE_ROOTS = frozenset({"plugin-data", "runtime"})
@@ -33,7 +32,6 @@ class ComposablePlugin:
     _apply: Callable[[Context, object], object] = field(repr=False)
     _service_view: ServiceView | None = field(default=None, init=False, repr=False)
     _static_active: bool | None = field(default=None, init=False, repr=False)
-    context: PluginContext = field(init=False, repr=False)
     api_version: int = field(default=3, init=False)
 
     @classmethod
@@ -112,7 +110,7 @@ class ComposablePlugin:
         ctx._set_static_active(active)  # pyright: ignore[reportPrivateUsage]
         if not active:
             return
-        result = self._apply(ctx, self.context.config)
+        result = self._apply(ctx, ctx.runtime.config)
         if inspect.isawaitable(result):
             await result
 

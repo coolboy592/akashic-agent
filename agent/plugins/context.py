@@ -24,9 +24,9 @@ if TYPE_CHECKING:
     from agent.plugins.scope import Cleanup, PluginScope, ScopedEventBus
 
 
-# V2_REMOVAL(plugin-context-api)：v2 插件直接读取这些字段并登记资源。
-# v3 loader 暂借此 DTO 保存 Core-private generation metadata；先迁出该 metadata，
-# 再随 v2 Manager 分支物理删除整个 DTO，不保留兼容壳。
+# V2_REMOVAL(plugin-context-api)：仅 v2 插件读取这些字段并登记资源。
+# Default/Wake Proactive 私有兼容岛与全部 legacy consumer 迁走后，连同 Manager v2 分支
+# 物理删除整个 DTO，不保留兼容壳。
 @dataclass
 class PluginContext:
     event_bus: "ScopedEventBus"

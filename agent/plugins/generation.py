@@ -98,7 +98,9 @@ class PluginGeneration:
     module_path: str
     source_revision: str
     config_revision: str
+    plugin_dir: Path
     data_dir: Path
+    config: object | None
     instance: object
     scope: PluginScope
     contributions: PluginContributions
