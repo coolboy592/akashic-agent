@@ -8,10 +8,14 @@ plugins never receive a client, process, or mutable tool wrapper.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
+import json
 import logging
+import os
 from collections.abc import Awaitable, Callable, Iterator, Mapping
 from dataclasses import dataclass, field
+from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Literal, Protocol, cast
 
@@ -137,6 +141,17 @@ class McpCleanupTombstone:
     attempt_count: int
 
 
+@dataclass(frozen=True, slots=True)
+class McpObservationDiagnostic:
+    """Structured callback failure retained independently from resource cleanup."""
+
+    generation_id: str
+    server_name: str
+    callback: Literal["health", "incident"]
+    reason: str
+    error: str
+
+
 @dataclass
 class _McpEntry:
     generation_id: str
@@ -147,6 +162,8 @@ class _McpEntry:
     mode: McpMode
     allowed_tools: frozenset[str]
     tools: Mapping[str, McpToolView]
+    catalog_tools: tuple[McpToolView, ...]
+    catalog_digest: str
     epoch: int
     process_identity: object | None
     watcher: asyncio.Task[None] | None = None
@@ -308,6 +325,17 @@ class McpServerView:
         return self._entry.tools
 
     @property
+    def catalog_digest(self) -> str:
+        """Return the protected full tools/list identity for Core inspection."""
+
+        self._host._resolve_route(
+            self.generation_id,
+            self._generation_token,
+            self._entry,
+        )
+        return self._entry.catalog_digest
+
+    @property
     def tool_names(self) -> tuple[str, ...]:
         return tuple(self.tools)
 
@@ -362,6 +390,9 @@ class McpGeneration(Mapping[str, McpServerView]):
             for tool_name in server.tool_names
         )
 
+    def catalog_digest(self, server_name: str) -> str:
+        return self.server(server_name).catalog_digest
+
     def server(self, server_name: str) -> McpServerView:
         return self._servers[server_name]
 
@@ -405,6 +436,7 @@ class McpGenerationHost:
         self._readiness_timeout_seconds = readiness_timeout_seconds
         self._generations: dict[str, _Generation] = {}
         self._tombstones: dict[str, McpCleanupTombstone] = {}
+        self._diagnostics: dict[str, tuple[McpObservationDiagnostic, ...]] = {}
         self._next_epoch = 0
 
     async def start_candidate(
@@ -432,6 +464,7 @@ class McpGenerationHost:
         materialized_commands: Mapping[str, McpMaterializedCommand],
         *,
         endpoint_ports: Mapping[str, int] | None = None,
+        expected_catalog_digests: Mapping[str, str] | None = None,
     ) -> McpGeneration:
         """Materialize a formal generation with its complete tool catalog."""
 
@@ -441,6 +474,7 @@ class McpGenerationHost:
             materialized_commands,
             mode="formal",
             endpoint_ports=endpoint_ports,
+            expected_catalog_digests=expected_catalog_digests,
         )
 
     async def start_generation(
@@ -451,6 +485,7 @@ class McpGenerationHost:
         *,
         mode: McpMode = "candidate",
         endpoint_ports: Mapping[str, int] | None = None,
+        expected_catalog_digests: Mapping[str, str] | None = None,
     ) -> McpGeneration:
         """Start one exact Root registry and publish it only after MCP readiness."""
 
@@ -460,6 +495,11 @@ class McpGenerationHost:
         if generation_id in self._generations or generation_id in self._tombstones:
             raise RuntimeError(f"MCP generation already exists: {generation_id}")
         bindings = self._validate_registry(registry)
+        expected_digests = self._validate_expected_catalog_digests(
+            bindings,
+            mode,
+            expected_catalog_digests,
+        )
         commands = self._validate_materialized_commands(
             bindings,
             materialized_commands,
@@ -471,6 +511,7 @@ class McpGenerationHost:
             registry=registry,
             entries={},
         )
+        self._diagnostics.pop(generation_id, None)
         self._generations[generation_id] = generation
         try:
             # 1. Build each Core-owned client and complete its handshake/tools-list.
@@ -480,6 +521,7 @@ class McpGenerationHost:
                     binding,
                     commands[name],
                     endpoint_ports or {},
+                    expected_digests.get(name),
                 )
                 generation.entries[name] = entry
             generation.state = "ready"
@@ -591,6 +633,11 @@ class McpGenerationHost:
     def tombstone(self, generation_id: str) -> McpCleanupTombstone | None:
         return self._tombstones.get(generation_id)
 
+    def diagnostics(self, generation_id: str) -> tuple[McpObservationDiagnostic, ...]:
+        """Return retained observation failures without implying resource failure."""
+
+        return self._diagnostics.get(generation_id, ())
+
     def generation_state(
         self,
         generation_id: str,
@@ -648,6 +695,23 @@ class McpGenerationHost:
             stdout=tuple(entry.client._recent_stdout)[-_MAX_LOG_LINES:],
             stderr=tuple(entry.client._recent_stderr)[-_MAX_LOG_LINES:],
         )
+
+    def catalog_digest(
+        self,
+        generation_id: str,
+        server_name: str,
+        token: object | None = None,
+    ) -> str:
+        generation = self._require_generation(generation_id)
+        self._assert_token(generation, token)
+        entry = generation.entries.get(server_name)
+        if entry is None:
+            raise KeyError(f"unknown MCP server: {generation_id}:{server_name}")
+        if generation.state != "ready" or entry.stopping:
+            raise RuntimeError(
+                f"MCP generation {generation_id!r} 当前不可检查 catalog"
+            )
+        return entry.catalog_digest
 
     def route_for(self, generation_id: str, server_name: str) -> McpRoute:
         """Create a route bound to the exact current generation entry."""
@@ -708,6 +772,7 @@ class McpGenerationHost:
         binding: McpServerBinding,
         materialized: McpMaterializedCommand,
         endpoint_ports: Mapping[str, int],
+        expected_catalog_digest: str | None,
     ) -> _McpEntry:
         definition = binding.definition
         environment = self._materialize_env(
@@ -737,6 +802,8 @@ class McpGenerationHost:
             mode=generation.mode,
             allowed_tools=frozenset(),
             tools=MappingProxyType({}),
+            catalog_tools=(),
+            catalog_digest="",
             epoch=self._next_epoch,
             process_identity=None,
         )
@@ -764,6 +831,20 @@ class McpGenerationHost:
                 _error_text(error),
             )
             raise
+        catalog_tools = tuple(
+            _tool_view(info)
+            for info in sorted(infos, key=lambda item: item.name)
+        )
+        catalog_digest = _catalog_digest(catalog_tools)
+        if (
+            expected_catalog_digest is not None
+            and catalog_digest != expected_catalog_digest
+        ):
+            await _disconnect_after_readiness_failure(client)
+            raise RuntimeError(
+                f"MCP server {definition.name!r} tools/list catalog drift: "
+                f"expected={expected_catalog_digest} actual={catalog_digest}"
+            )
         actual = {info.name for info in infos}
         missing_required = sorted(set(definition.required_tools) - actual)
         if missing_required:
@@ -783,15 +864,13 @@ class McpGenerationHost:
         entry.allowed_tools = (
             frozenset(actual) if generation.mode == "formal" else allowed_tools
         )
+        entry.catalog_tools = catalog_tools
+        entry.catalog_digest = catalog_digest
         entry.tools = MappingProxyType(
             {
-                info.name: McpToolView(
-                    name=info.name,
-                    description=info.description,
-                    input_schema=_freeze_schema(info.input_schema),
-                )
-                for info in infos
-                if info.name in visible_tools
+                tool.name: tool
+                for tool in catalog_tools
+                if tool.name in visible_tools
             }
         )
         entry.process_identity = client._process
@@ -909,7 +988,12 @@ class McpGenerationHost:
             raise RuntimeError(
                 f"MCP server {entry.name!r} stop 超时: {self._stop_timeout_seconds}s"
             ) from error
-        await self._emit_health(entry.generation_id, entry.name, False, "stopped")
+        try:
+            await self._emit_health(entry.generation_id, entry.name, False, "stopped")
+        except asyncio.CancelledError as error:
+            self._record_diagnostic(entry, "health", "stopped", error)
+        except Exception as error:
+            self._record_diagnostic(entry, "health", "stopped", error)
 
     def _retain_tombstone(
         self,
@@ -930,6 +1014,29 @@ class McpGenerationHost:
             resource_names=tuple(generation.entries),
             error=_error_text(error),
             attempt_count=generation.cleanup_attempts,
+        )
+
+    def _record_diagnostic(
+        self,
+        entry: _McpEntry,
+        callback: Literal["health", "incident"],
+        reason: str,
+        error: BaseException,
+    ) -> None:
+        diagnostic = McpObservationDiagnostic(
+            generation_id=entry.generation_id,
+            server_name=entry.name,
+            callback=callback,
+            reason=reason,
+            error=_error_text(error),
+        )
+        existing = self._diagnostics.get(entry.generation_id, ())
+        self._diagnostics[entry.generation_id] = (*existing, diagnostic)[-16:]
+        logger.error(
+            "[mcp] observation callback failed for %s:%s: %s",
+            entry.generation_id,
+            entry.name,
+            diagnostic.error,
         )
 
     def _watch_stop_requested(
@@ -1003,8 +1110,41 @@ class McpGenerationHost:
                 raise RuntimeError(f"MCP declaration is not live: {name}")
             if _descriptor_fields(binding.descriptor) != _definition_fields(binding.definition):
                 raise ValueError(f"MCP definition/descriptor drift: {name}")
+            declared_env = {key for key, _ in binding.descriptor.env}
+            candidate_env = {key for key, _ in binding.descriptor.candidate_env}
+            overlap = sorted(declared_env & candidate_env)
+            if overlap:
+                raise ValueError(
+                    f"MCP env 与 candidate_env 不得重叠: {name}: "
+                    + ", ".join(overlap)
+                )
             bindings[name] = binding
         return dict(sorted(bindings.items()))
+
+    @staticmethod
+    def _validate_expected_catalog_digests(
+        bindings: Mapping[str, McpServerBinding],
+        mode: McpMode,
+        expected: Mapping[str, str] | None,
+    ) -> dict[str, str]:
+        if expected is None:
+            return {}
+        if mode == "candidate":
+            raise ValueError(
+                "MCP candidate generation cannot receive formal catalog expectations"
+            )
+        if not isinstance(expected, Mapping):
+            raise TypeError("MCP expected catalog digests must be a mapping")
+        if set(expected) != set(bindings):
+            raise ValueError(
+                "MCP expected catalog digests must exactly match registry"
+            )
+        result: dict[str, str] = {}
+        for name, digest in expected.items():
+            if not isinstance(digest, str) or not digest:
+                raise TypeError(f"MCP expected catalog digest invalid: {name}")
+            result[name] = digest
+        return result
 
     @staticmethod
     def _validate_materialized_commands(
@@ -1045,6 +1185,15 @@ class McpGenerationHost:
                 or not materialized.cwd.startswith("/")
             ):
                 raise ValueError(f"MCP materialized command invalid: {name}")
+            argv0 = Path(materialized.command[0])
+            if (
+                not argv0.is_absolute()
+                or not argv0.is_file()
+                or not os.access(argv0, os.X_OK)
+            ):
+                raise ValueError(
+                    f"MCP materialized argv[0] must be an absolute executable: {name}"
+                )
             if not isinstance(materialized.env, Mapping) or any(
                 not isinstance(key, str) or not isinstance(value, str)
                 for key, value in materialized.env.items()
@@ -1065,6 +1214,14 @@ class McpGenerationHost:
         endpoint_ports: Mapping[str, int],
     ) -> dict[str, str]:
         environment = dict(materialized.env)
+        candidate_keys = {key for key, _ in descriptor.candidate_env}
+        materialized_candidate_keys = sorted(candidate_keys & set(environment))
+        if materialized_candidate_keys:
+            raise ValueError(
+                f"MCP materialized env 不得提供 candidate-only key: "
+                f"{descriptor.name}: "
+                + ", ".join(materialized_candidate_keys)
+            )
         for key, value in descriptor.env:
             existing = environment.get(key)
             if existing is not None and existing != value:
@@ -1132,6 +1289,40 @@ def _definition_fields(definition: McpServerDefinition) -> tuple[object, ...]:
         definition.endpoint_env,
         tuple(sorted(definition.candidate_env.items())),
     )
+
+
+def _tool_view(info: Any) -> McpToolView:
+    return McpToolView(
+        name=info.name,
+        description=info.description,
+        input_schema=_freeze_schema(info.input_schema),
+    )
+
+
+def _catalog_digest(tools: tuple[McpToolView, ...]) -> str:
+    contract = [
+        (
+            tool.name,
+            tool.description,
+            _schema_json(tool.input_schema),
+        )
+        for tool in tools
+    ]
+    payload = json.dumps(
+        contract,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _schema_json(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {str(key): _schema_json(child) for key, child in value.items()}
+    if isinstance(value, tuple):
+        return [_schema_json(child) for child in value]
+    return value
 
 
 def _freeze_schema(value: Mapping[str, Any]) -> Mapping[str, Any]:

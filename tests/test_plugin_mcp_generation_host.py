@@ -54,35 +54,43 @@ def _write_server(path: Path, *, mode: str = "normal") -> None:
         exit_code = "    if method == 'initialize':\n        time.sleep(30)\n"
     else:
         exit_code = ""
+    catalog = (
+        "            {'name': 'read_tool', 'description': 'changed', "
+        "'inputSchema': {'type': 'object', 'properties': {'changed': {'type': 'boolean'}}}},\n"
+        if mode == "catalog_drift"
+        else "            {'name': 'read_tool', 'description': 'read', 'inputSchema': {'type': 'object'}},\n"
+    )
     path.write_text(
-        "import json, os, sys, time\n"
-        "from pathlib import Path\n"
-        "counter_path = Path(os.environ.get('COUNTER', 'counter'))\n"
-        "epoch = int(counter_path.read_text()) + 1 if counter_path.exists() else 1\n"
-        "counter_path.write_text(str(epoch))\n"
-        "print('server stderr epoch=' + str(epoch), file=sys.stderr, flush=True)\n"
-        "for raw in sys.stdin:\n"
-        "    msg = json.loads(raw); method = msg.get('method')\n"
-        "    if method == 'initialize':\n"
-        "        result = {'protocolVersion': '2025-11-25'}\n"
-        "    elif method == 'tools/list':\n"
-        "        result = {'tools': [\n"
-        "            {'name': 'read_tool', 'description': 'read', 'inputSchema': {'type': 'object'}},\n"
-        "            {'name': 'write_tool', 'description': 'write', 'inputSchema': {'type': 'object'}},\n"
-        "        ]}\n"
-        "    elif method == 'tools/call':\n"
-        "        name = msg['params']['name']\n"
-        "        if name == 'write_tool':\n"
-        "            result = {'isError': True, 'content': [{'type': 'text', 'text': 'write denied'}]}\n"
-        "        else:\n"
-        "            result = {'content': [{'type': 'text', 'text': '|'.join((\n"
-        "                os.environ.get('ROLE', 'none'), os.environ.get('GEN', 'none'),\n"
-        "                os.environ.get('PORT', 'none'), str(epoch),\n"
-        "            ))}]}\n"
-        "    else:\n"
-        "        continue\n"
-        "    print(json.dumps({'jsonrpc': '2.0', 'id': msg['id'], 'result': result}), flush=True)\n"
-        + exit_code,
+        (
+            "import json, os, sys, time\n"
+            "from pathlib import Path\n"
+            "counter_path = Path(os.environ.get('COUNTER', 'counter'))\n"
+            "epoch = int(counter_path.read_text()) + 1 if counter_path.exists() else 1\n"
+            "counter_path.write_text(str(epoch))\n"
+            "print('server stderr epoch=' + str(epoch), file=sys.stderr, flush=True)\n"
+            "for raw in sys.stdin:\n"
+            "    msg = json.loads(raw); method = msg.get('method')\n"
+            "    if method == 'initialize':\n"
+            "        result = {'protocolVersion': '2025-11-25'}\n"
+            "    elif method == 'tools/list':\n"
+            "        result = {'tools': [\n"
+            + catalog
+            + "            {'name': 'write_tool', 'description': 'write', 'inputSchema': {'type': 'object'}},\n"
+            + "        ]}\n"
+            + "    elif method == 'tools/call':\n"
+            + "        name = msg['params']['name']\n"
+            + "        if name == 'write_tool':\n"
+            + "            result = {'isError': True, 'content': [{'type': 'text', 'text': 'write denied'}]}\n"
+            + "        else:\n"
+            + "            result = {'content': [{'type': 'text', 'text': '|'.join((\n"
+            + "                os.environ.get('ROLE', 'none'), os.environ.get('GEN', 'none'),\n"
+            + "                os.environ.get('PORT', 'none'), str(epoch),\n"
+            + "            ))}]}\n"
+            + "    else:\n"
+            + "        continue\n"
+            + "    print(json.dumps({'jsonrpc': '2.0', 'id': msg['id'], 'result': result}), flush=True)\n"
+            + exit_code
+        ),
         encoding="utf-8",
     )
 
@@ -93,6 +101,7 @@ async def _registry(
     *,
     required_tools: tuple[str, ...] = ("read_tool",),
     candidate_tools: tuple[str, ...] = ("read_tool",),
+    candidate_env: dict[str, str] | None = None,
 ) -> tuple[CompositionRoot, object]:
     plugin_dir = tmp_path / "calendar"
     plugin_dir.mkdir(exist_ok=True)
@@ -100,6 +109,9 @@ async def _registry(
     root = CompositionRoot("mcp-host-test")
     service = PluginMcpServers(root.instance_token)
     _ = await root.context.provide(MCP_SERVERS, service)
+    projected_candidate_env = (
+        {"ROLE": "candidate"} if candidate_env is None else candidate_env
+    )
     definition = McpServerDefinition(
         name="calendar",
         command=("python", script.name),
@@ -108,7 +120,7 @@ async def _registry(
         required_tools=required_tools,
         candidate_read_only_tools=candidate_tools,
         endpoint_env=(EndpointEnv("PORT", "calendar_api"),),
-        candidate_env={"ROLE": "candidate"},
+        candidate_env=projected_candidate_env,
     )
 
     async def apply(ctx) -> None:
@@ -188,6 +200,119 @@ async def test_formal_exposes_all_tools_and_does_not_apply_candidate_env(tmp_pat
         assert result.status == "tool_error"
         read_result = await generation.route("calendar").call("read_tool", {})
         assert read_result.output.startswith("none|formal-a|")
+    finally:
+        await host.close()
+        await root.dispose()
+
+
+@pytest.mark.asyncio
+async def test_formal_rejects_catalog_drift_from_candidate_identity(tmp_path: Path) -> None:
+    script = tmp_path / "server.py"
+    _write_server(script)
+    root, registry = await _registry(tmp_path, script)
+    host = McpGenerationHost()
+    try:
+        candidate = await host.start_candidate(
+            "candidate-catalog",
+            registry,
+            _command(script),
+            endpoint_ports={"calendar_api": _free_port()},
+        )
+        expected_digest = candidate.catalog_digest("calendar")
+        _write_server(script, mode="catalog_drift")
+        with pytest.raises(RuntimeError, match="catalog drift"):
+            await host.start_formal(
+                "formal-catalog-drift",
+                registry,
+                _command(script),
+                endpoint_ports={"calendar_api": _free_port()},
+                expected_catalog_digests={"calendar": expected_digest},
+            )
+        assert host.get("formal-catalog-drift") is None
+        assert host.tombstone("formal-catalog-drift") is None
+        assert candidate.catalog_digest("calendar") == expected_digest
+        await host.stop_generation("candidate-catalog")
+    finally:
+        await host.close()
+        await root.dispose()
+
+
+@pytest.mark.asyncio
+async def test_materialized_candidate_env_is_rejected_for_candidate_and_formal(
+    tmp_path: Path,
+) -> None:
+    script = tmp_path / "server.py"
+    _write_server(script)
+    root, registry = await _registry(tmp_path, script)
+    host = McpGenerationHost()
+    try:
+        for generation_id, start in (
+            ("candidate-base-env", host.start_candidate),
+            ("formal-base-env", host.start_formal),
+        ):
+            with pytest.raises(ValueError, match="candidate-only"):
+                await start(
+                    generation_id,
+                    registry,
+                    _command(script, env={"ROLE": "candidate"}),
+                    endpoint_ports={"calendar_api": _free_port()},
+                )
+            assert host.get(generation_id) is None
+        assert not (script.parent / "counter").exists()
+    finally:
+        await host.close()
+        await root.dispose()
+
+
+@pytest.mark.asyncio
+async def test_declaration_rejects_overlapping_candidate_env(tmp_path: Path) -> None:
+    script = tmp_path / "server.py"
+    _write_server(script)
+    root, registry = await _registry(
+        tmp_path,
+        script,
+        candidate_env={"DECLARED": "candidate"},
+    )
+    host = McpGenerationHost()
+    try:
+        with pytest.raises(ValueError, match="不得重叠"):
+            await host.start_formal(
+                "formal-overlap",
+                registry,
+                _command(script),
+                endpoint_ports={"calendar_api": _free_port()},
+            )
+        assert host.get("formal-overlap") is None
+        assert not (script.parent / "counter").exists()
+    finally:
+        await host.close()
+        await root.dispose()
+
+
+@pytest.mark.asyncio
+async def test_materialized_argv0_must_be_pinned_absolute_executable(
+    tmp_path: Path,
+) -> None:
+    script = tmp_path / "server.py"
+    _write_server(script)
+    root, registry = await _registry(tmp_path, script)
+    host = McpGenerationHost()
+    try:
+        with pytest.raises(ValueError, match=r"argv\[0\].*absolute executable"):
+            await host.start_candidate(
+                "candidate-path-hostile",
+                registry,
+                {
+                    "calendar": McpMaterializedCommand(
+                        command=("python", str(script)),
+                        cwd=str(script.parent),
+                        env={"COUNTER": str(script.parent / "counter")},
+                    )
+                },
+                endpoint_ports={"calendar_api": _free_port()},
+            )
+        assert host.get("candidate-path-hostile") is None
+        assert not (script.parent / "counter").exists()
     finally:
         await host.close()
         await root.dispose()
@@ -392,6 +517,41 @@ async def test_cleanup_failure_retains_tombstone_until_retry(tmp_path: Path, mon
         await host.retry_generation_cleanup("candidate-cleanup")
         assert host.tombstone("candidate-cleanup") is None
         assert host.get("candidate-cleanup") is None
+    finally:
+        await host.close()
+        await root.dispose()
+
+
+@pytest.mark.asyncio
+async def test_stopped_health_failure_is_diagnostic_not_cleanup_failure(tmp_path: Path) -> None:
+    script = tmp_path / "server.py"
+    _write_server(script)
+    root, registry = await _registry(tmp_path, script)
+
+    def fail_stopped(
+        _generation: str,
+        _server: str,
+        _healthy: bool,
+        reason: str,
+    ) -> None:
+        if reason == "stopped":
+            raise RuntimeError("health sink disposed")
+
+    host = McpGenerationHost(on_health=fail_stopped)
+    try:
+        await host.start_candidate(
+            "candidate-observation-failure",
+            registry,
+            _command(script),
+            endpoint_ports={"calendar_api": _free_port()},
+        )
+        await host.stop_generation("candidate-observation-failure")
+        assert host.get("candidate-observation-failure") is None
+        assert host.tombstone("candidate-observation-failure") is None
+        diagnostics = host.diagnostics("candidate-observation-failure")
+        assert len(diagnostics) == 1
+        assert diagnostics[0].reason == "stopped"
+        assert "health sink disposed" in diagnostics[0].error
     finally:
         await host.close()
         await root.dispose()
