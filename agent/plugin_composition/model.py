@@ -176,6 +176,7 @@ class CompositionReceipt:
     required_degraded: tuple[str, ...]
     incidents: tuple[IncidentView, ...]
     incident_sequence: int
+    incident_counts: tuple[tuple[str, int], ...]
     incident_overflowed: bool
     writes: tuple[WriteObservation, ...]
     external_effects: tuple[ExternalEffectObservation, ...]

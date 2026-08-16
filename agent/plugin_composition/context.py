@@ -647,6 +647,7 @@ class CompositionRoot:
         self._dispose_observers: list[FiberObserver] = []
         self._health_entries: dict[tuple[int, str], _HealthEntry] = {}
         self._incident_sequence = 0
+        self._incident_counts: dict[str, int] = {}
         self._candidate_incident_limit = candidate_incident_limit
         self._incident_overflowed = False
         self._recent_incidents: deque[IncidentView] = deque(
@@ -798,6 +799,7 @@ class CompositionRoot:
             required_degraded=required_degraded,
             incidents=self.recent_incidents(),
             incident_sequence=self._incident_sequence,
+            incident_counts=tuple(sorted(self._incident_counts.items())),
             incident_overflowed=self._incident_overflowed,
             writes=self._audit.writes,
             external_effects=external_effects,
@@ -1236,6 +1238,9 @@ class CompositionRoot:
         error_type: str | None = None,
     ) -> IncidentView:
         self._incident_sequence += 1
+        self._incident_counts[fiber.name] = (
+            self._incident_counts.get(fiber.name, 0) + 1
+        )
         incident = IncidentView(
             sequence=self._incident_sequence,
             owner=fiber.name,
