@@ -97,6 +97,7 @@ from agent.lifecycle.types import (
     PromptRenderCtx,
 )
 from infra.channels.base import SessionIdentityIndex
+from infra.channels.artifacts import ChannelAttachmentArtifactStore
 from agent.plugins.registry import MetadataKind, PluginEventType, plugin_registry
 from agent.plugins.artifacts import (
     ArtifactPointer,
@@ -278,6 +279,7 @@ class PluginManager:
         memory_engine: Any = None,
         llm: PluginLlmService | None = None,
         installed_cache_root: Path | None = None,
+        channel_attachment_store: ChannelAttachmentArtifactStore | None = None,
     ) -> None:
         self._dirs = plugin_dirs
         self._event_bus = event_bus
@@ -392,6 +394,8 @@ class PluginManager:
             snapshot_lease_acquirer=self._snapshot_store.acquire,
             identity_resolver=self._resolve_channel_identity,
             identity_rememberer=self._remember_channel_identity,
+            attachment_import=channel_attachment_store,
+            attachment_read=channel_attachment_store,
         )
         self._active_channel_generation: ChannelGeneration | None = None
         self._active_channel_catalog_identity: str | None = None

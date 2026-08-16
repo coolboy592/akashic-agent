@@ -18,7 +18,12 @@ from types import ModuleType
 from typing import TYPE_CHECKING, Any, cast
 
 from agent.plugin_composition.channels import (
+    AttachmentKind,
+    AttachmentReadLease,
+    AttachmentRef,
     ChannelAdapter,
+    ChannelAttachmentImportPort,
+    ChannelAttachmentReadPort,
     ChannelCapability,
     ChannelCleanupFailure,
     ChannelDeliveryReceipt,
@@ -344,6 +349,135 @@ class _ChannelIdentity:
         return self._host._resolve_identity(self._key, provider_identity)
 
 
+class _ChannelAttachmentImport:
+    """Expose the Core attachment importer only while this binding is admitted."""
+
+    def __init__(
+        self,
+        host: ChannelGenerationHost,
+        key: tuple[str, str],
+        port: ChannelAttachmentImportPort,
+    ) -> None:
+        self._host = host
+        self._key = key
+        self._port = port
+
+    async def import_bytes(
+        self,
+        data: bytes,
+        *,
+        kind: AttachmentKind,
+        filename: str | None,
+        media_type: str | None,
+    ) -> AttachmentRef:
+        """Import bytes while retaining this binding in the Host drain set."""
+
+        self._host._begin_attachment_operation(self._key)
+        try:
+            result = self._port.import_bytes(
+                data,
+                kind=kind,
+                filename=filename,
+                media_type=media_type,
+            )
+            if not inspect.isawaitable(result):
+                raise TypeError("attachment import 必须返回 awaitable")
+            result = await result
+            if not isinstance(result, AttachmentRef):
+                raise TypeError("attachment import 必须返回 AttachmentRef")
+            return result
+        finally:
+            self._host._release_attachment_operation(self._key)
+
+
+class _ChannelAttachmentRead:
+    """Expose Core read leases while charging the exact binding in-flight count."""
+
+    def __init__(
+        self,
+        host: ChannelGenerationHost,
+        key: tuple[str, str],
+        port: ChannelAttachmentReadPort,
+    ) -> None:
+        self._host = host
+        self._key = key
+        self._port = port
+
+    async def acquire(self, ref: AttachmentRef) -> AttachmentReadLease:
+        """Acquire a binding-owned read lease or release the claim on failure."""
+
+        if not isinstance(ref, AttachmentRef):
+            raise TypeError("attachment read 只接受 AttachmentRef")
+        self._host._begin_attachment_operation(self._key)
+        try:
+            result = self._port.acquire(ref)
+            if not inspect.isawaitable(result):
+                raise TypeError("attachment acquire 必须返回 awaitable")
+            lease = await result
+            _validate_attachment_read_lease(lease, ref)
+            return _ChannelAttachmentReadLease(self._host, self._key, lease, ref)
+        except BaseException:
+            self._host._release_attachment_operation(self._key)
+            raise
+
+
+class _ChannelAttachmentReadLease:
+    """Keep the Host claim until the underlying lease close has settled successfully."""
+
+    def __init__(
+        self,
+        host: ChannelGenerationHost,
+        key: tuple[str, str],
+        lease: AttachmentReadLease,
+        ref: AttachmentRef,
+    ) -> None:
+        self._host = host
+        self._key = key
+        self._lease = lease
+        self._ref = ref
+        self._closed = False
+        self._close_lock = asyncio.Lock()
+
+    @property
+    def ref(self) -> AttachmentRef:
+        return self._ref
+
+    async def read_bytes(self, *, max_bytes: int) -> bytes:
+        """Read through the retained Core lease until it is critically closed."""
+
+        if self._closed:
+            raise RuntimeError("attachment read lease 已关闭")
+        result = self._lease.read_bytes(max_bytes=max_bytes)
+        if not inspect.isawaitable(result):
+            raise TypeError("attachment read_bytes 必须返回 awaitable")
+        value = await result
+        if not isinstance(value, bytes):
+            raise TypeError("attachment read_bytes 必须返回 bytes")
+        return value
+
+    async def aclose(self) -> None:
+        """Finish the underlying close before releasing Host drain ownership."""
+
+        async with self._close_lock:
+            if self._closed:
+                return
+            task = asyncio.create_task(
+                _invoke_attachment_lease_close(self._lease),
+                name=f"channel_attachment_lease_close:{self._key[0]}:{self._key[1]}",
+            )
+            try:
+                await _await_task_after_cancellation(task)
+            except asyncio.CancelledError:
+                if _task_succeeded(task):
+                    self._host._release_attachment_operation(self._key)
+                    self._closed = True
+                raise
+            if task.cancelled():
+                raise asyncio.CancelledError
+            self._host._release_attachment_operation(self._key)
+            self._closed = True
+
+
 class ChannelGeneration:
     """A closed set of channel bindings staged for one committed snapshot."""
 
@@ -406,6 +540,8 @@ class ChannelGenerationHost:
         snapshot_lease_acquirer: SnapshotLeaseAcquirer | None = None,
         identity_resolver: IdentityResolver | None = None,
         identity_rememberer: IdentityRememberer | None = None,
+        attachment_import: ChannelAttachmentImportPort | None = None,
+        attachment_read: ChannelAttachmentReadPort | None = None,
     ) -> None:
         if not callable(on_before_start):
             raise TypeError("on_before_start 必须是 async callback")
@@ -423,6 +559,16 @@ class ChannelGenerationHost:
             raise TypeError("identity_resolver 必须可调用")
         if identity_rememberer is not None and not callable(identity_rememberer):
             raise TypeError("identity_rememberer 必须可调用")
+        if (attachment_import is None) != (attachment_read is None):
+            raise TypeError("attachment import/read ports 必须同时绑定")
+        if attachment_import is not None and not callable(
+            getattr(attachment_import, "import_bytes", None)
+        ):
+            raise TypeError("attachment_import 必须提供 import_bytes(data, ...)")
+        if attachment_read is not None and not callable(
+            getattr(attachment_read, "acquire", None)
+        ):
+            raise TypeError("attachment_read 必须提供 acquire(ref)")
         self._on_before_start = on_before_start
         self._config_revision_checker = config_revision_checker
         self._on_failure = on_failure
@@ -430,6 +576,8 @@ class ChannelGenerationHost:
         self._inbound_publisher: InboundPublisher | None = None
         self._identity_resolver = identity_resolver
         self._identity_rememberer = identity_rememberer
+        self._attachment_import = attachment_import
+        self._attachment_read = attachment_read
         self._bindings: dict[tuple[str, str], _ChannelBindingState] = {}
         self._tombstones: dict[tuple[str, str], ChannelCleanupTombstone] = {}
         self._start_counts: dict[tuple[str, str], int] = {}
@@ -946,6 +1094,16 @@ class ChannelGenerationHost:
                 and self._identity_resolver is not None
                 else None
             ),
+            attachment_import=(
+                _ChannelAttachmentImport(self, key, self._attachment_import)
+                if self._attachment_import is not None
+                else None
+            ),
+            attachment_read=(
+                _ChannelAttachmentRead(self, key, self._attachment_read)
+                if self._attachment_read is not None
+                else None
+            ),
         )
         try:
             adapter = state.factory(state.factory_context)
@@ -1015,7 +1173,26 @@ class ChannelGenerationHost:
         state = self._binding(key)
         await state.drain_event.wait()
 
+    def _begin_attachment_operation(self, key: tuple[str, str]) -> None:
+        """Admit one attachment import/acquire before its first await."""
+
+        state = self._binding(key)
+        if self._attachment_import is None or self._attachment_read is None:
+            raise RuntimeError("Channel attachment runtime ports 未绑定")
+        if not state.admission_open or state.stopping or state.stopped:
+            raise RuntimeError("channel admission 已关闭")
+        state.in_flight += 1
+        state.drain_event.clear()
+
+    def _release_attachment_operation(self, key: tuple[str, str]) -> None:
+        """Release one attachment operation only after its owner is settled."""
+
+        self._release_in_flight(key)
+
     def _release_binding_lease(self, key: tuple[str, str]) -> None:
+        self._release_in_flight(key)
+
+    def _release_in_flight(self, key: tuple[str, str]) -> None:
         state = self._binding(key)
         if state.in_flight <= 0:
             raise RuntimeError("channel binding lease 计数下溢")
@@ -1351,6 +1528,29 @@ async def _close_provider_factory(factory: ProviderClientFactory) -> None:
     result = factory.aclose()
     if not inspect.isawaitable(result):
         raise TypeError("provider client factory.aclose 必须返回 awaitable")
+    await result
+
+
+def _validate_attachment_read_lease(
+    lease: object,
+    ref: AttachmentRef,
+) -> None:
+    """Validate the store lease before transferring its drain ownership."""
+
+    if not callable(getattr(lease, "read_bytes", None)):
+        raise TypeError("attachment read lease 必须提供 read_bytes(max_bytes=...)")
+    if not callable(getattr(lease, "aclose", None)):
+        raise TypeError("attachment read lease 必须提供 aclose()")
+    if getattr(lease, "ref", None) != ref:
+        raise RuntimeError("attachment read lease ref 不匹配")
+
+
+async def _invoke_attachment_lease_close(lease: AttachmentReadLease) -> None:
+    """Invoke a store lease close and preserve its cancellation/error result."""
+
+    result = lease.aclose()
+    if not inspect.isawaitable(result):
+        raise TypeError("attachment read lease aclose 必须返回 awaitable")
     await result
 
 

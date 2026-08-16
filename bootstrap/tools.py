@@ -624,6 +624,7 @@ def build_core_runtime(
     )
 
     from agent.plugins.manager import PluginManager as _PluginManager
+    from infra.channels.artifacts import ChannelAttachmentArtifactStore
 
     # 3. 创建插件 manager，并把 snapshot store 绑定到 loop。
     plugin_manager = _PluginManager(
@@ -639,6 +640,10 @@ def build_core_runtime(
             max_tokens=0,
         ),
         installed_cache_root=plugins_root() / "cache",
+        channel_attachment_store=ChannelAttachmentArtifactStore(
+            workspace=workspace,
+            session_store=session_manager.control_store,
+        ),
     )
     bus.bind_channel_outbound_dispatcher(
         plugin_manager.channel_generation_host.dispatch_outbound

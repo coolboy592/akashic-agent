@@ -13,6 +13,7 @@ from pydantic import BaseModel
 import agent.plugins.manager as plugin_manager_module
 from agent.plugin_composition import (
     CHANNELS,
+    AttachmentKind,
     ChannelCapability,
     ChannelDefinition,
     CompositionRoot,
@@ -40,6 +41,8 @@ from agent.tools.message_push import MessagePushTool
 from bootstrap.tools import _dispatch_v3_channel_push
 from bus.event_bus import EventBus
 from bus.queue import MessageBus
+from infra.channels.artifacts import ChannelAttachmentArtifactStore
+from session.store import SessionStore
 
 
 @pytest.fixture(autouse=True)
@@ -273,6 +276,65 @@ async def test_v3_channel_registry_redacts_candidate_credentials_before_import(
     assert config_path.read_bytes() == original_config
     await manager.terminate_all()
     assert manager.active_channel_generation is None
+
+
+@pytest.mark.asyncio
+async def test_v3_channel_manager_binds_core_attachment_ports(
+    tmp_path: Path,
+) -> None:
+    plugin_dir = _write_plugin(
+        tmp_path / "plugins",
+        "channel_probe",
+        _channel_plugin_source("1.0.0"),
+    )
+    (plugin_dir / "akashic.plugin.toml").write_text(
+        _channel_static_manifest("1.0.0"),
+        encoding="utf-8",
+    )
+    workspace = tmp_path / "workspace"
+    data_dir = workspace / "plugin-data" / "channel_probe-builtin"
+    data_dir.mkdir(parents=True)
+    (data_dir / "config.local.toml").write_text(
+        "app_id = 'app-1'\napp_secret = 'secret'\n",
+        encoding="utf-8",
+    )
+    session_store = SessionStore(workspace / "sessions.db")
+    attachment_store = ChannelAttachmentArtifactStore(
+        workspace=workspace,
+        session_store=session_store,
+    )
+    manager = PluginManager(
+        plugin_dirs=[tmp_path / "plugins"],
+        event_bus=EventBus(),
+        tool_registry=None,
+        workspace=workspace,
+        installed_cache_root=tmp_path / "home" / "cache",
+        channel_attachment_store=attachment_store,
+    )
+    try:
+        await manager.load_all()
+        runtime = manager.active_channel_generation
+        assert runtime is not None
+        state = cast(Any, manager.channel_generation_host)._bindings[
+            (runtime.snapshot_id, "feishu")
+        ]
+        context = state.factory_context
+        assert context is not None
+        assert context.attachment_import is not None
+        assert context.attachment_read is not None
+
+        ref = await context.attachment_import.import_bytes(
+            b"manager-bound attachment",
+            kind=AttachmentKind.FILE,
+            filename="evidence.txt",
+            media_type="text/plain",
+        )
+        lease = await context.attachment_read.acquire(ref)
+        assert await lease.read_bytes(max_bytes=1024) == b"manager-bound attachment"
+        await lease.aclose()
+    finally:
+        await manager.terminate_all()
+        session_store.close()
 
 
 @pytest.mark.asyncio

@@ -9,6 +9,9 @@ from typing import Any, cast
 import pytest
 
 from agent.plugin_composition.channels import (
+    AttachmentKind,
+    AttachmentRef,
+    AttachmentReadLease,
     ChannelCapability,
     ChannelDeliveryReceipt,
     ChannelDefinition,
@@ -152,6 +155,86 @@ class _FakeSnapshotLease:
         if self.release_gate is not None:
             await self.release_gate.wait()
         self.active = False
+
+
+def _attachment_ref() -> AttachmentRef:
+    return AttachmentRef(
+        artifact_id="artifact-1",
+        kind=AttachmentKind.FILE,
+        filename="report.txt",
+        media_type="text/plain",
+        size_bytes=5,
+        sha256="a" * 64,
+    )
+
+
+class _FakeAttachmentReadLease:
+    def __init__(
+        self,
+        ref: AttachmentRef,
+        *,
+        close_started: asyncio.Event | None = None,
+        close_release: asyncio.Event | None = None,
+    ) -> None:
+        self.ref = ref
+        self.close_started = close_started
+        self.close_release = close_release
+        self.close_calls = 0
+
+    async def read_bytes(self, *, max_bytes: int) -> bytes:
+        assert max_bytes >= 5
+        return b"hello"
+
+    async def aclose(self) -> None:
+        self.close_calls += 1
+        if self.close_started is not None:
+            self.close_started.set()
+        if self.close_release is not None:
+            await self.close_release.wait()
+
+
+class _FakeAttachmentImportPort:
+    def __init__(self, ref: AttachmentRef) -> None:
+        self.ref = ref
+        self.calls = 0
+        self.fail = False
+        self.gate: asyncio.Event | None = None
+
+    async def import_bytes(
+        self,
+        data: bytes,
+        *,
+        kind: AttachmentKind,
+        filename: str | None,
+        media_type: str | None,
+    ) -> AttachmentRef:
+        self.calls += 1
+        assert data == b"hello"
+        assert kind is AttachmentKind.FILE
+        assert filename == "report.txt"
+        assert media_type == "text/plain"
+        if self.fail:
+            raise OSError("import failed")
+        if self.gate is not None:
+            await self.gate.wait()
+        return self.ref
+
+
+class _FakeAttachmentReadPort:
+    def __init__(self, lease: AttachmentReadLease) -> None:
+        self.lease = lease
+        self.calls = 0
+        self.fail = False
+        self.gate: asyncio.Event | None = None
+
+    async def acquire(self, ref: AttachmentRef) -> AttachmentReadLease:
+        self.calls += 1
+        assert ref == self.lease.ref
+        if self.fail:
+            raise OSError("acquire failed")
+        if self.gate is not None:
+            await self.gate.wait()
+        return self.lease
 
 
 def _module(
@@ -1023,3 +1106,223 @@ async def test_caller_cancellation_waits_for_cleanup() -> None:
         await stop_task
     assert factories["feishu"].closed == 1
     assert host.failure(snapshot.snapshot_id) is None
+
+
+def test_attachment_ports_must_be_bound_as_a_pair() -> None:
+    ref = _attachment_ref()
+    import_port = _FakeAttachmentImportPort(ref)
+    read_port = _FakeAttachmentReadPort(_FakeAttachmentReadLease(ref))
+    with pytest.raises(TypeError, match="同时绑定"):
+        _host(attachment_import=import_port)
+    with pytest.raises(TypeError, match="同时绑定"):
+        _host(attachment_read=read_port)
+
+
+@pytest.mark.asyncio
+async def test_formal_context_gets_per_binding_attachment_facades_and_none_without_ports() -> None:
+    snapshot, factories, adapters = await _make_snapshot()
+    host = _host()
+    generation = await host.start(snapshot, factories)
+    context = tuple(adapters.values())[0].context
+    assert context.attachment_import is None
+    assert context.attachment_read is None
+    await generation.stop()
+
+    snapshot, factories, adapters = await _make_snapshot()
+    ref = _attachment_ref()
+    import_port = _FakeAttachmentImportPort(ref)
+    read_port = _FakeAttachmentReadPort(_FakeAttachmentReadLease(ref))
+    host = _host(attachment_import=import_port, attachment_read=read_port)
+    generation = await host.start(snapshot, factories)
+    context = tuple(adapters.values())[0].context
+    assert context.attachment_import is not None
+    assert context.attachment_read is not None
+    assert context.attachment_import is not import_port
+    assert context.attachment_read is not read_port
+    generation.open_admission()
+    imported = await context.attachment_import.import_bytes(
+        b"hello",
+        kind=AttachmentKind.FILE,
+        filename="report.txt",
+        media_type="text/plain",
+    )
+    assert imported == ref
+    assert import_port.calls == 1
+    await generation.stop()
+
+
+@pytest.mark.asyncio
+async def test_held_attachment_read_lease_blocks_generation_drain() -> None:
+    snapshot, factories, adapters = await _make_snapshot()
+    ref = _attachment_ref()
+    underlying = _FakeAttachmentReadLease(ref)
+    import_port = _FakeAttachmentImportPort(ref)
+    read_port = _FakeAttachmentReadPort(underlying)
+    host = _host(attachment_import=import_port, attachment_read=read_port)
+    generation = await host.start(snapshot, factories)
+    generation.open_admission()
+    context = tuple(adapters.values())[0].context
+    binding = generation.channel("feishu")
+    assert context.attachment_read is not None
+    lease = await context.attachment_read.acquire(ref)
+    assert binding.in_flight == 1
+    assert await lease.read_bytes(max_bytes=5) == b"hello"
+
+    stopping = asyncio.create_task(generation.stop())
+    await asyncio.sleep(0)
+    assert not stopping.done()
+    await lease.aclose()
+    assert binding.in_flight == 0
+    await stopping
+    assert underlying.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_attachment_import_and_acquire_failure_or_cancel_release_in_flight() -> None:
+    snapshot, factories, adapters = await _make_snapshot()
+    ref = _attachment_ref()
+    import_port = _FakeAttachmentImportPort(ref)
+    read_port = _FakeAttachmentReadPort(_FakeAttachmentReadLease(ref))
+    host = _host(attachment_import=import_port, attachment_read=read_port)
+    generation = await host.start(snapshot, factories)
+    generation.open_admission()
+    context = tuple(adapters.values())[0].context
+    binding = generation.channel("feishu")
+    assert context.attachment_import is not None
+    assert context.attachment_read is not None
+
+    import_port.fail = True
+    with pytest.raises(OSError, match="import failed"):
+        await context.attachment_import.import_bytes(
+            b"hello",
+            kind=AttachmentKind.FILE,
+            filename="report.txt",
+            media_type="text/plain",
+        )
+    assert binding.in_flight == 0
+
+    read_port.fail = True
+    with pytest.raises(OSError, match="acquire failed"):
+        await context.attachment_read.acquire(ref)
+    assert binding.in_flight == 0
+    read_port.fail = False
+
+    import_port.fail = False
+    import_port.gate = asyncio.Event()
+    import_task = asyncio.create_task(
+        context.attachment_import.import_bytes(
+            b"hello",
+            kind=AttachmentKind.FILE,
+            filename="report.txt",
+            media_type="text/plain",
+        )
+    )
+    await asyncio.sleep(0)
+    assert binding.in_flight == 1
+    import_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await import_task
+    assert binding.in_flight == 0
+
+    read_port.gate = asyncio.Event()
+    acquire_task = asyncio.create_task(context.attachment_read.acquire(ref))
+    await asyncio.sleep(0)
+    assert binding.in_flight == 1
+    acquire_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await acquire_task
+    assert binding.in_flight == 0
+    await generation.stop()
+
+
+@pytest.mark.asyncio
+async def test_closed_or_stale_binding_rejects_attachment_before_store_call() -> None:
+    snapshot, factories, adapters = await _make_snapshot()
+    ref = _attachment_ref()
+    import_port = _FakeAttachmentImportPort(ref)
+    read_port = _FakeAttachmentReadPort(_FakeAttachmentReadLease(ref))
+    host = _host(attachment_import=import_port, attachment_read=read_port)
+    generation = await host.start(snapshot, factories)
+    generation.open_admission()
+    context = tuple(adapters.values())[0].context
+    assert context.attachment_import is not None
+    generation.close_admission()
+    with pytest.raises(RuntimeError, match="关闭"):
+        await context.attachment_import.import_bytes(
+            b"hello",
+            kind=AttachmentKind.FILE,
+            filename="report.txt",
+            media_type="text/plain",
+        )
+    assert import_port.calls == 0
+    await generation.stop()
+    with pytest.raises(KeyError):
+        await context.attachment_import.import_bytes(
+            b"hello",
+            kind=AttachmentKind.FILE,
+            filename="report.txt",
+            media_type="text/plain",
+        )
+    assert import_port.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_attachment_lease_close_is_critical_under_caller_cancellation() -> None:
+    snapshot, factories, adapters = await _make_snapshot()
+    ref = _attachment_ref()
+    close_started = asyncio.Event()
+    close_release = asyncio.Event()
+    underlying = _FakeAttachmentReadLease(
+        ref,
+        close_started=close_started,
+        close_release=close_release,
+    )
+    import_port = _FakeAttachmentImportPort(ref)
+    read_port = _FakeAttachmentReadPort(underlying)
+    host = _host(attachment_import=import_port, attachment_read=read_port)
+    generation = await host.start(snapshot, factories)
+    generation.open_admission()
+    context = tuple(adapters.values())[0].context
+    binding = generation.channel("feishu")
+    assert context.attachment_read is not None
+    lease = await context.attachment_read.acquire(ref)
+    stopping = asyncio.create_task(generation.stop())
+    await asyncio.sleep(0)
+    assert not stopping.done()
+
+    closing = asyncio.create_task(lease.aclose())
+    await close_started.wait()
+    closing.cancel()
+    await asyncio.sleep(0)
+    assert not closing.done()
+    assert binding.in_flight == 1
+
+    close_release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await closing
+    assert binding.in_flight == 0
+    await stopping
+    assert underlying.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_attachment_lease_concurrent_close_releases_host_once() -> None:
+    snapshot, factories, adapters = await _make_snapshot()
+    ref = _attachment_ref()
+    underlying = _FakeAttachmentReadLease(ref)
+    host = _host(
+        attachment_import=_FakeAttachmentImportPort(ref),
+        attachment_read=_FakeAttachmentReadPort(underlying),
+    )
+    generation = await host.start(snapshot, factories)
+    generation.open_admission()
+    context = tuple(adapters.values())[0].context
+    binding = generation.channel("feishu")
+    assert context.attachment_read is not None
+    lease = await context.attachment_read.acquire(ref)
+
+    await asyncio.gather(lease.aclose(), lease.aclose())
+
+    assert binding.in_flight == 0
+    assert underlying.close_calls == 1
+    await generation.stop()
