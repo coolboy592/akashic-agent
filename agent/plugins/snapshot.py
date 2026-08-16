@@ -985,6 +985,7 @@ class RuntimeSnapshotStore:
         transaction: SnapshotTransaction,
         *,
         keep_candidate_latest: bool,
+        reopen_previous: bool = True,
     ) -> None:
         """Restore the previous stable before disposing or retrying the candidate."""
 
@@ -996,7 +997,7 @@ class RuntimeSnapshotStore:
             raise RuntimeError("RuntimeSnapshot provisional stable 指针已漂移")
         if previous is not None:
             previous.state = "committed"
-            previous.accepting_leases = True
+            previous.accepting_leases = reopen_previous
         self._provisional = None
 
         # 2. Either retain latest for normal discard or restore the pending transaction.
@@ -1090,12 +1091,17 @@ class RuntimeSnapshotStore:
             self._condition.notify_all()
         return candidate
 
-    async def abort(self, transaction: SnapshotTransaction) -> None:
+    async def abort(
+        self,
+        transaction: SnapshotTransaction,
+        *,
+        reopen_previous: bool = True,
+    ) -> None:
         self._require_pending(transaction)
         transaction.candidate.state = "aborted"
         transaction.candidate.accepting_leases = False
         if self._current is transaction.previous and transaction.previous is not None:
-            transaction.previous.accepting_leases = True
+            transaction.previous.accepting_leases = reopen_previous
         self._pending = None
         self._schedule_drain(transaction.candidate)
         await self._await_drain_tasks((transaction.candidate.snapshot_id,))

@@ -230,6 +230,14 @@ class _ReadyPluginCandidate:
     snapshot: RuntimeSnapshot
 
 
+class _PublicationParticipantSwitchError(RuntimeError):
+    """Report a forward participant switch rejected before publication opened."""
+
+
+class _PublicationParticipantRestoreError(RuntimeError):
+    """Keep the old snapshot closed when an external owner cannot be restored."""
+
+
 class PluginManager:
     POST_PUBLISH_TIMEOUT_SECONDS = 5.0
 
@@ -2154,7 +2162,6 @@ class PluginManager:
             if publication_gated
             else None
         )
-        endpoints_switched = False
         transaction = None
         try:
             if quiesced is not None:
@@ -2162,17 +2169,6 @@ class PluginManager:
                     await self._endpoint_quiescer()
                 if exclusive_endpoint_changed:
                     await self._snapshot_store.wait_for_no_leases(quiesced)
-            if exclusive_endpoint_changed:
-                await self._switch_plugin_endpoints(
-                    plugin_id,
-                    old_services,
-                    {},
-                    old_channels,
-                    (),
-                    old_commands,
-                    old_commands,
-                )
-                endpoints_switched = True
             self._snapshot_skill_catalogs[snapshot.snapshot_id] = catalog_id
             transaction = self._snapshot_store.begin_publish(
                 snapshot,
@@ -2180,20 +2176,6 @@ class PluginManager:
             )
             await self._post_snapshot_invariants(snapshot)
         except BaseException:
-            endpoint_error: BaseException | None = None
-            if endpoints_switched:
-                try:
-                    await self._switch_plugin_endpoints(
-                        plugin_id,
-                        {},
-                        old_services,
-                        (),
-                        old_channels,
-                        old_commands,
-                        old_commands,
-                    )
-                except BaseException as error:
-                    endpoint_error = error
             if transaction is not None:
                 await self._snapshot_store.abort(transaction)
             else:
@@ -2203,8 +2185,6 @@ class PluginManager:
                 await self._dispose_unreferenced_composition_root(snapshot)
             if self._endpoint_resumer is not None and exclusive_endpoint_changed:
                 await self._endpoint_resumer()
-            if endpoint_error is not None:
-                raise RuntimeError("禁用插件后旧端点恢复失败") from endpoint_error
             raise
 
         commit_error: BaseException | None = None
@@ -2212,40 +2192,38 @@ class PluginManager:
         try:
             assert transaction is not None
             _, commit_cancelled = await _complete_critical(
-                self._commit_snapshot_with_command_catalog(
+                self._commit_snapshot_with_publication_participants(
                     transaction,
                     plugin_id=plugin_id,
+                    old_services=old_services,
+                    new_services={},
+                    old_channels=old_channels,
+                    new_channels=(),
                     old_commands=old_commands,
                     new_commands=new_commands,
                     promote_latest=False,
+                    force_provisional=exclusive_endpoint_changed,
                     after_open=lambda: self._retire_generation(active),
                 )
             )
         except BaseException as error:
             commit_error = error
         if commit_error is not None:
-            rollback_error: BaseException | None = None
-            if endpoints_switched:
-                try:
-                    await self._switch_plugin_endpoints(
-                        plugin_id,
-                        {},
-                        old_services,
-                        (),
-                        old_channels,
-                        old_commands,
-                        old_commands,
-                    )
-                except BaseException as error:
-                    rollback_error = error
             if self._snapshot_store.pending_candidate is snapshot:
-                await self._snapshot_store.abort(transaction)
-            if self._endpoint_resumer is not None and exclusive_endpoint_changed:
+                await self._snapshot_store.abort(
+                    transaction,
+                    reopen_previous=not isinstance(
+                        commit_error,
+                        _PublicationParticipantRestoreError,
+                    ),
+                )
+            if (
+                self._endpoint_resumer is not None
+                and exclusive_endpoint_changed
+                and self.current_snapshot is not None
+                and self.current_snapshot.accepting_leases
+            ):
                 await self._endpoint_resumer()
-            if rollback_error is not None:
-                raise RuntimeError(
-                    "禁用插件发布失败后旧端点恢复失败"
-                ) from rollback_error
             raise commit_error
 
         _ = self._active_generations.pop(plugin_id)
@@ -2306,21 +2284,31 @@ class PluginManager:
                 raise RuntimeError("Channel 宿主未绑定")
             await self._channel_switcher(plugin_id, old_channels, new_channels)
 
-    async def _commit_snapshot_with_command_catalog(
+    async def _commit_snapshot_with_publication_participants(
         self,
         transaction: SnapshotTransaction,
         *,
         plugin_id: str,
+        old_services: dict[str, dict[str, Any]],
+        new_services: dict[str, dict[str, Any]],
+        old_channels: tuple[Channel, ...],
+        new_channels: tuple[Channel, ...],
         old_commands: tuple[tuple[str, str], ...],
         new_commands: tuple[tuple[str, str], ...],
         promote_latest: bool,
+        force_provisional: bool = False,
         before_open: Callable[[], None] | None = None,
         after_open: Callable[[], None] | None = None,
     ) -> SnapshotTransaction:
-        """Publish one snapshot and expose its bot command catalog atomically."""
+        """Publish one snapshot around a single closed external-participant step."""
 
-        # 1. Keep the original one-step path when no external catalog changes.
-        if old_commands == new_commands:
+        # 1. Snapshots without external participants retain the one-step path.
+        endpoints_changed = (
+            old_services != new_services
+            or old_channels != new_channels
+            or old_commands != new_commands
+        )
+        if not endpoints_changed and not force_provisional:
             if promote_latest:
                 return await self._snapshot_store.promote_latest(
                     before_open=before_open,
@@ -2333,7 +2321,7 @@ class PluginManager:
             )
             return transaction
 
-        # 2. Move to a closed provisional pointer before publishing externally.
+        # 2. Close both snapshots before any service/channel/command side effect.
         provisional = (
             await self._snapshot_store.promote_latest_provisional()
             if promote_latest
@@ -2342,44 +2330,61 @@ class PluginManager:
         if not promote_latest:
             await self._snapshot_store.commit_provisional(provisional)
 
+        participants_switch_attempted = False
+        forward_error: BaseException | None = None
         try:
-            await self._switch_plugin_endpoints(
-                plugin_id,
-                {},
-                {},
-                (),
-                (),
-                old_commands,
-                new_commands,
-            )
+            if endpoints_changed:
+                participants_switch_attempted = True
+                try:
+                    await self._switch_plugin_endpoints(
+                        plugin_id,
+                        old_services,
+                        new_services,
+                        old_channels,
+                        new_channels,
+                        old_commands,
+                        new_commands,
+                    )
+                except BaseException as error:
+                    forward_error = error
+                    raise
             await self._snapshot_store.finalize_provisional(
                 provisional,
                 before_open=before_open,
                 after_open=after_open,
             )
-        except BaseException:
+        except BaseException as publication_error:
             rollback_error: BaseException | None = None
-            try:
-                await self._switch_plugin_endpoints(
-                    plugin_id,
-                    {},
-                    {},
-                    (),
-                    (),
-                    new_commands,
-                    old_commands,
-                )
-            except BaseException as caught:
-                rollback_error = caught
+            if participants_switch_attempted:
+                try:
+                    await self._switch_plugin_endpoints(
+                        plugin_id,
+                        new_services,
+                        old_services,
+                        new_channels,
+                        old_channels,
+                        new_commands,
+                        old_commands,
+                    )
+                except BaseException as caught:
+                    rollback_error = caught
             await self._snapshot_store.rollback_provisional(
                 provisional,
                 keep_candidate_latest=promote_latest,
+                reopen_previous=rollback_error is None,
             )
             if rollback_error is not None:
-                raise RuntimeError(
-                    "bot command catalog 发布失败后旧目录恢复失败"
+                raise _PublicationParticipantRestoreError(
+                    "外部 publication participant 失败后旧 owner 恢复失败"
                 ) from rollback_error
-            raise
+            if forward_error is not None:
+                if isinstance(forward_error, asyncio.CancelledError):
+                    raise forward_error
+                raise _PublicationParticipantSwitchError(
+                    "外部 publication participant 拒绝切换: "
+                    f"{str(forward_error) or type(forward_error).__name__}"
+                ) from forward_error
+            raise publication_error
         return provisional
 
     async def _compile_topology_snapshot(
@@ -2507,7 +2512,6 @@ class PluginManager:
             quiesced_snapshot = (
                 self._snapshot_store.pause_admission() if publication_gated else None
             )
-            endpoints_switched = False
             runtime_restore_started = False
             if publication_gated:
                 try:
@@ -2531,17 +2535,6 @@ class PluginManager:
                         ready.snapshot,
                         "telegram_bot_commands",
                     )
-                    if exclusive_endpoint_changed:
-                        await self._switch_plugin_endpoints(
-                            plugin_id,
-                            old_services,
-                            new_services,
-                            old_channels,
-                            new_channels,
-                            old_commands,
-                            old_commands,
-                        )
-                        endpoints_switched = True
                 except BaseException:
                     gated_runtime_error: BaseException | None = None
                     if runtime_restore_started:
@@ -2663,41 +2656,40 @@ class PluginManager:
                 self._drain_transactions[previous_snapshot.snapshot_id] = tx_id
             try:
                 transaction, cancelled = await _complete_critical(
-                    self._commit_snapshot_with_command_catalog(
+                    self._commit_snapshot_with_publication_participants(
                         SnapshotTransaction(
                             previous=previous_snapshot,
                             candidate=ready.snapshot,
                         ),
                         plugin_id=plugin_id,
+                        old_services=old_services,
+                        new_services=new_services,
+                        old_channels=old_channels,
+                        new_channels=new_channels,
                         old_commands=old_commands,
                         new_commands=new_commands,
                         promote_latest=True,
+                        force_provisional=exclusive_endpoint_changed,
                         before_open=before_open,
                         after_open=after_open,
                     )
                 )
-            except BaseException:
-                endpoint_error: BaseException | None = None
+            except BaseException as publication_error:
                 skill_error: BaseException | None = None
                 runtime_error: BaseException | None = None
+                participant_restore_error = (
+                    publication_error
+                    if isinstance(
+                        publication_error,
+                        _PublicationParticipantRestoreError,
+                    )
+                    else None
+                )
                 if skill_links_switched:
                     try:
                         skill_linker.sync(stable_skill_plugins)
                     except BaseException as error:
                         skill_error = error
-                if endpoints_switched:
-                    try:
-                        await self._switch_plugin_endpoints(
-                            plugin_id,
-                            new_services,
-                            old_services,
-                            new_channels,
-                            old_channels,
-                            old_commands,
-                            old_commands,
-                        )
-                    except BaseException as error:
-                        endpoint_error = error
                 if runtime_restore_started:
                     try:
                         await self._rollback_composition_runtime_replacement(
@@ -2713,15 +2705,23 @@ class PluginManager:
                         previous_snapshot.snapshot_id,
                         None,
                     )
-                if runtime_error is None:
+                if (
+                    runtime_error is None
+                    and skill_error is None
+                    and participant_restore_error is None
+                ):
                     await self._snapshot_store.resume(quiesced_snapshot)
                 if (
                     runtime_error is None
+                    and skill_error is None
+                    and participant_restore_error is None
                     and self._endpoint_resumer is not None
                     and exclusive_endpoint_changed
                 ):
                     await self._endpoint_resumer()
-                recovery_error = runtime_error or endpoint_error or skill_error
+                recovery_error = (
+                    runtime_error or participant_restore_error or skill_error
+                )
                 if self._ready_candidate is ready and recovery_error is None:
                     _ = await self._drop_ready(plugin_id)
                 if recovery_error is not None:
@@ -2735,7 +2735,7 @@ class PluginManager:
                                 "old_runtime_restore_uncertain",
                             )
                         )
-                    if endpoint_error is not None:
+                    if participant_restore_error is not None:
                         recovery_resources.append("plugin-endpoint")
                         recovery_effects.append("endpoint_restore_uncertain")
                     if skill_error is not None:
@@ -3517,42 +3517,6 @@ class PluginManager:
                     error=f"endpoint_quiesce: {error_text}",
                 )
                 raise
-        endpoints_switched = False
-        if exclusive_endpoint_changed and not stage_latest:
-            try:
-                await self._switch_plugin_endpoints(
-                    plugin_id,
-                    old_services,
-                    new_services,
-                    old_channels,
-                    new_channels,
-                    old_commands,
-                    old_commands,
-                )
-                endpoints_switched = True
-            except (asyncio.CancelledError, Exception) as error:
-                error_text = str(error) or type(error).__name__
-                self._record_failed_gate(
-                    plugin_id=plugin_id,
-                    revision=generation.source_revision,
-                    check_id="endpoints",
-                    reason=error_text,
-                )
-                await self._snapshot_store.resume(quiesced_snapshot)
-                if self._endpoint_resumer is not None:
-                    await self._endpoint_resumer()
-                await self.discard_prepared(
-                    plugin_id,
-                    error=f"endpoints: {error_text}",
-                )
-                if isinstance(error, asyncio.CancelledError):
-                    raise
-                return self._publication_status(
-                    plugin_id,
-                    active=active,
-                    candidate=generation,
-                    publication_state="failed",
-                )
         transaction = self._snapshot_store.begin_publish(
             snapshot,
             admission_gated=quiesced_snapshot is not None,
@@ -3570,20 +3534,6 @@ class PluginManager:
         except (asyncio.CancelledError, Exception):
             _ = self._prepared_generations.pop(plugin_id, None)
             generation.state = "aborted"
-            invariant_endpoint_error: BaseException | None = None
-            if endpoints_switched:
-                try:
-                    await self._switch_plugin_endpoints(
-                        plugin_id,
-                        new_services,
-                        old_services,
-                        new_channels,
-                        old_channels,
-                        old_commands,
-                        old_commands,
-                    )
-                except BaseException as error:
-                    invariant_endpoint_error = error
             await self._abort_failed_publication(
                 generation,
                 transaction,
@@ -3591,10 +3541,6 @@ class PluginManager:
             )
             if self._endpoint_resumer is not None and exclusive_endpoint_changed:
                 await self._endpoint_resumer()
-            if invariant_endpoint_error is not None:
-                raise RuntimeError(
-                    "Snapshot abort 后旧端点恢复失败"
-                ) from invariant_endpoint_error
             raise
 
         if not stage_latest:
@@ -3614,20 +3560,6 @@ class PluginManager:
                 )
                 _ = self._prepared_generations.pop(plugin_id, None)
                 generation.state = "aborted"
-                production_endpoint_error: BaseException | None = None
-                if endpoints_switched:
-                    try:
-                        await self._switch_plugin_endpoints(
-                            plugin_id,
-                            new_services,
-                            old_services,
-                            new_channels,
-                            old_channels,
-                            old_commands,
-                            old_commands,
-                        )
-                    except BaseException as rollback_error:
-                        production_endpoint_error = rollback_error
                 previous_runtime = (
                     generation.replaced_composition_runtime_generation
                 )
@@ -3653,10 +3585,6 @@ class PluginManager:
                 )
                 if self._endpoint_resumer is not None and exclusive_endpoint_changed:
                     await self._endpoint_resumer()
-                if production_endpoint_error is not None:
-                    raise RuntimeError(
-                        "production Root 重建失败后旧端点恢复失败"
-                    ) from production_endpoint_error
                 raise
 
         commit_error: BaseException | None = None
@@ -3707,12 +3635,17 @@ class PluginManager:
                 )
             else:
                 _, commit_cancelled = await _complete_critical(
-                    self._commit_snapshot_with_command_catalog(
+                    self._commit_snapshot_with_publication_participants(
                         transaction,
                         plugin_id=plugin_id,
+                        old_services=old_services,
+                        new_services=new_services,
+                        old_channels=old_channels,
+                        new_channels=new_channels,
                         old_commands=old_commands,
                         new_commands=new_commands,
                         promote_latest=False,
+                        force_provisional=exclusive_endpoint_changed,
                         before_open=open_candidate,
                         after_open=(
                             None
@@ -3735,25 +3668,15 @@ class PluginManager:
                 )
             _ = self._prepared_generations.pop(plugin_id, None)
             generation.state = "aborted"
-            commit_endpoint_error: BaseException | None = None
-            if endpoints_switched:
-                try:
-                    await self._switch_plugin_endpoints(
-                        plugin_id,
-                        new_services,
-                        old_services,
-                        new_channels,
-                        old_channels,
-                        old_commands,
-                        old_commands,
-                    )
-                except BaseException as error:
-                    commit_endpoint_error = error
             await self._abort_failed_publication(
                 generation,
                 transaction,
                 error=str(commit_error) or type(commit_error).__name__,
                 finish_journal=False,
+                reopen_previous=not isinstance(
+                    commit_error,
+                    _PublicationParticipantRestoreError,
+                ),
             )
             runtime_restore_error: BaseException | None = None
             try:
@@ -3769,21 +3692,32 @@ class PluginManager:
                         "old_runtime_restore_uncertain",
                     ),
                 )
-            elif commit_endpoint_error is None:
+            else:
                 self._abort_reload(
                     generation,
                     error=str(commit_error) or type(commit_error).__name__,
                 )
-            if self._endpoint_resumer is not None and exclusive_endpoint_changed:
+            if (
+                self._endpoint_resumer is not None
+                and exclusive_endpoint_changed
+                and self.current_snapshot is not None
+                and self.current_snapshot.accepting_leases
+            ):
                 await self._endpoint_resumer()
-            if commit_endpoint_error is not None:
-                raise RuntimeError(
-                    "Snapshot commit 失败后旧端点恢复失败"
-                ) from commit_endpoint_error
             if runtime_restore_error is not None:
                 raise RuntimeError(
                     "Snapshot commit 失败后旧 v3 runtime 恢复失败"
                 ) from runtime_restore_error
+            if (
+                exclusive_endpoint_changed
+                and isinstance(commit_error, _PublicationParticipantSwitchError)
+            ):
+                return self._publication_status(
+                    plugin_id,
+                    active=active,
+                    candidate=generation,
+                    publication_state="failed",
+                )
             raise commit_error
         if commit_error is None:
             generation.publication_created_data_dir = False
@@ -4146,6 +4080,7 @@ class PluginManager:
         *,
         error: str,
         finish_journal: bool = True,
+        reopen_previous: bool = True,
     ) -> None:
         """撤销失败发布，并留下可被启动恢复判定的持久状态。"""
 
@@ -4159,7 +4094,12 @@ class PluginManager:
         # 2. snapshot drain 失败不能阻止已恢复 pointer 的 journal 终态。
         snapshot_error: BaseException | None = None
         try:
-            _, _ = await _complete_critical(self._snapshot_store.abort(transaction))
+            _, _ = await _complete_critical(
+                self._snapshot_store.abort(
+                    transaction,
+                    reopen_previous=reopen_previous,
+                )
+            )
         except BaseException as caught:
             snapshot_error = caught
         tx_id = generation.reload_tx_id

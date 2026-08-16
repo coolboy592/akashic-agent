@@ -1594,6 +1594,19 @@ async def test_runtime_snapshot_provisional_promotion_can_finalize_or_rollback(
     assert not latest.accepting_leases
 
     transaction = await store.promote_latest_provisional()
+    await store.rollback_provisional(
+        transaction,
+        keep_candidate_latest=True,
+        reopen_previous=False,
+    )
+    assert store.stable is stable
+    assert not stable.accepting_leases
+    with pytest.raises(RuntimeError, match="暂停接收"):
+        store.lease()
+    await store.resume(stable)
+    assert stable.accepting_leases
+
+    transaction = await store.promote_latest_provisional()
     await store.finalize_provisional(transaction)
     assert store.stable is latest
     assert latest.accepting_leases
@@ -2739,12 +2752,19 @@ async def test_managed_service_publish_drains_old_snapshot_before_switch(
     _ = (plugin_dir / "service.py").write_text("pass\n", encoding="utf-8")
     manager = _manager(tmp_path)
     await manager.load_all()
+    old_snapshot = manager.current_snapshot
+    assert old_snapshot is not None
     held = manager.snapshot_store.lease()
     switched = asyncio.Event()
 
     async def switch_services(plugin_id, old_services, new_services) -> None:
         assert plugin_id == "service_admission"
         assert old_services["worker"]["revision"] != new_services["worker"]["revision"]
+        assert manager.current_snapshot is old_snapshot
+        assert not old_snapshot.accepting_leases
+        provisional = manager.latest_snapshot
+        assert provisional is not None and provisional is not old_snapshot
+        assert not provisional.accepting_leases
         switched.set()
 
     manager.bind_service_switcher(switch_services)
@@ -2798,6 +2818,7 @@ async def test_endpoint_failure_resumes_admission_before_candidate_terminate(
     candidate = await manager.prepare_candidate("service_cleanup")
     assert candidate is not None
     terminated = asyncio.Event()
+    switch_calls = 0
 
     async def terminate() -> None:
         lease = await manager.snapshot_store.acquire()
@@ -2805,7 +2826,10 @@ async def test_endpoint_failure_resumes_admission_before_candidate_terminate(
         terminated.set()
 
     async def fail_switch(_plugin_id, _old, _new) -> None:
-        raise RuntimeError("endpoint failed")
+        nonlocal switch_calls
+        switch_calls += 1
+        if switch_calls == 1:
+            raise RuntimeError("endpoint failed")
 
     candidate.instance.terminate = terminate  # type: ignore[method-assign]
     manager.bind_service_switcher(fail_switch)
@@ -2816,6 +2840,7 @@ async def test_endpoint_failure_resumes_admission_before_candidate_terminate(
     )
 
     assert result["publication_state"] == "failed"
+    assert switch_calls == 2
     assert terminated.is_set()
     await manager.terminate_all()
 
