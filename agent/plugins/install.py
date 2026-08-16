@@ -34,6 +34,10 @@ from agent.plugins.manifest import (
 from agent.plugins.registry import plugin_registry
 from agent.plugins.composable import ComposablePlugin
 from agent.plugins.specs import McpServerSpec
+from agent.plugins.static_manifest import (
+    StaticPluginManifest,
+    load_static_plugin_manifest,
+)
 
 
 @dataclass(frozen=True)
@@ -189,20 +193,32 @@ def install_git_plugin(
         source_revision = _run_git(["rev-parse", "HEAD"], cwd=clone_root)
         if re.fullmatch(r"[0-9a-f]{40}", source_revision) is None:
             raise RuntimeError(f"插件 Git HEAD 无效: {source_revision}")
-        plugin_class = _load_plugin_entry(clone_root)
-        plugin_name = _validate_path_segment(
-            getattr(plugin_class, "name", None),
-            "插件 name",
-        )
-        plugin_version = _validate_path_segment(
-            getattr(plugin_class, "version", None),
-            "插件 version",
-        )
-        mcp_servers = _load_mcp_specs(plugin_class)
+        static_manifest = _load_optional_static_manifest(clone_root)
+        if static_manifest is not None:
+            # 1. Static v3 identity is available before any plugin import.
+            plugin_name = _validate_path_segment(static_manifest.name, "插件 name")
+            plugin_version = _validate_path_segment(
+                static_manifest.version,
+                "插件 version",
+            )
+            mcp_servers: list[McpServerSpec] = []
+        else:
+            # 2. The v2 transition path retains its class import and declarations.
+            plugin_class = _load_plugin_entry(clone_root)
+            plugin_name = _validate_path_segment(
+                getattr(plugin_class, "name", None),
+                "插件 name",
+            )
+            plugin_version = _validate_path_segment(
+                getattr(plugin_class, "version", None),
+                "插件 version",
+            )
+            mcp_servers = _load_mcp_specs(plugin_class)
         activation = _activate_plugin_version(
             plugin_name=plugin_name,
             plugin_version=plugin_version,
             mcp_servers=mcp_servers,
+            static_manifest=static_manifest,
             marketplace=marketplace,
             clone_root=clone_root,
             cache_root=cache_root,
@@ -293,6 +309,7 @@ def _activate_plugin_version(
     plugin_name: str,
     plugin_version: str,
     mcp_servers: list[McpServerSpec],
+    static_manifest: StaticPluginManifest | None,
     marketplace: str,
     clone_root: Path,
     cache_root: Path,
@@ -341,7 +358,10 @@ def _activate_plugin_version(
     try:
         # 2. 在不可发现的 staging 目录复制代码并准备依赖，旧版本保持可见
         _ = shutil.copytree(clone_root, staging_root, dirs_exist_ok=True)
-        _prepare_plugin_mcp_runtimes(staging_root, mcp_servers)
+        if static_manifest is not None:
+            _prepare_static_python_runtimes(staging_root, static_manifest)
+        else:
+            _prepare_plugin_mcp_runtimes(staging_root, mcp_servers)
 
         # 3. Artifact 只创建一次；一次原子写发布完整 stable/latest pair。
         if target_root.exists():
@@ -485,6 +505,34 @@ def _prepare_plugin_mcp_runtimes(
 ) -> None:
     for server in servers:
         _prepare_single_mcp_server(plugin_root=plugin_root, server=server)
+
+
+def _prepare_static_python_runtimes(
+    plugin_root: Path,
+    manifest: StaticPluginManifest,
+) -> None:
+    """Stage all manifest-declared Python runtimes before publishing an artifact."""
+
+    # 1. Each requirements parent owns its own immutable .venv.
+    for index, runtime in enumerate(manifest.python):
+        requirements = plugin_root / runtime.requirements
+        runtime_root = requirements.parent
+        _ = _ensure_python_runtime(
+            runtime_root,
+            requirements,
+            f"{manifest.name} python[{index}]",
+        )
+
+
+def _load_optional_static_manifest(
+    plugin_root: Path,
+) -> StaticPluginManifest | None:
+    """Load a v3 static manifest when present, without importing plugin.py."""
+
+    path = plugin_root / "akashic.plugin.toml"
+    if not path.exists() and not path.is_symlink():
+        return None
+    return load_static_plugin_manifest(plugin_root)
 
 
 def _prepare_single_mcp_server(

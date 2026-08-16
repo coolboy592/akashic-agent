@@ -13,6 +13,11 @@ from agent.plugins.composable import ComposablePlugin
 from agent.plugins.manifest import load_plugin_manifest, plugins_root
 from agent.plugins.registry import plugin_registry
 from agent.plugins.specs import McpServerSpec
+from agent.plugins.static_manifest import (
+    StaticPluginManifest,
+    load_static_plugin_manifest,
+    validate_module_exports,
+)
 
 
 def run_plugin_doctor(
@@ -165,8 +170,11 @@ PluginDeclaration = type[Plugin] | ComposablePlugin
 def _load_plugin_declaration(plugin_root: Path) -> PluginDeclaration:
     """读取一个 v3 namespace，或暂时兼容 v2 Plugin class。"""
 
+    static_manifest = _load_optional_static_manifest(plugin_root)
     module_name = f"akasic_plugin_doctor_{uuid.uuid4().hex}"
-    path = plugin_root / "plugin.py"
+    path = plugin_root / (
+        static_manifest.entrypoint if static_manifest is not None else "plugin.py"
+    )
     spec = importlib.util.spec_from_file_location(
         module_name,
         path,
@@ -178,7 +186,15 @@ def _load_plugin_declaration(plugin_root: Path) -> PluginDeclaration:
     sys.modules[module_name] = module
     try:
         spec.loader.exec_module(module)
+        if static_manifest is not None and getattr(module, "api_version", None) != 3:
+            raise ValueError("静态 v3 manifest 与 module api_version 不一致")
         if getattr(module, "api_version", None) == 3:
+            if static_manifest is not None:
+                validate_module_exports(
+                    static_manifest,
+                    module,
+                    plugin_root=plugin_root,
+                )
             return ComposablePlugin.from_module(module)
         # V2_REMOVAL(plugin-doctor-declaration)：最后一个 v2 插件迁移后删除
         # registry class 发现与 Plugin 子类校验。
@@ -191,6 +207,17 @@ def _load_plugin_declaration(plugin_root: Path) -> PluginDeclaration:
     finally:
         plugin_registry.remove_plugin(module_name)
         _ = sys.modules.pop(module_name, None)
+
+
+def _load_optional_static_manifest(
+    plugin_root: Path,
+) -> StaticPluginManifest | None:
+    """读取外部 v3 static manifest；无 manifest 时保留 v2 迁移期路径。"""
+
+    path = plugin_root / "akashic.plugin.toml"
+    if not path.exists() and not path.is_symlink():
+        return None
+    return load_static_plugin_manifest(plugin_root)
 
 
 def _check_capabilities(
