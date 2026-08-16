@@ -34,6 +34,7 @@ from agent.plugins.composable import ComposablePlugin
 logger = logging.getLogger(__name__)
 
 BeforeStartCallback = Callable[["ChannelStartRecord"], Awaitable[None]]
+ConfigRevisionChecker = Callable[["ChannelStartRecord"], Awaitable[None]]
 FailureCallback = Callable[["ChannelCleanupTombstone"], Awaitable[None] | None]
 
 
@@ -80,6 +81,10 @@ class ChannelCleanupTombstone:
     descriptor_digest: str
     target: str
     boot_owner: str
+    adapter_stop_settled: bool
+    adapter_stop_succeeded: bool
+    factory_close_settled: bool
+    factory_close_succeeded: bool
     resource: str
     error_type: str
     message: str
@@ -126,6 +131,10 @@ class _ChannelBindingState:
     stop_receipt: StopReceipt | None = None
     ready: ChannelReady | None = None
     internal_cancellation: str | None = None
+    adapter_stop_settled: bool = False
+    adapter_stop_succeeded: bool = False
+    factory_close_settled: bool = False
+    factory_close_succeeded: bool = False
 
     def __post_init__(self) -> None:
         self.drain_event.set()
@@ -252,15 +261,21 @@ class ChannelGeneration:
 
 
 class ChannelGenerationHost:
-    """Materialize and clean formal adapters from one exact committed snapshot."""
+    """Materialize formal adapters without retaining a plugin Fiber or Context."""
 
     def __init__(
         self,
         *,
-        on_before_start: BeforeStartCallback | None = None,
+        on_before_start: BeforeStartCallback,
+        config_revision_checker: ConfigRevisionChecker,
         on_failure: FailureCallback | None = None,
     ) -> None:
+        if not callable(on_before_start):
+            raise TypeError("on_before_start 必须是 async callback")
+        if not callable(config_revision_checker):
+            raise TypeError("config_revision_checker 必须是 async callback")
         self._on_before_start = on_before_start
+        self._config_revision_checker = config_revision_checker
         self._on_failure = on_failure
         self._bindings: dict[tuple[str, str], _ChannelBindingState] = {}
         self._tombstones: dict[tuple[str, str], ChannelCleanupTombstone] = {}
@@ -312,6 +327,8 @@ class ChannelGenerationHost:
         expected_names = {descriptor.name for descriptor in descriptors}
         if set(provider_client_factories) != expected_names:
             raise RuntimeError("provider client factory 必须与 committed channel catalog 精确匹配")
+        if not descriptors:
+            return ChannelGeneration(self, snapshot_id, ())
         if len({id(value) for value in provider_client_factories.values()}) != len(
             provider_client_factories
         ):
@@ -440,28 +457,28 @@ class ChannelGenerationHost:
             return
         await generation.drain()
 
-    async def retry_generation_cleanup(
-        self,
-        snapshot_id: str,
-        *,
-        binding_token: str | None = None,
-    ) -> None:
-        """Retry exact retained adapter/factory owners without re-entering composition."""
+    async def retry_generation_cleanup(self, binding_token: str) -> None:
+        """Retry one retained owner by exact binding token only."""
 
-        keys = tuple(
-            key
+        await self._retry_binding_cleanup(binding_token)
+
+    async def _retry_binding_cleanup(self, binding_token: str) -> None:
+        """Retry one tombstone only when its exact binding token is supplied."""
+
+        _text(binding_token, "binding_token")
+        matches = tuple(
+            (key, tombstone)
             for key, tombstone in self._tombstones.items()
-            if key[0] == snapshot_id
-            and (binding_token is None or tombstone.binding_token == binding_token)
+            if tombstone.binding_token == binding_token
         )
-        if not keys:
-            if binding_token is not None:
-                raise RuntimeError("channel cleanup binding token 不匹配")
-            return
+        if len(matches) != 1:
+            raise RuntimeError("channel cleanup binding token 未知或不唯一")
+        (key, tombstone), = matches
+        snapshot_id = key[0]
         lock = self._locks.setdefault(snapshot_id, asyncio.Lock())
         async with lock:
             cleanup_task = asyncio.create_task(
-                self._retry_keys(keys),
+                self._retry_keys((key,)),
                 name=f"channel_generation_retry:{snapshot_id}",
             )
             try:
@@ -472,21 +489,6 @@ class ChannelGenerationHost:
                 raise
             if not any(key[0] == snapshot_id for key in self._tombstones):
                 self._remove_generation(snapshot_id)
-
-    async def retry_binding_cleanup(self, binding_token: str) -> None:
-        """Retry one tombstone only when its exact binding token is supplied."""
-
-        matches = tuple(
-            tombstone
-            for tombstone in self._tombstones.values()
-            if tombstone.binding_token == binding_token
-        )
-        if len(matches) != 1:
-            raise RuntimeError("channel cleanup binding token 未知或不唯一")
-        await self.retry_generation_cleanup(
-            matches[0].snapshot_id,
-            binding_token=binding_token,
-        )
 
     def failure(
         self,
@@ -571,7 +573,7 @@ class ChannelGenerationHost:
             generation_id=generation.generation_id,
             channel_name=descriptor.name,
             module=module,
-            artifact_pointer=generation.module_path,
+            artifact_pointer=str(generation.plugin_dir),
             factory=factory,
             adapter=None,
             provider_client_factory=provider_client_factory,
@@ -607,8 +609,11 @@ class ChannelGenerationHost:
             boot_owner=state.boot_owner,
             attempt=state.start_attempt,
         )
-        if self._on_before_start is not None:
-            await _require_awaitable(self._on_before_start(record), "on_before_start")
+        await _require_awaitable(self._on_before_start(record), "on_before_start")
+        await _require_awaitable(
+            self._config_revision_checker(record),
+            "config_revision_checker",
+        )
         credentials = _resolve_credentials(state.config, state.credential_paths)
         state.factory_context = ChannelFactoryContext(
             snapshot_id=state.snapshot_id,
@@ -695,33 +700,59 @@ class ChannelGenerationHost:
         await state.drain_event.wait()
         try:
             failures: list[ChannelCleanupFailure] = []
-            receipt: StopReceipt | None = None
-            if state.start_attempted and state.adapter is not None:
+            receipt = state.stop_receipt
+            if not state.adapter_stop_succeeded:
+                state.adapter_stop_settled = False
+                if state.start_attempted and state.adapter is not None:
+                    try:
+                        result = await _invoke_async(state.adapter, "stop")
+                        if not isinstance(result, StopReceipt):
+                            raise TypeError("channel adapter.stop 返回值无效")
+                        if result.binding_token != state.binding_token:
+                            raise RuntimeError("channel stop receipt binding token 不匹配")
+                        if any(
+                            failure.binding_token != state.binding_token
+                            or failure.plugin_id != state.plugin_id
+                            or failure.generation_id != state.generation_id
+                            for failure in result.failures
+                        ):
+                            raise RuntimeError("channel stop receipt failure owner 不匹配")
+                        receipt = result
+                        state.stop_receipt = result
+                        failures.extend(result.failures)
+                        if not result.resources_closed:
+                            failures.append(
+                                _cleanup_failure(
+                                    state,
+                                    "adapter",
+                                    "adapter resources_closed=false",
+                                )
+                            )
+                        if not failures:
+                            state.adapter_stop_succeeded = True
+                    except BaseException as error:
+                        failures.append(_cleanup_failure(state, "adapter", str(error), error))
+                    finally:
+                        state.adapter_stop_settled = True
+                else:
+                    state.adapter_stop_succeeded = True
+                    state.adapter_stop_settled = True
+            if not state.factory_close_succeeded:
+                state.factory_close_settled = False
                 try:
-                    result = await _invoke_async(state.adapter, "stop")
-                    if not isinstance(result, StopReceipt):
-                        raise TypeError("channel adapter.stop 返回值无效")
-                    if result.binding_token != state.binding_token:
-                        raise RuntimeError("channel stop receipt binding token 不匹配")
-                    if any(
-                        failure.binding_token != state.binding_token
-                        or failure.plugin_id != state.plugin_id
-                        or failure.generation_id != state.generation_id
-                        for failure in result.failures
-                    ):
-                        raise RuntimeError("channel stop receipt failure owner 不匹配")
-                    receipt = result
-                    failures.extend(result.failures)
-                    if not result.resources_closed:
-                        failures.append(
-                            _cleanup_failure(state, "adapter", "adapter resources_closed=false")
-                        )
+                    await _close_provider_factory(state.provider_client_factory)
+                    state.factory_close_succeeded = True
                 except BaseException as error:
-                    failures.append(_cleanup_failure(state, "adapter", str(error), error))
-            try:
-                await _close_provider_factory(state.provider_client_factory)
-            except BaseException as error:
-                failures.append(_cleanup_failure(state, "provider-client-factory", str(error), error))
+                    failures.append(
+                        _cleanup_failure(
+                            state,
+                            "provider-client-factory",
+                            str(error),
+                            error,
+                        )
+                    )
+                finally:
+                    state.factory_close_settled = True
             if state.internal_cancellation is not None and not failures:
                 failures.append(
                     _cleanup_failure(
@@ -834,6 +865,10 @@ class ChannelGenerationHost:
             descriptor_digest=state.descriptor_digest,
             target=state.target,
             boot_owner=state.boot_owner,
+            adapter_stop_settled=state.adapter_stop_settled,
+            adapter_stop_succeeded=state.adapter_stop_succeeded,
+            factory_close_settled=state.factory_close_settled,
+            factory_close_succeeded=state.factory_close_succeeded,
             resource=failure.resource,
             error_type=type(error).__name__,
             message=str(error),
@@ -867,6 +902,9 @@ class ChannelGenerationHost:
         return tuple(key for key in self._bindings if key[0] == generation_id)
 
     def _remove_generation(self, generation_id: str) -> None:
+        states = [state for key, state in self._bindings.items() if key[0] == generation_id]
+        if any(not state.stopped for state in states):
+            return
         for key in tuple(self._bindings):
             if key[0] == generation_id:
                 self._bindings.pop(key, None)
@@ -875,7 +913,6 @@ class ChannelGenerationHost:
 
 
 ChannelHost = ChannelGenerationHost
-ChannelBindingLease = ChannelBinding
 
 
 def _require_committed_snapshot(snapshot: object) -> Any:
@@ -1061,6 +1098,5 @@ __all__ = [
     "ChannelGeneration",
     "ChannelGenerationHost",
     "ChannelHost",
-    "ChannelBindingLease",
     "ChannelStartRecord",
 ]

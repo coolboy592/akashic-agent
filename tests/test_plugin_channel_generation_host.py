@@ -98,6 +98,16 @@ class Adapter:
         return StopReceipt(self.context.binding_token, True)
 
 
+async def _noop_record(record: ChannelStartRecord) -> None:
+    return None
+
+
+def _host(**kwargs: Any) -> ChannelGenerationHost:
+    kwargs.setdefault("on_before_start", _noop_record)
+    kwargs.setdefault("config_revision_checker", _noop_record)
+    return ChannelGenerationHost(**kwargs)
+
+
 def _module(
     *,
     name: str = "feishu",
@@ -236,7 +246,7 @@ async def _make_snapshot(
 @pytest.mark.asyncio
 async def test_formal_binding_starts_closed_and_delivers_after_open() -> None:
     snapshot, factories, adapters = await _make_snapshot()
-    host = ChannelGenerationHost()
+    host = _host()
     generation = await host.start(snapshot, factories)
     binding = generation.channel("feishu")
     assert not binding.admission_open
@@ -263,7 +273,7 @@ async def test_formal_binding_starts_closed_and_delivers_after_open() -> None:
 @pytest.mark.asyncio
 async def test_wrong_binding_and_receipt_identity_fail_loud() -> None:
     snapshot, factories, _ = await _make_snapshot()
-    host = ChannelGenerationHost()
+    host = _host()
     generation = await host.start(snapshot, factories)
     binding = generation.channel("feishu")
     binding.open_admission()
@@ -272,7 +282,7 @@ async def test_wrong_binding_and_receipt_identity_fail_loud() -> None:
     await generation.stop()
 
     snapshot, factories, adapters = await _make_snapshot(wrong_receipt=True)
-    host = ChannelGenerationHost()
+    host = _host()
     generation = await host.start(snapshot, factories)
     binding = generation.channel("feishu")
     binding.open_admission()
@@ -293,14 +303,17 @@ async def test_journal_callback_happens_before_start_and_failure_keeps_count_zer
         records.append(record)
         events.append("journal")
 
-    host = ChannelGenerationHost(on_before_start=before)
+    async def check(record: ChannelStartRecord) -> None:
+        events.append("config-check")
+
+    host = _host(on_before_start=before, config_revision_checker=check)
     generation = await host.start(snapshot, factories)
-    assert events == ["journal", "factory"]
+    assert events == ["journal", "config-check", "factory"]
     assert records[0].source_revision == "source-1"
     assert records[0].config_revision == "config-1"
     assert len(records[0].descriptor_digest) == 64
     assert records[0].factory_export == "make_adapter"
-    assert records[0].artifact_pointer == "plugins/feishu/plugin.py"
+    assert records[0].artifact_pointer == "/tmp/plugin"
     assert records[0].target == "formal"
     assert records[0].boot_owner == "plugin-manager"
     assert host.start_count(snapshot.snapshot_id, "feishu") == 1
@@ -311,11 +324,60 @@ async def test_journal_callback_happens_before_start_and_failure_keeps_count_zer
 
     events = []
     snapshot, _, _ = await _make_snapshot(factory_events=events)
-    host = ChannelGenerationHost(on_before_start=fail_before)
+    host = _host(on_before_start=fail_before)
     with pytest.raises(RuntimeError, match="journal failed"):
         await host.start(snapshot, {"feishu": ClientFactory()})
     assert host.start_count(snapshot.snapshot_id, "feishu") == 0
     assert events == []
+
+
+def test_durable_callbacks_are_mandatory() -> None:
+    with pytest.raises(TypeError):
+        ChannelGenerationHost(
+            on_before_start=None,  # type: ignore[arg-type]
+            config_revision_checker=_noop_record,
+        )
+    with pytest.raises(TypeError):
+        ChannelGenerationHost(
+            on_before_start=_noop_record,
+            config_revision_checker=None,  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.asyncio
+async def test_config_revision_checker_failure_is_before_factory_and_start() -> None:
+    events: list[str] = []
+    snapshot, factories, _ = await _make_snapshot(factory_events=events)
+
+    async def check(record: ChannelStartRecord) -> None:
+        raise RuntimeError("config revision drift")
+
+    host = _host(config_revision_checker=check)
+    with pytest.raises(RuntimeError, match="config revision drift"):
+        await host.start(snapshot, factories)
+    assert events == []
+    assert factories["feishu"].closed == 1
+    assert host.start_count(snapshot.snapshot_id, "feishu") == 0
+
+
+@pytest.mark.asyncio
+async def test_empty_registry_is_repeatable_noop_without_lock_or_fiber_owner() -> None:
+    snapshot, _, _ = await _make_snapshot()
+    root_token = snapshot.composition_root.instance_token
+    empty_channels = PluginChannels(root_token)
+    empty_registry = _freeze_plugin_channels(empty_channels, root_token)
+    snapshot.channel_registry = empty_registry
+    snapshot.channel_registry_identity = empty_registry.identity
+    snapshot.generations = {}
+    host = _host()
+    first = await host.start(snapshot, {})
+    second = await host.start(snapshot, {})
+    assert first.snapshot_id == second.snapshot_id == snapshot.snapshot_id
+    assert await first.stop() == ()
+    assert await second.stop() == ()
+    assert host._locks == {}
+    assert not hasattr(host, "fiber")
+    assert not hasattr(host, "context")
 
 
 @pytest.mark.asyncio
@@ -326,7 +388,7 @@ async def test_partial_start_rolls_back_started_adapter_and_provider_factory() -
         module=module,
         fail_after=2,
     )
-    host = ChannelGenerationHost()
+    host = _host()
     with pytest.raises(RuntimeError, match="start failed"):
         await host.start(snapshot, failing_factories)
     assert all(factory.closed == 1 for factory in failing_factories.values())
@@ -338,26 +400,54 @@ async def test_partial_start_rolls_back_started_adapter_and_provider_factory() -
 @pytest.mark.asyncio
 async def test_stop_failure_retains_tombstone_and_retry_cleans_exact_owner() -> None:
     snapshot, factories, adapters = await _make_snapshot(fail_stop=True)
-    host = ChannelGenerationHost()
+    host = _host()
     generation = await host.start(snapshot, factories)
     with pytest.raises(RuntimeError, match="cleanup"):
         await generation.stop()
     tombstone = host.failure(snapshot.snapshot_id, "feishu")
     assert tombstone is not None
     assert tombstone.binding_token == generation.channel("feishu").binding_token
-    assert tombstone.artifact_pointer == "plugins/feishu/plugin.py"
+    assert tombstone.artifact_pointer == "/tmp/plugin"
     assert tombstone.factory_export == "make_adapter"
     assert tombstone.source_revision == "source-1"
     assert tombstone.config_revision == "config-1"
     assert len(tombstone.descriptor_digest) == 64
     assert tombstone.target == "formal"
     assert tombstone.boot_owner == "plugin-manager"
+    assert tombstone.adapter_stop_settled is True
+    assert tombstone.adapter_stop_succeeded is False
+    assert tombstone.factory_close_settled is True
+    assert tombstone.factory_close_succeeded is True
     with pytest.raises(RuntimeError, match="未知"):
-        await host.retry_binding_cleanup("wrong-binding-token")
+        await host.retry_generation_cleanup("wrong-binding-token")
     adapter = next(iter(adapters.values()))
     adapter.fail_stop = False
-    await host.retry_generation_cleanup(snapshot.snapshot_id)
+    await host.retry_generation_cleanup(tombstone.binding_token)
+    assert adapter.stopped == 2
+    assert factories["feishu"].closed == 1
     assert host.failure(snapshot.snapshot_id) is None
+
+
+@pytest.mark.asyncio
+async def test_retry_skips_successful_adapter_stop_when_factory_close_failed() -> None:
+    snapshot, factories, adapters = await _make_snapshot()
+    factories["feishu"].fail_close = True
+    host = _host()
+    generation = await host.start(snapshot, factories)
+    with pytest.raises(RuntimeError, match="cleanup"):
+        await generation.stop()
+    adapter = next(iter(adapters.values()))
+    assert adapter.stopped == 1
+    assert factories["feishu"].closed == 1
+    tombstone = host.failure(snapshot.snapshot_id, "feishu")
+    assert tombstone is not None
+    assert tombstone.adapter_stop_succeeded is True
+    assert tombstone.factory_close_settled is True
+    assert tombstone.factory_close_succeeded is False
+    factories["feishu"].fail_close = False
+    await host.retry_generation_cleanup(tombstone.binding_token)
+    assert adapter.stopped == 1
+    assert factories["feishu"].closed == 2
 
 
 @pytest.mark.asyncio
@@ -367,7 +457,7 @@ async def test_provider_cancel_and_failure_callback_cancel_retain_tombstone() ->
     async def on_failure(record: Any) -> None:
         raise asyncio.CancelledError
 
-    host = ChannelGenerationHost(on_failure=on_failure)
+    host = _host(on_failure=on_failure)
     generation = await host.start(snapshot, factories)
     with pytest.raises(RuntimeError, match="cleanup"):
         await generation.stop()
@@ -377,25 +467,25 @@ async def test_provider_cancel_and_failure_callback_cancel_retain_tombstone() ->
 @pytest.mark.asyncio
 async def test_factory_and_adapter_start_cancellation_keep_exact_tombstones() -> None:
     snapshot, factories, _ = await _make_snapshot(cancel_factory=True)
-    host = ChannelGenerationHost()
+    host = _host()
     with pytest.raises(asyncio.CancelledError):
         await host.start(snapshot, factories)
     factory_failure = host.failure(snapshot.snapshot_id, "feishu")
     assert factory_failure is not None
     assert factory_failure.binding_token
     assert factories["feishu"].closed == 1
-    await host.retry_binding_cleanup(factory_failure.binding_token)
+    await host.retry_generation_cleanup(factory_failure.binding_token)
     assert host.failure(snapshot.snapshot_id) is None
 
     snapshot, factories, adapters = await _make_snapshot(cancel_start=True)
-    host = ChannelGenerationHost()
+    host = _host()
     with pytest.raises(asyncio.CancelledError):
         await host.start(snapshot, factories)
     adapter_failure = host.failure(snapshot.snapshot_id, "feishu")
     assert adapter_failure is not None
     assert adapter_failure.adapter is next(iter(adapters.values()))
     assert factories["feishu"].closed == 1
-    await host.retry_binding_cleanup(adapter_failure.binding_token)
+    await host.retry_generation_cleanup(adapter_failure.binding_token)
     assert host.failure(snapshot.snapshot_id) is None
 
 
@@ -408,13 +498,13 @@ async def test_async_factory_and_noncallable_factory_are_rejected_before_start()
 
     setattr(snapshot.generations["plugin.feishu"].instance.module, "make_adapter", async_factory)
     with pytest.raises(TypeError, match="async"):
-        await ChannelGenerationHost().start(snapshot, factories)
+        await _host().start(snapshot, factories)
     assert factories["feishu"].closed == 0
 
     snapshot, factories, _ = await _make_snapshot()
     setattr(snapshot.generations["plugin.feishu"].instance.module, "make_adapter", None)
     with pytest.raises(TypeError, match="不可调用"):
-        await ChannelGenerationHost().start(snapshot, factories)
+        await _host().start(snapshot, factories)
 
 
 @pytest.mark.asyncio
@@ -422,18 +512,18 @@ async def test_exact_root_and_factory_provenance_are_required() -> None:
     snapshot, factories, _ = await _make_snapshot()
     snapshot.composition_root = SimpleNamespace(instance_token=object())
     with pytest.raises(RuntimeError, match="exact composition Root"):
-        await ChannelGenerationHost().start(snapshot, factories)
+        await _host().start(snapshot, factories)
 
     snapshot, factories, _ = await _make_snapshot()
     object.__setattr__(snapshot.channel_registry.factories[0], "config_revision", "drift")
     with pytest.raises(RuntimeError):
-        await ChannelGenerationHost().start(snapshot, factories)
+        await _host().start(snapshot, factories)
 
 
 @pytest.mark.asyncio
 async def test_caller_cancellation_waits_for_cleanup() -> None:
     snapshot, factories, adapters = await _make_snapshot(block_stop=True)
-    host = ChannelGenerationHost()
+    host = _host()
     generation = await host.start(snapshot, factories)
     stop_task = asyncio.create_task(generation.stop())
     adapter = next(iter(adapters.values()))
