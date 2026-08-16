@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import math
@@ -9,7 +10,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, time
 from enum import StrEnum
 from types import MappingProxyType
-from typing import Protocol
+from typing import Protocol, TypeAlias
 
 from agent.plugin_composition.context import Context, FiberHandle, HealthHandle
 from agent.plugin_composition.model import CompositionError, IncidentView, ServiceKey
@@ -80,6 +81,270 @@ class DeliveryStatus(StrEnum):
     DELIVERED = "delivered"
     REJECTED = "rejected"
     UNKNOWN = "unknown"
+
+
+JsonValue: TypeAlias = (
+    None
+    | bool
+    | int
+    | float
+    | str
+    | tuple["JsonValue", ...]
+    | Mapping[str, "JsonValue"]
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ChannelInboundMessage:
+    """Represent one provider text message without retaining mutable input state."""
+
+    channel: str
+    sender: str
+    chat_id: str
+    content: str
+    timestamp: datetime
+    metadata: Mapping[str, JsonValue]
+
+    def __post_init__(self) -> None:
+        _text(self.channel, "channel")
+        _text(self.sender, "sender")
+        _text(self.chat_id, "chat_id")
+        _string(self.content, "content")
+        if not isinstance(self.timestamp, datetime):
+            raise TypeError("timestamp 必须是 datetime")
+        if self.timestamp.tzinfo is None or self.timestamp.utcoffset() is None:
+            raise ValueError("timestamp 必须是 timezone-aware datetime")
+        object.__setattr__(self, "metadata", _freeze_json_mapping(self.metadata))
+
+
+class InboundOwner(StrEnum):
+    INGRESS = "ingress"
+    BUS = "bus"
+    LANE = "lane"
+    LOOP = "loop"
+    CLOSED = "closed"
+
+
+class InboundState(StrEnum):
+    ADMITTED = "admitted"
+    BUS_QUEUED = "bus_queued"
+    LANE_QUEUED = "lane_queued"
+    RUNNING = "running"
+    TERMINAL = "terminal"
+
+
+class ChannelBindingLease(Protocol):
+    snapshot_lease: object
+    snapshot_id: str
+    generation_id: str
+    channel_name: str
+    binding_token: str
+
+    async def aclose(self) -> None: ...
+
+
+@dataclass(slots=True, kw_only=True)
+class InboundEnvelope:
+    """Own one inbound message lease through its fixed Core processing path."""
+
+    message_id: str
+    snapshot_id: str
+    generation_id: str
+    binding_token: str
+    message: ChannelInboundMessage
+    lease: ChannelBindingLease
+    state: InboundState = InboundState.ADMITTED
+    owner: InboundOwner = InboundOwner.INGRESS
+    _closed_by: InboundOwner | None = field(
+        default=None,
+        init=False,
+        repr=False,
+        compare=False,
+    )
+
+    def __post_init__(self) -> None:
+        _message_id(self.message_id)
+        _text(self.snapshot_id, "snapshot_id")
+        _text(self.generation_id, "generation_id")
+        _text(self.binding_token, "binding_token")
+        if not isinstance(self.message, ChannelInboundMessage):
+            raise TypeError("message 必须是 ChannelInboundMessage")
+        _validate_binding_lease(self.lease)
+        if not isinstance(self.state, InboundState):
+            raise TypeError("state 必须是 InboundState")
+        if not isinstance(self.owner, InboundOwner):
+            raise TypeError("owner 必须是 InboundOwner")
+        if (self.owner, self.state) not in _INBOUND_STATES:
+            raise ValueError("InboundEnvelope owner/state 组合无效")
+        if self.state is InboundState.TERMINAL or self.owner is InboundOwner.CLOSED:
+            raise ValueError("terminal envelope 只能由 close() 产生")
+        if self.lease.snapshot_id != self.snapshot_id:
+            raise ValueError("InboundEnvelope snapshot_id 与 lease 不一致")
+        if self.lease.generation_id != self.generation_id:
+            raise ValueError("InboundEnvelope generation_id 与 lease 不一致")
+        if self.lease.binding_token != self.binding_token:
+            raise ValueError("InboundEnvelope binding_token 与 lease 不一致")
+        if self.lease.channel_name != self.message.channel:
+            raise ValueError("InboundEnvelope channel 与 lease 不一致")
+
+    def handoff(
+        self,
+        expected_owner: InboundOwner,
+        next_owner: InboundOwner,
+    ) -> InboundEnvelope:
+        """Transfer the sole close owner along the fixed inbound path."""
+
+        if not isinstance(expected_owner, InboundOwner):
+            raise TypeError("expected_owner 必须是 InboundOwner")
+        if not isinstance(next_owner, InboundOwner):
+            raise TypeError("next_owner 必须是 InboundOwner")
+        if self._closed_by is not None or self.state is InboundState.TERMINAL:
+            raise CompositionError(
+                "INBOUND_ENVELOPE_TERMINAL",
+                "terminal inbound envelope 不能 handoff",
+            )
+        if self.owner is not expected_owner:
+            raise CompositionError(
+                "INBOUND_ENVELOPE_OWNER_MISMATCH",
+                f"inbound envelope 当前 owner 是 {self.owner.value}，不是 {expected_owner.value}",
+            )
+        transition = _INBOUND_TRANSITIONS.get((expected_owner, self.state))
+        if transition is not next_owner:
+            raise CompositionError(
+                "INBOUND_ENVELOPE_INVALID_HANDOFF",
+                f"不能从 {expected_owner.value}/{self.state.value} 转移到 {next_owner.value}",
+            )
+        self.owner = next_owner
+        self.state = _INBOUND_STATE_BY_OWNER[next_owner]
+        return self
+
+    async def close(self, expected_owner: InboundOwner) -> None:
+        """Release the exact lease before publishing terminal state."""
+
+        if not isinstance(expected_owner, InboundOwner):
+            raise TypeError("expected_owner 必须是 InboundOwner")
+        if self._closed_by is not None:
+            if expected_owner is not self._closed_by:
+                raise CompositionError(
+                    "INBOUND_ENVELOPE_CLOSE_OWNER_MISMATCH",
+                    "inbound envelope 已由另一 owner close",
+                )
+            return
+        if self.owner is not expected_owner:
+            raise CompositionError(
+                "INBOUND_ENVELOPE_OWNER_MISMATCH",
+                f"inbound envelope 当前 owner 是 {self.owner.value}，不是 {expected_owner.value}",
+            )
+        cancelled = await _close_lease_critically(self.lease)
+        self._closed_by = expected_owner
+        self.state = InboundState.TERMINAL
+        self.owner = InboundOwner.CLOSED
+        if cancelled:
+            raise asyncio.CancelledError
+
+
+@dataclass(frozen=True, slots=True)
+class RawInbound:
+    """Carry provider identity and a frozen text projection to Core admission."""
+
+    message_id: str
+    message: ChannelInboundMessage
+    provider_identity: str | None = None
+    recipient: str | None = None
+
+    def __post_init__(self) -> None:
+        _message_id(self.message_id)
+        if not isinstance(self.message, ChannelInboundMessage):
+            raise TypeError("message 必须是 ChannelInboundMessage")
+        if self.provider_identity is not None:
+            _text(self.provider_identity, "provider_identity")
+        if self.recipient is not None:
+            _text(self.recipient, "recipient")
+
+
+@dataclass(frozen=True, slots=True)
+class OutboundEnvelope:
+    """Identify one exact channel delivery attempt and its immutable payload."""
+
+    logical_delivery_id: str
+    delivery_id: str
+    attempt_sequence: int
+    snapshot_id: str
+    generation_id: str
+    binding_token: str
+    channel: str
+    recipient: str
+    body: str
+    metadata: Mapping[str, JsonValue]
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "logical_delivery_id",
+            "delivery_id",
+            "snapshot_id",
+            "generation_id",
+            "binding_token",
+            "channel",
+            "recipient",
+        ):
+            _text(getattr(self, field_name), field_name)
+        _string(self.body, "body")
+        if isinstance(self.attempt_sequence, bool) or not isinstance(
+            self.attempt_sequence, int
+        ) or self.attempt_sequence < 1:
+            raise ValueError("attempt_sequence 必须是正整数")
+        if self.attempt_sequence == 1 and self.logical_delivery_id != self.delivery_id:
+            raise ValueError("首次 delivery 的 logical_delivery_id 必须等于 delivery_id")
+        if self.attempt_sequence > 1 and self.logical_delivery_id == self.delivery_id:
+            raise ValueError("重试 attempt 必须生成新的 delivery_id")
+        object.__setattr__(self, "metadata", _freeze_json_mapping(self.metadata))
+
+
+@dataclass(frozen=True, slots=True)
+class ChannelDeliveryReceipt:
+    """Report a settled provider delivery attempt without encoding retry policy."""
+
+    delivery_id: str
+    status: DeliveryStatus
+    provider_ids: tuple[str, ...] = ()
+    error: str | None = None
+
+    def __post_init__(self) -> None:
+        _text(self.delivery_id, "delivery_id")
+        if not isinstance(self.status, DeliveryStatus):
+            raise TypeError("status 必须是 DeliveryStatus")
+        object.__setattr__(self, "provider_ids", _text_tuple(self.provider_ids, "provider_ids"))
+        if self.error is not None:
+            _text(self.error, "error")
+
+
+@dataclass(frozen=True, slots=True)
+class QueuedReceipt:
+    """Represent queue admission separately from a settled delivery receipt."""
+
+    delivery_id: str
+    queued: bool
+
+    def __post_init__(self) -> None:
+        _text(self.delivery_id, "delivery_id")
+        if not isinstance(self.queued, bool):
+            raise TypeError("queued 必须是 bool")
+
+
+@dataclass(frozen=True, slots=True)
+class PushToolRequest:
+    """Carry a direct push request before it is converted to an outbound envelope."""
+
+    channel: str
+    recipient: str
+    body: str
+    metadata: Mapping[str, JsonValue]
+
+    def __post_init__(self) -> None:
+        _text(self.channel, "channel")
+        _text(self.recipient, "recipient")
+        _string(self.body, "body")
+        object.__setattr__(self, "metadata", _freeze_json_mapping(self.metadata))
 
 
 @dataclass(frozen=True, slots=True)
@@ -710,6 +975,105 @@ def _freeze_channel_config(value: object, *, seen: frozenset[int] = frozenset())
     raise TypeError(f"channel factory config 值类型无效: {type(value).__name__}")
 
 
+_INBOUND_STATES = {
+    (InboundOwner.INGRESS, InboundState.ADMITTED),
+    (InboundOwner.BUS, InboundState.BUS_QUEUED),
+    (InboundOwner.LANE, InboundState.LANE_QUEUED),
+    (InboundOwner.LOOP, InboundState.RUNNING),
+}
+
+_INBOUND_TRANSITIONS = {
+    (InboundOwner.INGRESS, InboundState.ADMITTED): InboundOwner.BUS,
+    (InboundOwner.BUS, InboundState.BUS_QUEUED): InboundOwner.LANE,
+    (InboundOwner.LANE, InboundState.LANE_QUEUED): InboundOwner.LOOP,
+}
+
+_INBOUND_STATE_BY_OWNER = {
+    InboundOwner.BUS: InboundState.BUS_QUEUED,
+    InboundOwner.LANE: InboundState.LANE_QUEUED,
+    InboundOwner.LOOP: InboundState.RUNNING,
+}
+
+
+def _validate_binding_lease(lease: object) -> None:
+    """Check the narrow exact-binding fields before an envelope retains a lease."""
+
+    for field_name in (
+        "snapshot_lease",
+        "snapshot_id",
+        "generation_id",
+        "channel_name",
+        "binding_token",
+    ):
+        if not hasattr(lease, field_name):
+            raise TypeError(f"ChannelBindingLease 缺少 {field_name}")
+    aclose = getattr(lease, "aclose", None)
+    if not callable(aclose):
+        raise TypeError("ChannelBindingLease.aclose 必须是 callable")
+    _text(getattr(lease, "snapshot_id"), "lease.snapshot_id")
+    _text(getattr(lease, "generation_id"), "lease.generation_id")
+    _text(getattr(lease, "channel_name"), "lease.channel_name")
+    _text(getattr(lease, "binding_token"), "lease.binding_token")
+
+
+async def _close_lease_critically(lease: ChannelBindingLease) -> bool:
+    """Finish lease cleanup before restoring caller cancellation."""
+
+    task = asyncio.ensure_future(lease.aclose())
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+    # Reading the task result preserves a real lease-close failure.
+    task.result()
+    return cancelled
+
+
+def _freeze_json_mapping(value: object) -> Mapping[str, JsonValue]:
+    if not isinstance(value, Mapping):
+        raise TypeError("metadata 必须是 mapping")
+    frozen = _freeze_json_value(value)
+    assert isinstance(frozen, Mapping)
+    return frozen
+
+
+def _freeze_json_value(
+    value: object,
+    *,
+    seen: frozenset[int] = frozenset(),
+) -> JsonValue:
+    """Freeze JSON-shaped metadata and reject mutable or non-finite values."""
+
+    if value is None or isinstance(value, (bool, int, str)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("metadata 不接受非有限 float")
+        return value
+    if isinstance(value, Mapping):
+        marker = id(value)
+        if marker in seen:
+            raise ValueError("metadata 不接受 cycle")
+        keys = tuple(value.keys())
+        if any(not isinstance(key, str) for key in keys):
+            raise TypeError("metadata mapping key 必须是 str")
+        next_seen = seen | {marker}
+        result = {
+            key: _freeze_json_value(value[key], seen=next_seen)
+            for key in sorted(keys)
+        }
+        return MappingProxyType(result)
+    if isinstance(value, (list, tuple)):
+        marker = id(value)
+        if marker in seen:
+            raise ValueError("metadata 不接受 cycle")
+        next_seen = seen | {marker}
+        return tuple(_freeze_json_value(item, seen=next_seen) for item in value)
+    raise TypeError(f"metadata 值类型无效: {type(value).__name__}")
+
+
 def _text_tuple(value: object, field_name: str) -> tuple[str, ...]:
     if not isinstance(value, tuple):
         raise TypeError(f"{field_name} 必须是 tuple")
@@ -727,13 +1091,30 @@ def _text(value: object, field_name: str) -> str:
     return value
 
 
+def _message_id(value: object) -> str:
+    result = _text(value, "message_id")
+    if len(result) > 256:
+        raise ValueError("message_id 长度必须在 1～256 字符")
+    return result
+
+
+def _string(value: object, field_name: str) -> str:
+    if not isinstance(value, str):
+        raise TypeError(f"{field_name} 必须是 str")
+    if any(ord(char) < 32 for char in value):
+        raise ValueError(f"{field_name} 不能包含控制字符")
+    return value
+
+
 __all__ = [
     "CHANNELS",
     "ChannelAdapter",
     "ChannelCapability",
     "ChannelCleanupFailure",
+    "ChannelDeliveryReceipt",
     "ChannelFactoryContext",
     "ChannelReady",
+    "ChannelInboundMessage",
     "CredentialRef",
     "DeliveryStatus",
     "ChannelDefinition",
@@ -741,12 +1122,20 @@ __all__ = [
     "ChannelFactoryFreezeInput",
     "ChannelFactoryProvenance",
     "ChannelRegistrySnapshot",
+    "InboundEnvelope",
     "InboundIdentity",
+    "InboundOwner",
+    "InboundState",
+    "JsonValue",
+    "OutboundEnvelope",
     "PluginChannels",
     "ProviderClient",
     "ProviderClientFactory",
     "ProviderDeliveryReceipt",
     "ProviderDeliveryRequest",
+    "PushToolRequest",
+    "QueuedReceipt",
+    "RawInbound",
     "StopReceipt",
     "_freeze_plugin_channels",
 ]

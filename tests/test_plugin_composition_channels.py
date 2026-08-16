@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -7,6 +9,8 @@ import pytest
 from agent.plugin_composition import (
     CHANNELS,
     ChannelCapability,
+    ChannelDeliveryReceipt,
+    ChannelInboundMessage,
     ChannelCleanupFailure,
     ChannelDefinition,
     ChannelFactoryContext,
@@ -16,10 +20,17 @@ from agent.plugin_composition import (
     CredentialRef,
     DeliveryStatus,
     InboundIdentity,
+    InboundEnvelope,
+    InboundOwner,
+    InboundState,
+    OutboundEnvelope,
     PluginChannels,
     PluginRuntime,
     ProviderDeliveryReceipt,
     ProviderDeliveryRequest,
+    PushToolRequest,
+    QueuedReceipt,
+    RawInbound,
     StopReceipt,
 )
 from agent.plugin_composition.channels import (
@@ -64,6 +75,44 @@ def _provenance(name: str, *, generation: str = "plugin-generation") -> ChannelF
         source_revision="source-1",
         config_revision="config-1",
         factory_export=definition.factory_export,
+    )
+
+
+class _Lease:
+    snapshot_lease = object()
+    snapshot_id = "snapshot"
+    generation_id = "generation"
+    channel_name = "feishu"
+    binding_token = "binding"
+
+    def __init__(self) -> None:
+        self.close_calls = 0
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def aclose(self) -> None:
+        self.close_calls += 1
+        self.started.set()
+        await self.release.wait()
+
+
+def _inbound_envelope(lease: _Lease | None = None) -> InboundEnvelope:
+    actual_lease = lease or _Lease()
+    message = ChannelInboundMessage(
+        channel="feishu",
+        sender="sender",
+        chat_id="chat",
+        content="hello",
+        timestamp=datetime.now(timezone.utc),
+        metadata={"nested": {"items": [1, "two"]}},
+    )
+    return InboundEnvelope(
+        message_id="provider-message",
+        snapshot_id="snapshot",
+        generation_id="generation",
+        binding_token="binding",
+        message=message,
+        lease=actual_lease,
     )
 
 
@@ -352,3 +401,157 @@ def test_channel_provider_delivery_and_cleanup_receipts_are_typed() -> None:
         resources_closed=False,
         failures=(failure,),
     ).failures == (failure,)
+
+
+def test_c14c_metadata_is_recursively_frozen_and_rejects_unsafe_values() -> None:
+    metadata = {"nested": {"items": [1, "two"]}}
+    message = ChannelInboundMessage(
+        channel="feishu",
+        sender="sender",
+        chat_id="chat",
+        content="hello",
+        timestamp=datetime.now(timezone.utc),
+        metadata=metadata,
+    )
+    outbound = OutboundEnvelope(
+        logical_delivery_id="delivery",
+        delivery_id="delivery",
+        attempt_sequence=1,
+        snapshot_id="snapshot",
+        generation_id="generation",
+        binding_token="binding",
+        channel="feishu",
+        recipient="chat",
+        body="hello",
+        metadata=metadata,
+    )
+    push = PushToolRequest(
+        channel="feishu",
+        recipient="chat",
+        body="hello",
+        metadata=metadata,
+    )
+    metadata["nested"]["items"].append("source mutation")
+    assert message.metadata["nested"]["items"] == (1, "two")  # type: ignore[index]
+    assert outbound.metadata["nested"]["items"] == (1, "two")  # type: ignore[index]
+    assert push.metadata["nested"]["items"] == (1, "two")  # type: ignore[index]
+
+    with pytest.raises(TypeError):
+        message.metadata["new"] = "value"  # type: ignore[index]
+    with pytest.raises(ValueError, match="非有限"):
+        _ = ChannelInboundMessage(
+            channel="feishu",
+            sender="sender",
+            chat_id="chat",
+            content="hello",
+            timestamp=datetime.now(timezone.utc),
+            metadata={"bad": float("nan")},
+        )
+    with pytest.raises(ValueError, match="timezone-aware"):
+        _ = ChannelInboundMessage(
+            channel="feishu",
+            sender="sender",
+            chat_id="chat",
+            content="hello",
+            timestamp=datetime.now(),
+            metadata={},
+        )
+    with pytest.raises(TypeError, match="值类型无效"):
+        _ = PushToolRequest(
+            channel="feishu",
+            recipient="chat",
+            body="hello",
+            metadata={"bad": {"not", "json"}},  # type: ignore[dict-item]
+        )
+
+
+def test_raw_inbound_and_outbound_receipts_enforce_identity_contract() -> None:
+    envelope = _inbound_envelope()
+    raw = RawInbound(message_id="provider-message", message=envelope.message)
+    assert raw.message is envelope.message
+    with pytest.raises(ValueError, match="1～256"):
+        _ = RawInbound(message_id="x" * 257, message=envelope.message)
+    assert ChannelDeliveryReceipt(
+        delivery_id="delivery",
+        status=DeliveryStatus.UNKNOWN,
+        error="provider effect uncertain",
+    ).status is DeliveryStatus.UNKNOWN
+    assert QueuedReceipt(delivery_id="delivery", queued=True).queued is True
+
+    with pytest.raises(ValueError, match="首次 delivery"):
+        _ = OutboundEnvelope(
+            logical_delivery_id="logical",
+            delivery_id="delivery",
+            attempt_sequence=1,
+            snapshot_id="snapshot",
+            generation_id="generation",
+            binding_token="binding",
+            channel="feishu",
+            recipient="chat",
+            body="hello",
+            metadata={},
+        )
+    with pytest.raises(ValueError, match="新的 delivery_id"):
+        _ = OutboundEnvelope(
+            logical_delivery_id="delivery",
+            delivery_id="delivery",
+            attempt_sequence=2,
+            snapshot_id="snapshot",
+            generation_id="generation",
+            binding_token="binding",
+            channel="feishu",
+            recipient="chat",
+            body="hello",
+            metadata={},
+        )
+
+
+@pytest.mark.asyncio
+async def test_inbound_handoff_rejects_owner_jump_and_old_owner_close() -> None:
+    envelope = _inbound_envelope()
+    with pytest.raises(CompositionError, match="不能从"):
+        envelope.handoff(InboundOwner.INGRESS, InboundOwner.LANE)
+
+    assert envelope.handoff(InboundOwner.INGRESS, InboundOwner.BUS) is envelope
+    with pytest.raises(CompositionError, match="当前 owner"):
+        await envelope.close(InboundOwner.INGRESS)
+
+    assert envelope.handoff(InboundOwner.BUS, InboundOwner.LANE) is envelope
+    assert envelope.handoff(InboundOwner.LANE, InboundOwner.LOOP) is envelope
+    with pytest.raises(CompositionError, match="当前 owner"):
+        await envelope.close(InboundOwner.BUS)
+    envelope.lease.release.set()  # type: ignore[attr-defined]
+    await envelope.close(InboundOwner.LOOP)
+    with pytest.raises(CompositionError, match="terminal"):
+        envelope.handoff(InboundOwner.LOOP, InboundOwner.BUS)
+
+
+@pytest.mark.asyncio
+async def test_inbound_close_is_idempotent_only_for_exact_owner() -> None:
+    lease = _Lease()
+    envelope = _inbound_envelope(lease)
+    lease.release.set()
+    await envelope.close(InboundOwner.INGRESS)
+    await envelope.close(InboundOwner.INGRESS)
+    assert lease.close_calls == 1
+    assert envelope.owner is InboundOwner.CLOSED
+    assert envelope.state is InboundState.TERMINAL
+    with pytest.raises(CompositionError, match="另一 owner"):
+        await envelope.close(InboundOwner.BUS)
+
+
+@pytest.mark.asyncio
+async def test_inbound_close_completes_lease_before_propagating_cancellation() -> None:
+    lease = _Lease()
+    envelope = _inbound_envelope(lease)
+    close_task = asyncio.create_task(envelope.close(InboundOwner.INGRESS))
+    await lease.started.wait()
+    close_task.cancel()
+    lease.release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await close_task
+    assert lease.close_calls == 1
+    assert envelope.owner is InboundOwner.CLOSED
+    assert envelope.state is InboundState.TERMINAL
+    await envelope.close(InboundOwner.INGRESS)
