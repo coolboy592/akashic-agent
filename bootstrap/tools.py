@@ -4,10 +4,11 @@ import asyncio
 import logging
 import inspect
 import os
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, cast
+from uuid import uuid4
 
 if TYPE_CHECKING:
     from agent.plugins.manager import PluginManager
@@ -16,7 +17,14 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 from agent.config_models import Config
+from agent.plugin_composition.channels import (
+    ChannelDeliveryReceipt,
+    DeliveryStatus as ChannelDeliveryStatus,
+    JsonValue,
+    OutboundEnvelope,
+)
 from agent.plugins.manifest import plugins_root
+from agent.plugins.snapshot import lease_current_runtime_snapshot
 from agent.context import ContextBuilder
 from agent.looping.core import AgentLoop
 from agent.looping.ports import (
@@ -50,6 +58,7 @@ from agent.plugins.jobs import ProviderPluginLlmService
 from bootstrap.providers import build_model_registry, build_providers, build_vl_provider
 from bootstrap.cleanup import run_cleanup_steps
 from bus.event_bus import EventBus
+from bus.events import ChannelMessage
 from bus.processing import ProcessingState
 from bus.queue import MessageBus
 from core.memory.runtime import MemoryRuntime
@@ -60,6 +69,71 @@ from session.manager import SessionManager
 
 async def _noop_async() -> None:
     return None
+
+
+async def _dispatch_v3_channel_push(
+    plugin_manager: PluginManager,
+    bus: MessageBus,
+    message: ChannelMessage,
+    passive: bool,
+) -> ChannelDeliveryReceipt | None:
+    """Dispatch one direct push through the exact public stable Channel binding."""
+
+    # 1. 当前 turn 优先复用 exact snapshot；独立调用才租用公开 stable。
+    source = lease_current_runtime_snapshot()
+    if source is None:
+        source = await plugin_manager.snapshot_store.acquire()
+    binding = None
+    try:
+        registry = source.snapshot.channel_registry
+        if registry is None or all(
+            descriptor.name != message.channel for descriptor in registry.descriptors
+        ):
+            return None
+        binding = plugin_manager.channel_generation_host.acquire_binding(
+            source,
+            message.channel,
+        )
+    finally:
+        try:
+            await source.release()
+        except BaseException:
+            if binding is not None:
+                await binding.aclose()
+            raise
+
+    # 2. C14 is text-only; reject attachments before reading any source path.
+    if binding is None:
+        raise RuntimeError("v3 Channel catalog 存在但 exact binding 未建立")
+    delivery_id = uuid4().hex
+    if message.attachments:
+        await binding.aclose()
+        return ChannelDeliveryReceipt(
+            delivery_id=delivery_id,
+            status=ChannelDeliveryStatus.REJECTED,
+            error="v3 Channel 首批迁移不接受附件",
+        )
+
+    # 3. The exact binding remains retained until the one-shot receipt settles.
+    try:
+        return await bus.publish_channel_outbound_awaited(
+            OutboundEnvelope(
+                logical_delivery_id=delivery_id,
+                delivery_id=delivery_id,
+                attempt_sequence=1,
+                snapshot_id=binding.snapshot_id,
+                generation_id=binding.generation_id,
+                binding_token=binding.binding_token,
+                channel=message.channel,
+                recipient=message.chat_id,
+                body=message.content,
+                metadata=cast(Mapping[str, JsonValue], message.metadata),
+            ),
+            binding,
+            passive=passive,
+        )
+    finally:
+        await binding.aclose()
 
 
 @dataclass
@@ -568,6 +642,14 @@ def build_core_runtime(
     )
     bus.bind_channel_outbound_dispatcher(
         plugin_manager.channel_generation_host.dispatch_outbound
+    )
+    push_tool.bind_v3_channel_dispatcher(
+        lambda message, passive: _dispatch_v3_channel_push(
+            plugin_manager,
+            bus,
+            message,
+            passive,
+        )
     )
     plugin_manager.channel_generation_host.bind_inbound_publisher(
         bus.publish_channel_inbound

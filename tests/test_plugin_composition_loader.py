@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -31,9 +32,14 @@ from agent.plugins.registry import plugin_registry
 from agent.plugins.snapshot import (
     RuntimeSnapshotCompiler,
     RuntimeSnapshotStore,
+    bind_runtime_snapshot,
     plugin_is_active,
+    reset_runtime_snapshot,
 )
+from agent.tools.message_push import MessagePushTool
+from bootstrap.tools import _dispatch_v3_channel_push
 from bus.event_bus import EventBus
+from bus.queue import MessageBus
 
 
 @pytest.fixture(autouse=True)
@@ -74,8 +80,16 @@ def _channel_plugin_source(
     *,
     fail_start: bool = False,
     fail_stop: bool = False,
+    block_deliver: bool = False,
 ) -> str:
+    delivery_body = (
+        "        DELIVERY_ENTERED.set()\n"
+        "        await asyncio.Event().wait()\n"
+        if block_deliver
+        else "        return ProviderDeliveryReceipt(request.delivery_id, DeliveryStatus.DELIVERED)\n"
+    )
     return (
+        "import asyncio\n"
         "from pydantic import AliasChoices, BaseModel, Field\n"
         "from agent.plugin_composition import (\n"
         "    CHANNELS, ChannelCapability, ChannelDefinition, ChannelReady, CredentialRef,\n"
@@ -84,6 +98,7 @@ def _channel_plugin_source(
         "api_version = 3\n"
         "name = 'channel_probe'\n"
         f"version = {version!r}\n"
+        "DELIVERY_ENTERED = asyncio.Event()\n"
         "inject = (CHANNELS,)\n"
         "class Config(BaseModel):\n"
         "    app_id: str\n"
@@ -107,8 +122,8 @@ def _channel_plugin_source(
         "        if self.fail_start: raise RuntimeError('channel start failed')\n"
         "        return ChannelReady(self.context.binding_token)\n"
         "    async def deliver(self, request):\n"
-        "        return ProviderDeliveryReceipt(request.delivery_id, DeliveryStatus.DELIVERED)\n"
-        "    async def stop(self):\n"
+        + delivery_body
+        + "    async def stop(self):\n"
         "        if self.fail_stop: raise RuntimeError('channel stop failed')\n"
         "        return StopReceipt(self.context.binding_token, True)\n"
         "def build_adapter(context): return Adapter(context)\n"
@@ -258,6 +273,151 @@ async def test_v3_channel_registry_redacts_candidate_credentials_before_import(
     assert config_path.read_bytes() == original_config
     await manager.terminate_all()
     assert manager.active_channel_generation is None
+
+
+@pytest.mark.asyncio
+async def test_v3_channel_direct_push_uses_exact_stable_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin_dir = _write_plugin(
+        tmp_path / "plugins",
+        "channel_probe",
+        _channel_plugin_source("1.0.0"),
+    )
+    (plugin_dir / "akashic.plugin.toml").write_text(
+        _channel_static_manifest("1.0.0"),
+        encoding="utf-8",
+    )
+    data_dir = tmp_path / "workspace" / "plugin-data" / "channel_probe-builtin"
+    data_dir.mkdir(parents=True)
+    (data_dir / "config.local.toml").write_text(
+        "app_id = 'app-1'\napp_secret = 'secret'\n",
+        encoding="utf-8",
+    )
+    manager = _manager(tmp_path)
+    await manager.load_all()
+    bus = MessageBus()
+    bus.bind_channel_outbound_dispatcher(
+        manager.channel_generation_host.dispatch_outbound
+    )
+    dispatch_task = asyncio.create_task(bus.dispatch_outbound())
+    tool = MessagePushTool(chat_lane=bus.chat_lane)
+    tool.bind_v3_channel_dispatcher(
+        lambda message, passive: _dispatch_v3_channel_push(
+            manager,
+            bus,
+            message,
+            passive,
+        )
+    )
+
+    source = await manager.snapshot_store.acquire()
+    snapshot_token = bind_runtime_snapshot(source)
+
+    async def reject_stable_reacquire(*args: object, **kwargs: object) -> object:
+        raise AssertionError("direct push 必须复用当前 exact snapshot lease")
+
+    monkeypatch.setattr(manager.snapshot_store, "acquire", reject_stable_reacquire)
+
+    try:
+        delivered = json.loads(
+            await asyncio.wait_for(
+                tool.execute(
+                    target_channel="feishu",
+                    target_chat_id="ou_1",
+                    message="hello",
+                ),
+                timeout=1,
+            )
+        )
+        rejected = json.loads(
+            await asyncio.wait_for(
+                tool.execute(
+                    target_channel="feishu",
+                    target_chat_id="ou_1",
+                    image="/must-not-be-read.png",
+                ),
+                timeout=1,
+            )
+        )
+    finally:
+        reset_runtime_snapshot(snapshot_token)
+        await source.release()
+
+    assert delivered["status"] == "delivered"
+    assert delivered["retryable"] is False
+    assert rejected["status"] == "rejected"
+    assert rejected["retryable"] is False
+    runtime = manager.active_channel_generation
+    assert runtime is not None
+    assert runtime.channel("feishu").in_flight == 0
+
+    await bus.aclose()
+    dispatch_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await dispatch_task
+    await manager.terminate_all()
+
+
+@pytest.mark.asyncio
+async def test_v3_channel_direct_push_bus_close_settles_unknown_and_releases_binding(
+    tmp_path: Path,
+) -> None:
+    plugin_dir = _write_plugin(
+        tmp_path / "plugins",
+        "channel_probe",
+        _channel_plugin_source("1.0.0", block_deliver=True),
+    )
+    (plugin_dir / "akashic.plugin.toml").write_text(
+        _channel_static_manifest("1.0.0"),
+        encoding="utf-8",
+    )
+    data_dir = tmp_path / "workspace" / "plugin-data" / "channel_probe-builtin"
+    data_dir.mkdir(parents=True)
+    (data_dir / "config.local.toml").write_text(
+        "app_id = 'app-1'\napp_secret = 'secret'\n",
+        encoding="utf-8",
+    )
+    manager = _manager(tmp_path)
+    await manager.load_all()
+    generation = manager.generation("channel_probe")
+    assert generation is not None
+    module = cast(ComposablePlugin, generation.instance).module
+    entered = cast(asyncio.Event, module.DELIVERY_ENTERED)
+    bus = MessageBus()
+    bus.bind_channel_outbound_dispatcher(
+        manager.channel_generation_host.dispatch_outbound
+    )
+    dispatch_task = asyncio.create_task(bus.dispatch_outbound())
+    tool = MessagePushTool(chat_lane=bus.chat_lane)
+    tool.bind_v3_channel_dispatcher(
+        lambda message, passive: _dispatch_v3_channel_push(
+            manager,
+            bus,
+            message,
+            passive,
+        )
+    )
+
+    pending = asyncio.create_task(
+        tool.execute(
+            target_channel="feishu",
+            target_chat_id="ou_1",
+            message="hello",
+        )
+    )
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    await asyncio.wait_for(bus.aclose(), timeout=1)
+    result = json.loads(await asyncio.wait_for(pending, timeout=1))
+
+    assert result["status"] == "unknown"
+    assert result["retryable"] is False
+    runtime = manager.active_channel_generation
+    assert runtime is not None
+    assert runtime.channel("feishu").in_flight == 0
+    assert dispatch_task.done()
+    await manager.terminate_all()
 
 
 @pytest.mark.asyncio

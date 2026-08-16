@@ -19,6 +19,10 @@ from agent.prompting import PromptSectionRender, SYSTEM_CONTEXT_FRAME_MARKER
 from agent.tools.base import Tool
 from agent.tools.memorize import MemorizeTool
 from agent.tools.message_push import MessagePushTool
+from agent.plugin_composition.channels import (
+    ChannelDeliveryReceipt,
+    DeliveryStatus as ChannelDeliveryStatus,
+)
 from agent.tools.registry import ToolMeta, ToolRegistry
 from agent.tools.web_search import WebSearchTool
 from bus.events import (
@@ -223,6 +227,83 @@ async def test_message_push_tool_covers_success_failure_and_fallbacks():
     assert "发送失败" in await tool.execute(
         target_channel="broken", target_chat_id=1, message="x"
     )
+
+
+@pytest.mark.asyncio
+async def test_message_push_prefers_v3_and_returns_non_retryable_receipt() -> None:
+    tool = MessagePushTool()
+    legacy_calls: list[ChannelMessage] = []
+    passive_roles: list[bool] = []
+
+    async def legacy(message: ChannelMessage) -> DeliveryReceipt:
+        legacy_calls.append(message)
+        return DeliveryReceipt(DeliveryStatus.SUCCESS)
+
+    async def dispatch_v3(
+        message: ChannelMessage,
+        passive: bool,
+    ) -> ChannelDeliveryReceipt | None:
+        assert message.channel == "feishu"
+        passive_roles.append(passive)
+        return ChannelDeliveryReceipt(
+            delivery_id="delivery-1",
+            status=ChannelDeliveryStatus.UNKNOWN,
+            provider_ids=("provider-1",),
+            error="provider outcome unknown",
+        )
+
+    _ = tool.register_channel("feishu", deliver=legacy)
+    tool.bind_v3_channel_dispatcher(dispatch_v3)
+
+    result = json.loads(
+        await tool.execute(
+            target_channel="feishu",
+            target_chat_id="ou_1",
+            message="hello",
+        )
+    )
+    passive_result = json.loads(
+        await tool.execute(
+            target_channel="feishu",
+            target_chat_id="ou_1",
+            message="passive",
+            _commit_role="passive",
+        )
+    )
+
+    assert result == {
+        "delivery_id": "delivery-1",
+        "status": "unknown",
+        "retryable": False,
+        "provider_ids": ["provider-1"],
+        "error": "provider outcome unknown",
+    }
+    assert passive_result["status"] == "unknown"
+    assert passive_roles == [False, True]
+    assert legacy_calls == []
+
+
+@pytest.mark.asyncio
+async def test_message_push_falls_back_only_when_v3_channel_is_absent() -> None:
+    tool = MessagePushTool()
+    legacy_calls: list[ChannelMessage] = []
+
+    async def legacy(message: ChannelMessage) -> DeliveryReceipt:
+        legacy_calls.append(message)
+        return DeliveryReceipt(DeliveryStatus.SUCCESS)
+
+    async def no_v3(_message: ChannelMessage, _passive: bool) -> None:
+        return None
+
+    _ = tool.register_channel("telegram", deliver=legacy)
+    tool.bind_v3_channel_dispatcher(no_v3)
+
+    assert await tool.execute(
+        target_channel="telegram",
+        target_chat_id="1",
+        message="legacy",
+    ) == "消息已发送"
+    assert [message.content for message in legacy_calls] == ["legacy"]
 
 
 @pytest.mark.asyncio

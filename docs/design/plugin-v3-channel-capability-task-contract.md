@@ -510,6 +510,10 @@ provider network。promotion 本身只切 endpoint/registration，不发送业�
    fork 一份 exact lease并封装成 `ChannelBindingLease`。direct Push caller 是该 binding lease 的唯一 close owner：无论
    dispatch 正常、异常或取消，都在 Receipt/critical cleanup 后 `finally await binding_lease.aclose()`；
    `PushToolOutboundPort.dispatch()` 只借用 lease，不得替 caller 关闭。
+   passive turn 内的 `message_push` 必须把其既有 passive lane 身份显式传给 Bus，不能作为 non-passive send 等待自己
+   结束；独立 scheduler/direct push 则使用 non-passive lane，并等待该 chat 的既有 passive turn。Bus terminal close 必须
+   取消并收束已 dequeue 但仍在 lane 等待的 direct push：provider 尚未调用时返回 `REJECTED`，已经调用但没有收据时
+   返回 `UNKNOWN`，随后 caller 才释放 exact binding。
    第一版边界固定为：
 
    ```python

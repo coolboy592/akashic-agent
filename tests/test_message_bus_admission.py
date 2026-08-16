@@ -562,6 +562,135 @@ async def test_v3_channel_outbound_returns_exact_provider_receipt_once() -> None
 
 
 @pytest.mark.asyncio
+async def test_v3_direct_channel_outbound_waits_for_passive_turn() -> None:
+    bus = MessageBus()
+    envelope, binding = _v3_outbound()
+    entered = asyncio.Event()
+
+    async def deliver(
+        received: OutboundEnvelope,
+        _owner: Any,
+    ) -> ChannelDeliveryReceipt:
+        entered.set()
+        return ChannelDeliveryReceipt(
+            received.delivery_id,
+            DeliveryStatus.DELIVERED,
+        )
+
+    bus.bind_channel_outbound_dispatcher(deliver)
+    await bus.chat_lane.mark_passive_pending(
+        envelope.channel,
+        envelope.recipient,
+    )
+    dispatch = asyncio.create_task(bus.dispatch_outbound())
+    pending = asyncio.create_task(
+        bus.publish_channel_outbound_awaited(
+            envelope,
+            binding,
+            passive=False,
+        )
+    )
+    await asyncio.sleep(0)
+    assert not entered.is_set()
+    assert not pending.done()
+
+    await bus.chat_lane.mark_passive_done(
+        envelope.channel,
+        envelope.recipient,
+    )
+    receipt = await asyncio.wait_for(pending, timeout=1)
+    assert receipt.status is DeliveryStatus.DELIVERED
+    assert entered.is_set()
+    bus.stop()
+    await dispatch
+
+
+@pytest.mark.asyncio
+async def test_v3_direct_channel_wait_is_rejected_by_terminal_bus_close() -> None:
+    bus = MessageBus()
+    envelope, binding = _v3_outbound()
+    calls = 0
+
+    async def deliver(
+        _received: OutboundEnvelope,
+        _owner: Any,
+    ) -> ChannelDeliveryReceipt:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("关闭前仍在 lane 等待的 direct push 不得调用 provider")
+
+    bus.bind_channel_outbound_dispatcher(deliver)
+    await bus.chat_lane.mark_passive_pending(
+        envelope.channel,
+        envelope.recipient,
+    )
+    dispatch = asyncio.create_task(bus.dispatch_outbound())
+    pending = asyncio.create_task(
+        bus.publish_channel_outbound_awaited(
+            envelope,
+            binding,
+            passive=False,
+        )
+    )
+    while bus.outbound_size:
+        await asyncio.sleep(0)
+
+    await asyncio.wait_for(bus.aclose(), timeout=1)
+    receipt = await asyncio.wait_for(pending, timeout=1)
+
+    assert receipt.status is DeliveryStatus.REJECTED
+    assert calls == 0
+    assert dispatch.done()
+    await bus.chat_lane.mark_passive_done(
+        envelope.channel,
+        envelope.recipient,
+    )
+
+
+@pytest.mark.asyncio
+async def test_v3_passive_channel_outbound_does_not_wait_for_its_own_turn() -> None:
+    bus = MessageBus()
+    envelope, binding = _v3_outbound()
+    calls = 0
+
+    async def deliver(
+        received: OutboundEnvelope,
+        _owner: Any,
+    ) -> ChannelDeliveryReceipt:
+        nonlocal calls
+        calls += 1
+        return ChannelDeliveryReceipt(
+            received.delivery_id,
+            DeliveryStatus.DELIVERED,
+        )
+
+    bus.bind_channel_outbound_dispatcher(deliver)
+    await bus.chat_lane.mark_passive_pending(
+        envelope.channel,
+        envelope.recipient,
+    )
+    dispatch = asyncio.create_task(bus.dispatch_outbound())
+
+    receipt = await asyncio.wait_for(
+        bus.publish_channel_outbound_awaited(
+            envelope,
+            binding,
+            passive=True,
+        ),
+        timeout=1,
+    )
+
+    assert receipt.status is DeliveryStatus.DELIVERED
+    assert calls == 1
+    await bus.chat_lane.mark_passive_done(
+        envelope.channel,
+        envelope.recipient,
+    )
+    bus.stop()
+    await dispatch
+
+
+@pytest.mark.asyncio
 async def test_v3_channel_outbound_exception_is_unknown_without_retry() -> None:
     bus = MessageBus()
     envelope, binding = _v3_outbound()
