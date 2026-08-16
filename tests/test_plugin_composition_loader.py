@@ -7,6 +7,7 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 
+import agent.plugins.manager as plugin_manager_module
 from agent.plugin_composition import ServiceView
 from agent.plugins.composable import ComposablePlugin
 from agent.plugins.artifacts import ArtifactPointer, read_pointer, write_pointers
@@ -489,6 +490,45 @@ async def test_v3_manager_rejects_invalid_apply_before_plugin_data_creation(
         tmp_path / "workspace" / "plugin-data" / "invalid_apply-builtin"
     ).exists()
     await manager.terminate_all()
+
+
+@pytest.mark.asyncio
+async def test_v3_manager_validates_plugin_data_path_before_config_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_plugin(
+        tmp_path / "plugins",
+        "invalid_apply",
+        "api_version = 3\n"
+        "name = 'invalid_apply'\n"
+        "version = '1.0.0'\n"
+        "def apply(ctx): pass\n",
+    )
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    external = tmp_path / "external-plugin-data"
+    external.mkdir()
+    (workspace / "plugin-data").symlink_to(external, target_is_directory=True)
+    config_revision_called = False
+
+    def unexpected_config_revision(_path: Path) -> str:
+        nonlocal config_revision_called
+        config_revision_called = True
+        raise AssertionError("config revision must not cross the plugin-data boundary")
+
+    monkeypatch.setattr(
+        plugin_manager_module,
+        "_file_revision",
+        unexpected_config_revision,
+    )
+    manager = _manager(tmp_path)
+
+    with pytest.raises(ValueError, match="插件数据目录不能穿过符号链接"):
+        await manager.load_all()
+
+    assert config_revision_called is False
+    assert tuple(external.iterdir()) == ()
 
 
 @pytest.mark.asyncio

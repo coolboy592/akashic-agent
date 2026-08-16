@@ -38,6 +38,7 @@ from agent.plugins.manifest import (
     load_package_manifest,
     load_plugin_manifest,
     plugins_root,
+    validate_workspace_plugin_data_path,
     workspace_plugin_data_dir,
     write_package_manifest,
     write_plugin_manifest,
@@ -3481,6 +3482,7 @@ class PluginManager:
             mod,
             self._workspace,
         )
+        validate_workspace_plugin_data_path(data_dir, self._workspace)
         config_revision = _file_revision(data_dir / "config.local.toml")
         generation_id = (
             f"{initial_plugin_id}:{source_revision[:12]}:{generation_sequence}"
