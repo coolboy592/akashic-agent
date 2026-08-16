@@ -2001,6 +2001,7 @@ async def test_turn_stop_idle_result_still_closes_stale_mobile_turn(
                 ),
                 attachment_store=AttachmentStore(tmp_path / "uploads"),
                 mobile_bot_commands=[],
+                command_catalog_provider=None,
             ),
         )
     )
@@ -2247,6 +2248,12 @@ async def test_command_list_uses_active_channel_catalog_without_stop(
     _register_device(storage, device_id)
     runtime = _Runtime(storage)
     channel = MobileRealtimeChannel(cast(MobileGatewayRuntime, runtime))
+    active_catalog = [
+        ("undo", "撤销上一轮对话"),
+        ("/memorystatus", "查看记忆整理状态"),
+        ("emoji", "😀" * 129),
+        ("stop", "中断当前回复"),
+    ]
     await channel.start(
         cast(
             Any,
@@ -2257,12 +2264,8 @@ async def test_command_list_uses_active_channel_catalog_without_stop(
                 push_tool=_PushTool(),
                 interrupt_controller=None,
                 attachment_store=AttachmentStore(tmp_path / "uploads"),
-                mobile_bot_commands=[
-                    ("undo", "撤销上一轮对话"),
-                    ("/memorystatus", "查看记忆整理状态"),
-                    ("emoji", "😀" * 129),
-                    ("stop", "中断当前回复"),
-                ],
+                mobile_bot_commands=[],
+                command_catalog_provider=lambda: tuple(active_catalog),
             ),
         )
     )
@@ -2282,6 +2285,17 @@ async def test_command_list_uses_active_channel_catalog_without_stop(
             {"command": "memorystatus", "description": "查看记忆整理状态"},
             {"command": "emoji", "description": "😀" * 129},
         ]
+    }
+    active_catalog[:] = [("status", "查看状态")]
+    refreshed = await channel.handle_command(
+        device_id=device_id,
+        frame=_generic_frame(
+            frame_id="01ARZ3NDEKTSV4RRFFQ69G5FB0",
+            command_type="command.list",
+        ),
+    )
+    assert refreshed.payload == {
+        "items": [{"command": "status", "description": "查看状态"}]
     }
     await channel.stop()
     storage.close()
@@ -2310,6 +2324,7 @@ async def test_message_send_preserves_mobile_slash_command_for_bus(
                 interrupt_controller=None,
                 attachment_store=AttachmentStore(tmp_path / "uploads"),
                 mobile_bot_commands=[("undo", "撤销上一轮对话")],
+                command_catalog_provider=None,
             ),
         )
     )

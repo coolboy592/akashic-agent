@@ -25,6 +25,7 @@ from pydantic import BaseModel, ValidationError
 from agent.plugin_composition import (
     COMMANDS,
     MEMORY_RUNTIME,
+    CommandRegistry,
     CompositionRoot,
     FiberState,
     MemoryRuntimeInfo,
@@ -264,6 +265,8 @@ class PluginManager:
                     dict[str, dict[str, Any]],
                     tuple[Channel, ...],
                     tuple[Channel, ...],
+                    tuple[tuple[str, str], ...],
+                    tuple[tuple[str, str], ...],
                 ],
                 Awaitable[None],
             ]
@@ -723,6 +726,8 @@ class PluginManager:
                 dict[str, dict[str, Any]],
                 tuple[Channel, ...],
                 tuple[Channel, ...],
+                tuple[tuple[str, str], ...],
+                tuple[tuple[str, str], ...],
             ],
             Awaitable[None],
         ],
@@ -821,18 +826,45 @@ class PluginManager:
     def telegram_bot_commands(self) -> list[tuple[str, str]]:
         # V2_REMOVAL(channel-command-catalog)：Observe/Setup Helper/Status Commands 迁到只发布
         # stable generation 的 channel command catalog 后，连同 mobile 聚合和 bootstrap 传参删除。
-        return self._declared_bot_commands("telegram_bot_commands")
+        return list(self.stable_telegram_command_catalog())
 
     @property
     def mobile_bot_commands(self) -> list[tuple[str, str]]:
-        return self._declared_bot_commands("mobile_bot_commands")
+        return list(self.stable_mobile_command_catalog())
+
+    def stable_telegram_command_catalog(self) -> tuple[tuple[str, str], ...]:
+        """Return discovery commands from the exact committed stable snapshot."""
+
+        return self._snapshot_bot_commands(
+            self.current_snapshot,
+            "telegram_bot_commands",
+        )
+
+    def stable_mobile_command_catalog(self) -> tuple[tuple[str, str], ...]:
+        """Return mobile commands from the exact committed stable snapshot."""
+
+        return self._snapshot_bot_commands(
+            self.current_snapshot,
+            "mobile_bot_commands",
+        )
 
     def _declared_bot_commands(self, getter_name: str) -> list[tuple[str, str]]:
         """聚合当前插件代际为指定渠道显式声明的命令。"""
 
+        return list(self._snapshot_bot_commands(self.current_snapshot, getter_name))
+
+    @staticmethod
+    def _snapshot_bot_commands(
+        snapshot: RuntimeSnapshot | None,
+        getter_name: str,
+    ) -> tuple[tuple[str, str], ...]:
+        """Project one immutable channel catalog from a snapshot."""
+
+        if snapshot is None:
+            return ()
         commands: list[tuple[str, str]] = []
-        for generation in self._active_generations.values():
-            if not self._registry_active(generation.module_path):
+        for generation in snapshot.active_generations():
+            if isinstance(generation.instance, ComposablePlugin):
                 continue
             instance = generation.instance
             getter = getattr(instance, getter_name, None)
@@ -841,13 +873,12 @@ class PluginManager:
             typed_getter = cast(Callable[[], list[tuple[str, str]]], getter)
             for command, description in typed_getter():
                 commands.append((str(command), str(description)))
-        snapshot = self.current_snapshot
-        if snapshot is not None and snapshot.command_registry is not None:
+        if snapshot.command_registry is not None:
             commands.extend(
                 (descriptor.name, descriptor.description)
                 for descriptor in snapshot.command_registry.descriptors
             )
-        return commands
+        return tuple(commands)
 
     # 扫描所有 plugin_dirs，返回可加载的插件描述列表
     def discover(
@@ -1807,15 +1838,22 @@ class PluginManager:
 
         old_services = active.contributions.managed_services
         old_channels = active.contributions.channels
+        old_commands = self.stable_telegram_command_catalog()
+        new_commands = self._snapshot_bot_commands(
+            snapshot,
+            "telegram_bot_commands",
+        )
+        exclusive_endpoint_changed = bool(old_services or old_channels)
+        endpoint_changed = exclusive_endpoint_changed or old_commands != new_commands
         from agent.plugins.snapshot import get_current_runtime_lease
 
-        if (old_services or old_channels) and get_current_runtime_lease() is not None:
+        if exclusive_endpoint_changed and get_current_runtime_lease() is not None:
             self._skill_host.close(catalog_id)
             await self._dispose_unreferenced_composition_root(snapshot)
             raise RuntimeError("持有 RuntimeSnapshot lease 时不能切换独占端点")
         quiesced = (
             self._snapshot_store.pause_admission()
-            if old_services or old_channels
+            if endpoint_changed
             else None
         )
         endpoints_switched = False
@@ -1824,14 +1862,17 @@ class PluginManager:
             if quiesced is not None:
                 if self._endpoint_quiescer is not None:
                     await self._endpoint_quiescer()
-                await self._snapshot_store.wait_for_no_leases(quiesced)
-            if old_services or old_channels:
+                if exclusive_endpoint_changed:
+                    await self._snapshot_store.wait_for_no_leases(quiesced)
+            if endpoint_changed:
                 await self._switch_plugin_endpoints(
                     plugin_id,
                     old_services,
                     {},
                     old_channels,
                     (),
+                    old_commands,
+                    new_commands,
                 )
                 endpoints_switched = True
             self._snapshot_skill_catalogs[snapshot.snapshot_id] = catalog_id
@@ -1850,6 +1891,8 @@ class PluginManager:
                         old_services,
                         (),
                         old_channels,
+                        new_commands,
+                        old_commands,
                     )
                 except BaseException as error:
                     endpoint_error = error
@@ -1911,6 +1954,8 @@ class PluginManager:
         new_services: dict[str, dict[str, Any]],
         old_channels: tuple[Channel, ...],
         new_channels: tuple[Channel, ...],
+        old_commands: tuple[tuple[str, str], ...],
+        new_commands: tuple[tuple[str, str], ...],
     ) -> None:
         services_changed = old_services != new_services
         channels_changed = old_channels != new_channels
@@ -1921,6 +1966,8 @@ class PluginManager:
                 new_services,
                 old_channels,
                 new_channels,
+                old_commands,
+                new_commands,
             )
             return
         if services_changed and channels_changed:
@@ -2021,8 +2068,16 @@ class PluginManager:
                 else ()
             )
             new_channels = target_contributions.channels
-            endpoint_changed = (
+            old_commands = self.stable_telegram_command_catalog()
+            new_commands = self._snapshot_bot_commands(
+                ready.snapshot,
+                "telegram_bot_commands",
+            )
+            exclusive_endpoint_changed = (
                 old_services != new_services or old_channels != new_channels
+            )
+            endpoint_changed = (
+                exclusive_endpoint_changed or old_commands != new_commands
             )
 
             skill_linker, stable_skill_plugins, target_skill_plugins = (
@@ -2042,7 +2097,7 @@ class PluginManager:
                 try:
                     if self._endpoint_quiescer is not None:
                         await self._endpoint_quiescer()
-                    if quiesced_snapshot is not None:
+                    if quiesced_snapshot is not None and exclusive_endpoint_changed:
                         await self._snapshot_store.wait_for_no_leases(quiesced_snapshot)
                     await self._snapshot_store.wait_for_no_leases(ready.snapshot)
                     self._snapshot_store.seal_candidate_validation(ready.snapshot)
@@ -2056,12 +2111,18 @@ class PluginManager:
                     )
                     new_services = generation.contributions.managed_services
                     new_channels = generation.contributions.channels
+                    new_commands = self._snapshot_bot_commands(
+                        ready.snapshot,
+                        "telegram_bot_commands",
+                    )
                     await self._switch_plugin_endpoints(
                         plugin_id,
                         old_services,
                         new_services,
                         old_channels,
                         new_channels,
+                        old_commands,
+                        new_commands,
                     )
                     endpoints_switched = True
                 except BaseException:
@@ -2156,6 +2217,8 @@ class PluginManager:
                             old_services,
                             new_channels,
                             old_channels,
+                            new_commands,
+                            old_commands,
                         )
                     except BaseException as error:
                         endpoint_error = error
@@ -2607,8 +2670,16 @@ class PluginManager:
         new_services = generation.contributions.managed_services
         old_channels = active.contributions.channels if active is not None else ()
         new_channels = generation.contributions.channels
-        endpoint_changed = not stage_latest and (
+        old_commands = self.stable_telegram_command_catalog()
+        new_commands = self._snapshot_bot_commands(
+            snapshot,
+            "telegram_bot_commands",
+        )
+        exclusive_endpoint_changed = (
             old_services != new_services or old_channels != new_channels
+        )
+        endpoint_changed = not stage_latest and (
+            exclusive_endpoint_changed or old_commands != new_commands
         )
         if stage_latest and production_endpoint_changed:
             self._reload_journal.annotate(
@@ -2655,7 +2726,7 @@ class PluginManager:
         if endpoint_changed:
             from agent.plugins.snapshot import get_current_runtime_lease
 
-            if get_current_runtime_lease() is not None:
+            if exclusive_endpoint_changed and get_current_runtime_lease() is not None:
                 error_text = "持有 RuntimeSnapshot lease 时不能切换独占端点"
                 await self.discard_prepared(
                     plugin_id,
@@ -2666,7 +2737,7 @@ class PluginManager:
             try:
                 if self._endpoint_quiescer is not None:
                     await self._endpoint_quiescer()
-                if quiesced_snapshot is not None:
+                if quiesced_snapshot is not None and exclusive_endpoint_changed:
                     await self._snapshot_store.wait_for_no_leases(quiesced_snapshot)
             except BaseException as error:
                 error_text = str(error) or type(error).__name__
@@ -2687,6 +2758,8 @@ class PluginManager:
                     new_services,
                     old_channels,
                     new_channels,
+                    old_commands,
+                    new_commands,
                 )
                 endpoints_switched = True
             except (asyncio.CancelledError, Exception) as error:
@@ -2738,6 +2811,8 @@ class PluginManager:
                         old_services,
                         new_channels,
                         old_channels,
+                        new_commands,
+                        old_commands,
                     )
                 except BaseException as error:
                     invariant_endpoint_error = error
@@ -2780,6 +2855,8 @@ class PluginManager:
                             old_services,
                             new_channels,
                             old_channels,
+                            new_commands,
+                            old_commands,
                         )
                     except BaseException as rollback_error:
                         production_endpoint_error = rollback_error
@@ -2875,6 +2952,8 @@ class PluginManager:
                         old_services,
                         new_channels,
                         old_channels,
+                        new_commands,
+                        old_commands,
                     )
                 except BaseException as error:
                     commit_endpoint_error = error
@@ -4237,11 +4316,9 @@ class PluginManager:
     ) -> None:
         """Validate v2 claims against the frozen v3 command namespace."""
 
-        registry = snapshot.command_registry
-        if registry is None:
-            return
+        registry = snapshot.command_registry or CommandRegistry.empty()
         claims: set[tuple[str, str]] = set()
-        for generation in snapshot.active_generations():
+        for generation in snapshot.generations.values():
             if isinstance(generation.instance, ComposablePlugin):
                 continue
             for getter_name in (

@@ -1,6 +1,6 @@
 # 插件 v3 committed command catalog 任务合同
 
-- 状态：approved / implementing
+- 状态：implemented / independent review pending
 - 日期：2026-08-16
 - 实现基线：`a6ba0360`
 - 关联条款：PLG-001～PLG-004、PLG-008～PLG-010、PLG-014、TST-001～TST-008
@@ -38,6 +38,13 @@ passive input ── known slash command ─┴─► direct result / no Session
    `CommandResult(success|error, text)`，异常或非法结果进入既有 turn error path，不伪装成功。
 5. 第一版 universal descriptor 同时投影到现有 Telegram/Mobile discovery adapter；aliases 不作为展示项。
    最后一个 v2 consumer 迁走后删除两个 Manager 聚合属性和 bootstrap 固定传参。
+6. v3 canonical name 采用 Telegram 与 Mobile 共同可接受的 `[a-z][a-z0-9_]{0,31}`；迁移期 v2
+   claim 继续接受原有连字符，避免在迁移完成前偷改旧插件输入合同。
+7. command admission 由 `AgentLoop` 在 model selection、Session、resume 与 `TurnStarted` 之前执行；
+   `PassiveTurnPipeline` 保留 direct-call 入口，但已 admission 的输入不得重复执行 command。
+8. Telegram discovery 在 stable publish 时事务性刷新；远端刷新失败时恢复旧 catalog 并阻止发布。
+   Mobile discovery 每次从 exact stable snapshot provider 读取。纯 command catalog 切换只暂停新 admission，
+   不等待旧 stable lease；旧 lease 继续观察旧 snapshot，新 admission 只能观察新 snapshot。
 
 ## 3. 验证与停止条件
 
@@ -51,7 +58,15 @@ passive input ── known slash command ─┴─► direct result / no Session
 任何 candidate command 提前公开、命令碰撞被覆盖、known command 创建 Session/调用模型、alias 出现在 discovery、
 或 Root dispose 后 names/Effect 残留都停止交付。
 
-## 4. 回滚
+## 4. 当前验证证据
+
+- command/channel 定向回归：`114 passed`；
+- loader、Manager、hot reload、turn pipeline、lifecycle 累计回归：`346 passed`；
+- 修改文件 Basedpyright：`0 errors, 0 warnings, 0 notes`；
+- `compileall` 与 `git diff --check` 通过；
+- 尚未进入 `CANDIDATE`：需独立 reviewer 对当前完整 diff 做只读复核。
+
+## 5. 回滚
 
 代码恢复点为分支 `backup/plugin-v3-c19-implemented-20260816` 的 `a6ba0360`。本任务没有正式运行数据变更；
 回滚只需撤销本 PR 的源码、测试和合同提交。

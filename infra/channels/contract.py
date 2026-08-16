@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -36,3 +37,4 @@ class ChannelContext:
     interrupt_controller: InterruptController | None
     mobile_bot_commands: list[tuple[str, str]]
     log: logging.Logger
+    command_catalog_provider: Callable[[], tuple[tuple[str, str], ...]] | None = None

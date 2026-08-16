@@ -497,6 +497,89 @@ class PassiveTurnPipeline:
             )
         return self._snapshot_phases[1]
 
+    async def run_command(
+        self,
+        msg: InboundMessage,
+        key: str,
+        *,
+        dispatch_outbound: bool = True,
+    ) -> OutboundMessage | None:
+        """Execute one committed command before Session and model admission."""
+
+        # 1. Only the command catalog frozen into this turn's snapshot may handle it.
+        snapshot = get_current_runtime_snapshot()
+        command_registry = snapshot.command_registry if snapshot is not None else None
+        if command_registry is None:
+            return None
+        started = time.perf_counter()
+        turn_id = _turn_log_id(key, msg)
+        state = TurnState(
+            msg=msg,
+            session_key=key,
+            dispatch_outbound=dispatch_outbound,
+            persistence=_persistence_from_metadata(msg.metadata),
+        )
+        try:
+            execution = await command_registry.execute(
+                msg.content,
+                session_key=key,
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                sender=msg.sender,
+            )
+        except Exception as exc:
+            logger.exception(
+                diagnostic_line(
+                    "PassiveTurnPipeline.run",
+                    event="phase_error",
+                    flow="passive",
+                    phase="command",
+                    session=key,
+                    turn=turn_id,
+                    action="fail",
+                    reason=_phase_error_reason("command"),
+                    duration_ms=int((time.perf_counter() - started) * 1000),
+                    error_type=type(exc).__name__,
+                    note=str(exc)[:160],
+                )
+            )
+            if not dispatch_outbound:
+                raise
+            return await self._control_outbound(
+                state,
+                OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content="处理消息时出错，请稍后再试。",
+                ),
+            )
+        if execution is None:
+            return None
+
+        # 2. A known command settles through the normal outbound owner without a Turn.
+        logger.info(
+            diagnostic_line(
+                "PassiveTurnPipeline.run",
+                event="gate_exit",
+                flow="passive",
+                phase="command",
+                session=key,
+                turn=turn_id,
+                action="short_circuit",
+                reason=execution.name,
+                duration_ms=int((time.perf_counter() - started) * 1000),
+            )
+        )
+        return await self._control_outbound(
+            state,
+            OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=execution.result.text,
+                turn_disposition=TurnDisposition.SHORT_CIRCUITED,
+            ),
+        )
+
     # 核心方法：处理一条普通被动消息，并提交最终出站结果。
     async def run(
         self,
@@ -504,6 +587,7 @@ class PassiveTurnPipeline:
         key: str,
         *,
         dispatch_outbound: bool = True,
+        command_admitted: bool = False,
     ) -> OutboundMessage:
         started = time.perf_counter()
         phase_started = started
@@ -530,44 +614,15 @@ class PassiveTurnPipeline:
             # try/except 只包前置模块链和 reasoning：在派发前兜底并返回错误提示。
             try:
                 # Phase 0: stable command catalog 在 Session 与模型调用前短路。
-                snapshot = get_current_runtime_snapshot()
-                command_registry = (
-                    snapshot.command_registry if snapshot is not None else None
-                )
-                if command_registry is not None:
+                if not command_admitted:
                     active_phase = "command"
-                    execution = await command_registry.execute(
-                        msg.content,
-                        session_key=key,
-                        channel=msg.channel,
-                        chat_id=msg.chat_id,
-                        sender=msg.sender,
+                    command_result = await self.run_command(
+                        msg,
+                        key,
+                        dispatch_outbound=dispatch_outbound,
                     )
-                    if execution is not None:
-                        logger.info(
-                            diagnostic_line(
-                                "PassiveTurnPipeline.run",
-                                event="gate_exit",
-                                flow="passive",
-                                phase="command",
-                                session=key,
-                                turn=turn_id,
-                                action="short_circuit",
-                                reason=execution.name,
-                                duration_ms=int(
-                                    (time.perf_counter() - phase_started) * 1000
-                                ),
-                            )
-                        )
-                        return await self._control_outbound(
-                            state,
-                            OutboundMessage(
-                                channel=msg.channel,
-                                chat_id=msg.chat_id,
-                                content=execution.result.text,
-                                turn_disposition=TurnDisposition.SHORT_CIRCUITED,
-                            ),
-                        )
+                    if command_result is not None:
+                        return command_result
 
                 # Phase 1: BeforeTurn 模块链（会话、上下文、BeforeTurn 事件）。
                 active_phase = "before_turn"

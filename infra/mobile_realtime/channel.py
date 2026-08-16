@@ -1061,7 +1061,13 @@ class MobileRealtimeChannel:
         _expect_keys(frame.payload, set())
         items: list[dict[str, str]] = []
         seen: set[str] = set()
-        for raw_command, raw_description in self._require_ctx().mobile_bot_commands:
+        context = self._require_ctx()
+        catalog = (
+            context.command_catalog_provider()
+            if context.command_catalog_provider is not None
+            else tuple(context.mobile_bot_commands)
+        )
+        for raw_command, raw_description in catalog:
             command = raw_command.strip().removeprefix("/")
             description = raw_description.strip()
             if not _BOT_COMMAND_PATTERN.fullmatch(command):

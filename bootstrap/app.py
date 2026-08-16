@@ -488,6 +488,16 @@ class AppRuntime:
                 mobile_bot_commands=(
                     plugin_manager.mobile_bot_commands if plugin_manager else None
                 ),
+                telegram_command_catalog_provider=(
+                    plugin_manager.stable_telegram_command_catalog
+                    if plugin_manager is not None
+                    else None
+                ),
+                mobile_command_catalog_provider=(
+                    plugin_manager.stable_mobile_command_catalog
+                    if plugin_manager is not None
+                    else None
+                ),
                 interrupt_controller=self.conversation_runtime,
                 plugin_channels=plugin_channels,
             )
@@ -1124,6 +1134,8 @@ class AppRuntime:
         new_services: dict[str, dict[str, Any]],
         old_channels: tuple[Any, ...],
         new_channels: tuple[Any, ...],
+        old_commands: tuple[tuple[str, str], ...],
+        new_commands: tuple[tuple[str, str], ...],
     ) -> None:
         assert self.channel_host is not None
         assert self.plugin_service_host is not None
@@ -1139,6 +1151,7 @@ class AppRuntime:
         if swap is not None:
             await self.channel_host.stop_plugin_swap(swap)
         services_switched = False
+        commands_switched = False
         try:
             if old_services != new_services:
                 await self.plugin_service_host.swap_plugin_services(
@@ -1147,9 +1160,24 @@ class AppRuntime:
                     new_services,
                 )
                 services_switched = True
+            if old_commands != new_commands:
+                await self.channel_host.swap_command_catalog(
+                    old_commands,
+                    new_commands,
+                )
+                commands_switched = True
             if swap is not None:
                 await self.channel_host.start_plugin_swap(swap)
         except BaseException as error:
+            command_restore_error: BaseException | None = None
+            if commands_switched:
+                try:
+                    await self.channel_host.swap_command_catalog(
+                        new_commands,
+                        old_commands,
+                    )
+                except BaseException as restore_error:
+                    command_restore_error = restore_error
             service_restore_error: BaseException | None = None
             if services_switched:
                 try:
@@ -1166,8 +1194,14 @@ class AppRuntime:
                     await self.channel_host.restore_plugin_swap(swap)
                 except BaseException as restore_error:
                     channel_restore_error = restore_error
-            if service_restore_error is not None or channel_restore_error is not None:
+            if (
+                command_restore_error is not None
+                or service_restore_error is not None
+                or channel_restore_error is not None
+            ):
                 details: list[str] = []
+                if command_restore_error is not None:
+                    details.append(f"command catalog: {command_restore_error}")
                 if service_restore_error is not None:
                     details.append(f"managed service: {service_restore_error}")
                 if channel_restore_error is not None:

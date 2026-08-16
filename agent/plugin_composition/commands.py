@@ -18,7 +18,8 @@ CommandHandler = Callable[
 ]
 CommandResultKind = Literal["success", "error"]
 
-_COMMAND_NAME = re.compile(r"^[a-z][a-z0-9_-]*$")
+_COMMAND_NAME = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
+_LEGACY_COMMAND_NAME = re.compile(r"^[a-z][a-z0-9_-]*$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,6 +109,12 @@ class CommandRegistry:
             ).encode("utf-8")
         ).hexdigest()
 
+    @classmethod
+    def empty(cls) -> CommandRegistry:
+        """Build an empty registry for legacy namespace validation."""
+
+        return cls({}, {}, ())
+
     @property
     def descriptors(self) -> tuple[CommandDescriptor, ...]:
         return self._descriptors
@@ -128,7 +135,9 @@ class CommandRegistry:
 
         owners = dict(self._owners)
         for raw_name, owner in claims:
-            if not isinstance(raw_name, str) or not _COMMAND_NAME.fullmatch(raw_name):
+            if not isinstance(raw_name, str) or not _LEGACY_COMMAND_NAME.fullmatch(
+                raw_name
+            ):
                 raise ValueError(f"Legacy Command name 无效: {raw_name}")
             previous = owners.get(raw_name)
             if previous is not None:

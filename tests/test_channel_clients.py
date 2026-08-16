@@ -383,6 +383,11 @@ async def test_telegram_channel_paths(monkeypatch: pytest.MonkeyPatch, tmp_path:
         "kvcache",
         "stop",
     ]
+    await channel.replace_command_catalog((("status", "查看状态"),))
+    assert [cmd.command for cmd in channel._app.bot.set_my_commands.await_args.args[0]] == [
+        "status",
+        "stop",
+    ]
     assert bus.outbound[0][0] == "telegram"
 
     class _File:

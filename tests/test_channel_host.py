@@ -91,6 +91,23 @@ class _RegisteredChannel:
         return None
 
 
+class _CommandCatalogChannel(_Channel):
+    def __init__(self, events: list[str]) -> None:
+        super().__init__("catalog", events)
+        self.catalog: tuple[tuple[str, str], ...] = (("old", "old"),)
+        self.fail_next = False
+
+    async def replace_command_catalog(
+        self,
+        commands: tuple[tuple[str, str], ...],
+    ) -> None:
+        self._events.append(f"commands:{commands[0][0] if commands else 'empty'}")
+        self.catalog = commands
+        if self.fail_next:
+            self.fail_next = False
+            raise RuntimeError("command publish failed")
+
+
 def _context(channel: _Channel) -> SimpleNamespace:
     return SimpleNamespace(
         bus=SimpleNamespace(),
@@ -101,6 +118,7 @@ def _context(channel: _Channel) -> SimpleNamespace:
         http_resources=None,
         interrupt_controller=None,
         mobile_bot_commands=[],
+        command_catalog_provider=None,
         log=f"ctx:{channel.name}",
     )
 
@@ -122,6 +140,27 @@ async def test_channel_host_start_failure_does_not_block_others():
         "stop:b",
         "start:c:ctx:c",
     ]
+
+
+@pytest.mark.asyncio
+async def test_channel_host_command_catalog_failure_restores_old_remote_state():
+    events: list[str] = []
+    channel = _CommandCatalogChannel(events)
+    host = ChannelHost(_context)  # type: ignore[arg-type]
+    host.add(channel)  # type: ignore[arg-type]
+    await host.start_all()
+    events.clear()
+    channel.fail_next = True
+
+    with pytest.raises(RuntimeError, match="command publish failed"):
+        await host.swap_command_catalog(
+            (("old", "old"),),
+            (("new", "new"),),
+        )
+
+    assert channel.catalog == (("old", "old"),)
+    assert events == ["commands:new", "commands:old"]
+    await host.stop_all()
 
 
 @pytest.mark.asyncio
@@ -265,6 +304,7 @@ async def test_channel_host_revokes_shared_registrations_on_stop():
         http_resources=None,
         interrupt_controller=None,
         mobile_bot_commands=[],
+        command_catalog_provider=None,
         log="ctx:registered",
     )
     host = ChannelHost(lambda _channel: context)  # type: ignore[arg-type]
@@ -307,6 +347,7 @@ async def test_channel_host_restores_shared_registrations_after_failed_swap():
         http_resources=None,
         interrupt_controller=None,
         mobile_bot_commands=[],
+        command_catalog_provider=None,
         log="ctx:registered",
     )
     host = ChannelHost(lambda _channel: context)  # type: ignore[arg-type]
@@ -367,6 +408,8 @@ async def test_endpoint_transaction_orders_channel_around_service_and_rolls_back
             v2,
             (old,),
             (failed,),
+            (),
+            (),
         )
 
     assert service.version == "v1"
@@ -415,6 +458,8 @@ async def test_endpoint_transaction_attempts_channel_restore_when_service_restor
             v2,
             (old,),
             (failed,),
+            (),
+            (),
         )
 
     assert "service_restore_failed" in events

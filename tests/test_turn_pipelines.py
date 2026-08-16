@@ -417,6 +417,7 @@ async def test_process_uses_busy_session_key_for_processing_state(tmp_path: Path
         msg,
         "scheduler:job",
         dispatch_outbound=False,
+        command_admitted=True,
     )
 
 

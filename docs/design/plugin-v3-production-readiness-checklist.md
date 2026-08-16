@@ -111,7 +111,7 @@ Gate 报告。分支名、PR 号和浮动 ref 不能代替 commit。
 
 | ID | 能力 owner | 状态 | 验收 oracle | 首个真实 consumer |
 |---|---|---|---|---|
-| C11 | committed channel command catalog | `OPEN` | canonical/alias collision、candidate 不发布、stable projection | Status Commands |
+| C11 | committed channel command catalog | `IMPLEMENTED` | command/channel 114 tests、累计 Manager/loader/hot-reload/turn/lifecycle 346 tests、Basedpyright/compileall/diff-check 已通过；待独立 review 与 Status Commands 首个 consumer Gate | Status Commands |
 | C12 | scoped MCP capability | `OPEN` | candidate port/data 隔离、readiness、route、drain、失败零残留 | Calendar MCP |
 | C13 | managed process capability | `OPEN` | start/ready/cancel/terminate/log Effect；同 generation 单实例 | Calendar MCP |
 | C14 | inbound/outbound channel capability | `OPEN` | committed binding、stop/drain/swap、失败恢复旧代、无重复发送 | Feishu / QQBot |

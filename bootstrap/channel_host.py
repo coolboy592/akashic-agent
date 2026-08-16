@@ -3,7 +3,8 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
-from collections.abc import Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable
+from typing import cast
 
 from infra.channels.contract import Channel, ChannelContext
 
@@ -69,6 +70,52 @@ class ChannelHost:
         channels: dict[str, tuple[Channel, ...]],
     ) -> None:
         self._plugin_channels = dict(channels)
+
+    async def swap_command_catalog(
+        self,
+        old_commands: tuple[tuple[str, str], ...],
+        new_commands: tuple[tuple[str, str], ...],
+    ) -> None:
+        """Publish discovery metadata and restore the old catalog on failure."""
+
+        # 1. Only started adapters that own an external command catalog participate.
+        attempted: list[Channel] = []
+        try:
+            for channel in self._channels:
+                replace_catalog = cast(
+                    Callable[
+                        [tuple[tuple[str, str], ...]],
+                        Awaitable[None],
+                    ]
+                    | None,
+                    getattr(channel, "replace_command_catalog", None),
+                )
+                if id(channel) not in self._started or not callable(replace_catalog):
+                    continue
+                attempted.append(channel)
+                await replace_catalog(new_commands)
+        except BaseException as error:
+            # 2. A failed remote call may have applied before reporting failure.
+            restore_errors: list[str] = []
+            for channel in reversed(attempted):
+                replace_catalog = cast(
+                    Callable[
+                        [tuple[tuple[str, str], ...]],
+                        Awaitable[None],
+                    ]
+                    | None,
+                    getattr(channel, "replace_command_catalog", None),
+                )
+                assert callable(replace_catalog)
+                try:
+                    await replace_catalog(old_commands)
+                except BaseException as restore_error:
+                    restore_errors.append(f"{channel.name}: {restore_error}")
+            if restore_errors:
+                raise RuntimeError(
+                    "旧命令目录恢复失败: " + "; ".join(restore_errors)
+                ) from error
+            raise
 
     async def swap_plugin_channels(
         self,
@@ -218,6 +265,7 @@ class _ChannelResources:
             interrupt_controller=context.interrupt_controller,
             mobile_bot_commands=context.mobile_bot_commands,
             log=context.log,
+            command_catalog_provider=context.command_catalog_provider,
         )
 
     def close(self) -> None:

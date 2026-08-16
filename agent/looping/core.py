@@ -786,6 +786,7 @@ class AgentLoop:
         key: str,
         *,
         dispatch_outbound: bool = True,
+        command_admitted: bool = False,
     ) -> OutboundMessage:
         """把一个输入交给被动链路，返回它生成的消息。"""
 
@@ -802,6 +803,7 @@ class AgentLoop:
                     msg,
                     key,
                     dispatch_outbound=dispatch_outbound,
+                    command_admitted=command_admitted,
                 )
         raise TypeError(f"unsupported inbound item: {type(msg).__name__}")
 
@@ -840,6 +842,16 @@ class AgentLoop:
                 fact = rollout_fact_provider()
                 if fact:
                     msg.metadata["_plugin_rollout_fact"] = fact
+
+            # 4. Committed commands settle before model, Session, resume, and TurnStarted.
+            if isinstance(msg, InboundMessage):
+                command_result = await self._passive_pipeline.run_command(
+                    msg,
+                    key,
+                    dispatch_outbound=dispatch_outbound,
+                )
+                if command_result is not None:
+                    return command_result
             model_selection = await self._resolve_model_selection(msg, key)
             async with model_execution_scope(
                 self._llm_services.provider,
@@ -849,7 +861,7 @@ class AgentLoop:
                 if model_binding is not None and isinstance(msg, InboundMessage):
                     msg.metadata["model_binding"] = model_binding.describe("agent")
 
-                # 4. 处理可能存在的续跑态，并发布 turn started。
+                # 5. 处理可能存在的续跑态，并发布 turn started。
                 msg, resumed_from_interrupt = await self._resume_interrupted_message(
                     msg, key
                 )
@@ -858,7 +870,7 @@ class AgentLoop:
                 preview = content[:60] + "..." if len(content) > 60 else content
                 logger.info(f"Processing message from {msg.channel}: {preview}")
 
-                # 5. 再进入 busy 状态并执行核心处理。
+                # 6. 再进入 busy 状态并执行核心处理。
                 if self._processing_state:
                     self._processing_state.enter(busy_key)
                 try:
@@ -866,6 +878,7 @@ class AgentLoop:
                         msg,
                         key,
                         dispatch_outbound=dispatch_outbound,
+                        command_admitted=isinstance(msg, InboundMessage),
                     )
                     if resumed_from_interrupt:
                         self._interrupt_states.pop(key, None)
@@ -874,7 +887,7 @@ class AgentLoop:
                     if self._processing_state:
                         self._processing_state.exit(busy_key)
         finally:
-            # 6. 当前 query 结束即回收其 shell，再恢复调用方上下文。
+            # 7. 当前 query 结束即回收其 shell，再恢复调用方上下文。
             try:
                 await self._cleanup_shell_owner(key)
             finally:

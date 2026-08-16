@@ -10,7 +10,7 @@ import hashlib
 import html
 import json
 import time
-from collections.abc import Coroutine
+from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -91,6 +91,9 @@ class TelegramChannel:
         session_manager: SessionManager,
         allow_from: list[str] | None = None,
         bot_commands: list[tuple[str, str]] | None = None,
+        command_catalog_provider: Callable[
+            [], tuple[tuple[str, str], ...]
+        ] | None = None,
         event_bus: EventBus | None = None,
         interrupt_controller: InterruptController | None = None,
         channel_name: str = _CHANNEL,
@@ -111,6 +114,7 @@ class TelegramChannel:
         )
         self._app = Application.builder().token(token).build()
         self._bot_commands = bot_commands or []
+        self._command_catalog_provider = command_catalog_provider
         self._app.add_handler(CommandHandler("stop", self._on_stop_command))
         self._app.add_handler(
             MessageHandler(filters.COMMAND, self._on_command)
@@ -242,14 +246,32 @@ class TelegramChannel:
         )
 
     async def _register_bot_commands(self) -> None:
+        catalog = (
+            self._command_catalog_provider()
+            if self._command_catalog_provider is not None
+            else tuple(self._bot_commands)
+        )
         commands = [
             BotCommand(command, description)
             for command, description in [
-                *self._bot_commands,
+                *catalog,
                 ("stop", "中断当前回复"),
             ]
         ]
         await self._app.bot.set_my_commands(commands)
+
+    async def replace_command_catalog(
+        self,
+        commands: tuple[tuple[str, str], ...],
+    ) -> None:
+        """Publish one committed command catalog to Telegram discovery."""
+
+        published = [
+            BotCommand(command, description)
+            for command, description in (*commands, ("stop", "中断当前回复"))
+        ]
+        await self._app.bot.set_my_commands(published)
+        self._bot_commands = list(commands)
 
     async def _remember_username(self, chat_id: str, username: str | None) -> None:
         if username:

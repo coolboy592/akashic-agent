@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -16,6 +16,8 @@ from agent.core.passive_turn import (
 )
 from agent.core.runtime_support import SessionLike
 from agent.looping.ports import SessionServices
+from agent.looping.core import AgentLoop
+from agent.looping.ports import AgentLoopConfig, AgentLoopDeps, MemoryServices
 from agent.plugin_composition import (
     COMMANDS,
     CommandDefinition,
@@ -39,6 +41,9 @@ from agent.tools.registry import ToolRegistry
 from agent.turns.outbound import OutboundPort
 from bus.event_bus import EventBus
 from bus.events import InboundMessage, TurnDisposition
+from bus.queue import MessageBus
+from tests.memory_fakes import FakeMemoryEngine
+from tests.provider_fakes import ProviderContextBudgetStub
 
 
 @pytest.fixture(autouse=True)
@@ -132,6 +137,40 @@ async def test_plugin_commands_execute_alias_and_cleanup(tmp_path: Path) -> None
     await root.dispose()
     assert root.receipt().effects == ()
     assert root.receipt().services == ()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name", ("bad-name", "a" * 33))
+async def test_plugin_commands_reject_names_outside_channel_contract(
+    tmp_path: Path,
+    name: str,
+) -> None:
+    root = CompositionRoot("commands")
+    commands = PluginCommands()
+    _ = await root.context.provide(COMMANDS, commands)
+    runtime = PluginRuntime(
+        plugin_id="command-probe",
+        plugin_dir=tmp_path / "plugin",
+        data_dir=tmp_path / "data",
+        workspace=tmp_path,
+        config=None,
+    )
+
+    async def plugin(ctx) -> None:
+        await ctx.require(COMMANDS).register(
+            ctx,
+            CommandDefinition(
+                name=name,
+                description="invalid",
+                handler=lambda _invocation: CommandResult("success", "ok"),
+            ),
+        )
+
+    fiber = await root.mount(plugin, name="command-probe", runtime=runtime)
+    assert fiber.state.value == "failed"
+    assert "Command name 无效" in (root.receipt().fibers[0].error or "")
+    assert not root.receipt().ready
+    await root.dispose()
 
 
 def test_command_digest_covers_every_descriptor_field() -> None:
@@ -268,6 +307,8 @@ async def test_manager_keeps_candidate_commands_private_until_promotion(
     assert old_snapshot is not None and old_snapshot.command_registry is not None
     assert manager.telegram_bot_commands == [("hello", "old description")]
     assert manager.mobile_bot_commands == [("hello", "old description")]
+    endpoint_switcher = AsyncMock()
+    manager.bind_endpoint_switcher(endpoint_switcher)
 
     (plugin_dir / "plugin.py").write_text(
         _command_plugin("new description", "new"),
@@ -284,6 +325,11 @@ async def test_manager_keeps_candidate_commands_private_until_promotion(
     assert manager.telegram_bot_commands == [("hello", "new description")]
     assert manager.mobile_bot_commands == [("hello", "new description")]
     assert all(name != "hi" for name, _description in manager.telegram_bot_commands)
+    endpoint_switcher.assert_awaited_once()
+    assert endpoint_switcher.await_args.args[-2:] == (
+        (("hello", "old description"),),
+        (("hello", "new description"),),
+    )
     root = manager.current_snapshot.composition_root
     assert root is not None
     await manager.terminate_all()
@@ -316,6 +362,76 @@ async def test_mixed_v2_v3_command_collision_prevents_stable_publish(
     assert manager.current_snapshot is None
     assert manager.generation("commands_v3") is None
     assert manager.generation("legacy") is None
+
+
+@pytest.mark.asyncio
+async def test_v2_only_command_collision_prevents_stable_publish(
+    tmp_path: Path,
+) -> None:
+    for plugin_id in ("legacy_a", "legacy_b"):
+        _write_plugin(
+            tmp_path / "plugins",
+            plugin_id,
+            "from agent.plugins import Plugin\n"
+            f"class {plugin_id.title().replace('_', '')}(Plugin):\n"
+            f"    name = {plugin_id!r}\n"
+            "    def telegram_bot_commands(self): return [('same', 'legacy')]\n",
+        )
+    manager = _manager(tmp_path)
+
+    with pytest.raises(CompositionError, match="same"):
+        await manager.load_all()
+
+    assert manager.current_snapshot is None
+    assert manager.loaded_count == 0
+
+
+class _CommandProvider(ProviderContextBudgetStub):
+    async def chat(self, **_kwargs):
+        raise AssertionError("known command must not call the model")
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_command_precedes_model_session_and_turn_started(
+    tmp_path: Path,
+) -> None:
+    _write_plugin(
+        tmp_path / "plugins",
+        "commands_v3",
+        _command_plugin("description", "handled"),
+    )
+    manager = _manager(tmp_path)
+    await manager.load_all()
+    session_manager = MagicMock()
+    tools = ToolRegistry()
+    provider = _CommandProvider()
+    loop = AgentLoop(
+        AgentLoopDeps(
+            bus=MessageBus(),
+            provider=cast(Any, provider),
+            tools=tools,
+            session_manager=session_manager,
+            workspace=tmp_path / "loop-workspace",
+            memory_services=MemoryServices(engine=FakeMemoryEngine(tmp_path)),
+        ),
+        AgentLoopConfig(),
+    )
+    loop.bind_runtime_snapshot_store(manager.snapshot_store)
+    loop._resolve_model_selection = AsyncMock(  # type: ignore[method-assign]
+        side_effect=AssertionError("known command must not resolve a model")
+    )
+    loop._observe_turn_started = AsyncMock()  # type: ignore[method-assign]
+
+    result = await loop._process_with_runtime_admission(
+        InboundMessage("web", "hua", "1", "/hi Akashic"),
+        dispatch_outbound=False,
+    )
+
+    assert result.content == "handled: Akashic"
+    session_manager.get_or_create.assert_not_called()
+    loop._resolve_model_selection.assert_not_awaited()
+    loop._observe_turn_started.assert_not_awaited()
+    await manager.terminate_all()
 
 
 def _passive_pipeline(
