@@ -554,3 +554,39 @@ async def test_cleanup_failure_retains_tombstone_until_retry(
     await host.retry_generation_cleanup(generation_id)
     assert host.tombstone(generation_id) is None
     assert host.get(generation_id) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "callback_error",
+    [RuntimeError("root disposed"), asyncio.CancelledError()],
+)
+async def test_stopped_observer_failure_cannot_retain_cleaned_process(
+    tmp_path: Path,
+    callback_error: BaseException,
+) -> None:
+    script = tmp_path / "server.py"
+    _write_http_server(script)
+
+    def fail_after_root_dispose(
+        _generation: str,
+        _name: str,
+        healthy: bool,
+        reason: str,
+    ) -> None:
+        if not healthy and reason == "stopped":
+            raise callback_error
+
+    host = ManagedProcessGenerationHost(on_health=fail_after_root_dispose)
+    generation_id = "stopped-observer"
+    generation = await host.start_candidate(
+        generation_id,
+        {"calendar_api": _http_definition(script, formal_port=_free_port())},
+    )
+    port = generation.endpoint("calendar_api").port
+
+    await host.stop_generation(generation_id)
+
+    assert host.get(generation_id) is None
+    assert host.tombstone(generation_id) is None
+    assert not _port_live(port)

@@ -839,16 +839,38 @@ class ManagedProcessGenerationHost:
                 "managed process log drain failed: "
                 + "; ".join(_error_text(error) for error in reader_errors)
             ) from reader_errors[0]
-        await self._emit_health(
-            entry.generation_id,
-            entry.definition.name,
-            False,
-            "stopped",
-        )
+        # 资源释放一旦完成，失效的 Root observer 不能把零残留伪装成
+        # cleanup_failed；retry 也不能依赖已经卸载的插件回调。
         entry.process = None
         entry.process_group = None
         entry.endpoint = None
         entry.ready = False
+        entry.stdout_task = None
+        entry.stderr_task = None
+        entry.watch_task = None
+        try:
+            await self._emit_health(
+                entry.generation_id,
+                entry.definition.name,
+                False,
+                "stopped",
+            )
+        except asyncio.CancelledError:
+            current = asyncio.current_task()
+            if current is not None and current.cancelling() > 0:
+                raise
+            logger.error(
+                "managed process stopped observer 已失效: generation=%s process=%s",
+                entry.generation_id,
+                entry.definition.name,
+            )
+        except Exception as error:
+            logger.error(
+                "managed process stopped observer 已失效: generation=%s process=%s error=%s",
+                entry.generation_id,
+                entry.definition.name,
+                _error_text(error),
+            )
 
     async def _terminate_runtime(self, entry: _ProcessEpoch) -> None:
         """Kill an exited leader's complete process group before recovery."""
