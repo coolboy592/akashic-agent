@@ -85,6 +85,7 @@ class IncidentView:
 @dataclass(frozen=True, slots=True)
 class TopologyFiberView:
     name: str
+    parent: str | None
     required_for_readiness: bool
     dependencies: tuple[str, ...]
     static_active: bool
