@@ -33,12 +33,13 @@ def _http_definition(
     *,
     formal_port: int,
     startup_timeout_seconds: float = 3.0,
+    env: dict[str, str] | None = None,
 ) -> ManagedProcessDefinition:
     return ManagedProcessDefinition(
         name="calendar_api",
         command=(sys.executable, str(script)),
         cwd=str(script.parent),
-        env={},
+        env=env or {},
         port_env="PORT",
         formal_port=formal_port,
         readiness_path="/health",
@@ -81,6 +82,9 @@ def _write_http_server(
         + "        self.end_headers(); self.wfile.write(b'ready')\n"
         "    def log_message(self, *args): pass\n"
         "server = HTTPServer(('127.0.0.1', int(os.environ['PORT'])), Handler)\n"
+        "if os.environ.get('PID_LOG'):\n"
+        "    with open(os.environ['PID_LOG'], 'a', encoding='utf-8') as output:\n"
+        "        output.write(str(os.getpid()) + '\\n')\n"
         "print('managed stdout', flush=True)\n"
         "print('managed stderr', file=sys.stderr, flush=True)\n"
         + first_exit
@@ -294,6 +298,7 @@ async def test_process_exit_recovers_with_new_epoch_without_stale_resurrection(
     tmp_path: Path,
 ) -> None:
     script = tmp_path / "recover.py"
+    pid_log = tmp_path / "recover-pids.txt"
     _write_http_server(script, exit_first=True)
     incidents: list[tuple[str, str, str, str]] = []
     host = ManagedProcessGenerationHost(
@@ -303,7 +308,13 @@ async def test_process_exit_recovers_with_new_epoch_without_stale_resurrection(
     )
     generation = await host.start_candidate(
         "candidate-recover",
-        {"calendar_api": _http_definition(script, formal_port=_free_port())},
+        {
+            "calendar_api": _http_definition(
+                script,
+                formal_port=_free_port(),
+                env={"PID_LOG": str(pid_log)},
+            )
+        },
     )
     initial = generation.endpoint("calendar_api")
 
@@ -323,7 +334,12 @@ async def test_process_exit_recovers_with_new_epoch_without_stale_resurrection(
     assert host.health("candidate-recover", "calendar_api")
 
     await host.stop_generation("candidate-recover")
-    await asyncio.sleep(0.05)
+    process_ids = tuple(
+        int(value)
+        for value in pid_log.read_text(encoding="utf-8").splitlines()
+    )
+    assert len(process_ids) >= 2
+    await _wait_until(lambda: all(not _pid_live(pid) for pid in process_ids))
     assert host.get("candidate-recover") is None
 
 
