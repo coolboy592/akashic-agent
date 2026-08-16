@@ -62,6 +62,14 @@ from agent.plugin_composition.process_slots import (
     MANAGED_PROCESSES,
     ManagedProcessDefinition,
 )
+from agent.plugin_composition.channels import (
+    CHANNELS,
+    ChannelCapability,
+    ChannelDefinition,
+    CredentialRef,
+    InboundIdentity,
+    PluginChannels,
+)
 from agent.plugin_composition.ui_slots import (
     UI_SLOTS,
     MobileUiBinding,
@@ -90,6 +98,10 @@ __all__ = [
     "CommandResult",
     "DashboardContext",
     "Bail",
+    "CHANNELS",
+    "ChannelCapability",
+    "ChannelDefinition",
+    "CredentialRef",
     "EmitEventKey",
     "Effect",
     "ExternalEffectObservation",
@@ -102,6 +114,7 @@ __all__ = [
     "HealthView",
     "HealthHandle",
     "IncidentView",
+    "InboundIdentity",
     "MEMORY_RUNTIME",
     "MANAGED_PROCESSES",
     "MCP_SERVERS",
@@ -118,6 +131,7 @@ __all__ = [
     "MobileUiRpcInvalidRequest",
     "ObserveEventKey",
     "Plugin",
+    "PluginChannels",
     "PluginCommands",
     "PluginUiSlots",
     "resolve_mobile_ui_asset",
