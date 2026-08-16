@@ -23,10 +23,12 @@ from urllib.parse import urlsplit, urlunsplit
 from pydantic import BaseModel, ValidationError
 
 from agent.plugin_composition import (
+    COMMANDS,
     MEMORY_RUNTIME,
     CompositionRoot,
     FiberState,
     MemoryRuntimeInfo,
+    PluginCommands,
     PluginRuntime,
     ServiceView,
 )
@@ -839,6 +841,12 @@ class PluginManager:
             typed_getter = cast(Callable[[], list[tuple[str, str]]], getter)
             for command, description in typed_getter():
                 commands.append((str(command), str(description)))
+        snapshot = self.current_snapshot
+        if snapshot is not None and snapshot.command_registry is not None:
+            commands.extend(
+                (descriptor.name, descriptor.description)
+                for descriptor in snapshot.command_registry.descriptors
+            )
         return commands
 
     # 扫描所有 plugin_dirs，返回可加载的插件描述列表
@@ -1966,6 +1974,7 @@ class PluginManager:
                 self._active_workspace_mcp,
             )
             snapshot.tool_hooks = self._compile_snapshot_tool_hooks(generations)
+            self._validate_snapshot_command_claims(snapshot)
             return snapshot, catalog_id
         except BaseException:
             self._skill_host.close(catalog_id)
@@ -4098,6 +4107,7 @@ class PluginManager:
                 self._active_workspace_mcp,
             )
             snapshot.tool_hooks = self._compile_snapshot_tool_hooks(generations)
+            self._validate_snapshot_command_claims(snapshot)
             return snapshot
         except Exception as error:
             if created_root and composition_root is not None:
@@ -4163,6 +4173,7 @@ class PluginManager:
             candidate_incident_limit=(1024 if candidate_owner is not None else None),
         )
         try:
+            _ = await root.context.provide(COMMANDS, PluginCommands())
             memory_runtime = self._get_composition_memory_runtime()
             if memory_runtime is not None:
                 _ = await root.context.provide(
@@ -4219,6 +4230,31 @@ class PluginManager:
             await root.dispose()
             raise
         return root, True
+
+    def _validate_snapshot_command_claims(
+        self,
+        snapshot: RuntimeSnapshot,
+    ) -> None:
+        """Validate v2 claims against the frozen v3 command namespace."""
+
+        registry = snapshot.command_registry
+        if registry is None:
+            return
+        claims: set[tuple[str, str]] = set()
+        for generation in snapshot.active_generations():
+            if isinstance(generation.instance, ComposablePlugin):
+                continue
+            for getter_name in (
+                "telegram_bot_commands",
+                "mobile_bot_commands",
+            ):
+                getter = getattr(generation.instance, getter_name, None)
+                if getter is None:
+                    continue
+                typed_getter = cast(Callable[[], list[tuple[str, str]]], getter)
+                for command, _description in typed_getter():
+                    claims.add((str(command), generation.plugin_id))
+        registry.validate_legacy_claims(sorted(claims))
 
     def _get_composition_memory_runtime(self) -> MemoryRuntimeInfo | None:
         """为本 Manager 构建的全部 Root 冻结同一份 Memory 描述能力。"""
@@ -5820,6 +5856,7 @@ def _replace_snapshot_payload(
         "dashboard_bindings",
         "tool_registry",
         "plugin_skill_index",
+        "command_registry",
         "event_handlers",
         "composition_root",
         "composition_topology",

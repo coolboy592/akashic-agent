@@ -238,6 +238,7 @@ def _turn_log_id(key: str, msg: InboundMessage) -> str:
 
 def _phase_error_reason(phase: str) -> str:
     return {
+        "command": "command_error",
         "before_turn": "before_turn_error",
         "before_reasoning": "before_reasoning_error",
         "reasoner": "provider_error",
@@ -506,7 +507,7 @@ class PassiveTurnPipeline:
     ) -> OutboundMessage:
         started = time.perf_counter()
         phase_started = started
-        active_phase = "before_turn"
+        active_phase = "command"
         turn_id = _turn_log_id(key, msg)
         state = TurnState(
             msg=msg,
@@ -520,7 +521,7 @@ class PassiveTurnPipeline:
                     "PassiveTurnPipeline.run",
                     event="start",
                     flow="passive",
-                    phase="before_turn",
+                    phase="command",
                     session=key,
                     turn=turn_id,
                     action="run",
@@ -528,7 +529,33 @@ class PassiveTurnPipeline:
             )
             # try/except 只包前置模块链和 reasoning：在派发前兜底并返回错误提示。
             try:
+                # Phase 0: stable command catalog 在 Session 与模型调用前短路。
+                snapshot = get_current_runtime_snapshot()
+                command_registry = (
+                    snapshot.command_registry if snapshot is not None else None
+                )
+                if command_registry is not None:
+                    execution = await command_registry.execute(
+                        msg.content,
+                        session_key=key,
+                        channel=msg.channel,
+                        chat_id=msg.chat_id,
+                        sender=msg.sender,
+                    )
+                    if execution is not None:
+                        return await self._control_outbound(
+                            state,
+                            OutboundMessage(
+                                channel=msg.channel,
+                                chat_id=msg.chat_id,
+                                content=execution.result.text,
+                                turn_disposition=TurnDisposition.SHORT_CIRCUITED,
+                            ),
+                        )
+
                 # Phase 1: BeforeTurn 模块链（会话、上下文、BeforeTurn 事件）。
+                active_phase = "before_turn"
+                phase_started = time.perf_counter()
                 with diagnostic_context(phase="before_turn"):
                     before_turn = await self._runtime_phases().before_turn.run(state)
                 # TurnState 存内部默认 metadata；BeforeTurnCtx 存插件导出，同名 key 以后者覆盖。

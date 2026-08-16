@@ -7,6 +7,16 @@ from agent.plugin_composition.context import (
     Plugin,
 )
 from agent.plugin_composition.dashboard import DashboardContext
+from agent.plugin_composition.commands import (
+    COMMANDS,
+    CommandDefinition,
+    CommandDescriptor,
+    CommandExecution,
+    CommandInvocation,
+    CommandRegistry,
+    CommandResult,
+    PluginCommands,
+)
 from agent.plugin_composition.access import (
     CompositionAudit,
 )
@@ -50,6 +60,13 @@ __all__ = [
     "CompositionRoot",
     "CompositionAudit",
     "Context",
+    "COMMANDS",
+    "CommandDefinition",
+    "CommandDescriptor",
+    "CommandExecution",
+    "CommandInvocation",
+    "CommandRegistry",
+    "CommandResult",
     "DashboardContext",
     "Bail",
     "EmitEventKey",
@@ -68,6 +85,7 @@ __all__ = [
     "MemoryRuntimeInfo",
     "ObserveEventKey",
     "Plugin",
+    "PluginCommands",
     "PluginRuntime",
     "ParallelEventKey",
     "ServiceKey",

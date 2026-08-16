@@ -116,7 +116,10 @@ async def test_v3_namespace_loader_waits_for_service_not_scan_order(
     )
     assert snapshot.composition_root is not None
     assert snapshot.composition_topology is not None
-    assert snapshot.composition_topology.services == ("fixture.value",)
+    assert snapshot.composition_topology.services == (
+        "core.commands",
+        "fixture.value",
+    )
     assert tuple(item.name for item in snapshot.composition_topology.fibers) == (
         "a_consumer",
         "z_provider",
@@ -158,9 +161,15 @@ async def test_v3_loader_provides_read_only_memory_runtime_info(
     assert generation.instance.module.observed == ("default", False)
     root = snapshot.composition_root
     assert root is not None
-    assert root.receipt().services == ("core.memory.runtime",)
+    assert root.receipt().services == (
+        "core.commands",
+        "core.memory.runtime",
+    )
     assert snapshot.composition_topology is not None
-    assert snapshot.composition_topology.services == ("core.memory.runtime",)
+    assert snapshot.composition_topology.services == (
+        "core.commands",
+        "core.memory.runtime",
+    )
 
     await manager.terminate_all()
 
@@ -888,7 +897,10 @@ async def test_mixed_stable_boot_publishes_one_complete_snapshot(
     assert set(snapshot.generations) == {"consumer", "legacy", "provider"}
     assert snapshot.composition_root is not None
     assert snapshot.composition_topology is not None
-    assert snapshot.composition_topology.services == ("fixture.batch",)
+    assert snapshot.composition_topology.services == (
+        "core.commands",
+        "fixture.batch",
+    )
     assert getattr(legacy.instance, "activated") is True
     catalog_id = snapshot.skill_catalog_generation_id
     assert catalog_id is not None
