@@ -507,7 +507,7 @@ class PassiveTurnPipeline:
     ) -> OutboundMessage:
         started = time.perf_counter()
         phase_started = started
-        active_phase = "command"
+        active_phase = "before_turn"
         turn_id = _turn_log_id(key, msg)
         state = TurnState(
             msg=msg,
@@ -521,7 +521,7 @@ class PassiveTurnPipeline:
                     "PassiveTurnPipeline.run",
                     event="start",
                     flow="passive",
-                    phase="command",
+                    phase="before_turn",
                     session=key,
                     turn=turn_id,
                     action="run",
@@ -535,6 +535,7 @@ class PassiveTurnPipeline:
                     snapshot.command_registry if snapshot is not None else None
                 )
                 if command_registry is not None:
+                    active_phase = "command"
                     execution = await command_registry.execute(
                         msg.content,
                         session_key=key,
@@ -543,6 +544,21 @@ class PassiveTurnPipeline:
                         sender=msg.sender,
                     )
                     if execution is not None:
+                        logger.info(
+                            diagnostic_line(
+                                "PassiveTurnPipeline.run",
+                                event="gate_exit",
+                                flow="passive",
+                                phase="command",
+                                session=key,
+                                turn=turn_id,
+                                action="short_circuit",
+                                reason=execution.name,
+                                duration_ms=int(
+                                    (time.perf_counter() - phase_started) * 1000
+                                ),
+                            )
+                        )
                         return await self._control_outbound(
                             state,
                             OutboundMessage(
