@@ -65,19 +65,26 @@ class McpServerBinding:
     health: HealthHandle
     owner_fiber: FiberHandle
     activation_token: object
+    runtime_plugin_dir: Path = field(repr=False, compare=False)
+    runtime_data_dir: Path = field(repr=False, compare=False)
+    runtime_workspace: Path = field(repr=False, compare=False)
     incident_reporter: Callable[[str, str], IncidentView] = field(
         repr=False,
         compare=False,
     )
 
-    def is_live(self) -> bool:
+    def is_owned(self) -> bool:
         """Return whether the declaration still belongs to its Fiber activation."""
 
         return (
             self.owner_fiber.state is FiberState.ACTIVE
             and self.owner_fiber.activation_token is self.activation_token
-            and self.health.healthy
         )
+
+    def is_live(self) -> bool:
+        """Return whether the declaration is owned and currently healthy."""
+
+        return self.is_owned() and self.health.healthy
 
 
 class McpServerRegistry(Mapping[str, McpServerBinding]):
@@ -161,6 +168,9 @@ class _McpRegistration:
     descriptor: McpServerDescriptor
     owner_fiber: FiberHandle
     activation_token: object
+    runtime_plugin_dir: Path
+    runtime_data_dir: Path
+    runtime_workspace: Path
     incident_reporter: Callable[[str, str], IncidentView]
     health: HealthHandle | None = None
 
@@ -199,6 +209,9 @@ class _McpServerDeclarations:
                 normalized,
                 owner_fiber,
                 activation_token,
+                ctx.runtime.plugin_dir,
+                ctx.runtime.data_dir,
+                ctx.runtime.workspace,
                 ctx.report_incident,
             )
             return cleanup
@@ -235,6 +248,9 @@ class _McpServerDeclarations:
                 health=registration.health,
                 owner_fiber=registration.owner_fiber,
                 activation_token=registration.activation_token,
+                runtime_plugin_dir=registration.runtime_plugin_dir,
+                runtime_data_dir=registration.runtime_data_dir,
+                runtime_workspace=registration.runtime_workspace,
                 incident_reporter=registration.incident_reporter,
             )
         self._frozen = McpServerRegistry(
@@ -249,6 +265,9 @@ class _McpServerDeclarations:
         definition: McpServerDefinition,
         owner_fiber: FiberHandle,
         activation_token: object,
+        runtime_plugin_dir: Path,
+        runtime_data_dir: Path,
+        runtime_workspace: Path,
         incident_reporter: Callable[[str, str], IncidentView],
     ) -> tuple[_McpRegistration, Callable[[], None]]:
         """Add one normalized declaration and return its exact inverse."""
@@ -272,6 +291,9 @@ class _McpServerDeclarations:
             descriptor=_descriptor(owner, definition),
             owner_fiber=owner_fiber,
             activation_token=activation_token,
+            runtime_plugin_dir=runtime_plugin_dir,
+            runtime_data_dir=runtime_data_dir,
+            runtime_workspace=runtime_workspace,
             incident_reporter=incident_reporter,
         )
         self._registrations[token] = registration

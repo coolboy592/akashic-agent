@@ -140,6 +140,9 @@ class McpCleanupTombstone:
     attempt_count: int
 
 
+FailureCallback = Callable[[McpCleanupTombstone], None]
+
+
 @dataclass(frozen=True, slots=True)
 class McpObservationDiagnostic:
     """Structured callback failure retained independently from resource cleanup."""
@@ -422,6 +425,7 @@ class McpGenerationHost:
         *,
         on_health: HealthReporter | None = None,
         on_incident: IncidentReporter | None = None,
+        on_failure: FailureCallback | None = None,
         stop_timeout_seconds: float = _STOP_TIMEOUT_SECONDS,
         readiness_timeout_seconds: float = _READINESS_TIMEOUT_SECONDS,
     ) -> None:
@@ -431,6 +435,7 @@ class McpGenerationHost:
             raise ValueError("readiness_timeout_seconds must be positive")
         self._on_health = on_health
         self._on_incident = on_incident
+        self._on_failure = on_failure
         self._stop_timeout_seconds = stop_timeout_seconds
         self._readiness_timeout_seconds = readiness_timeout_seconds
         self._generations: dict[str, _Generation] = {}
@@ -1009,7 +1014,7 @@ class McpGenerationHost:
         action: Literal["retry_generation_cleanup", "retry_runtime_recovery"] = (
             "retry_runtime_recovery" if state == "degraded" else "retry_generation_cleanup"
         )
-        self._tombstones[generation.generation_id] = McpCleanupTombstone(
+        tombstone = McpCleanupTombstone(
             generation_id=generation.generation_id,
             state=state,
             action=action,
@@ -1017,6 +1022,9 @@ class McpGenerationHost:
             error=_error_text(error),
             attempt_count=generation.cleanup_attempts,
         )
+        self._tombstones[generation.generation_id] = tombstone
+        if self._on_failure is not None:
+            self._on_failure(tombstone)
 
     def _record_diagnostic(
         self,
@@ -1108,8 +1116,8 @@ class McpGenerationHost:
                 raise TypeError("MCP definition type invalid")
             if type(binding.descriptor) is not McpServerDescriptor:
                 raise TypeError("MCP descriptor type invalid")
-            if not binding.is_live():
-                raise RuntimeError(f"MCP declaration is not live: {name}")
+            if not binding.is_owned():
+                raise RuntimeError(f"MCP declaration owner is not live: {name}")
             if _descriptor_fields(binding.descriptor) != _definition_fields(binding.definition):
                 raise ValueError(f"MCP definition/descriptor drift: {name}")
             declared_env = {key for key, _ in binding.descriptor.env}

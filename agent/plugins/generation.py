@@ -116,6 +116,8 @@ class PluginGeneration:
     source_type: Literal["builtin", "installed"] = "builtin"
     static_manifest: StaticPluginManifest | None = None
     static_runtime_commands: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    composition_runtime_cleanup_registered: bool = False
+    replaced_composition_runtime_generation: PluginGeneration | None = None
     entrypoint: str = "plugin.py"
     skill_catalog: PreparedSkillCatalog | None = None
     mcp_catalog: PreparedMcpCatalog | None = None

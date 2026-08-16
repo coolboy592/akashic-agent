@@ -42,6 +42,11 @@ from agent.plugin_composition.mcp_slots import PluginMcpServers
 from agent.plugin_composition.process_slots import PluginManagedProcesses
 from agent.plugin_composition.model import resolve_declared_workspace_root
 from agent.plugins.composable import ComposablePlugin
+from agent.plugins.composition_generation_host import (
+    CompositionGenerationHost,
+    CompositionRuntimeFailure,
+    CompositionRuntimeGeneration,
+)
 
 from agent.plugins.manifest import (
     ensure_workspace_plugin_data_dir,
@@ -115,6 +120,8 @@ from agent.plugins.static_manifest import (
     validate_module_exports,
 )
 from agent.plugins.reload_journal import (
+    RecoveryActionName,
+    RecoveryTarget,
     ReloadJournal,
     ReloadPhase,
     ReloadRecoveryAction,
@@ -319,6 +326,10 @@ class PluginManager:
         self._manager_namespace = secrets.token_hex(4)
         self._skill_host = PluginSkillHost(workspace)
         self._mcp_host = McpGenerationHost()
+        self._composition_runtime_generations: dict[str, PluginGeneration] = {}
+        self._composition_generation_host = CompositionGenerationHost(
+            on_failure=self._on_composition_runtime_failure,
+        )
         self._active_workspace_mcp: WorkspaceMcpGeneration | None = None
         self._prepared_workspace_mcp: WorkspaceMcpGeneration | None = None
         self._job_host = PluginJobHost()
@@ -965,6 +976,23 @@ class PluginManager:
         self._require_unique_recovery_plugins(recovery)
         stable_by_id = self._discovered_by_id(installed_selector="stable")
         latest_by_id = self._discovered_by_id(installed_selector="latest")
+        runtime_recovery = tuple(
+            action
+            for action in recovery
+            if action.action in {
+                "retry_generation_cleanup",
+                "retry_runtime_recovery",
+            }
+        )
+        runtime_receipts = await self._prepare_boot_runtime_recovery(
+            runtime_recovery
+        )
+        recovery = tuple(
+            action for action in recovery if action not in runtime_recovery
+        )
+        if runtime_recovery:
+            stable_by_id = self._discovered_by_id(installed_selector="stable")
+            latest_by_id = self._discovered_by_id(installed_selector="latest")
         for action in recovery:
             if action.action != "discard_candidate":
                 continue
@@ -998,7 +1026,156 @@ class PluginManager:
         else:
             await self._load_stable_batch(tuple(stable_by_id.values()))
         self._finish_committed_recovery(restore_committed)
+        self._finish_boot_runtime_recovery(
+            runtime_recovery,
+            runtime_receipts,
+        )
         await self._restore_latest_candidates(restore_candidates, latest_by_id)
+
+    async def _prepare_boot_runtime_recovery(
+        self,
+        actions: tuple[ReloadRecoveryAction, ...],
+    ) -> dict[str, str]:
+        """Clean exact previous boots and normalize their durable artifact targets."""
+
+        if not actions:
+            return {}
+        current_boot_id = os.environ.get("AKASHIC_BOOT_ID", "").strip()
+        if os.environ.get("AKASHIC_SUPERVISED") != "1" or not current_boot_id:
+            raise RuntimeError(
+                "v3 runtime recovery 需要 supervised boot identity"
+            )
+        from agent.background.boot_guardian import _cleanup_boot_processes
+
+        cleaned_boots: set[str] = set()
+        receipts: dict[str, str] = {}
+        for action in actions:
+            previous_boot_id = action.runtime_owner_boot_id
+            if not previous_boot_id or previous_boot_id == current_boot_id:
+                raise RuntimeError(
+                    "v3 runtime recovery 缺少不同于当前进程的旧 boot identity"
+                )
+            if previous_boot_id not in cleaned_boots:
+                await asyncio.to_thread(
+                    _cleanup_boot_processes,
+                    boot_id=previous_boot_id,
+                    gateway_group_id=None,
+                )
+                cleaned_boots.add(previous_boot_id)
+            self._normalize_runtime_recovery_pointer(action)
+            receipts[action.tx_id] = (
+                f"boot-reconcile:previous={previous_boot_id}:"
+                f"current={current_boot_id}:cleanup=complete:"
+                f"target={action.recovery_target}"
+            )
+        return receipts
+
+    def _normalize_runtime_recovery_pointer(
+        self,
+        action: ReloadRecoveryAction,
+    ) -> None:
+        """Verify one exact pointer pair and select only its recorded target."""
+
+        plugin_name, separator, marketplace = action.plugin_id.rpartition("@")
+        if not separator:
+            raise RuntimeError(
+                "跨 boot runtime recovery 只接受带 exact pointer 的 installed plugin"
+            )
+        plugin_base = (
+            _plugins_home(self._installed_cache_root)
+            / "cache"
+            / marketplace
+            / plugin_name
+        )
+        pointers = read_pointers(plugin_base)
+        if pointers is None or action.recovery_target is None:
+            raise RuntimeError("runtime recovery 缺少 durable pointer/target evidence")
+        base = ArtifactPointer(action.base_artifact_pointer)
+        candidate_pointer = action.candidate_artifact_pointer
+        pair = (pointers.stable, pointers.latest)
+        if action.recovery_target == "base":
+            accepted = {(base, base)}
+            if candidate_pointer is not None:
+                accepted.add((base, ArtifactPointer(candidate_pointer)))
+            if pair not in accepted:
+                raise RuntimeError(
+                    f"runtime recovery base pointer 漂移: {plugin_base}: {pair}"
+                )
+            _ = write_pointers(plugin_base, stable=base, latest=base)
+            return
+        if candidate_pointer is None:
+            raise RuntimeError("runtime recovery candidate target 缺少 exact pointer")
+        candidate = ArtifactPointer(candidate_pointer)
+        if pair != (candidate, candidate):
+            raise RuntimeError(
+                f"runtime recovery candidate pointer 未提交: {plugin_base}: {pair}"
+            )
+
+    def _finish_boot_runtime_recovery(
+        self,
+        actions: tuple[ReloadRecoveryAction, ...],
+        receipts: Mapping[str, str],
+    ) -> None:
+        """Seal boot reconciliation only after the authoritative stable Root is live."""
+
+        snapshot = self.current_snapshot
+        for action in actions:
+            generation = self._active_generations.get(action.plugin_id)
+            expected_pointer = (
+                action.candidate_artifact_pointer
+                if action.recovery_target == "candidate"
+                else action.base_artifact_pointer
+            )
+            if expected_pointer is not None:
+                if generation is None:
+                    raise RuntimeError(
+                        "runtime recovery 未重建 exact stable generation"
+                    )
+                plugin_base = _installed_artifact_base(generation)
+                if plugin_base is None or (
+                    generation.plugin_dir.relative_to(plugin_base).as_posix()
+                    != expected_pointer
+                ):
+                    raise RuntimeError(
+                        "runtime recovery stable artifact identity 不一致"
+                    )
+            elif generation is not None:
+                raise RuntimeError("runtime recovery 应恢复为无插件 base")
+            if (
+                action.recovery_target == "candidate"
+                and generation is not None
+                and generation.source_revision != action.source_revision
+            ):
+                raise RuntimeError(
+                    "candidate runtime recovery source revision 不一致"
+                )
+            if generation is not None and snapshot is not None:
+                if self._composition_runtime_declared(snapshot, action.plugin_id):
+                    if self._composition_generation_host.get(
+                        generation.generation_id
+                    ) is None:
+                        raise RuntimeError(
+                            "boot runtime recovery stable Host 未就绪"
+                        )
+            receipt = receipts.get(action.tx_id)
+            if receipt is None:
+                raise RuntimeError("boot runtime recovery receipt 缺失")
+            stable_identity = (
+                "none"
+                if generation is None
+                else f"{generation.generation_id}:{generation.source_revision}"
+            )
+            snapshot_id = "none" if snapshot is None else snapshot.snapshot_id
+            self._reload_journal.finish_recovery(
+                action,
+                retry_receipt=(
+                    f"{receipt}:snapshot={snapshot_id}:stable={stable_identity}"
+                ),
+            )
+            self._write_startup_recovery_fact(
+                action,
+                committed=action.recovery_target == "candidate",
+            )
 
     async def _load_stable_batch(
         self,
@@ -1022,15 +1199,23 @@ class PluginManager:
             for generation in staged:
                 generation.runtime_snapshot = snapshot
 
-            # 2. legacy v2 只作为待迁移参与者在事务内 prepare/activate；
+            # 2. Root declarations become live only after the whole batch settled.
+            for generation in staged:
+                await self._start_composition_generation_runtime(
+                    generation,
+                    snapshot,
+                    mode="formal",
+                )
+
+            # 3. legacy v2 只作为待迁移参与者在事务内 prepare/activate；
             #    v3 lifecycle 已由完整 CompositionRoot mount。
             await self._activate_stable_batch(staged)
 
-            # 3. 全部准备成功后才登记 stable owner，并一次安装快照。
+            # 4. 全部准备成功后才登记 stable owner，并一次安装快照。
             assert catalog_id is not None
             await self._publish_stable_batch(staged, snapshot, catalog_id)
         except BaseException as error:
-            # 4. 未发布事务失败时恢复所有进程内 owner，并反向释放资源。
+            # 5. 未发布事务失败时恢复所有进程内 owner，并反向释放资源。
             _, cleanup_cancelled = await _complete_critical(
                 self._discard_stable_batch(
                     staged,
@@ -1458,8 +1643,19 @@ class PluginManager:
             return
         if not preserve_latest:
             _discard_generation_candidate_pointer(generation)
+        _, cancelled = await _complete_critical(
+            self._dispose_generation(generation, state="discarded")
+        )
+        runtime_failure = self._composition_generation_host.failure(
+            generation.generation_id
+        )
+        if runtime_failure is not None:
+            raise RuntimeError(
+                "候选 runtime cleanup 未完成，必须显式 retry"
+            )
         self._abort_reload(generation, error=error)
-        await self._dispose_generation(generation, state="discarded")
+        if cancelled:
+            raise asyncio.CancelledError
 
     def _begin_reload_attempt(
         self,
@@ -1468,14 +1664,40 @@ class PluginManager:
         generation_id: str,
         source_revision: str,
         config_revision: str,
+        plugin_dir: Path,
+        source_type: str,
     ) -> str:
         base = self.current_snapshot
+        base_generation = (
+            None if base is None else base.generations.get(plugin_id)
+        )
+        base_pointer: str | None = None
+        candidate_pointer: str | None = None
+        if source_type == "installed":
+            plugin_base = _installed_artifact_base_from_root(plugin_dir)
+            pointers = read_pointers(plugin_base)
+            if pointers is None:
+                raise RuntimeError(
+                    f"installed reload 缺少 artifact pointer state: {plugin_base}"
+                )
+            candidate_pointer = plugin_dir.relative_to(plugin_base).as_posix()
+            if pointers.latest.path != candidate_pointer:
+                raise RuntimeError(
+                    "installed reload generation 与 latest pointer 不一致: "
+                    f"generation={candidate_pointer} latest={pointers.latest.path}"
+                )
+            base_pointer = pointers.stable.path
         return self._reload_journal.begin(
             plugin_id=plugin_id,
             base_snapshot_id=base.snapshot_id if base is not None else None,
+            base_generation_id=(
+                None if base_generation is None else base_generation.generation_id
+            ),
             generation_id=generation_id,
             source_revision=source_revision,
             config_revision=config_revision,
+            base_artifact_pointer=base_pointer,
+            candidate_artifact_pointer=candidate_pointer,
         )
 
     def _abort_reload_attempt(self, tx_id: str | None, *, error: str) -> None:
@@ -1488,19 +1710,34 @@ class PluginManager:
         *,
         state: str,
         preserve_stable_alias: bool = False,
+        skip_composition_runtime: bool = False,
     ) -> None:
         """完成插件终止、作用域清理和注册表卸载。"""
 
         from agent.plugins.context import allow_plugin_cleanup_writes
 
-        # 1. 回收尚未交给 snapshot store 的组合 Root。
+        # 1. Host 必须在 exact Root/Health observer 仍存活时先回收进程。
+        externally_cancelled = False
+        if not skip_composition_runtime:
+            try:
+                await self._stop_composition_generation_runtime(generation)
+            except asyncio.CancelledError:
+                externally_cancelled = True
+            except Exception as error:
+                self._cleanup_failures.append(
+                    CleanupFailure(
+                        resource=f"plugin:{generation.plugin_id}:composition-runtime",
+                        error=str(error) or type(error).__name__,
+                    )
+                )
+
+        # 2. 回收尚未交给 snapshot store 的组合 Root。
         if generation.runtime_snapshot is not None:
             await self._dispose_unreferenced_composition_root(
                 generation.runtime_snapshot
             )
 
-        # 2. 终止 lifecycle v2 对象，并在调用方取消后继续完成它
-        externally_cancelled = False
+        # 3. 终止 lifecycle v2 对象，并在调用方取消后继续完成它
         if generation.prepare_started:
             terminator = getattr(generation.instance, "terminate", None)
             if callable(terminator):
@@ -1509,7 +1746,9 @@ class PluginManager:
                         _, terminator_cancelled = await _complete_critical(
                             cast(Callable[[], Awaitable[None]], terminator)()
                         )
-                    externally_cancelled = terminator_cancelled
+                    externally_cancelled = (
+                        externally_cancelled or terminator_cancelled
+                    )
                 except (asyncio.CancelledError, Exception) as error:
                     current = asyncio.current_task()
                     externally_cancelled = (
@@ -1522,15 +1761,25 @@ class PluginManager:
                         )
                     )
 
-        # 3. 收集作用域失败，确保外部取消不会截断资源清理
+        # 4. 收集作用域失败，确保外部取消不会截断资源清理
         with allow_plugin_cleanup_writes(generation.generation_id):
             cleanup_failures, cleanup_cancelled = await _complete_critical(
                 generation.scope.aclose()
             )
         self._cleanup_failures.extend(cleanup_failures)
         externally_cancelled = externally_cancelled or cleanup_cancelled
+        if (
+            not skip_composition_runtime
+            and self._composition_generation_host.failure(generation.generation_id)
+            is not None
+        ):
+            self._record_composition_runtime_failure(
+                generation,
+                RuntimeError("generation runtime cleanup 未完成"),
+                formal_effects=("generation_runtime_cleanup_pending",),
+            )
 
-        # 4. 清理注册表和模块树
+        # 5. 清理注册表和模块树
         _ = self._scopes.pop(generation.module_path, None)
         self._loaded.discard(generation.module_path)
         _ = self._active_plugins.pop(generation.module_path, None)
@@ -1608,6 +1857,31 @@ class PluginManager:
             _ = self._draining_generations.pop(generation.plugin_id, None)
 
     async def _on_snapshot_drained(self, snapshot: RuntimeSnapshot) -> None:
+        unreferenced_generations = tuple(
+            generation
+            for generation in snapshot.generations.values()
+            if not self._snapshot_store.generation_is_referenced_elsewhere(
+                generation,
+                excluding_snapshot_id=snapshot.snapshot_id,
+            )
+        )
+        for generation in unreferenced_generations:
+            try:
+                await self._stop_composition_generation_runtime(generation)
+            except Exception as error:
+                self._record_drained_composition_runtime_failure(
+                    snapshot,
+                    generation,
+                    error,
+                )
+                self._cleanup_failures.append(
+                    CleanupFailure(
+                        resource=(
+                            f"plugin:{generation.plugin_id}:composition-runtime"
+                        ),
+                        error=str(error) or type(error).__name__,
+                    )
+                )
         composition_root = snapshot.composition_root
         if (
             composition_root is not None
@@ -1624,12 +1898,7 @@ class PluginManager:
             self._skill_host.close(catalog_id)
         state = "aborted" if snapshot.state == "aborted" else "retired"
         current = self._snapshot_store.current
-        for generation in snapshot.generations.values():
-            if self._snapshot_store.generation_is_referenced_elsewhere(
-                generation,
-                excluding_snapshot_id=snapshot.snapshot_id,
-            ):
-                continue
+        for generation in unreferenced_generations:
             replacement = (
                 current.generations.get(generation.plugin_id)
                 if current is not None
@@ -1641,6 +1910,7 @@ class PluginManager:
                 preserve_stable_alias=(
                     replacement is not None and replacement is not generation
                 ),
+                skip_composition_runtime=True,
             )
             self._forget_drained_generation(generation)
         workspace_mcp = snapshot.workspace_mcp_generation
@@ -2163,6 +2433,8 @@ class PluginManager:
             tx_id = generation.reload_tx_id
             if tx_id is None:
                 raise RuntimeError("latest candidate 缺少 reload transaction")
+            if self._reload_journal.get(tx_id).phase != "latest_ready":
+                raise RuntimeError("latest candidate 已被 runtime recovery 撤销准入")
             from agent.plugins.context import PreparedPluginKVStore
 
             context = (
@@ -2194,8 +2466,21 @@ class PluginManager:
                 ready.snapshot,
                 "telegram_bot_commands",
             )
+            stable_snapshot = self.current_snapshot
+            v3_runtime_handoff = self._composition_runtime_declared(
+                ready.snapshot,
+                plugin_id,
+            ) or (
+                stable_snapshot is not None
+                and self._composition_runtime_declared(
+                    stable_snapshot,
+                    plugin_id,
+                )
+            )
             exclusive_endpoint_changed = (
-                old_services != new_services or old_channels != new_channels
+                old_services != new_services
+                or old_channels != new_channels
+                or v3_runtime_handoff
             )
             command_catalog_changed = old_commands != new_commands
             publication_gated = exclusive_endpoint_changed or command_catalog_changed
@@ -2247,16 +2532,39 @@ class PluginManager:
                         )
                         endpoints_switched = True
                 except BaseException:
-                    await self._snapshot_store.resume(quiesced_snapshot)
+                    gated_runtime_error: BaseException | None = None
+                    if runtime_restore_started:
+                        try:
+                            await self._rollback_composition_runtime_replacement(
+                                generation
+                            )
+                        except BaseException as error:
+                            gated_runtime_error = error
+                    if gated_runtime_error is None:
+                        await self._snapshot_store.resume(quiesced_snapshot)
                     if (
-                        exclusive_endpoint_changed
+                        gated_runtime_error is None
+                        and exclusive_endpoint_changed
                         and self._endpoint_resumer is not None
                     ):
                         await self._endpoint_resumer()
                     if runtime_restore_started and self._ready_candidate is ready:
-                        _ = await self._drop_ready(plugin_id)
+                        if gated_runtime_error is None:
+                            _ = await self._drop_ready(plugin_id)
                     else:
                         await self._snapshot_store.resume(candidate_snapshot)
+                    if gated_runtime_error is not None:
+                        self._record_composition_runtime_failure(
+                            generation,
+                            gated_runtime_error,
+                            formal_effects=(
+                                "candidate_validation_stopped",
+                                "old_runtime_restore_uncertain",
+                            ),
+                        )
+                        raise RuntimeError(
+                            "candidate formalization 失败后旧 v3 runtime 恢复失败"
+                        ) from gated_runtime_error
                     raise
             else:
                 try:
@@ -2271,10 +2579,31 @@ class PluginManager:
                         else cast(Any, generation.instance).context.kv_store
                     )
                 except BaseException:
+                    formalization_runtime_error: BaseException | None = None
+                    if runtime_restore_started:
+                        try:
+                            await self._rollback_composition_runtime_replacement(
+                                generation
+                            )
+                        except BaseException as error:
+                            formalization_runtime_error = error
                     if runtime_restore_started and self._ready_candidate is ready:
-                        _ = await self._drop_ready(plugin_id)
+                        if formalization_runtime_error is None:
+                            _ = await self._drop_ready(plugin_id)
                     else:
                         await self._snapshot_store.resume(candidate_snapshot)
+                    if formalization_runtime_error is not None:
+                        self._record_composition_runtime_failure(
+                            generation,
+                            formalization_runtime_error,
+                            formal_effects=(
+                                "candidate_validation_stopped",
+                                "old_runtime_restore_uncertain",
+                            ),
+                        )
+                        raise RuntimeError(
+                            "candidate formalization 失败后旧 v3 runtime 恢复失败"
+                        ) from formalization_runtime_error
                     raise
 
             # 2. 先切可回滚的 Skill 投影，再提交持久 pointer；整个回调不跨 await。
@@ -2290,8 +2619,11 @@ class PluginManager:
                     raise
                 skill_links_switched = True
                 phase = self._reload_journal.get(tx_id).phase
-                if phase == "latest_ready":
-                    self._advance_reload(generation, "promoting")
+                if phase != "latest_ready":
+                    raise RuntimeError(
+                        "candidate runtime recovery 已阻止 pointer commit"
+                    )
+                self._advance_reload(generation, "promoting")
                 artifact_base = _installed_artifact_base(generation)
                 if artifact_base is not None:
                     _switch_ready_pointer(ready, artifact_base)
@@ -2336,6 +2668,7 @@ class PluginManager:
             except BaseException:
                 endpoint_error: BaseException | None = None
                 skill_error: BaseException | None = None
+                runtime_error: BaseException | None = None
                 if skill_links_switched:
                     try:
                         skill_linker.sync(stable_skill_plugins)
@@ -2354,6 +2687,13 @@ class PluginManager:
                         )
                     except BaseException as error:
                         endpoint_error = error
+                if runtime_restore_started:
+                    try:
+                        await self._rollback_composition_runtime_replacement(
+                            generation
+                        )
+                    except BaseException as error:
+                        runtime_error = error
                 if (
                     previous_snapshot is not None
                     and self.current_snapshot is previous_snapshot
@@ -2362,24 +2702,47 @@ class PluginManager:
                         previous_snapshot.snapshot_id,
                         None,
                     )
-                await self._snapshot_store.resume(quiesced_snapshot)
+                if runtime_error is None:
+                    await self._snapshot_store.resume(quiesced_snapshot)
                 if (
-                    self._endpoint_resumer is not None
+                    runtime_error is None
+                    and self._endpoint_resumer is not None
                     and exclusive_endpoint_changed
                 ):
                     await self._endpoint_resumer()
-                if self._ready_candidate is ready:
+                recovery_error = runtime_error or endpoint_error or skill_error
+                if self._ready_candidate is ready and recovery_error is None:
                     _ = await self._drop_ready(plugin_id)
-                if endpoint_error is not None:
+                if recovery_error is not None:
+                    recovery_resources: list[str] = []
+                    recovery_effects: list[str] = []
+                    if runtime_error is not None:
+                        recovery_resources.append("composition-runtime")
+                        recovery_effects.extend(
+                            (
+                                "candidate_formal_started",
+                                "old_runtime_restore_uncertain",
+                            )
+                        )
+                    if endpoint_error is not None:
+                        recovery_resources.append("plugin-endpoint")
+                        recovery_effects.append("endpoint_restore_uncertain")
+                    if skill_error is not None:
+                        recovery_resources.append("plugin-skill-projection")
+                        recovery_effects.append("stable_skill_restore_uncertain")
+                    self._record_composition_runtime_failure(
+                        generation,
+                        recovery_error,
+                        resource=",".join(recovery_resources),
+                        formal_effects=tuple(recovery_effects),
+                    )
                     raise RuntimeError(
-                        "插件 promote 失败后旧 endpoint 恢复失败"
-                    ) from endpoint_error
-                if skill_error is not None:
-                    raise RuntimeError(
-                        "插件 promote 失败后 stable skill 投影恢复失败"
-                    ) from skill_error
+                        "插件 promote 失败后存在未完成的 formal recovery: "
+                        + ", ".join(recovery_resources)
+                    ) from recovery_error
                 raise
             self._ready_candidate = None
+            generation.replaced_composition_runtime_generation = None
             self._track_reload_drain(generation, transaction.previous)
             if self._endpoint_resumer is not None and exclusive_endpoint_changed:
                 await self._endpoint_resumer()
@@ -2422,6 +2785,212 @@ class PluginManager:
                 raise asyncio.CancelledError
             return result
 
+    async def retry_runtime_recovery(self, plugin_id: str) -> dict[str, object]:
+        """Retry one durable v3 runtime owner and reconcile its exact pointer target."""
+
+        result, cancelled = await _complete_critical(
+            self._retry_runtime_recovery_critical(plugin_id)
+        )
+        if cancelled:
+            raise asyncio.CancelledError
+        return result
+
+    async def _retry_runtime_recovery_critical(
+        self,
+        plugin_id: str,
+    ) -> dict[str, object]:
+        """Complete one runtime recovery transaction before exposing cancellation."""
+
+        async with self._candidate_prepare_lock:
+            actions = tuple(
+                action
+                for action in self._reload_journal.pending_recovery()
+                if action.plugin_id == plugin_id
+                and action.action
+                in {"retry_generation_cleanup", "retry_runtime_recovery"}
+            )
+            if len(actions) != 1:
+                raise RuntimeError("插件没有待执行的 runtime recovery")
+            action = actions[0]
+            ready = self._ready_candidate
+            if (
+                ready is not None
+                and (
+                    ready.plugin_id != plugin_id
+                    or ready.candidate.reload_tx_id != action.tx_id
+                )
+            ):
+                ready = None
+            prepared = self._prepared_generations.get(plugin_id)
+            if (
+                prepared is not None
+                and prepared.reload_tx_id != action.tx_id
+            ):
+                prepared = None
+
+            # 1. Retry every exact retained Host owner before changing pointers.
+            receipts: list[str] = []
+            resource = action.failure_resource or ""
+            if "runtime-snapshot-drain" in resource:
+                await self._snapshot_store.retry_drains()
+                receipts.append("runtime-snapshot-drain-complete")
+            retained_generation_ids = tuple(
+                dict.fromkeys(
+                    generation_id
+                    for generation_id in (
+                        action.generation_id,
+                        action.base_generation_id,
+                    )
+                    if generation_id is not None
+                    and self._composition_generation_host.failure(generation_id)
+                    is not None
+                )
+            )
+            for generation_id in retained_generation_ids:
+                if action.action == "retry_runtime_recovery":
+                    receipts.append(
+                        await self._composition_generation_host.retry_runtime_recovery(
+                            generation_id
+                        )
+                    )
+                if self._composition_generation_host.failure(generation_id) is None:
+                    _ = self._composition_runtime_generations.pop(
+                        generation_id,
+                        None,
+                    )
+                else:
+                    receipts.append(
+                        await self._composition_generation_host.retry_generation_cleanup(
+                            generation_id
+                        )
+                    )
+
+            # 2. Rebuild the exact committed stable runtime when rollback left it absent.
+            stable = self._active_generations.get(plugin_id)
+            current = self.current_snapshot
+            if (
+                action.action == "retry_runtime_recovery"
+                and stable is not None
+                and current is not None
+                and self._composition_runtime_declared(current, plugin_id)
+                and self._composition_generation_host.get(stable.generation_id) is None
+                and (
+                    ready is None
+                    or ready.candidate.replaced_composition_runtime_generation is None
+                )
+            ):
+                await self._start_composition_generation_runtime(
+                    stable,
+                    current,
+                    mode="formal",
+                )
+                receipts.append("stable-composition-runtime-restored")
+
+            # 3. Restore non-runtime formal effects only while their candidate owner exists.
+            if (
+                action.action == "retry_runtime_recovery"
+                and ready is not None
+                and ready.candidate.replaced_composition_runtime_generation is not None
+            ):
+                await self._restore_replaced_composition_runtime(ready.candidate)
+                receipts.append("stable-composition-runtime-restored")
+            if "plugin-endpoint" in resource:
+                if ready is None:
+                    raise RuntimeError("runtime recovery 缺少 endpoint candidate owner")
+                old_services = (
+                    {} if ready.previous is None else ready.previous.contributions.managed_services
+                )
+                old_channels = (
+                    () if ready.previous is None else ready.previous.contributions.channels
+                )
+                new_contributions = (
+                    ready.candidate.production_contributions
+                    or ready.candidate.contributions
+                )
+                old_commands = self.stable_telegram_command_catalog()
+                await self._switch_plugin_endpoints(
+                    plugin_id,
+                    new_contributions.managed_services,
+                    old_services,
+                    new_contributions.channels,
+                    old_channels,
+                    old_commands,
+                    old_commands,
+                )
+                receipts.append("stable-plugin-endpoints-restored")
+            if "plugin-skill-projection" in resource:
+                if ready is None:
+                    raise RuntimeError("runtime recovery 缺少 skill candidate owner")
+                linker, stable_plugins, _target_plugins = (
+                    self._prepare_skill_links_for_promotion(
+                        ready.candidate,
+                        ready.snapshot,
+                    )
+                )
+                _ = linker.sync(stable_plugins)
+                receipts.append("stable-skill-projection-restored")
+
+            # 4. Normalize the exact durable target, then drain its unpublished candidate.
+            if (
+                action.base_artifact_pointer is not None
+                or action.candidate_artifact_pointer is not None
+            ):
+                self._normalize_runtime_recovery_pointer(action)
+            elif "@" in plugin_id:
+                raise RuntimeError(
+                    "installed runtime recovery 缺少 exact artifact pointer"
+                )
+            cancelled = False
+            candidate_snapshot = self._snapshot_store.unpromoted_candidate
+            if action.recovery_target == "base" and candidate_snapshot is not None:
+                _, cancelled = await _complete_critical(
+                    self._snapshot_store.discard_latest(candidate_snapshot)
+                )
+            if action.recovery_target == "base" and ready is not None:
+                self._ready_candidate = None
+            if action.recovery_target == "base" and prepared is not None:
+                _ = self._prepared_generations.pop(plugin_id, None)
+                _, prepared_cancelled = await _complete_critical(
+                    self._dispose_generation(prepared, state="discarded")
+                )
+                cancelled = cancelled or prepared_cancelled
+            if action.recovery_target == "candidate" and ready is not None:
+                if self.current_snapshot is not ready.snapshot:
+                    raise RuntimeError(
+                        "runtime recovery candidate target 尚未成为 stable"
+                    )
+                self._ready_candidate = None
+            receipt = ";".join(receipts) or "runtime-owner-already-clean"
+            _, resume_cancelled = await _complete_critical(
+                self._snapshot_store.resume(self.current_snapshot)
+            )
+            endpoint_resume_cancelled = False
+            if self._endpoint_resumer is not None:
+                _, endpoint_resume_cancelled = await _complete_critical(
+                    self._endpoint_resumer()
+                )
+            self._reload_journal.finish_recovery(
+                action,
+                retry_receipt=receipt,
+            )
+            if cancelled or resume_cancelled or endpoint_resume_cancelled:
+                raise asyncio.CancelledError
+            active = self._active_generations.get(plugin_id)
+            return {
+                "plugin_id": plugin_id,
+                "publication_state": "recovered",
+                "recovery_target": action.recovery_target,
+                "generation_id": (
+                    None if active is None else active.generation_id
+                ),
+                "snapshot_id": (
+                    None
+                    if self.current_snapshot is None
+                    else self.current_snapshot.snapshot_id
+                ),
+                "retry_receipt": receipt,
+            }
+
     async def _restore_ready_runtime(
         self,
         ready: _ReadyPluginCandidate,
@@ -2435,10 +3004,19 @@ class PluginManager:
         production_data_dir = generation.production_data_dir
         if production_data_dir is None:
             raise RuntimeError("候选缺少 production plugin-data identity")
+        candidate_runtime = self._composition_generation_host.get(
+            generation.generation_id
+        )
+        expected_mcp_catalog_digests = (
+            None
+            if candidate_runtime is None
+            else candidate_runtime.mcp_catalog_digests
+        )
 
         # 1. 隔离 Root 已封存，先停止其任务，再进入任何 formal await。
         if self._dashboard_validation_releaser is not None:
             await self._dashboard_validation_releaser(ready.snapshot)
+        await self._stop_composition_generation_runtime(generation)
         validation_root = ready.snapshot.composition_root
         if validation_root is not None:
             await validation_root.dispose()
@@ -2494,6 +3072,24 @@ class PluginManager:
                 "候选隔离资源恢复后 snapshot identity 发生变化: "
                 f"{ready.snapshot.snapshot_id} -> {replacement.snapshot_id}"
             )
+        try:
+            await self._stop_replaced_composition_runtime(generation)
+            await self._start_composition_generation_runtime(
+                generation,
+                replacement,
+                mode="formal",
+                expected_mcp_catalog_digests=expected_mcp_catalog_digests,
+            )
+        except BaseException:
+            try:
+                await self._stop_composition_generation_runtime(generation)
+                await self._restore_replaced_composition_runtime(generation)
+            except BaseException as restore_error:
+                raise RuntimeError(
+                    "candidate formal runtime 失败后旧 stable runtime 恢复失败"
+                ) from restore_error
+            await self._dispose_unreferenced_composition_root(replacement)
+            raise
         _replace_snapshot_payload(ready.snapshot, replacement)
         validation_workspace = generation.validation_workspace
         generation.validation_workspace = None
@@ -2537,6 +3133,11 @@ class PluginManager:
         _, cancelled = await _complete_critical(
             self._snapshot_store.discard_latest(ready.snapshot)
         )
+        retained = self._reload_journal.get(tx_id)
+        if retained.phase in {"cleanup_failed", "degraded"}:
+            raise RuntimeError(
+                "candidate runtime cleanup 未完成，必须先执行 recovery"
+            )
         self._advance_reload(
             ready.candidate,
             "aborted",
@@ -2686,6 +3287,10 @@ class PluginManager:
         generation = self._prepared_generations.get(plugin_id)
         if generation is None:
             raise KeyError(f"插件没有待发布候选: {plugin_id}")
+        if generation.reload_tx_id is not None and (
+            self._reload_journal.get(generation.reload_tx_id).phase != "prepared"
+        ):
+            raise RuntimeError("插件候选已被 runtime recovery 撤销准入")
         active = self._active_generations.get(plugin_id)
         stage_latest = _installed_generation_is_candidate(generation)
         production = generation.production_contributions or generation.contributions
@@ -2746,6 +3351,11 @@ class PluginManager:
             generation.runtime_snapshot = await self._compile_generation_snapshot(
                 generation,
                 candidate_owner=generation,
+            )
+            await self._start_composition_generation_runtime(
+                generation,
+                generation.runtime_snapshot,
+                mode="candidate",
             )
             if (
                 prepared_snapshot is not None
@@ -2811,8 +3421,18 @@ class PluginManager:
             snapshot,
             "telegram_bot_commands",
         )
+        current = self.current_snapshot
+        v3_runtime_handoff = self._composition_runtime_declared(
+            snapshot,
+            plugin_id,
+        ) or (
+            current is not None
+            and self._composition_runtime_declared(current, plugin_id)
+        )
         exclusive_endpoint_changed = (
-            old_services != new_services or old_channels != new_channels
+            old_services != new_services
+            or old_channels != new_channels
+            or v3_runtime_handoff
         )
         command_catalog_changed = old_commands != new_commands
         publication_gated = not stage_latest and (
@@ -2997,6 +3617,24 @@ class PluginManager:
                         )
                     except BaseException as rollback_error:
                         production_endpoint_error = rollback_error
+                previous_runtime = (
+                    generation.replaced_composition_runtime_generation
+                )
+                if (
+                    previous_runtime is not None
+                    and self._composition_generation_host.get(
+                        previous_runtime.generation_id
+                    )
+                    is None
+                ):
+                    self._record_composition_runtime_failure(
+                        generation,
+                        error,
+                        formal_effects=(
+                            "candidate_pointer_restored",
+                            "old_runtime_restore_uncertain",
+                        ),
+                    )
                 await self._abort_failed_publication(
                     generation,
                     transaction,
@@ -3104,13 +3742,37 @@ class PluginManager:
                 generation,
                 transaction,
                 error=str(commit_error) or type(commit_error).__name__,
+                finish_journal=False,
             )
+            runtime_restore_error: BaseException | None = None
+            try:
+                await self._restore_replaced_composition_runtime(generation)
+            except BaseException as error:
+                runtime_restore_error = error
+            if runtime_restore_error is not None:
+                self._record_composition_runtime_failure(
+                    generation,
+                    runtime_restore_error,
+                    formal_effects=(
+                        "candidate_pointer_restored",
+                        "old_runtime_restore_uncertain",
+                    ),
+                )
+            elif commit_endpoint_error is None:
+                self._abort_reload(
+                    generation,
+                    error=str(commit_error) or type(commit_error).__name__,
+                )
             if self._endpoint_resumer is not None and exclusive_endpoint_changed:
                 await self._endpoint_resumer()
             if commit_endpoint_error is not None:
                 raise RuntimeError(
                     "Snapshot commit 失败后旧端点恢复失败"
                 ) from commit_endpoint_error
+            if runtime_restore_error is not None:
+                raise RuntimeError(
+                    "Snapshot commit 失败后旧 v3 runtime 恢复失败"
+                ) from runtime_restore_error
             raise commit_error
         if commit_error is None:
             generation.publication_created_data_dir = False
@@ -3145,6 +3807,7 @@ class PluginManager:
         self._loaded.add(generation.module_path)
         generation.state = "active"
         self._active_generations[plugin_id] = generation
+        generation.replaced_composition_runtime_generation = None
         if active is not None:
             active.state = "retired"
         self._channels = [
@@ -3179,13 +3842,23 @@ class PluginManager:
     ) -> RuntimeSnapshot:
         """直接发布前用正式 runtime 重建并关闭 candidate Root。"""
 
+        candidate_runtime = self._composition_generation_host.get(
+            generation.generation_id
+        )
+        expected_mcp_catalog_digests = (
+            None
+            if candidate_runtime is None
+            else candidate_runtime.mcp_catalog_digests
+        )
         if self._dashboard_validation_releaser is not None:
             await self._dashboard_validation_releaser(validation_snapshot)
+        await self._stop_composition_generation_runtime(generation)
         previous_root = validation_snapshot.composition_root
         if previous_root is not None:
             await previous_root.dispose()
         created_data_dir = not generation.data_dir.exists()
         ensure_workspace_plugin_data_dir(generation.data_dir, self._workspace)
+        production_snapshot: RuntimeSnapshot | None = None
         try:
             production_snapshot = await self._compile_generation_snapshot(
                 generation,
@@ -3198,7 +3871,25 @@ class PluginManager:
                     f"{validation_snapshot.snapshot_id} -> "
                     f"{production_snapshot.snapshot_id}"
                 )
+            await self._stop_replaced_composition_runtime(generation)
+            await self._start_composition_generation_runtime(
+                generation,
+                production_snapshot,
+                mode="formal",
+                expected_mcp_catalog_digests=expected_mcp_catalog_digests,
+            )
         except BaseException:
+            try:
+                await self._stop_composition_generation_runtime(generation)
+                await self._restore_replaced_composition_runtime(generation)
+            except BaseException as restore_error:
+                raise RuntimeError(
+                    "production runtime 失败后旧 stable runtime 恢复失败"
+                ) from restore_error
+            if production_snapshot is not None:
+                await self._dispose_unreferenced_composition_root(
+                    production_snapshot
+                )
             if created_data_dir:
                 _remove_validation_data_dir(generation.data_dir)
             raise
@@ -3394,6 +4085,12 @@ class PluginManager:
         *,
         candidate_snapshot_id: str | None = None,
         error: str = "",
+        resource: str | None = None,
+        formal_effects: tuple[str, ...] | None = None,
+        recovery_action: RecoveryActionName | None = None,
+        attempt_count: int | None = None,
+        details: dict[str, object] | None = None,
+        recovery_target: RecoveryTarget | None = None,
     ) -> None:
         tx_id = generation.reload_tx_id
         if tx_id is None:
@@ -3403,6 +4100,12 @@ class PluginManager:
             phase,
             candidate_snapshot_id=candidate_snapshot_id,
             error=error,
+            resource=resource,
+            formal_effects=formal_effects,
+            recovery_action=recovery_action,
+            attempt_count=attempt_count,
+            details=details,
+            recovery_target=recovery_target,
         )
 
     def _abort_reload(
@@ -3415,7 +4118,13 @@ class PluginManager:
         if tx_id is None:
             return
         phase = self._reload_journal.get(tx_id).phase
-        if phase in {"complete", "aborted", "recovered"}:
+        if phase in {
+            "complete",
+            "aborted",
+            "recovered",
+            "cleanup_failed",
+            "degraded",
+        }:
             return
         self._advance_reload(generation, "aborted", error=error)
 
@@ -3425,6 +4134,7 @@ class PluginManager:
         transaction: SnapshotTransaction,
         *,
         error: str,
+        finish_journal: bool = True,
     ) -> None:
         """撤销失败发布，并留下可被启动恢复判定的持久状态。"""
 
@@ -3441,7 +4151,24 @@ class PluginManager:
             _, _ = await _complete_critical(self._snapshot_store.abort(transaction))
         except BaseException as caught:
             snapshot_error = caught
-        if pointer_error is None:
+        tx_id = generation.reload_tx_id
+        if snapshot_error is not None and tx_id is not None:
+            phase = self._reload_journal.get(tx_id).phase
+            if phase not in {"cleanup_failed", "degraded"}:
+                self._record_composition_runtime_failure(
+                    generation,
+                    snapshot_error,
+                    resource="runtime-snapshot-drain",
+                    formal_effects=(
+                        "candidate_pointer_restored",
+                        "candidate_runtime_cleanup_pending",
+                    ),
+                )
+        if finish_journal and pointer_error is None and (
+            tx_id is None
+            or self._reload_journal.get(tx_id).phase
+            not in {"cleanup_failed", "degraded"}
+        ):
             self._abort_reload(generation, error=error)
 
         # 3. Root 已排空后恢复本次 publication 才创建的正式数据身份。
@@ -3753,6 +4480,8 @@ class PluginManager:
                     generation_id=generation_id,
                     source_revision=revision,
                     config_revision="",
+                    plugin_dir=plugin_dir,
+                    source_type=mod.get("source_type", "builtin"),
                 )
                 if not activate
                 else None
@@ -3785,6 +4514,8 @@ class PluginManager:
                 generation_id=generation_id,
                 source_revision=source_revision,
                 config_revision=config_revision,
+                plugin_dir=plugin_dir,
+                source_type=mod.get("source_type", "builtin"),
             )
             if not activate
             else None
@@ -4768,6 +5499,410 @@ class PluginManager:
         except BaseException:
             self._remove_module_tree(module_path)
             raise
+
+    async def _start_composition_generation_runtime(
+        self,
+        generation: PluginGeneration,
+        snapshot: RuntimeSnapshot,
+        *,
+        mode: Literal["candidate", "formal"],
+        expected_mcp_catalog_digests: Mapping[str, str] | None = None,
+    ) -> CompositionRuntimeGeneration | None:
+        """Start one exact Root runtime and refresh snapshot Tool routes."""
+
+        if (
+            generation.reload_tx_id is not None
+            and self._composition_runtime_declared(snapshot, generation.plugin_id)
+        ):
+            boot_id = os.environ.get("AKASHIC_BOOT_ID", "").strip()
+            if boot_id:
+                self._reload_journal.mark_runtime_owner(
+                    generation.reload_tx_id,
+                    boot_id,
+                )
+        self._composition_runtime_generations[generation.generation_id] = generation
+        try:
+            runtime = await self._composition_generation_host.start(
+                generation,
+                snapshot,
+                mode=mode,
+                expected_mcp_catalog_digests=expected_mcp_catalog_digests,
+            )
+        except BaseException:
+            if (
+                self._composition_generation_host.failure(generation.generation_id)
+                is None
+            ):
+                _ = self._composition_runtime_generations.pop(
+                    generation.generation_id,
+                    None,
+                )
+            raise
+        if runtime is None:
+            _ = self._composition_runtime_generations.pop(
+                generation.generation_id,
+                None,
+            )
+        self._refresh_composition_runtime_tools(snapshot)
+        return runtime
+
+    async def _stop_composition_generation_runtime(
+        self,
+        generation: PluginGeneration,
+    ) -> None:
+        """Stop one generation before its exact Root is disposed."""
+
+        await self._composition_generation_host.stop(generation.generation_id)
+        _ = self._composition_runtime_generations.pop(
+            generation.generation_id,
+            None,
+        )
+
+    async def _stop_replaced_composition_runtime(
+        self,
+        generation: PluginGeneration,
+    ) -> None:
+        """Stop the old stable runtime after admission and leases are drained."""
+
+        previous = self._active_generations.get(generation.plugin_id)
+        if (
+            previous is None
+            or self._composition_generation_host.get(previous.generation_id) is None
+        ):
+            return
+        await self._stop_composition_generation_runtime(previous)
+        generation.replaced_composition_runtime_generation = previous
+
+    async def _restore_replaced_composition_runtime(
+        self,
+        generation: PluginGeneration,
+    ) -> None:
+        """Restore an old stable runtime before reopening its snapshot."""
+
+        previous = generation.replaced_composition_runtime_generation
+        if previous is None:
+            return
+        snapshot = self.current_snapshot
+        if snapshot is None or snapshot.generations.get(previous.plugin_id) is not previous:
+            raise RuntimeError("旧 stable runtime snapshot 身份已失效")
+        await self._start_composition_generation_runtime(
+            previous,
+            snapshot,
+            mode="formal",
+        )
+        generation.replaced_composition_runtime_generation = None
+
+    async def _rollback_composition_runtime_replacement(
+        self,
+        generation: PluginGeneration,
+    ) -> None:
+        """Stop an unpublished formal runtime and restore the prior stable owner."""
+
+        await self._stop_composition_generation_runtime(generation)
+        await self._restore_replaced_composition_runtime(generation)
+
+    def _record_composition_runtime_failure(
+        self,
+        generation: PluginGeneration,
+        error: BaseException,
+        *,
+        resource: str = "composition-runtime",
+        formal_effects: tuple[str, ...],
+    ) -> None:
+        """Persist one executable runtime failure without releasing its owner."""
+
+        tx_id = self._ensure_runtime_recovery_transaction(generation)
+        failure = self._composition_generation_host.failure(
+            generation.generation_id
+        )
+        if failure is None:
+            action: RecoveryActionName = (
+                "retry_generation_cleanup"
+                if resource == "runtime-snapshot-drain"
+                else "retry_runtime_recovery"
+            )
+        else:
+            action = failure.action
+        phase: ReloadPhase = (
+            "degraded" if action == "retry_runtime_recovery" else "cleanup_failed"
+        )
+        failure_resource = (
+            f"{resource}:{generation.generation_id}"
+            if failure is None
+            else ",".join((*failure.resource_names, resource))
+        )
+        failure_error = (
+            str(error) or type(error).__name__
+            if failure is None
+            else failure.error
+        )
+        self._reload_journal.advance(
+            tx_id,
+            phase,
+            error=failure_error,
+            resource=failure_resource,
+            formal_effects=formal_effects,
+            recovery_action=action,
+            recovery_target=self._composition_recovery_target(
+                generation,
+                tx_id=tx_id,
+            ),
+        )
+        ready = self._ready_candidate
+        if (
+            ready is not None
+            and ready.candidate.reload_tx_id == tx_id
+            and self._snapshot_store.unpromoted_candidate is ready.snapshot
+        ):
+            _ = self._snapshot_store.pause_candidate_admission(ready.snapshot)
+
+    def _on_composition_runtime_failure(
+        self,
+        failure: CompositionRuntimeFailure,
+    ) -> None:
+        """Persist a watchdog failure for the exact generation owner."""
+
+        generation = self._composition_runtime_generations.get(
+            failure.generation_id
+        )
+        if generation is None:
+            raise RuntimeError(
+                "v3 runtime failure 缺少 Manager generation owner: "
+                f"{failure.generation_id}"
+            )
+        self._record_composition_runtime_failure(
+            generation,
+            RuntimeError(failure.error),
+            formal_effects=("runtime_watchdog_failure",),
+        )
+
+    def _ensure_runtime_recovery_transaction(
+        self,
+        generation: PluginGeneration,
+    ) -> str:
+        """Create a durable owner when cleanup fails outside an active reload."""
+
+        tx_id = generation.reload_tx_id
+        if tx_id is not None:
+            phase = self._reload_journal.get(tx_id).phase
+            if phase not in {"complete", "aborted", "recovered"}:
+                return tx_id
+
+        # 1. A stable failure joins the one in-flight candidate transaction.
+        candidate = self._prepared_generations.get(generation.plugin_id)
+        ready = self._ready_candidate
+        if ready is not None and ready.plugin_id == generation.plugin_id:
+            candidate = ready.candidate
+        current = self.current_snapshot
+        if (
+            candidate is not None
+            and candidate is not generation
+            and current is not None
+            and current.generations.get(generation.plugin_id) is generation
+            and candidate.reload_tx_id is not None
+        ):
+            candidate_record = self._reload_journal.get(candidate.reload_tx_id)
+            if candidate_record.phase not in {"complete", "aborted", "recovered"}:
+                if candidate_record.base_generation_id != generation.generation_id:
+                    raise RuntimeError(
+                        "runtime recovery candidate base generation 身份不一致"
+                    )
+                return candidate.reload_tx_id
+
+        # 2. Freeze the exact stable artifact identity before exposing recovery.
+        base_snapshot = self.current_snapshot
+        base_generation = (
+            None
+            if base_snapshot is None
+            else base_snapshot.generations.get(generation.plugin_id)
+        )
+        base_pointer: str | None = None
+        candidate_pointer: str | None = None
+        plugin_base = _installed_artifact_base(generation)
+        if plugin_base is not None:
+            pointers = read_pointers(plugin_base)
+            if pointers is None:
+                raise RuntimeError(
+                    f"runtime cleanup recovery 缺少 artifact pointer: {plugin_base}"
+                )
+            base_pointer = pointers.stable.path
+            if (
+                base_snapshot is not None
+                and base_generation is generation
+            ):
+                candidate_pointer = generation.plugin_dir.relative_to(
+                    plugin_base
+                ).as_posix()
+
+        # 3. Persist the process boot owner before returning the cleanup failure.
+        tx_id = self._reload_journal.begin(
+            plugin_id=generation.plugin_id,
+            base_snapshot_id=(
+                None if base_snapshot is None else base_snapshot.snapshot_id
+            ),
+            base_generation_id=(
+                None if base_generation is None else base_generation.generation_id
+            ),
+            generation_id=generation.generation_id,
+            source_revision=generation.source_revision,
+            config_revision=generation.config_revision,
+            base_artifact_pointer=base_pointer,
+            candidate_artifact_pointer=candidate_pointer,
+        )
+        generation.reload_tx_id = tx_id
+        boot_id = os.environ.get("AKASHIC_BOOT_ID", "").strip()
+        if boot_id:
+            self._reload_journal.mark_runtime_owner(tx_id, boot_id)
+        return tx_id
+
+    def _record_drained_composition_runtime_failure(
+        self,
+        snapshot: RuntimeSnapshot,
+        generation: PluginGeneration,
+        error: BaseException,
+    ) -> None:
+        """Persist one retained Host owner while allowing Root and module drain."""
+
+        drain_tx_id = self._drain_transactions.get(snapshot.snapshot_id)
+        tx_id = drain_tx_id or generation.reload_tx_id
+        if tx_id is None:
+            return
+        record = self._reload_journal.get(tx_id)
+        if record.phase in {"complete", "aborted", "recovered"}:
+            return
+        failure = self._composition_generation_host.failure(
+            generation.generation_id
+        )
+        action: RecoveryActionName = (
+            "retry_generation_cleanup" if failure is None else failure.action
+        )
+        phase: ReloadPhase = (
+            "degraded" if action == "retry_runtime_recovery" else "cleanup_failed"
+        )
+        self._reload_journal.advance(
+            tx_id,
+            phase,
+            error=(
+                str(error) or type(error).__name__
+                if failure is None
+                else failure.error
+            ),
+            resource=(
+                f"composition-runtime:{generation.generation_id}"
+                if failure is None
+                else ",".join(failure.resource_names)
+            ),
+            formal_effects=(
+                "committed_generation_retained",
+                "old_runtime_cleanup_pending",
+            )
+            if drain_tx_id is not None
+            else (
+                "candidate_pointer_restored",
+                "candidate_runtime_cleanup_pending",
+            ),
+            recovery_action=action,
+            recovery_target=(
+                record.recovery_target
+                or (
+                    "candidate"
+                    if drain_tx_id is not None
+                    else self._composition_recovery_target(
+                        generation,
+                        tx_id=tx_id,
+                    )
+                )
+            ),
+        )
+
+    def _composition_recovery_target(
+        self,
+        generation: PluginGeneration,
+        *,
+        tx_id: str | None = None,
+    ) -> RecoveryTarget:
+        """Resolve the exact durable artifact selected at failure time."""
+
+        if tx_id is None:
+            tx_id = generation.reload_tx_id
+        if tx_id is None:
+            return "base"
+        record = self._reload_journal.get(tx_id)
+        if record.generation_id != generation.generation_id:
+            if record.base_generation_id == generation.generation_id:
+                return "base"
+            raise RuntimeError(
+                "runtime failure generation 不属于 recovery transaction"
+            )
+        if (
+            record.phase in {"cleanup_failed", "degraded"}
+            and record.recovery_target is not None
+        ):
+            return record.recovery_target
+        base_pointer = record.base_artifact_pointer
+        candidate_pointer = record.candidate_artifact_pointer
+        plugin_base = _installed_artifact_base(generation)
+        if plugin_base is None or candidate_pointer is None:
+            current = self.current_snapshot
+            if (
+                current is not None
+                and current.generations.get(generation.plugin_id) is generation
+            ):
+                return "candidate"
+            return "base"
+        pointers = read_pointers(plugin_base)
+        if pointers is None:
+            raise RuntimeError(
+                f"runtime failure 缺少 durable artifact pointer: {plugin_base}"
+            )
+        if pointers.stable.path == candidate_pointer:
+            return "candidate"
+        if pointers.stable.path == base_pointer:
+            return "base"
+        raise RuntimeError(
+            "runtime failure artifact pointer 超出 reload transaction: "
+            f"stable={pointers.stable.path} base={base_pointer} "
+            f"candidate={candidate_pointer}"
+        )
+
+    def _refresh_composition_runtime_tools(
+        self,
+        snapshot: RuntimeSnapshot,
+    ) -> None:
+        """Rebuild ToolRegistry and attach every exact live v3 MCP facade."""
+
+        snapshot.tool_registry = self._compile_snapshot_tools(
+            dict(snapshot.generations),
+            snapshot.workspace_mcp_generation,
+        )
+        for generation in sorted(
+            snapshot.generations.values(),
+            key=lambda item: item.plugin_id,
+        ):
+            runtime = self._composition_generation_host.get(
+                generation.generation_id
+            )
+            snapshot.tool_registry = self._composition_generation_host.attach_tools(
+                snapshot.tool_registry,
+                runtime,
+            )
+
+    @staticmethod
+    def _composition_runtime_declared(
+        snapshot: RuntimeSnapshot,
+        plugin_id: str,
+    ) -> bool:
+        """Return whether one plugin owns MCP/process declarations in a snapshot."""
+
+        return any(
+            binding.descriptor.owner == plugin_id
+            for registry in (
+                snapshot.managed_process_registry,
+                snapshot.mcp_server_registry,
+            )
+            if registry is not None
+            for binding in registry.values()
+        )
 
     def _compile_snapshot_tools(
         self,

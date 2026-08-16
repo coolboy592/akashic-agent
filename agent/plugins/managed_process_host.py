@@ -99,6 +99,9 @@ class GenerationCleanupTombstone:
     attempt_count: int
 
 
+FailureCallback = Callable[[GenerationCleanupTombstone], None]
+
+
 class _LogRing:
     """Keep a bounded line ring while retaining byte and drop diagnostics."""
 
@@ -213,6 +216,7 @@ class ManagedProcessGenerationHost:
         *,
         on_health: HealthReporter | None = None,
         on_incident: IncidentReporter | None = None,
+        on_failure: FailureCallback | None = None,
         log_max_bytes: int = _DEFAULT_LOG_BYTES,
         log_max_lines: int = _DEFAULT_LOG_LINES,
         stop_timeout_seconds: float = _DEFAULT_STOP_TIMEOUT_SECONDS,
@@ -227,6 +231,7 @@ class ManagedProcessGenerationHost:
             raise ValueError("recovery_stable_seconds must be positive")
         self._on_health = on_health
         self._on_incident = on_incident
+        self._on_failure = on_failure
         self._log_max_bytes = log_max_bytes
         self._log_max_lines = log_max_lines
         self._stop_timeout_seconds = stop_timeout_seconds
@@ -932,7 +937,7 @@ class ManagedProcessGenerationHost:
     ) -> None:
         generation.cleanup_attempts += 1
         generation.state = "cleanup_failed"
-        self._tombstones[generation.generation_id] = GenerationCleanupTombstone(
+        tombstone = GenerationCleanupTombstone(
             generation_id=generation.generation_id,
             state="cleanup_failed",
             action="retry_generation_cleanup",
@@ -940,6 +945,9 @@ class ManagedProcessGenerationHost:
             error=_error_text(error),
             attempt_count=generation.cleanup_attempts,
         )
+        self._tombstones[generation.generation_id] = tombstone
+        if self._on_failure is not None:
+            self._on_failure(tombstone)
 
     def _retain_runtime_tombstone(
         self,
@@ -948,7 +956,7 @@ class ManagedProcessGenerationHost:
         error: BaseException,
     ) -> None:
         generation.cleanup_attempts += 1
-        self._tombstones[generation.generation_id] = GenerationCleanupTombstone(
+        tombstone = GenerationCleanupTombstone(
             generation_id=generation.generation_id,
             state="degraded",
             action="retry_runtime_recovery",
@@ -956,6 +964,9 @@ class ManagedProcessGenerationHost:
             error=_error_text(error),
             attempt_count=generation.cleanup_attempts,
         )
+        self._tombstones[generation.generation_id] = tombstone
+        if self._on_failure is not None:
+            self._on_failure(tombstone)
 
     async def _emit_health(
         self,

@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import asyncio
+import os
+import sys
+import socket
+import shutil
 from pathlib import Path
 
 import pytest
@@ -17,9 +22,13 @@ from agent.plugin_composition.mcp_slots import (
     _freeze_plugin_mcp_servers,
 )
 from agent.plugins.manager import PluginManager
+from agent.plugins.artifacts import ArtifactPointer, read_pointers, write_pointers
+from agent.plugins.manifest import write_plugin_manifest
 from agent.plugins.registry import plugin_registry
 from agent.plugins.snapshot import RuntimeSnapshot
+from agent.tools.registry import ToolRegistry
 from bus.event_bus import EventBus
+from utils.process_group import OwnedProcessGroup
 
 
 @pytest.fixture(autouse=True)
@@ -287,17 +296,26 @@ async def test_mcp_registry_rejects_context_from_another_root(
     await root_a.dispose()
 
 
-def _manager(tmp_path: Path) -> PluginManager:
+def _manager(
+    tmp_path: Path,
+    *,
+    tool_registry: ToolRegistry | None = None,
+) -> PluginManager:
     return PluginManager(
         plugin_dirs=[tmp_path / "plugins"],
         event_bus=EventBus(),
-        tool_registry=None,
+        tool_registry=tool_registry,
         workspace=tmp_path / "workspace",
         installed_cache_root=tmp_path / "home" / "cache",
     )
 
 
-def _plugin_source(version: str) -> str:
+def _port_live(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        return probe.connect_ex(("127.0.0.1", port)) == 0
+
+
+def _plugin_source(version: str, *, python_command: str = "python") -> str:
     return (
         "from agent.plugin_composition import (\n"
         "    MANAGED_PROCESSES, MCP_SERVERS, EndpointEnv,\n"
@@ -310,13 +328,13 @@ def _plugin_source(version: str) -> str:
         "async def apply(ctx, config):\n"
         "    await ctx.require(MANAGED_PROCESSES).register(\n"
         "        ctx, ManagedProcessDefinition(\n"
-        "            name='calendar_api', command=('python', 'api.py'),\n"
+        f"            name='calendar_api', command=({python_command!r}, 'api.py'),\n"
         "            formal_port=18000, readiness_path='/health',\n"
         "        ),\n"
         "    )\n"
         "    await ctx.require(MCP_SERVERS).register(\n"
         "        ctx, McpServerDefinition(\n"
-        "            name='calendar', command=('python', 'mcp.py'),\n"
+        f"            name='calendar', command=({python_command!r}, 'mcp.py'),\n"
         "            required_tools=('get_events',),\n"
         "            candidate_read_only_tools=('get_events',),\n"
         "            endpoint_env=(EndpointEnv('PORT', 'calendar_api'),),\n"
@@ -329,10 +347,33 @@ def _plugin_source(version: str) -> str:
 def _write_manager_plugin(tmp_path: Path, version: str) -> Path:
     plugin_dir = _plugin_dir(tmp_path / "plugins")
     (plugin_dir / "plugin.py").write_text(
-        _plugin_source(version),
+        _plugin_source(version, python_command=sys.executable),
         encoding="utf-8",
     )
-    (plugin_dir / "api.py").write_text("print('api')\n", encoding="utf-8")
+    (plugin_dir / "api.py").write_text(
+        "import os\n"
+        "from http.server import BaseHTTPRequestHandler, HTTPServer\n"
+        "class Handler(BaseHTTPRequestHandler):\n"
+        "    def do_GET(self):\n"
+        "        self.send_response(200); self.end_headers(); self.wfile.write(b'ready')\n"
+        "    def log_message(self, *_args): pass\n"
+        "HTTPServer(('127.0.0.1', int(os.environ['PORT'])), Handler).serve_forever()\n",
+        encoding="utf-8",
+    )
+    (plugin_dir / "mcp.py").write_text(
+        "import json, os, sys\n"
+        "for raw in sys.stdin:\n"
+        "    msg = json.loads(raw); method = msg.get('method')\n"
+        "    if method == 'initialize': result = {'protocolVersion': '2025-11-25'}\n"
+        "    elif method == 'tools/list': result = {'tools': [{'name': 'get_events', "
+        "'description': 'read events', 'inputSchema': {'type': 'object'}}]}\n"
+        "    elif method == 'tools/call': result = {'content': [{'type': 'text', "
+        "'text': '|'.join((os.environ.get('VERSION', 'formal'), "
+        "os.environ['PORT'], os.environ['AKA_PLUGIN_DATA_DIR']))}]}\n"
+        "    else: continue\n"
+        "    print(json.dumps({'jsonrpc': '2.0', 'id': msg['id'], 'result': result}), flush=True)\n",
+        encoding="utf-8",
+    )
     return plugin_dir
 
 
@@ -342,11 +383,37 @@ def _write_static_manager_plugin(tmp_path: Path, version: str) -> Path:
         _plugin_source(version),
         encoding="utf-8",
     )
-    (plugin_dir / "api.py").write_text("print('api')\n", encoding="utf-8")
+    (plugin_dir / "api.py").write_text(
+        "import os\n"
+        "from http.server import BaseHTTPRequestHandler, HTTPServer\n"
+        "class Handler(BaseHTTPRequestHandler):\n"
+        "    def do_GET(self):\n"
+        "        self.send_response(200); self.end_headers(); self.wfile.write(b'ready')\n"
+        "    def log_message(self, *_args): pass\n"
+        "HTTPServer(('127.0.0.1', int(os.environ['PORT'])), Handler).serve_forever()\n",
+        encoding="utf-8",
+    )
+    (plugin_dir / "mcp.py").write_text(
+        "import json, os, sys\n"
+        "for raw in sys.stdin:\n"
+        "    msg = json.loads(raw); method = msg.get('method')\n"
+        "    if method == 'initialize': result = {'protocolVersion': '2025-11-25'}\n"
+        "    elif method == 'tools/list': result = {'tools': [{'name': 'get_events', "
+        "'description': 'read events', 'inputSchema': {'type': 'object'}}]}\n"
+        "    elif method == 'tools/call': result = {'content': [{'type': 'text', "
+        "'text': '|'.join((os.environ.get('VERSION', 'formal'), "
+        "os.environ['PORT'], os.environ['AKA_PLUGIN_DATA_DIR']))}]}\n"
+        "    else: continue\n"
+        "    print(json.dumps({'jsonrpc': '2.0', 'id': msg['id'], 'result': result}), flush=True)\n",
+        encoding="utf-8",
+    )
     (plugin_dir / "requirements.txt").write_text("", encoding="utf-8")
     interpreter = plugin_dir / ".venv" / "bin" / "python"
     interpreter.parent.mkdir(parents=True)
-    interpreter.write_text("", encoding="utf-8")
+    interpreter.write_text(
+        f"#!/bin/sh\nexec {sys.executable} \"$@\"\n",
+        encoding="utf-8",
+    )
     interpreter.chmod(0o755)
     (plugin_dir / "akashic.plugin.toml").write_text(
         "schema_version = 1\n"
@@ -374,12 +441,31 @@ def _write_static_manager_plugin(tmp_path: Path, version: str) -> Path:
     return plugin_dir
 
 
+def _upgrade_static_manager_plugin(plugin_dir: Path, version: str) -> None:
+    (plugin_dir / "entry.py").write_text(
+        _plugin_source(version),
+        encoding="utf-8",
+    )
+    manifest = plugin_dir / "akashic.plugin.toml"
+    text = manifest.read_text(encoding="utf-8")
+    manifest.write_text(
+        text.replace('version = "1"', f'version = "{version}"').replace(
+            'VERSION = "1"',
+            f'VERSION = "{version}"',
+        ),
+        encoding="utf-8",
+    )
+
+
 @pytest.mark.asyncio
 async def test_static_manifest_is_admission_source_and_reconciles_mcp_root(
     tmp_path: Path,
 ) -> None:
     plugin_dir = _write_static_manager_plugin(tmp_path, "1")
-    manager = _manager(tmp_path)
+    manager = _manager(
+        tmp_path,
+        tool_registry=ToolRegistry(follow_runtime_snapshot=False),
+    )
 
     await manager.load_all()
     generation = manager._active_generations["calendar"]  # pyright: ignore[reportPrivateUsage]
@@ -397,6 +483,19 @@ async def test_static_manifest_is_admission_source_and_reconciles_mcp_root(
     assert manager.current_snapshot is not None
     assert manager.current_snapshot.mcp_server_registry is not None
     assert manager.current_snapshot.managed_process_registry is not None
+    runtime = manager._composition_generation_host.get(  # pyright: ignore[reportPrivateUsage]
+        generation.generation_id
+    )
+    assert runtime is not None and runtime.processes is not None
+    endpoint = runtime.processes.endpoint("calendar_api")
+    assert endpoint.port == 18000 and _port_live(endpoint.port)
+    tool_registry = manager.current_snapshot.tool_registry
+    assert tool_registry is not None
+    tool = tool_registry.get_tool("mcp_calendar__get_events")
+    assert tool is not None
+    assert await tool.execute() == "|".join(
+        ("formal", "18000", str(generation.data_dir))
+    )
 
     (plugin_dir / "entry.py").write_text(
         _plugin_source("2"),
@@ -415,6 +514,1284 @@ async def test_static_manifest_is_admission_source_and_reconciles_mcp_root(
     assert candidate.static_manifest is not None
     await manager.discard_prepared("calendar")
     await manager.terminate_all()
+    assert not _port_live(18000)
+
+
+@pytest.mark.asyncio
+async def test_builtin_direct_formal_failure_recovers_stable_runtime_explicitly(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AKASHIC_BOOT_ID", "boot-builtin-recovery")
+    plugin_dir = _write_static_manager_plugin(tmp_path, "1")
+    manager = _manager(
+        tmp_path,
+        tool_registry=ToolRegistry(follow_runtime_snapshot=False),
+    )
+    try:
+        await manager.load_all()
+        stable = manager.generation("calendar")
+        stable_snapshot = manager.current_snapshot
+        assert stable is not None and stable_snapshot is not None
+        assert _port_live(18000)
+        _upgrade_static_manager_plugin(plugin_dir, "2")
+        candidate = await manager.prepare_candidate("calendar")
+        assert candidate is not None and candidate.reload_tx_id is not None
+        original_start = manager._composition_generation_host.start  # pyright: ignore[reportPrivateUsage]
+        original_restore = manager._restore_replaced_composition_runtime  # pyright: ignore[reportPrivateUsage]
+        formal_failed = False
+        restore_failures = 0
+
+        async def fail_candidate_formal_once(*args, **kwargs):
+            nonlocal formal_failed
+            if kwargs.get("mode") == "formal" and not formal_failed:
+                formal_failed = True
+                raise RuntimeError("builtin candidate formal start failed")
+            return await original_start(*args, **kwargs)
+
+        async def fail_stable_restore_twice(*args, **kwargs):
+            nonlocal restore_failures
+            if restore_failures < 2:
+                restore_failures += 1
+                raise RuntimeError("builtin stable restore failed")
+            return await original_restore(*args, **kwargs)
+
+        monkeypatch.setattr(
+            manager._composition_generation_host,  # pyright: ignore[reportPrivateUsage]
+            "start",
+            fail_candidate_formal_once,
+        )
+        monkeypatch.setattr(
+            manager,
+            "_restore_replaced_composition_runtime",
+            fail_stable_restore_twice,
+        )
+
+        with pytest.raises(RuntimeError, match="旧 stable runtime 恢复失败"):
+            await manager.publish_prepared("calendar")
+
+        record = manager._reload_journal.get(  # pyright: ignore[reportPrivateUsage]
+            candidate.reload_tx_id
+        )
+        assert record.phase == "degraded"
+        assert record.recovery_target == "base"
+        assert manager.current_snapshot is stable_snapshot
+        assert manager.generation("calendar") is stable
+        assert not _port_live(18000)
+
+        recovered = await manager.retry_runtime_recovery("calendar")
+
+        assert recovered["publication_state"] == "recovered"
+        assert recovered["recovery_target"] == "base"
+        assert manager.current_snapshot is stable_snapshot
+        assert manager.generation("calendar") is stable
+        assert _port_live(18000)
+        assert manager._reload_journal.get(  # pyright: ignore[reportPrivateUsage]
+            candidate.reload_tx_id
+        ).phase == "recovered"
+    finally:
+        await manager.terminate_all()
+    assert not _port_live(18000)
+
+
+@pytest.mark.asyncio
+async def test_installed_runtime_candidate_isolated_and_commit_failure_restores_stable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AKASHIC_BOOT_ID", "boot-runtime-v1")
+    monkeypatch.setenv("AKASHIC_SUPERVISED", "1")
+    source_root = _write_static_manager_plugin(tmp_path / "source", "1")
+    plugin_base = tmp_path / "home" / "cache" / "lab" / "calendar"
+    stable_artifact = plugin_base / ".artifacts" / "1.0.0-stable"
+    latest_artifact = plugin_base / ".artifacts" / "2.0.0-latest"
+    shutil.copytree(source_root, stable_artifact)
+    shutil.copytree(source_root, latest_artifact)
+    latest_entry = latest_artifact / "entry.py"
+    latest_entry.write_text(_plugin_source("2"), encoding="utf-8")
+    latest_manifest = latest_artifact / "akashic.plugin.toml"
+    latest_manifest.write_text(
+        latest_manifest.read_text(encoding="utf-8")
+        .replace('version = "1"', 'version = "2"')
+        .replace('VERSION = "1"', 'VERSION = "2"'),
+        encoding="utf-8",
+    )
+    stable_pointer = ArtifactPointer(".artifacts/1.0.0-stable")
+    latest_pointer = ArtifactPointer(".artifacts/2.0.0-latest")
+    write_pointers(plugin_base, stable=stable_pointer, latest=stable_pointer)
+    write_plugin_manifest(
+        {"calendar@lab": True},
+        plugins_home=tmp_path / "home",
+    )
+    manager = _manager(
+        tmp_path,
+        tool_registry=ToolRegistry(follow_runtime_snapshot=False),
+    )
+    try:
+        await manager.load_all()
+        stable = manager.generation("calendar@lab")
+        stable_snapshot = manager.current_snapshot
+        assert stable is not None and stable_snapshot is not None
+        assert _port_live(18000)
+
+        write_pointers(plugin_base, stable=stable_pointer, latest=latest_pointer)
+        result = (await manager.reconcile_changed())[0]
+        candidate = manager.ready_candidate
+        assert result.get("publication_state") == "latest_ready", result
+        assert candidate is not None and candidate.runtime_snapshot is not None
+        assert candidate.reload_tx_id is not None
+        journal_record = manager._reload_journal.get(  # pyright: ignore[reportPrivateUsage]
+            candidate.reload_tx_id
+        )
+        assert journal_record.runtime_owner_boot_id == "boot-runtime-v1"
+        assert journal_record.base_artifact_pointer == stable_pointer.path
+        assert journal_record.candidate_artifact_pointer == latest_pointer.path
+        candidate_runtime = manager._composition_generation_host.get(  # pyright: ignore[reportPrivateUsage]
+            candidate.generation_id
+        )
+        assert candidate_runtime is not None and candidate_runtime.processes is not None
+        candidate_port = candidate_runtime.processes.endpoint("calendar_api").port
+        assert candidate_port != 18000 and _port_live(candidate_port)
+        candidate_tool = candidate.runtime_snapshot.tool_registry.get_tool(  # type: ignore[union-attr]
+            "mcp_calendar__get_events"
+        )
+        assert candidate_tool is not None
+        candidate_output = await candidate_tool.execute()
+        assert candidate_output.startswith(f"2|{candidate_port}|")
+        assert "plugin-validation" in candidate_output
+        assert manager.current_snapshot is stable_snapshot
+        assert _port_live(18000)
+
+        original_host_start = manager._composition_generation_host.start  # pyright: ignore[reportPrivateUsage]
+        original_restore = manager._restore_replaced_composition_runtime  # pyright: ignore[reportPrivateUsage]
+        formal_failed = False
+        restore_failures = 0
+
+        async def fail_candidate_formal_once(*args, **kwargs):
+            nonlocal formal_failed
+            if kwargs.get("mode") == "formal" and not formal_failed:
+                formal_failed = True
+                raise RuntimeError("candidate formal start failed")
+            return await original_host_start(*args, **kwargs)
+
+        async def fail_stable_restore_once(*args, **kwargs):
+            nonlocal restore_failures
+            if restore_failures < 2:
+                restore_failures += 1
+                raise RuntimeError("stable runtime restore failed")
+            return await original_restore(*args, **kwargs)
+
+        monkeypatch.setattr(
+            manager._composition_generation_host,  # pyright: ignore[reportPrivateUsage]
+            "start",
+            fail_candidate_formal_once,
+        )
+        monkeypatch.setattr(
+            manager,
+            "_restore_replaced_composition_runtime",
+            fail_stable_restore_once,
+        )
+        with pytest.raises(RuntimeError, match="candidate formalization 失败"):
+            await manager.switch_ready("calendar@lab")
+
+        degraded = manager._reload_journal.get(  # pyright: ignore[reportPrivateUsage]
+            candidate.reload_tx_id
+        )
+        assert degraded.phase == "degraded"
+        assert degraded.recovery_target == "base"
+        assert manager.ready_candidate is not None
+        assert not _port_live(18000) and not _port_live(candidate_port)
+
+        recovered = await manager.retry_runtime_recovery("calendar@lab")
+
+        assert recovered["publication_state"] == "recovered"
+        assert manager.current_snapshot is stable_snapshot
+        assert manager.ready_candidate is None
+        assert _port_live(18000)
+        assert manager._reload_journal.get(  # pyright: ignore[reportPrivateUsage]
+            candidate.reload_tx_id
+        ).phase == "recovered"
+
+        monkeypatch.undo()
+        write_pointers(plugin_base, stable=stable_pointer, latest=latest_pointer)
+        result = (await manager.reconcile_changed())[0]
+        candidate = manager.ready_candidate
+        assert result.get("publication_state") == "latest_ready", result
+        assert candidate is not None
+        candidate_runtime = manager._composition_generation_host.get(  # pyright: ignore[reportPrivateUsage]
+            candidate.generation_id
+        )
+        assert candidate_runtime is not None and candidate_runtime.processes is not None
+        candidate_port = candidate_runtime.processes.endpoint("calendar_api").port
+
+        def fail_owner_commit(*_args: object) -> None:
+            raise RuntimeError("runtime owner commit failed")
+
+        monkeypatch.setattr(
+            manager,
+            "_activate_published_generation",
+            fail_owner_commit,
+        )
+        with pytest.raises(RuntimeError, match="runtime owner commit failed"):
+            await manager.switch_ready("calendar@lab")
+
+        assert manager.current_snapshot is stable_snapshot
+        assert manager.generation("calendar@lab") is stable
+        assert manager.ready_candidate is None
+        assert _port_live(18000)
+        assert not _port_live(candidate_port)
+        stable_tool = stable_snapshot.tool_registry.get_tool(  # type: ignore[union-attr]
+            "mcp_calendar__get_events"
+        )
+        assert stable_tool is not None
+        assert await stable_tool.execute() == "|".join(
+            ("formal", "18000", str(stable.data_dir))
+        )
+
+        monkeypatch.undo()
+        write_pointers(plugin_base, stable=stable_pointer, latest=latest_pointer)
+        retry_result = (await manager.reconcile_changed())[0]
+        retry_candidate = manager.ready_candidate
+        assert retry_result.get("publication_state") == "latest_ready", retry_result
+        assert retry_candidate is not None
+        retry_runtime = manager._composition_generation_host.get(  # pyright: ignore[reportPrivateUsage]
+            retry_candidate.generation_id
+        )
+        assert retry_runtime is not None and retry_runtime.processes is not None
+        retry_port = retry_runtime.processes.endpoint("calendar_api").port
+        assert retry_port != 18000 and _port_live(retry_port)
+
+        promoted = await manager.switch_ready("calendar@lab")
+
+        current = manager.current_snapshot
+        active = manager.generation("calendar@lab")
+        assert promoted["publication_state"] == "promoted"
+        assert current is not None and current is not stable_snapshot
+        assert active is retry_candidate
+        assert _port_live(18000) and not _port_live(retry_port)
+        promoted_tool = current.tool_registry.get_tool(  # type: ignore[union-attr]
+            "mcp_calendar__get_events"
+        )
+        assert promoted_tool is not None
+        assert await promoted_tool.execute() == "|".join(
+            ("formal", "18000", str(active.data_dir))
+        )
+    finally:
+        await manager.terminate_all()
+    assert not _port_live(18000)
+
+
+@pytest.mark.asyncio
+async def test_committed_watchdog_failure_is_journaled_and_restartable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AKASHIC_BOOT_ID", "boot-watchdog-failure")
+    _ = _write_static_manager_plugin(tmp_path, "1")
+    manager = _manager(
+        tmp_path,
+        tool_registry=ToolRegistry(follow_runtime_snapshot=False),
+    )
+    try:
+        await manager.load_all()
+        generation = manager.generation("calendar")
+        assert generation is not None
+        process_host = manager._composition_generation_host._process_host  # pyright: ignore[reportPrivateUsage]
+        process_host._recovery_backoff_seconds = ()  # pyright: ignore[reportPrivateUsage]
+        owned = process_host._generations[generation.generation_id]  # pyright: ignore[reportPrivateUsage]
+        process = owned.entries["calendar_api"].process
+        assert process is not None
+        process.kill()
+
+        action = None
+        for _ in range(100):
+            actions = manager._reload_journal.pending_recovery()  # pyright: ignore[reportPrivateUsage]
+            if actions:
+                action = actions[0]
+                break
+            await asyncio.sleep(0.01)
+        assert action is not None
+        assert action.phase == "degraded"
+        assert action.action == "retry_runtime_recovery"
+        assert action.recovery_target == "candidate"
+        assert action.runtime_owner_boot_id == "boot-watchdog-failure"
+        assert manager._composition_generation_host.failure(  # pyright: ignore[reportPrivateUsage]
+            generation.generation_id
+        ) is not None
+
+        recovered = await manager.retry_runtime_recovery("calendar")
+
+        assert recovered["recovery_target"] == "candidate"
+        assert manager._reload_journal.get(  # pyright: ignore[reportPrivateUsage]
+            action.tx_id
+        ).phase == "recovered"
+        runtime = manager._composition_generation_host.get(  # pyright: ignore[reportPrivateUsage]
+            generation.generation_id
+        )
+        assert runtime is not None and runtime.processes is not None
+        assert _port_live(runtime.processes.endpoint("calendar_api").port)
+    finally:
+        await manager.terminate_all()
+    assert not _port_live(18000)
+
+
+@pytest.mark.asyncio
+async def test_watchdog_failure_shutdown_drains_healthy_sibling_and_keeps_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setenv("AKASHIC_BOOT_ID", "boot-watchdog-shutdown")
+    _ = _write_static_manager_plugin(tmp_path, "1")
+    manager = _manager(
+        tmp_path,
+        tool_registry=ToolRegistry(follow_runtime_snapshot=False),
+    )
+    terminated = False
+    try:
+        await manager.load_all()
+        generation = manager.generation("calendar")
+        assert generation is not None
+        composition_host = manager._composition_generation_host  # pyright: ignore[reportPrivateUsage]
+        process_host = composition_host._process_host  # pyright: ignore[reportPrivateUsage]
+        process_host._recovery_backoff_seconds = ()  # pyright: ignore[reportPrivateUsage]
+        owned = process_host._generations[generation.generation_id]  # pyright: ignore[reportPrivateUsage]
+        process = owned.entries["calendar_api"].process
+        assert process is not None
+        process.kill()
+        action = None
+        for _ in range(100):
+            actions = manager._reload_journal.pending_recovery()  # pyright: ignore[reportPrivateUsage]
+            if actions:
+                action = actions[0]
+                break
+            await asyncio.sleep(0.01)
+        assert action is not None and action.recovery_target == "candidate"
+        caplog.clear()
+
+        await manager.terminate_all()
+        terminated = True
+
+        record = manager._reload_journal.get(action.tx_id)  # pyright: ignore[reportPrivateUsage]
+        assert record.phase == "degraded"
+        assert record.recovery_target == "candidate"
+        assert composition_host._mcp_host.get(generation.generation_id) is None  # pyright: ignore[reportPrivateUsage]
+        assert composition_host._mcp_host.tombstone(generation.generation_id) is None  # pyright: ignore[reportPrivateUsage]
+        assert composition_host._process_host.get(generation.generation_id) is not None  # pyright: ignore[reportPrivateUsage]
+        assert composition_host._process_host.tombstone(generation.generation_id) is not None  # pyright: ignore[reportPrivateUsage]
+
+        recovered = await manager.retry_runtime_recovery("calendar")
+        assert "composition-runtime" in str(recovered["retry_receipt"])
+        assert manager._reload_journal.get(action.tx_id).phase == "recovered"  # pyright: ignore[reportPrivateUsage]
+        assert composition_host.failure(generation.generation_id) is None
+        assert not any(
+            "observer 已失效" in record.message
+            or "health callback failed" in record.message
+            for record in caplog.records
+        )
+    finally:
+        if not terminated:
+            await manager.terminate_all()
+    assert not _port_live(18000)
+
+
+@pytest.mark.asyncio
+async def test_watchdog_failure_joins_prepared_candidate_transaction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AKASHIC_BOOT_ID", "boot-watchdog-prepared")
+    plugin_dir = _write_static_manager_plugin(tmp_path, "1")
+    manager = _manager(
+        tmp_path,
+        tool_registry=ToolRegistry(follow_runtime_snapshot=False),
+    )
+    try:
+        await manager.load_all()
+        stable = manager.generation("calendar")
+        stable_snapshot = manager.current_snapshot
+        assert stable is not None and stable_snapshot is not None
+        _upgrade_static_manager_plugin(plugin_dir, "2")
+        candidate = await manager.prepare_candidate("calendar")
+        assert candidate is not None and candidate.reload_tx_id is not None
+        validation_root = candidate.validation_workspace
+        assert validation_root is not None
+
+        process_host = manager._composition_generation_host._process_host  # pyright: ignore[reportPrivateUsage]
+        process_host._recovery_backoff_seconds = ()  # pyright: ignore[reportPrivateUsage]
+        owned = process_host._generations[stable.generation_id]  # pyright: ignore[reportPrivateUsage]
+        process = owned.entries["calendar_api"].process
+        assert process is not None
+        process.kill()
+
+        action = None
+        for _ in range(100):
+            actions = manager._reload_journal.pending_recovery()  # pyright: ignore[reportPrivateUsage]
+            if actions and actions[0].phase == "degraded":
+                action = actions[0]
+                break
+            await asyncio.sleep(0.01)
+        assert action is not None
+        assert len(manager._reload_journal.pending_recovery()) == 1  # pyright: ignore[reportPrivateUsage]
+        assert action.tx_id == candidate.reload_tx_id
+        assert action.generation_id == candidate.generation_id
+        assert action.base_generation_id == stable.generation_id
+        assert action.recovery_target == "base"
+        with pytest.raises(RuntimeError, match="撤销准入"):
+            await manager.publish_prepared("calendar")
+
+        recovered = await manager.retry_runtime_recovery("calendar")
+
+        assert recovered["recovery_target"] == "base"
+        assert manager.current_snapshot is stable_snapshot
+        assert manager.generation("calendar") is stable
+        assert candidate.scope.closed
+        assert not validation_root.parent.exists()
+        assert _port_live(18000)
+        assert manager._reload_journal.get(  # pyright: ignore[reportPrivateUsage]
+            candidate.reload_tx_id
+        ).phase == "recovered"
+    finally:
+        await manager.terminate_all()
+    assert not _port_live(18000)
+
+
+@pytest.mark.asyncio
+async def test_watchdog_failure_revokes_ready_candidate_and_restores_base(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AKASHIC_BOOT_ID", "boot-watchdog-ready")
+    source_root = _write_static_manager_plugin(tmp_path / "source", "1")
+    plugin_base = tmp_path / "home" / "cache" / "lab" / "calendar"
+    stable_artifact = plugin_base / ".artifacts" / "1.0.0-stable"
+    latest_artifact = plugin_base / ".artifacts" / "2.0.0-latest"
+    shutil.copytree(source_root, stable_artifact)
+    shutil.copytree(source_root, latest_artifact)
+    _upgrade_static_manager_plugin(latest_artifact, "2")
+    stable_pointer = ArtifactPointer(".artifacts/1.0.0-stable")
+    latest_pointer = ArtifactPointer(".artifacts/2.0.0-latest")
+    write_pointers(plugin_base, stable=stable_pointer, latest=stable_pointer)
+    write_plugin_manifest(
+        {"calendar@lab": True},
+        plugins_home=tmp_path / "home",
+    )
+    manager = _manager(
+        tmp_path,
+        tool_registry=ToolRegistry(follow_runtime_snapshot=False),
+    )
+    try:
+        await manager.load_all()
+        stable = manager.generation("calendar@lab")
+        stable_snapshot = manager.current_snapshot
+        assert stable is not None and stable_snapshot is not None
+        write_pointers(plugin_base, stable=stable_pointer, latest=latest_pointer)
+        result = (await manager.reconcile_changed())[0]
+        ready = manager.ready_candidate
+        assert result.get("publication_state") == "latest_ready"
+        assert ready is not None and ready.reload_tx_id is not None
+        candidate_snapshot = ready.runtime_snapshot
+        assert candidate_snapshot is not None
+        candidate_runtime = manager._composition_generation_host.get(  # pyright: ignore[reportPrivateUsage]
+            ready.generation_id
+        )
+        assert candidate_runtime is not None and candidate_runtime.processes is not None
+        candidate_port = candidate_runtime.processes.endpoint("calendar_api").port
+
+        process_host = manager._composition_generation_host._process_host  # pyright: ignore[reportPrivateUsage]
+        process_host._recovery_backoff_seconds = ()  # pyright: ignore[reportPrivateUsage]
+        owned = process_host._generations[stable.generation_id]  # pyright: ignore[reportPrivateUsage]
+        process = owned.entries["calendar_api"].process
+        assert process is not None
+        process.kill()
+        action = None
+        for _ in range(100):
+            actions = manager._reload_journal.pending_recovery()  # pyright: ignore[reportPrivateUsage]
+            if actions and actions[0].phase == "degraded":
+                action = actions[0]
+                break
+            await asyncio.sleep(0.01)
+        assert action is not None
+        assert len(manager._reload_journal.pending_recovery()) == 1  # pyright: ignore[reportPrivateUsage]
+        assert action.tx_id == ready.reload_tx_id
+        assert action.recovery_target == "base"
+        assert not candidate_snapshot.accepting_leases
+        with pytest.raises(RuntimeError, match="撤销准入"):
+            await manager.switch_ready("calendar@lab")
+        pointers = read_pointers(plugin_base)
+        assert pointers is not None
+        assert pointers.stable == stable_pointer
+        assert pointers.latest == latest_pointer
+        manager._reload_journal.advance(  # pyright: ignore[reportPrivateUsage]
+            action.tx_id,
+            "degraded",
+            resource="plugin-endpoint,plugin-skill-projection",
+            error="formal endpoint and skill rollback incomplete",
+            recovery_target="base",
+        )
+
+        recovered = await manager.retry_runtime_recovery("calendar@lab")
+
+        assert recovered["recovery_target"] == "base"
+        assert "stable-plugin-endpoints-restored" in str(
+            recovered["retry_receipt"]
+        )
+        assert "stable-skill-projection-restored" in str(
+            recovered["retry_receipt"]
+        )
+        assert manager.current_snapshot is stable_snapshot
+        assert manager.generation("calendar@lab") is stable
+        assert manager.ready_candidate is None
+        assert ready.scope.closed
+        assert _port_live(18000)
+        assert not _port_live(candidate_port)
+        pointers = read_pointers(plugin_base)
+        assert pointers is not None
+        assert pointers.stable == stable_pointer
+        assert pointers.latest == stable_pointer
+        assert manager._reload_journal.get(action.tx_id).phase == "recovered"  # pyright: ignore[reportPrivateUsage]
+    finally:
+        await manager.terminate_all()
+    assert not _port_live(18000)
+
+
+@pytest.mark.asyncio
+async def test_runtime_recovery_finishes_after_resume_even_when_caller_cancelled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AKASHIC_BOOT_ID", "boot-recovery-cancel")
+    _ = _write_static_manager_plugin(tmp_path, "1")
+    manager = _manager(
+        tmp_path,
+        tool_registry=ToolRegistry(follow_runtime_snapshot=False),
+    )
+    release = asyncio.Event()
+    entered = asyncio.Event()
+    try:
+        await manager.load_all()
+        generation = manager.generation("calendar")
+        assert generation is not None
+        process_host = manager._composition_generation_host._process_host  # pyright: ignore[reportPrivateUsage]
+        process_host._recovery_backoff_seconds = ()  # pyright: ignore[reportPrivateUsage]
+        owned = process_host._generations[generation.generation_id]  # pyright: ignore[reportPrivateUsage]
+        process = owned.entries["calendar_api"].process
+        assert process is not None
+        process.kill()
+        action = None
+        for _ in range(100):
+            actions = manager._reload_journal.pending_recovery()  # pyright: ignore[reportPrivateUsage]
+            if actions:
+                action = actions[0]
+                break
+            await asyncio.sleep(0.01)
+        assert action is not None
+
+        async def blocking_resumer() -> None:
+            entered.set()
+            await release.wait()
+
+        manager._endpoint_resumer = blocking_resumer  # pyright: ignore[reportPrivateUsage]
+        retry = asyncio.create_task(manager.retry_runtime_recovery("calendar"))
+        await entered.wait()
+        assert manager._reload_journal.get(action.tx_id).phase == "degraded"  # pyright: ignore[reportPrivateUsage]
+        retry.cancel()
+        await asyncio.sleep(0)
+        assert not retry.done()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await retry
+
+        assert manager._reload_journal.get(action.tx_id).phase == "recovered"  # pyright: ignore[reportPrivateUsage]
+        assert manager.current_snapshot is not None
+        assert manager.current_snapshot.accepting_leases
+    finally:
+        release.set()
+        await manager.terminate_all()
+    assert not _port_live(18000)
+
+
+@pytest.mark.asyncio
+async def test_runtime_recovery_finishes_host_retry_before_exposing_cancellation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AKASHIC_BOOT_ID", "boot-host-retry-cancel")
+    _ = _write_static_manager_plugin(tmp_path, "1")
+    manager = _manager(
+        tmp_path,
+        tool_registry=ToolRegistry(follow_runtime_snapshot=False),
+    )
+    release = asyncio.Event()
+    entered = asyncio.Event()
+    try:
+        await manager.load_all()
+        generation = manager.generation("calendar")
+        assert generation is not None
+        composition_host = manager._composition_generation_host  # pyright: ignore[reportPrivateUsage]
+        process_host = composition_host._process_host  # pyright: ignore[reportPrivateUsage]
+        process_host._recovery_backoff_seconds = ()  # pyright: ignore[reportPrivateUsage]
+        owned = process_host._generations[generation.generation_id]  # pyright: ignore[reportPrivateUsage]
+        process = owned.entries["calendar_api"].process
+        assert process is not None
+        process.kill()
+        action = None
+        for _ in range(100):
+            actions = manager._reload_journal.pending_recovery()  # pyright: ignore[reportPrivateUsage]
+            if actions:
+                action = actions[0]
+                break
+            await asyncio.sleep(0.01)
+        assert action is not None
+        original_retry = composition_host.retry_runtime_recovery
+
+        async def blocking_retry(generation_id: str) -> str:
+            entered.set()
+            await release.wait()
+            return await original_retry(generation_id)
+
+        monkeypatch.setattr(composition_host, "retry_runtime_recovery", blocking_retry)
+        retry = asyncio.create_task(manager.retry_runtime_recovery("calendar"))
+        await entered.wait()
+        retry.cancel()
+        await asyncio.sleep(0)
+        assert not retry.done()
+        assert manager._reload_journal.get(action.tx_id).phase == "degraded"  # pyright: ignore[reportPrivateUsage]
+
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await retry
+
+        assert manager._reload_journal.get(action.tx_id).phase == "recovered"  # pyright: ignore[reportPrivateUsage]
+        runtime = composition_host.get(generation.generation_id)
+        assert runtime is not None and runtime.processes is not None
+        assert _port_live(runtime.processes.endpoint("calendar_api").port)
+    finally:
+        release.set()
+        await manager.terminate_all()
+    assert not _port_live(18000)
+
+
+@pytest.mark.asyncio
+async def test_candidate_start_cleanup_failure_keeps_durable_retry_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AKASHIC_BOOT_ID", "boot-candidate-start-failure")
+    plugin_dir = _write_static_manager_plugin(tmp_path, "1")
+    manager = _manager(
+        tmp_path,
+        tool_registry=ToolRegistry(follow_runtime_snapshot=False),
+    )
+    original_terminate = OwnedProcessGroup.terminate
+
+    async def fail_runtime_cleanup(
+        _group: OwnedProcessGroup,
+        *,
+        timeout_s: float,
+    ) -> None:
+        _ = timeout_s
+        raise RuntimeError("injected candidate start cleanup failure")
+
+    try:
+        await manager.load_all()
+        stable_snapshot = manager.current_snapshot
+        _upgrade_static_manager_plugin(plugin_dir, "2")
+        candidate = await manager.prepare_candidate("calendar")
+        assert candidate is not None and candidate.reload_tx_id is not None
+        (plugin_dir / "mcp.py").write_text(
+            "raise SystemExit(23)\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            OwnedProcessGroup,
+            "terminate",
+            fail_runtime_cleanup,
+        )
+
+        with pytest.raises(RuntimeError, match="runtime cleanup 未完成"):
+            await manager.publish_prepared("calendar")
+
+        record = manager._reload_journal.get(  # pyright: ignore[reportPrivateUsage]
+            candidate.reload_tx_id
+        )
+        assert record.phase == "cleanup_failed"
+        assert record.recovery_action == "retry_generation_cleanup"
+        assert record.recovery_target == "base"
+        assert manager.current_snapshot is stable_snapshot
+        assert manager._composition_generation_host.failure(  # pyright: ignore[reportPrivateUsage]
+            candidate.generation_id
+        ) is not None
+        retained = manager._composition_generation_host.get(  # pyright: ignore[reportPrivateUsage]
+            candidate.generation_id
+        )
+        assert retained is not None and retained.processes is not None
+        retained_port = retained.processes.endpoint("calendar_api").port
+        assert _port_live(retained_port)
+
+        monkeypatch.setattr(
+            OwnedProcessGroup,
+            "terminate",
+            original_terminate,
+        )
+        recovered = await manager.retry_runtime_recovery("calendar")
+
+        assert recovered["recovery_target"] == "base"
+        assert manager._reload_journal.get(  # pyright: ignore[reportPrivateUsage]
+            candidate.reload_tx_id
+        ).phase == "aborted"
+        assert not _port_live(retained_port)
+    finally:
+        monkeypatch.setattr(
+            OwnedProcessGroup,
+            "terminate",
+            original_terminate,
+        )
+        await manager.terminate_all()
+
+
+@pytest.mark.asyncio
+async def test_stable_boot_cleanup_failure_creates_durable_retry_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AKASHIC_BOOT_ID", "boot-stable-start-failure")
+    plugin_dir = _write_static_manager_plugin(tmp_path, "1")
+    (plugin_dir / "mcp.py").write_text(
+        "raise SystemExit(24)\n",
+        encoding="utf-8",
+    )
+    manager = _manager(
+        tmp_path,
+        tool_registry=ToolRegistry(follow_runtime_snapshot=False),
+    )
+    original_terminate = OwnedProcessGroup.terminate
+
+    async def fail_runtime_cleanup(
+        _group: OwnedProcessGroup,
+        *,
+        timeout_s: float,
+    ) -> None:
+        _ = timeout_s
+        raise RuntimeError("injected stable boot cleanup failure")
+
+    monkeypatch.setattr(OwnedProcessGroup, "terminate", fail_runtime_cleanup)
+    try:
+        with pytest.raises(RuntimeError, match="cleanup"):
+            await manager.load_all()
+
+        actions = manager._reload_journal.pending_recovery()  # pyright: ignore[reportPrivateUsage]
+        assert len(actions) == 1
+        action = actions[0]
+        assert action.plugin_id == "calendar"
+        assert action.phase == "cleanup_failed"
+        assert action.action == "retry_generation_cleanup"
+        assert action.recovery_target == "base"
+        assert action.runtime_owner_boot_id == "boot-stable-start-failure"
+        retained = manager._composition_generation_host.get(  # pyright: ignore[reportPrivateUsage]
+            action.generation_id
+        )
+        assert retained is not None and retained.processes is not None
+        retained_port = retained.processes.endpoint("calendar_api").port
+        assert _port_live(retained_port)
+
+        monkeypatch.setattr(
+            OwnedProcessGroup,
+            "terminate",
+            original_terminate,
+        )
+        recovered = await manager.retry_runtime_recovery("calendar")
+
+        assert recovered["recovery_target"] == "base"
+        assert manager._reload_journal.get(  # pyright: ignore[reportPrivateUsage]
+            action.tx_id
+        ).phase == "aborted"
+        assert not _port_live(retained_port)
+    finally:
+        monkeypatch.setattr(
+            OwnedProcessGroup,
+            "terminate",
+            original_terminate,
+        )
+        await manager.terminate_all()
+
+
+@pytest.mark.asyncio
+async def test_candidate_cleanup_failure_requires_host_retry_before_abort(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AKASHIC_BOOT_ID", "boot-cleanup-retry")
+    monkeypatch.setenv("AKASHIC_SUPERVISED", "1")
+    source_root = _write_static_manager_plugin(tmp_path / "source", "1")
+    plugin_base = tmp_path / "home" / "cache" / "lab" / "calendar"
+    stable_artifact = plugin_base / ".artifacts" / "1.0.0-stable"
+    candidate_artifact = plugin_base / ".artifacts" / "2.0.0-latest"
+    shutil.copytree(source_root, stable_artifact)
+    shutil.copytree(source_root, candidate_artifact)
+    (candidate_artifact / "entry.py").write_text(
+        _plugin_source("2"),
+        encoding="utf-8",
+    )
+    candidate_manifest = candidate_artifact / "akashic.plugin.toml"
+    candidate_manifest.write_text(
+        candidate_manifest.read_text(encoding="utf-8")
+        .replace('version = "1"', 'version = "2"')
+        .replace('VERSION = "1"', 'VERSION = "2"'),
+        encoding="utf-8",
+    )
+    base_pointer = ArtifactPointer(".artifacts/1.0.0-stable")
+    candidate_pointer = ArtifactPointer(".artifacts/2.0.0-latest")
+    write_pointers(plugin_base, stable=base_pointer, latest=base_pointer)
+    write_plugin_manifest(
+        {"calendar@lab": True},
+        plugins_home=tmp_path / "home",
+    )
+    manager = _manager(
+        tmp_path,
+        tool_registry=ToolRegistry(follow_runtime_snapshot=False),
+    )
+    original_terminate = OwnedProcessGroup.terminate
+    terminate_calls = 0
+
+    async def fail_terminate_once(
+        group: OwnedProcessGroup,
+        *,
+        timeout_s: float,
+    ) -> None:
+        nonlocal terminate_calls
+        terminate_calls += 1
+        if terminate_calls == 2:
+            raise RuntimeError("injected process-group cleanup failure")
+        await original_terminate(group, timeout_s=timeout_s)
+
+    try:
+        await manager.load_all()
+        stable_snapshot = manager.current_snapshot
+        assert stable_snapshot is not None and _port_live(18000)
+        write_pointers(
+            plugin_base,
+            stable=base_pointer,
+            latest=candidate_pointer,
+        )
+        result = (await manager.reconcile_changed())[0]
+        candidate = manager.ready_candidate
+        assert result.get("publication_state") == "latest_ready"
+        assert candidate is not None and candidate.reload_tx_id is not None
+        runtime = manager._composition_generation_host.get(  # pyright: ignore[reportPrivateUsage]
+            candidate.generation_id
+        )
+        assert runtime is not None and runtime.processes is not None
+        candidate_port = runtime.processes.endpoint("calendar_api").port
+        monkeypatch.setattr(OwnedProcessGroup, "terminate", fail_terminate_once)
+
+        with pytest.raises(RuntimeError, match="runtime cleanup 未完成"):
+            await manager.drop_candidate("calendar@lab")
+
+        record = manager._reload_journal.get(  # pyright: ignore[reportPrivateUsage]
+            candidate.reload_tx_id
+        )
+        assert record.phase == "cleanup_failed"
+        assert record.recovery_target == "base"
+        assert manager.ready_candidate is candidate
+        assert manager.current_snapshot is stable_snapshot
+        assert _port_live(18000)
+        assert manager._composition_generation_host.failure(  # pyright: ignore[reportPrivateUsage]
+            candidate.generation_id
+        ) is not None
+
+        recovered = await manager.retry_runtime_recovery("calendar@lab")
+
+        assert recovered["publication_state"] == "recovered"
+        assert recovered["recovery_target"] == "base"
+        assert manager.ready_candidate is None
+        assert manager.current_snapshot is stable_snapshot
+        assert _port_live(18000) and not _port_live(candidate_port)
+        assert manager._reload_journal.get(  # pyright: ignore[reportPrivateUsage]
+            candidate.reload_tx_id
+        ).phase == "aborted"
+    finally:
+        monkeypatch.setattr(OwnedProcessGroup, "terminate", original_terminate)
+        await manager.terminate_all()
+    assert not _port_live(18000)
+
+
+@pytest.mark.asyncio
+async def test_installed_stable_boot_cleanup_failure_targets_base(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AKASHIC_BOOT_ID", "boot-installed-stable-failure")
+    source_root = _write_static_manager_plugin(tmp_path / "source", "1")
+    plugin_base = tmp_path / "home" / "cache" / "lab" / "calendar"
+    stable_artifact = plugin_base / ".artifacts" / "1.0.0-stable"
+    shutil.copytree(source_root, stable_artifact)
+    (stable_artifact / "mcp.py").write_text(
+        "raise SystemExit(24)\n",
+        encoding="utf-8",
+    )
+    stable_pointer = ArtifactPointer(".artifacts/1.0.0-stable")
+    write_pointers(plugin_base, stable=stable_pointer, latest=stable_pointer)
+    write_plugin_manifest(
+        {"calendar@lab": True},
+        plugins_home=tmp_path / "home",
+    )
+    manager = _manager(
+        tmp_path,
+        tool_registry=ToolRegistry(follow_runtime_snapshot=False),
+    )
+    original_terminate = OwnedProcessGroup.terminate
+
+    async def fail_runtime_cleanup(
+        _group: OwnedProcessGroup,
+        *,
+        timeout_s: float,
+    ) -> None:
+        _ = timeout_s
+        raise RuntimeError("injected installed stable cleanup failure")
+
+    monkeypatch.setattr(OwnedProcessGroup, "terminate", fail_runtime_cleanup)
+    try:
+        with pytest.raises(RuntimeError, match="cleanup"):
+            await manager.load_all()
+        action = manager._reload_journal.pending_recovery()[0]  # pyright: ignore[reportPrivateUsage]
+        assert action.action == "retry_generation_cleanup"
+        assert action.recovery_target == "base"
+        assert action.base_artifact_pointer == stable_pointer.path
+        assert action.candidate_artifact_pointer is None
+        assert manager.current_snapshot is None
+
+        monkeypatch.setattr(OwnedProcessGroup, "terminate", original_terminate)
+        recovered = await manager.retry_runtime_recovery("calendar@lab")
+
+        assert recovered["recovery_target"] == "base"
+        assert recovered["generation_id"] is None
+        assert recovered["snapshot_id"] is None
+        assert manager._reload_journal.get(action.tx_id).phase == "aborted"  # pyright: ignore[reportPrivateUsage]
+        pointers = read_pointers(plugin_base)
+        assert pointers is not None
+        assert pointers.stable == stable_pointer
+        assert pointers.latest == stable_pointer
+    finally:
+        monkeypatch.setattr(OwnedProcessGroup, "terminate", original_terminate)
+        await manager.terminate_all()
+    assert not _port_live(18000)
+
+
+@pytest.mark.asyncio
+async def test_supervised_boot_reconciles_degraded_runtime_to_exact_base(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AKASHIC_BOOT_ID", "boot-runtime-old")
+    monkeypatch.setenv("AKASHIC_SUPERVISED", "1")
+    source_root = _write_static_manager_plugin(tmp_path / "source", "1")
+    plugin_base = tmp_path / "home" / "cache" / "lab" / "calendar"
+    stable_artifact = plugin_base / ".artifacts" / "1.0.0-stable"
+    latest_artifact = plugin_base / ".artifacts" / "2.0.0-latest"
+    shutil.copytree(source_root, stable_artifact)
+    shutil.copytree(source_root, latest_artifact)
+    (latest_artifact / "entry.py").write_text(
+        _plugin_source("2"),
+        encoding="utf-8",
+    )
+    latest_manifest = latest_artifact / "akashic.plugin.toml"
+    latest_manifest.write_text(
+        latest_manifest.read_text(encoding="utf-8")
+        .replace('version = "1"', 'version = "2"')
+        .replace('VERSION = "1"', 'VERSION = "2"'),
+        encoding="utf-8",
+    )
+    stable_pointer = ArtifactPointer(".artifacts/1.0.0-stable")
+    latest_pointer = ArtifactPointer(".artifacts/2.0.0-latest")
+    write_pointers(plugin_base, stable=stable_pointer, latest=stable_pointer)
+    write_plugin_manifest(
+        {"calendar@lab": True},
+        plugins_home=tmp_path / "home",
+    )
+    old_manager = _manager(
+        tmp_path,
+        tool_registry=ToolRegistry(follow_runtime_snapshot=False),
+    )
+    new_manager: PluginManager | None = None
+    orphan: asyncio.subprocess.Process | None = None
+    try:
+        await old_manager.load_all()
+        write_pointers(plugin_base, stable=stable_pointer, latest=latest_pointer)
+        _ = await old_manager.reconcile_changed()
+        candidate = old_manager.ready_candidate
+        assert candidate is not None and candidate.reload_tx_id is not None
+
+        original_start = old_manager._composition_generation_host.start  # pyright: ignore[reportPrivateUsage]
+        formal_failed = False
+
+        async def fail_formal_once(*args, **kwargs):
+            nonlocal formal_failed
+            if kwargs.get("mode") == "formal" and not formal_failed:
+                formal_failed = True
+                raise RuntimeError("formal start failed before pointer commit")
+            return await original_start(*args, **kwargs)
+
+        async def fail_restore(*_args, **_kwargs):
+            raise RuntimeError("old runtime restore remains uncertain")
+
+        monkeypatch.setattr(
+            old_manager._composition_generation_host,  # pyright: ignore[reportPrivateUsage]
+            "start",
+            fail_formal_once,
+        )
+        monkeypatch.setattr(
+            old_manager,
+            "_restore_replaced_composition_runtime",
+            fail_restore,
+        )
+        with pytest.raises(RuntimeError, match="candidate formalization 失败"):
+            await old_manager.switch_ready("calendar@lab")
+        action = old_manager._reload_journal.pending_recovery()[0]  # pyright: ignore[reportPrivateUsage]
+        assert action.phase == "degraded"
+        assert action.recovery_target == "base"
+        assert action.runtime_owner_boot_id == "boot-runtime-old"
+
+        orphan_env = dict(os.environ)
+        orphan_env["AKASHIC_BOOT_ID"] = "boot-runtime-old"
+        orphan = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-c",
+            "import time; time.sleep(60)",
+            env=orphan_env,
+            start_new_session=True,
+        )
+        assert orphan.returncode is None
+
+        monkeypatch.setenv("AKASHIC_BOOT_ID", "boot-runtime-new")
+        new_manager = _manager(
+            tmp_path,
+            tool_registry=ToolRegistry(follow_runtime_snapshot=False),
+        )
+        await new_manager.load_all()
+
+        pointers = read_pointers(plugin_base)
+        assert pointers is not None
+        assert pointers.stable == stable_pointer
+        assert pointers.latest == stable_pointer
+        assert await asyncio.wait_for(orphan.wait(), timeout=2) != 0
+        stable = new_manager.generation("calendar@lab")
+        snapshot = new_manager.current_snapshot
+        assert stable is not None and snapshot is not None
+        assert stable.plugin_dir == stable_artifact
+        assert _port_live(18000)
+        tool = snapshot.tool_registry.get_tool(  # type: ignore[union-attr]
+            "mcp_calendar__get_events"
+        )
+        assert tool is not None
+        assert await tool.execute() == "|".join(
+            ("formal", "18000", str(stable.data_dir))
+        )
+        assert new_manager._reload_journal.get(  # pyright: ignore[reportPrivateUsage]
+            action.tx_id
+        ).phase == "recovered"
+    finally:
+        if orphan is not None and orphan.returncode is None:
+            orphan.kill()
+            _ = await orphan.wait()
+        if new_manager is not None:
+            await new_manager.terminate_all()
+        await old_manager.terminate_all()
+    assert not _port_live(18000)
+
+
+@pytest.mark.asyncio
+async def test_supervised_boot_rebuilds_exact_candidate_after_pointer_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AKASHIC_BOOT_ID", "boot-candidate-old")
+    monkeypatch.setenv("AKASHIC_SUPERVISED", "1")
+    source_root = _write_static_manager_plugin(tmp_path / "source", "1")
+    plugin_base = tmp_path / "home" / "cache" / "lab" / "calendar"
+    stable_artifact = plugin_base / ".artifacts" / "1.0.0-stable"
+    candidate_artifact = plugin_base / ".artifacts" / "2.0.0-latest"
+    shutil.copytree(source_root, stable_artifact)
+    shutil.copytree(source_root, candidate_artifact)
+    (candidate_artifact / "entry.py").write_text(
+        _plugin_source("2"),
+        encoding="utf-8",
+    )
+    candidate_manifest = candidate_artifact / "akashic.plugin.toml"
+    candidate_manifest.write_text(
+        candidate_manifest.read_text(encoding="utf-8")
+        .replace('version = "1"', 'version = "2"')
+        .replace('VERSION = "1"', 'VERSION = "2"'),
+        encoding="utf-8",
+    )
+    base_pointer = ArtifactPointer(".artifacts/1.0.0-stable")
+    candidate_pointer = ArtifactPointer(".artifacts/2.0.0-latest")
+    write_pointers(plugin_base, stable=base_pointer, latest=base_pointer)
+    write_plugin_manifest(
+        {"calendar@lab": True},
+        plugins_home=tmp_path / "home",
+    )
+    old_manager = _manager(
+        tmp_path,
+        tool_registry=ToolRegistry(follow_runtime_snapshot=False),
+    )
+    new_manager: PluginManager | None = None
+    orphan: asyncio.subprocess.Process | None = None
+    old_manager_closed = False
+    try:
+        await old_manager.load_all()
+        write_pointers(
+            plugin_base,
+            stable=base_pointer,
+            latest=candidate_pointer,
+        )
+        _ = await old_manager.reconcile_changed()
+        candidate = old_manager.ready_candidate
+        assert candidate is not None and candidate.reload_tx_id is not None
+        old_manager._advance_reload(candidate, "promoting")  # pyright: ignore[reportPrivateUsage]
+        write_pointers(
+            plugin_base,
+            stable=candidate_pointer,
+            latest=candidate_pointer,
+        )
+        old_manager._advance_reload(  # pyright: ignore[reportPrivateUsage]
+            candidate,
+            "degraded",
+            error="process crashed after pointer commit",
+            resource=f"composition-runtime:{candidate.generation_id}",
+            formal_effects=("candidate_pointer_committed",),
+            recovery_action="retry_runtime_recovery",
+            recovery_target="candidate",
+        )
+
+        # A real new boot cannot coexist with the old Gateway event loop.
+        await old_manager.terminate_all()
+        old_manager_closed = True
+        orphan_env = dict(os.environ)
+        orphan_env["AKASHIC_BOOT_ID"] = "boot-candidate-old"
+        orphan = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-c",
+            "import time; time.sleep(60)",
+            env=orphan_env,
+            start_new_session=True,
+        )
+        assert orphan.returncode is None
+
+        monkeypatch.setenv("AKASHIC_BOOT_ID", "boot-candidate-new")
+        new_manager = _manager(
+            tmp_path,
+            tool_registry=ToolRegistry(follow_runtime_snapshot=False),
+        )
+        await new_manager.load_all()
+
+        pointers = read_pointers(plugin_base)
+        assert pointers is not None
+        assert pointers.stable == candidate_pointer
+        assert pointers.latest == candidate_pointer
+        stable = new_manager.generation("calendar@lab")
+        snapshot = new_manager.current_snapshot
+        assert stable is not None and snapshot is not None
+        assert stable.plugin_dir == candidate_artifact
+        assert stable.source_revision == candidate.source_revision
+        tool = snapshot.tool_registry.get_tool(  # type: ignore[union-attr]
+            "mcp_calendar__get_events"
+        )
+        assert tool is not None
+        assert await tool.execute() == "|".join(
+            ("formal", "18000", str(stable.data_dir))
+        )
+        assert new_manager._reload_journal.get(  # pyright: ignore[reportPrivateUsage]
+            candidate.reload_tx_id
+        ).phase == "recovered"
+        assert await asyncio.wait_for(orphan.wait(), timeout=2) != 0
+    finally:
+        if orphan is not None and orphan.returncode is None:
+            orphan.kill()
+            _ = await orphan.wait()
+        if new_manager is not None:
+            await new_manager.terminate_all()
+        if not old_manager_closed:
+            await old_manager.terminate_all()
+    assert not _port_live(18000)
+
+
+@pytest.mark.parametrize(
+    ("supervised", "current_boot", "recorded_boot", "message"),
+    (
+        (False, "boot-new", "boot-old", "supervised boot identity"),
+        (True, "boot-same", "boot-same", "不同于当前进程"),
+        (True, "boot-new", None, "旧 boot identity"),
+    ),
+)
+@pytest.mark.asyncio
+async def test_runtime_recovery_rejects_unowned_boot_cleanup_without_pointer_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    supervised: bool,
+    current_boot: str,
+    recorded_boot: str | None,
+    message: str,
+) -> None:
+    monkeypatch.setenv("AKASHIC_BOOT_ID", current_boot)
+    if supervised:
+        monkeypatch.setenv("AKASHIC_SUPERVISED", "1")
+    else:
+        monkeypatch.delenv("AKASHIC_SUPERVISED", raising=False)
+    source_root = _write_static_manager_plugin(tmp_path / "source", "1")
+    plugin_base = tmp_path / "home" / "cache" / "lab" / "calendar"
+    stable_artifact = plugin_base / ".artifacts" / "1.0.0-stable"
+    candidate_artifact = plugin_base / ".artifacts" / "2.0.0-latest"
+    shutil.copytree(source_root, stable_artifact)
+    shutil.copytree(source_root, candidate_artifact)
+    base_pointer = ArtifactPointer(".artifacts/1.0.0-stable")
+    candidate_pointer = ArtifactPointer(".artifacts/2.0.0-latest")
+    write_pointers(
+        plugin_base,
+        stable=base_pointer,
+        latest=candidate_pointer,
+    )
+    write_plugin_manifest(
+        {"calendar@lab": True},
+        plugins_home=tmp_path / "home",
+    )
+    manager = _manager(
+        tmp_path,
+        tool_registry=ToolRegistry(follow_runtime_snapshot=False),
+    )
+    tx_id = manager._reload_journal.begin(  # pyright: ignore[reportPrivateUsage]
+        plugin_id="calendar@lab",
+        base_snapshot_id="stable-v1",
+        base_generation_id="calendar:stable:1",
+        generation_id="calendar:candidate:2",
+        source_revision="source-v2",
+        config_revision="config-v2",
+        base_artifact_pointer=base_pointer.path,
+        candidate_artifact_pointer=candidate_pointer.path,
+    )
+    if recorded_boot is not None:
+        manager._reload_journal.mark_runtime_owner(  # pyright: ignore[reportPrivateUsage]
+            tx_id,
+            recorded_boot,
+        )
+    manager._reload_journal.advance(  # pyright: ignore[reportPrivateUsage]
+        tx_id,
+        "degraded",
+        resource="composition-runtime:calendar:candidate:2",
+        error="runtime owner uncertain",
+        recovery_target="base",
+    )
+
+    with pytest.raises(RuntimeError, match=message):
+        await manager.load_all()
+
+    pointers = read_pointers(plugin_base)
+    assert pointers is not None
+    assert pointers.stable == base_pointer
+    assert pointers.latest == candidate_pointer
+    assert manager.current_snapshot is None
+    assert manager.generation("calendar@lab") is None
+    assert not _port_live(18000)
 
 
 @pytest.mark.asyncio
@@ -540,7 +1917,7 @@ async def test_static_manifest_runtime_drift_excludes_failed_stable_plugin(
 async def test_manager_keeps_candidate_mcp_registry_private_until_publish(
     tmp_path: Path,
 ) -> None:
-    plugin_dir = _write_manager_plugin(tmp_path, "1")
+    plugin_dir = _write_static_manager_plugin(tmp_path, "1")
     manager = _manager(tmp_path)
     await manager.load_all()
     stable = manager.current_snapshot
@@ -548,7 +1925,7 @@ async def test_manager_keeps_candidate_mcp_registry_private_until_publish(
     stable_registry = stable.mcp_server_registry
     assert stable_registry["calendar"].definition.candidate_env["VERSION"] == "1"
 
-    (plugin_dir / "plugin.py").write_text(_plugin_source("2"), encoding="utf-8")
+    _upgrade_static_manager_plugin(plugin_dir, "2")
     candidate = await manager.prepare_candidate("calendar")
     assert candidate is not None and candidate.runtime_snapshot is not None
     candidate_registry = candidate.runtime_snapshot.mcp_server_registry
@@ -570,14 +1947,14 @@ async def test_manager_keeps_candidate_mcp_registry_private_until_publish(
 async def test_manager_rejects_mcp_registry_drift_before_publish(
     tmp_path: Path,
 ) -> None:
-    plugin_dir = _write_manager_plugin(tmp_path, "1")
+    plugin_dir = _write_static_manager_plugin(tmp_path, "1")
     manager = _manager(tmp_path)
     await manager.load_all()
     stable = manager.current_snapshot
     assert stable is not None and stable.mcp_server_registry is not None
     stable_registry = stable.mcp_server_registry
 
-    (plugin_dir / "plugin.py").write_text(_plugin_source("2"), encoding="utf-8")
+    _upgrade_static_manager_plugin(plugin_dir, "2")
     candidate = await manager.prepare_candidate("calendar")
     assert candidate is not None and candidate.runtime_snapshot is not None
 

@@ -61,6 +61,9 @@ class ManagedProcessBinding:
     health: HealthHandle
     owner_fiber: FiberHandle
     activation_token: object
+    runtime_plugin_dir: Path = field(repr=False, compare=False)
+    runtime_data_dir: Path = field(repr=False, compare=False)
+    runtime_workspace: Path = field(repr=False, compare=False)
     incident_reporter: Callable[[str, str], IncidentView] = field(
         repr=False,
         compare=False,
@@ -154,6 +157,9 @@ class _ProcessRegistration:
     descriptor: ManagedProcessDescriptor
     owner_fiber: FiberHandle
     activation_token: object
+    runtime_plugin_dir: Path
+    runtime_data_dir: Path
+    runtime_workspace: Path
     incident_reporter: Callable[[str, str], IncidentView]
     health: HealthHandle | None = None
 
@@ -192,6 +198,9 @@ class _ManagedProcessDeclarations:
                 normalized,
                 owner_fiber,
                 activation_token,
+                ctx.runtime.plugin_dir,
+                ctx.runtime.data_dir,
+                ctx.runtime.workspace,
                 ctx.report_incident,
             )
             return cleanup
@@ -231,6 +240,9 @@ class _ManagedProcessDeclarations:
                 health=registration.health,
                 owner_fiber=registration.owner_fiber,
                 activation_token=registration.activation_token,
+                runtime_plugin_dir=registration.runtime_plugin_dir,
+                runtime_data_dir=registration.runtime_data_dir,
+                runtime_workspace=registration.runtime_workspace,
                 incident_reporter=registration.incident_reporter,
             )
         self._frozen = ManagedProcessRegistry(
@@ -245,6 +257,9 @@ class _ManagedProcessDeclarations:
         definition: ManagedProcessDefinition,
         owner_fiber: FiberHandle,
         activation_token: object,
+        runtime_plugin_dir: Path,
+        runtime_data_dir: Path,
+        runtime_workspace: Path,
         incident_reporter: Callable[[str, str], IncidentView],
     ) -> tuple[_ProcessRegistration, Callable[[], None]]:
         """Add one normalized declaration and return its exact inverse."""
@@ -268,6 +283,9 @@ class _ManagedProcessDeclarations:
             descriptor=_descriptor(owner, definition),
             owner_fiber=owner_fiber,
             activation_token=activation_token,
+            runtime_plugin_dir=runtime_plugin_dir,
+            runtime_data_dir=runtime_data_dir,
+            runtime_workspace=runtime_workspace,
             incident_reporter=incident_reporter,
         )
         self._registrations[token] = registration

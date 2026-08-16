@@ -2286,10 +2286,16 @@ async def test_installed_candidate_activate_cleanup_failure_keeps_recovery_termi
         await manager.publish_prepared("installed_snapshot@lab")
 
     assert manager.current_snapshot is stable_snapshot
-    assert manager.reload_journal.get(candidate.reload_tx_id).phase == "aborted"
+    recovery = manager.reload_journal.get(candidate.reload_tx_id)
+    assert recovery.phase == "cleanup_failed"
+    assert recovery.recovery_action == "retry_generation_cleanup"
+    assert recovery.failure_resource is not None
+    assert "runtime-snapshot-drain" in recovery.failure_resource
     assert read_pointer(plugin_base, "stable") == stable_pointer
     assert read_pointer(plugin_base, "latest") == stable_pointer
-    await manager.snapshot_store.retry_drains()
+    recovered = await manager.retry_runtime_recovery("installed_snapshot@lab")
+    assert "runtime-snapshot-drain-complete" in str(recovered["retry_receipt"])
+    assert manager.reload_journal.get(candidate.reload_tx_id).phase == "aborted"
     await manager.terminate_all()
 
     restarted = PluginManager(
