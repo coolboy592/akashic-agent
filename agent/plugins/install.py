@@ -28,6 +28,7 @@ from agent.plugins.manifest import (
     remove_plugin_manifest_entry,
     set_plugin_enabled,
     upsert_plugin_manifest,
+    validate_workspace_plugin_data_path,
     plugins_root,
     workspace_plugin_data_dir,
 )
@@ -57,6 +58,7 @@ class _CacheActivation:
     plugin_base: Path
     previous_pointers: ArtifactPointers | None
     created_artifact: bool
+    created_data_dir: bool
 
     def rollback(self) -> None:
         """撤销已发布 cache，并恢复发布前的可运行版本。"""
@@ -68,6 +70,10 @@ class _CacheActivation:
         target_root = self.result.installed_path
         if self.created_artifact and (target_root.exists() or target_root.is_symlink()):
             _remove_path(target_root)
+
+        # 3. 安装未提交时不留下本事务新建的正式 plugin-data 空目录。
+        if self.created_data_dir:
+            _remove_created_data_dir(self.result.data_path)
 
     def finalize(self) -> None:
         """Immutable artifacts require no destructive post-commit cleanup."""
@@ -320,9 +326,9 @@ def _activate_plugin_version(
 ) -> _CacheActivation:
     """Prepare one immutable artifact and publish it as latest."""
 
-    # 1. 创建受保护的数据目录和 cache 父目录
+    # 1. 校验正式数据身份，但在依赖 staging 成功前不创建它。
     data_path = data_root / f"{plugin_name}-{marketplace}"
-    ensure_workspace_plugin_data_dir(data_path, workspace)
+    validate_workspace_plugin_data_path(data_path, workspace)
     plugin_base = cache_root / plugin_name
     _ensure_directory(plugin_base)
     visible_versions = _cache_version_dirs(plugin_base)
@@ -355,6 +361,7 @@ def _activate_plugin_version(
         tempfile.mkdtemp(dir=cache_root, prefix=f".{plugin_name}-install-")
     )
     created_artifact = False
+    created_data_dir = False
     try:
         # 2. 在不可发现的 staging 目录复制代码并准备依赖，旧版本保持可见
         _ = shutil.copytree(clone_root, staging_root, dirs_exist_ok=True)
@@ -373,6 +380,8 @@ def _activate_plugin_version(
         else:
             os.replace(staging_root, target_root)
             created_artifact = True
+        created_data_dir = not data_path.exists()
+        ensure_workspace_plugin_data_dir(data_path, workspace)
         latest = relative_artifact_pointer(plugin_base, target_root)
         candidate_staged = stage_latest and stable != latest
         _ = write_pointers(
@@ -386,6 +395,8 @@ def _activate_plugin_version(
             _remove_path(target_root)
         if staging_root.exists() or staging_root.is_symlink():
             _remove_path(staging_root)
+        if created_data_dir:
+            _remove_created_data_dir(data_path)
         raise
 
     result = PluginInstallResult(
@@ -402,7 +413,21 @@ def _activate_plugin_version(
         plugin_base=plugin_base,
         previous_pointers=previous_pointers,
         created_artifact=created_artifact,
+        created_data_dir=created_data_dir,
     )
+
+
+def _remove_created_data_dir(path: Path) -> None:
+    """Remove only an empty plugin-data directory owned by this transaction."""
+
+    try:
+        path.rmdir()
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise RuntimeError(
+            f"安装回滚无法删除新建 plugin-data 空目录: {path}"
+        ) from error
 
 
 def _restore_pointers(
@@ -619,6 +644,8 @@ def _load_plugin_entry(plugin_root: Path) -> type | ComposablePlugin:
     sys.modules[module_name] = module
     try:
         spec.loader.exec_module(module)
+        # V2_REMOVAL(static-manifest-admission)：这是无静态 manifest 的过渡入口；
+        # 最后一个 v2 artifact 迁走后连同 install import fallback 一并删除。
         if getattr(module, "api_version", None) == 3:
             return ComposablePlugin.from_module(module)
         # V2_REMOVAL(plugin-install-v2)：full-fleet 只剩 v3 namespace 后删除 class registry

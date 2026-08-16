@@ -115,6 +115,7 @@ class PluginGeneration:
     gate_result: GateResult
     source_type: Literal["builtin", "installed"] = "builtin"
     static_manifest: StaticPluginManifest | None = None
+    static_runtime_commands: tuple[tuple[str, tuple[str, ...]], ...] = ()
     entrypoint: str = "plugin.py"
     skill_catalog: PreparedSkillCatalog | None = None
     mcp_catalog: PreparedMcpCatalog | None = None
@@ -132,5 +133,6 @@ class PluginGeneration:
     validation_managed_services: dict[str, dict[str, Any]] = field(default_factory=dict)
     production_data_dir: Path | None = None
     boot_created_data_dir: bool = False
+    publication_created_data_dir: bool = False
     validation_workspace: Path | None = None
     validation_data_inventory: tuple[str, ...] = ()

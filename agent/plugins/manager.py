@@ -110,6 +110,7 @@ from agent.plugins.install import PluginInstallResult, install_git_plugin
 from agent.plugins.static_manifest import (
     StaticPluginManifest,
     load_static_plugin_manifest,
+    materialize_static_command,
     staged_python_interpreter,
     validate_module_exports,
 )
@@ -3034,6 +3035,8 @@ class PluginManager:
                     context.kv_store.commit()
             if generation.staged_event_bus is not None:
                 generation.staged_event_bus.publish()
+            if not stage_latest:
+                self._activate_published_generation(generation, active)
             generation.state = "candidate" if stage_latest else "active"
 
         previous_snapshot = transaction.previous
@@ -3109,6 +3112,8 @@ class PluginManager:
                     "Snapshot commit 失败后旧端点恢复失败"
                 ) from commit_endpoint_error
             raise commit_error
+        if commit_error is None:
+            generation.publication_created_data_dir = False
 
         _ = self._prepared_generations.pop(plugin_id)
         if stage_latest:
@@ -3142,7 +3147,6 @@ class PluginManager:
         self._active_generations[plugin_id] = generation
         if active is not None:
             active.state = "retired"
-        self._activate_published_generation(generation, active)
         self._channels = [
             channel
             for item in self._active_generations.values()
@@ -3180,17 +3184,25 @@ class PluginManager:
         previous_root = validation_snapshot.composition_root
         if previous_root is not None:
             await previous_root.dispose()
-        production_snapshot = await self._compile_generation_snapshot(
-            generation,
-            allow_unready_stable_composition=True,
-        )
-        if production_snapshot.snapshot_id != validation_snapshot.snapshot_id:
-            await self._dispose_unreferenced_composition_root(production_snapshot)
-            raise RuntimeError(
-                "候选隔离资源恢复后 snapshot identity 发生变化: "
-                f"{validation_snapshot.snapshot_id} -> "
-                f"{production_snapshot.snapshot_id}"
+        created_data_dir = not generation.data_dir.exists()
+        ensure_workspace_plugin_data_dir(generation.data_dir, self._workspace)
+        try:
+            production_snapshot = await self._compile_generation_snapshot(
+                generation,
+                allow_unready_stable_composition=True,
             )
+            if production_snapshot.snapshot_id != validation_snapshot.snapshot_id:
+                await self._dispose_unreferenced_composition_root(production_snapshot)
+                raise RuntimeError(
+                    "候选隔离资源恢复后 snapshot identity 发生变化: "
+                    f"{validation_snapshot.snapshot_id} -> "
+                    f"{production_snapshot.snapshot_id}"
+                )
+        except BaseException:
+            if created_data_dir:
+                _remove_validation_data_dir(generation.data_dir)
+            raise
+        generation.publication_created_data_dir = created_data_dir
         validation_event_handlers = validation_snapshot.event_handlers
         _replace_snapshot_payload(validation_snapshot, production_snapshot)
         validation_snapshot.event_handlers = validation_event_handlers
@@ -3432,15 +3444,20 @@ class PluginManager:
         if pointer_error is None:
             self._abort_reload(generation, error=error)
 
-        # 3. 清理异常优先暴露，避免把半完成恢复伪装成原始发布失败。
-        if pointer_error is not None:
-            raise RuntimeError(
-                "候选发布失败后 artifact pointer 恢复失败"
-            ) from pointer_error
+        # 3. Root 已排空后恢复本次 publication 才创建的正式数据身份。
         if snapshot_error is not None:
             raise RuntimeError(
                 "候选发布失败后 RuntimeSnapshot 回收失败"
             ) from snapshot_error
+        if generation.publication_created_data_dir:
+            _remove_validation_data_dir(generation.data_dir)
+            generation.publication_created_data_dir = False
+
+        # 4. 清理异常优先暴露，避免把半完成恢复伪装成原始发布失败。
+        if pointer_error is not None:
+            raise RuntimeError(
+                "候选发布失败后 artifact pointer 恢复失败"
+            ) from pointer_error
 
     def _track_reload_drain(
         self,
@@ -3789,6 +3806,8 @@ class PluginManager:
                 error=f"plugin_module: {error_text}",
             )
             raise RuntimeError(error_text)
+        # V2_REMOVAL(static-manifest-admission)：无 manifest 的 plugin.py import
+        # 仅服务迁移期 v2/旧 v3；pure-v3 fleet 必须先完成 import-free admission。
         try:
             self._import_plugin(mp, Path(module_path))
         except Exception as error:
@@ -3885,7 +3904,7 @@ class PluginManager:
                 error=f"{check_id}: {error_text}",
             )
             return None
-        if not stage_stable:
+        if not stage_stable and activate:
             ensure_workspace_plugin_data_dir(data_dir, self._workspace)
         scope = PluginScope(plugin_id)
         if not isinstance(instance, ComposablePlugin):
@@ -4712,7 +4731,7 @@ class PluginManager:
         plugin_dir = generation.plugin_dir
         data_dir = attempt_workspace / "plugin-data" / generation.data_dir.name
         _ = data_dir.parent.mkdir(parents=True, exist_ok=True)
-        _ = _copy_validation_data(
+        inventory = _copy_validation_data(
             generation.data_dir,
             data_dir,
             (
@@ -4721,6 +4740,8 @@ class PluginManager:
                 else ()
             ),
         )
+        if generation is candidate_owner:
+            generation.validation_data_inventory = inventory
         module_path = (
             f"{generation.module_path}__candidate_"
             f"{candidate_owner.generation_id.replace(':', '_')}_"
@@ -6154,9 +6175,26 @@ def _copy_validation_data(
 ) -> tuple[str, ...]:
     """Copy plugin data to a candidate tree while returning copied file paths."""
 
-    source_root = source.resolve(strict=True)
+    validate_workspace_plugin_data_path(source, source.parents[1])
     excluded = tuple(PurePosixPath(item).as_posix() for item in exclude_paths)
 
+    # 1. A new plugin has no formal bytes; candidate starts from an empty tree.
+    if not source.exists():
+        target.mkdir(parents=True)
+        return ()
+    source_root = source.resolve(strict=True)
+
+    # 2. Candidate data must never retain an edge back into formal storage.
+    for directory, dirnames, filenames in os.walk(source_root, followlinks=False):
+        root = Path(directory)
+        for name in (*dirnames, *filenames):
+            path = root / name
+            if path.is_symlink():
+                raise RuntimeError(
+                    f"candidate plugin-data 不允许复制符号链接: {path}"
+                )
+
+    # 3. Excluded paths are omitted before copytree opens their contents.
     def ignore(directory: str, names: list[str]) -> list[str]:
         current = Path(directory).resolve(strict=True)
         relative_dir = current.relative_to(source_root)
@@ -6171,6 +6209,8 @@ def _copy_validation_data(
         return ignored
 
     shutil.copytree(source_root, target, ignore=ignore)
+
+    # 4. Freeze a relative file inventory for review and Gate evidence.
     inventory: list[str] = []
     for directory, _dirnames, filenames in os.walk(target):
         root = Path(directory)
@@ -6245,36 +6285,51 @@ def _validate_static_manifest_runtime(
 ) -> None:
     """Reconcile static MCP/process policy with the frozen Root projection."""
 
-    manifests = {
+    all_manifests = {
         plugin_id: generation.static_manifest
         for plugin_id, generation in generations.items()
         if generation.static_manifest is not None
     }
-    if not manifests:
+    if not all_manifests:
         return
 
     # 1. Install staging owns the interpreter used by every declared Python runtime.
-    for plugin_id, generation in generations.items():
+    for _plugin_id, generation in generations.items():
         manifest = generation.static_manifest
         if manifest is None:
             continue
+        runtime_commands: list[tuple[str, tuple[str, ...]]] = []
         for runtime in manifest.python:
             _ = staged_python_interpreter(generation.plugin_dir, runtime)
-
-    # 2. C13 has no Root-frozen process registry in this integration base.
-    process_owners = tuple(
-        plugin_id
-        for plugin_id, manifest in manifests.items()
-        if manifest is not None and manifest.managed_processes
-    )
-    if process_owners:
-        raise RuntimeError(
-            "静态 manifest 声明 managed process，但 Core process registry 尚未接入: "
-            + ", ".join(sorted(process_owners))
+        for kind, declarations in (
+            ("mcp", manifest.mcp_servers),
+            ("process", manifest.managed_processes),
+        ):
+            for declaration in declarations:
+                runtime_commands.append(
+                    (
+                        f"{kind}:{declaration.name}",
+                        materialize_static_command(
+                            generation.plugin_dir,
+                            manifest,
+                            declaration,
+                        ),
+                    )
+                )
+        generation.static_runtime_commands = tuple(
+            sorted(runtime_commands, key=lambda item: item[0])
         )
 
-    # 3. Compare every static owner's import-free MCP declaration with the exact
-    # Root-frozen descriptor.  Missing, extra, and field drift all fail closed.
+    # 2. Compare every static owner's import-free declarations with the exact
+    # Root-frozen descriptors.  Missing, extra, and field drift all fail closed.
+    if snapshot.composition_active_plugin_ids is None:
+        raise RuntimeError("静态 v3 manifest snapshot 缺少 active plugin projection")
+    active_plugin_ids = set(snapshot.composition_active_plugin_ids)
+    manifests = {
+        plugin_id: manifest
+        for plugin_id, manifest in all_manifests.items()
+        if plugin_id in active_plugin_ids
+    }
     expected: set[tuple[object, ...]] = set()
     for plugin_id, manifest in manifests.items():
         assert manifest is not None
@@ -6295,7 +6350,7 @@ def _validate_static_manifest_runtime(
     registry = snapshot.mcp_server_registry
     actual: set[tuple[object, ...]] = set()
     if registry is not None:
-        static_owners = set(manifests)
+        static_owners = set(all_manifests)
         actual.update(
             (
                 descriptor.owner,
@@ -6319,6 +6374,50 @@ def _validate_static_manifest_runtime(
         extra = sorted(actual - expected, key=repr)
         raise RuntimeError(
             "静态 manifest MCP 声明与 Root frozen registry 不一致: "
+            f"missing={missing!r} extra={extra!r}"
+        )
+
+    expected_processes: set[tuple[object, ...]] = set()
+    for plugin_id, manifest in manifests.items():
+        assert manifest is not None
+        expected_processes.update(
+            (
+                plugin_id,
+                declaration.name,
+                declaration.command,
+                declaration.cwd,
+                declaration.env,
+                declaration.port_env,
+                declaration.formal_port,
+                declaration.readiness_path,
+                declaration.startup_timeout_seconds,
+            )
+            for declaration in manifest.managed_processes
+        )
+    process_registry = snapshot.managed_process_registry
+    actual_processes: set[tuple[object, ...]] = set()
+    if process_registry is not None:
+        static_owners = set(all_manifests)
+        actual_processes.update(
+            (
+                descriptor.owner,
+                descriptor.name,
+                descriptor.command,
+                descriptor.cwd,
+                descriptor.env,
+                descriptor.port_env,
+                descriptor.formal_port,
+                descriptor.readiness_path,
+                descriptor.startup_timeout_seconds,
+            )
+            for descriptor in process_registry.descriptors
+            if descriptor.owner in static_owners
+        )
+    if actual_processes != expected_processes:
+        missing = sorted(expected_processes - actual_processes, key=repr)
+        extra = sorted(actual_processes - expected_processes, key=repr)
+        raise RuntimeError(
+            "静态 manifest managed process 声明与 Root frozen registry 不一致: "
             f"missing={missing!r} extra={extra!r}"
         )
 

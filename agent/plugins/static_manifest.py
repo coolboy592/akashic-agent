@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import tomllib
@@ -11,6 +12,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import cast
+from urllib.parse import urlsplit
 
 
 STATIC_MANIFEST_FILENAME = "akashic.plugin.toml"
@@ -41,6 +43,7 @@ _TOP_LEVEL_KEYS = frozenset(
         "managed_processes",
     }
 )
+_PYTHON_COMMAND = re.compile(r"python(?:\d+(?:\.\d+)*)?(?:\.exe)?")
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,6 +66,7 @@ class StaticMcpDeclaration:
     candidate_read_only_tools: tuple[str, ...]
     endpoint_env: tuple[tuple[str, str], ...]
     candidate_env: tuple[tuple[str, str], ...]
+    python_runtime: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,6 +81,7 @@ class StaticManagedProcessDeclaration:
     formal_port: int
     readiness_path: str
     startup_timeout_seconds: float
+    python_runtime: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,6 +184,32 @@ def staged_python_interpreter(
     return interpreter
 
 
+def materialize_static_command(
+    plugin_root: Path,
+    manifest: StaticPluginManifest,
+    declaration: StaticMcpDeclaration | StaticManagedProcessDeclaration,
+) -> tuple[str, ...]:
+    """Bind a static Python command to its staged artifact interpreter."""
+
+    runtime_root = declaration.python_runtime
+    if runtime_root is None:
+        return declaration.command
+    runtime = next(
+        (
+            item
+            for item in manifest.python
+            if item.runtime_root == runtime_root
+        ),
+        None,
+    )
+    if runtime is None:
+        raise RuntimeError(
+            f"静态 command 引用了未知 Python runtime: {runtime_root}"
+        )
+    interpreter = staged_python_interpreter(plugin_root, runtime)
+    return (str(interpreter), *declaration.command[1:])
+
+
 def _validate_manifest(root: Path, raw: Mapping[str, object]) -> StaticPluginManifest:
     """Validate manifest identity, declarations and artifact-relative paths."""
 
@@ -209,8 +240,8 @@ def _validate_manifest(root: Path, raw: Mapping[str, object]) -> StaticPluginMan
     exclude_data_paths = _validation_paths(root, raw.get("validation", {}))
 
     # 3. Optional declarations are checked statically and kept immutable.
-    mcp_servers = _mcp_declarations(root, raw)
-    managed_processes = _process_declarations(root, raw)
+    mcp_servers = _mcp_declarations(root, raw, python)
+    managed_processes = _process_declarations(root, raw, python)
     _validate_endpoint_process_refs(mcp_servers, managed_processes)
     identity = {
         "schema_version": schema_version,
@@ -261,6 +292,7 @@ def _python_runtimes(
         raise ValueError("插件静态 manifest python 必须是表数组")
     result: list[StaticPythonRuntime] = []
     seen: set[str] = set()
+    runtime_roots: set[str] = set()
     for index, item in enumerate(raw):
         mapping = _table(item, f"python[{index}]")
         _exact_keys(mapping, {"requirements"}, f"python[{index}]")
@@ -274,10 +306,14 @@ def _python_runtimes(
         if requirements in seen:
             raise ValueError(f"插件 requirements 重复: {requirements}")
         seen.add(requirements)
+        runtime_root = str(PurePosixPath(requirements).parent)
+        if runtime_root in runtime_roots:
+            raise ValueError(f"插件 Python runtime root 重复: {runtime_root}")
+        runtime_roots.add(runtime_root)
         result.append(
             StaticPythonRuntime(
                 requirements=requirements,
-                runtime_root=str(PurePosixPath(requirements).parent),
+                runtime_root=runtime_root,
             )
         )
     return tuple(result)
@@ -309,6 +345,7 @@ def _validation_paths(root: Path, raw: object) -> tuple[str, ...]:
 def _mcp_declarations(
     root: Path,
     raw: Mapping[str, object],
+    python: tuple[StaticPythonRuntime, ...],
 ) -> tuple[StaticMcpDeclaration, ...]:
     items = _alias_array(raw, ("mcp", "mcp_servers"), "MCP")
     result: list[StaticMcpDeclaration] = []
@@ -356,6 +393,13 @@ def _mcp_declarations(
         occupied = set(env) | set(candidate_env)
         if occupied.intersection(item[0] for item in endpoint_env):
             raise ValueError(f"MCP endpoint env 与声明 env 冲突: {name}")
+        python_runtime = _python_runtime_binding(
+            root,
+            command,
+            cwd,
+            python,
+            label=f"mcp[{index}].command",
+        )
         result.append(
             StaticMcpDeclaration(
                 name=name,
@@ -366,6 +410,7 @@ def _mcp_declarations(
                 candidate_read_only_tools=candidate_tools,
                 endpoint_env=endpoint_env,
                 candidate_env=candidate_env,
+                python_runtime=python_runtime,
             )
         )
     return tuple(result)
@@ -374,6 +419,7 @@ def _mcp_declarations(
 def _process_declarations(
     root: Path,
     raw: Mapping[str, object],
+    python: tuple[StaticPythonRuntime, ...],
 ) -> tuple[StaticManagedProcessDeclaration, ...]:
     items = _alias_array(
         raw,
@@ -412,34 +458,55 @@ def _process_declarations(
             require_file=False,
         )
         env = _environment(table.get("env", {}), f"process[{index}].env")
-        port_env = table.get("port_env", "")
-        if not isinstance(port_env, str) or (port_env and not _ENV_NAME.fullmatch(port_env)):
+        port_env = table.get("port_env")
+        if (
+            not isinstance(port_env, str)
+            or not _ENV_NAME.fullmatch(port_env)
+            or port_env in _RESERVED_ENV
+        ):
             raise ValueError(f"process[{index}].port_env 无效")
-        formal_port = table.get("formal_port", 0)
-        if isinstance(formal_port, bool) or not isinstance(formal_port, int):
-            raise ValueError(f"process[{index}].formal_port 必须是整数")
-        if formal_port and not 1 <= formal_port <= 65535:
-            raise ValueError(f"process[{index}].formal_port 超出范围")
-        if bool(port_env) != bool(formal_port):
-            raise ValueError(
-                f"process[{index}] 必须同时声明 port_env 与 formal_port，或同时省略"
-            )
-        if port_env and port_env in dict(env):
+        formal_port = table.get("formal_port")
+        if (
+            isinstance(formal_port, bool)
+            or not isinstance(formal_port, int)
+            or not 1 <= formal_port <= 65535
+        ):
+            raise ValueError(f"process[{index}].formal_port 无效")
+        if port_env in dict(env):
             raise ValueError(f"process[{index}].env 不得覆盖 port_env: {port_env}")
         readiness_path = table.get("readiness_path", "/health")
         if (
             not isinstance(readiness_path, str)
             or not readiness_path.startswith("/")
-            or "\n" in readiness_path
-            or "\r" in readiness_path
-            or ".." in PurePosixPath(readiness_path).parts
+            or readiness_path.startswith("//")
+            or readiness_path != readiness_path.strip()
+            or "\\" in readiness_path
+            or any(part in {".", ".."} for part in readiness_path.split("/"))
+        ):
+            raise ValueError(f"process[{index}].readiness_path 无效")
+        parsed_readiness = urlsplit(readiness_path)
+        if (
+            parsed_readiness.scheme
+            or parsed_readiness.netloc
+            or parsed_readiness.query
+            or parsed_readiness.fragment
         ):
             raise ValueError(f"process[{index}].readiness_path 无效")
         timeout = table.get("startup_timeout_seconds", 15.0)
-        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
-            raise ValueError(f"process[{index}].startup_timeout_seconds 必须是数字")
-        if timeout <= 0:
-            raise ValueError(f"process[{index}].startup_timeout_seconds 必须大于 0")
+        if (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or not math.isfinite(float(timeout))
+            or not 0 < float(timeout) <= 300
+        ):
+            raise ValueError(f"process[{index}].startup_timeout_seconds 无效")
+        python_runtime = _python_runtime_binding(
+            root,
+            command,
+            cwd,
+            python,
+            label=f"process[{index}].command",
+        )
         result.append(
             StaticManagedProcessDeclaration(
                 name=name,
@@ -450,6 +517,7 @@ def _process_declarations(
                 formal_port=formal_port,
                 readiness_path=readiness_path,
                 startup_timeout_seconds=float(timeout),
+                python_runtime=python_runtime,
             )
         )
     return tuple(result)
@@ -488,26 +556,52 @@ def _command(root: Path, raw: object, label: str) -> tuple[str, ...]:
     values = _string_list(raw, label)
     for index, value in enumerate(values):
         if _is_absolute_path(value):
-            if index == 0 and _is_legal_external_executable(value):
-                continue
             raise ValueError(f"{label}[{index}] 不得是 artifact 外绝对路径")
-    for value in values[1:]:
         if _looks_like_artifact_path(value):
             _ = _relative_artifact_path(
                 root,
                 value,
-                label=f"{label} path",
+                label=f"{label}[{index}] path",
                 must_exist=True,
                 require_file=True,
             )
     return values
 
 
-def _is_legal_external_executable(value: str) -> bool:
-    """Allow only an existing executable as command[0] outside the artifact."""
+def _python_runtime_binding(
+    root: Path,
+    command: tuple[str, ...],
+    cwd: str,
+    runtimes: tuple[StaticPythonRuntime, ...],
+    *,
+    label: str,
+) -> str | None:
+    """Resolve a Python command to exactly one staged runtime root."""
 
-    path = Path(value)
-    return path.is_absolute() and path.is_file() and os.access(path, os.X_OK)
+    if _PYTHON_COMMAND.fullmatch(PurePosixPath(command[0]).name.lower()) is None:
+        return None
+    target = root.joinpath(*PurePosixPath(cwd).parts).resolve(strict=True)
+    for item in command[1:]:
+        if item.startswith("-"):
+            continue
+        if _looks_like_artifact_path(item):
+            target = root.joinpath(*PurePosixPath(item).parts).resolve(strict=True)
+        break
+    matches = tuple(
+        runtime
+        for runtime in runtimes
+        if target.is_relative_to(
+            root.joinpath(*PurePosixPath(runtime.runtime_root).parts).resolve(
+                strict=True
+            )
+        )
+    )
+    if len(matches) != 1:
+        raise ValueError(
+            f"{label} 必须唯一绑定已声明 Python runtime: "
+            f"matches={[item.runtime_root for item in matches]}"
+        )
+    return matches[0].runtime_root
 
 
 def _venv_python(venv_dir: Path) -> Path:
@@ -529,6 +623,7 @@ def _endpoint_env(raw: object, label: str) -> tuple[tuple[str, str], ...]:
         if (
             not isinstance(env, str)
             or not _ENV_NAME.fullmatch(env)
+            or env in _RESERVED_ENV
             or not isinstance(process, str)
             or not _NAME.fullmatch(process)
         ):
@@ -599,7 +694,7 @@ def _relative_policy_path(root: Path, raw: object, *, label: str) -> str:
     if not isinstance(raw, str) or not raw or raw != raw.strip():
         raise ValueError(f"{label} 必须是非空相对路径")
     path = PurePosixPath(raw.replace("\\", "/"))
-    if _is_absolute_path(raw) or any(
+    if not path.parts or _is_absolute_path(raw) or any(
         part in {"", ".", ".."} for part in path.parts
     ):
         raise ValueError(f"{label} 必须是 artifact/data 内的相对路径")
@@ -676,6 +771,7 @@ def _mcp_identity(item: StaticMcpDeclaration) -> dict[str, object]:
         "candidate_read_only_tools": list(item.candidate_read_only_tools),
         "endpoint_env": [list(value) for value in item.endpoint_env],
         "candidate_env": list(item.candidate_env),
+        "python_runtime": item.python_runtime,
     }
 
 
@@ -689,4 +785,5 @@ def _process_identity(item: StaticManagedProcessDeclaration) -> dict[str, object
         "formal_port": item.formal_port,
         "readiness_path": item.readiness_path,
         "startup_timeout_seconds": item.startup_timeout_seconds,
+        "python_runtime": item.python_runtime,
     }

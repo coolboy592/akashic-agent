@@ -12,6 +12,7 @@ import agent.plugins.manager as manager_module
 from agent.plugins.install import install_git_plugin
 from agent.plugins.static_manifest import (
     load_static_plugin_manifest,
+    materialize_static_command,
     staged_python_interpreter,
 )
 
@@ -116,25 +117,29 @@ candidate_env = {CALENDAR_BACKEND = "recording"}
     assert manifest.managed_processes[0].formal_port == 18000
     assert manifest.mcp_servers[0].endpoint_env == (("PORT", "calendar_api"),)
     assert manifest.mcp_servers[0].candidate_env == (("CALENDAR_BACKEND", "recording"),)
+    assert manifest.mcp_servers[0].python_runtime == "mcp"
+    assert manifest.managed_processes[0].python_runtime == "mcp"
 
 
-def test_static_manifest_allows_external_executable_only_at_command_head(
+def test_static_manifest_validates_relative_command_head_inside_artifact(
     tmp_path: Path,
 ) -> None:
     root = tmp_path / "calendar"
     (root / "mcp").mkdir(parents=True)
     (root / "plugin.py").write_text("", encoding="utf-8")
     (root / "mcp" / "run_mcp.py").write_text("", encoding="utf-8")
+    runner = root / "mcp" / "runner"
+    runner.write_text("", encoding="utf-8")
     (root / "mcp" / "requirements.txt").write_text("", encoding="utf-8")
     (root / "akashic.plugin.toml").write_text(
         _manifest()
-        + f'\n[[mcp]]\nname = "calendar"\ncommand = ["{sys.executable}", "mcp/run_mcp.py"]\n',
+        + '\n[[mcp]]\nname = "calendar"\ncommand = ["mcp/runner", "mcp/run_mcp.py"]\n',
         encoding="utf-8",
     )
 
     manifest = load_static_plugin_manifest(root)
 
-    assert manifest.mcp_servers[0].command == (sys.executable, "mcp/run_mcp.py")
+    assert manifest.mcp_servers[0].command == ("mcp/runner", "mcp/run_mcp.py")
 
     (root / "mcp" / ".venv" / "bin").mkdir(parents=True)
     interpreter = root / "mcp" / ".venv" / "bin" / "python"
@@ -158,6 +163,25 @@ def test_static_manifest_rejects_external_command_argument(
     )
 
     with pytest.raises(ValueError, match="artifact 外绝对路径"):
+        load_static_plugin_manifest(root)
+
+
+def test_static_manifest_rejects_escaped_relative_command_head(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "calendar"
+    (root / "mcp").mkdir(parents=True)
+    (root / "plugin.py").write_text("", encoding="utf-8")
+    (root / "mcp" / "requirements.txt").write_text("", encoding="utf-8")
+    outside = tmp_path / "outside"
+    outside.write_text("", encoding="utf-8")
+    (root / "akashic.plugin.toml").write_text(
+        _manifest()
+        + '\n[[mcp]]\nname = "calendar"\ncommand = ["../outside"]\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="artifact 内的相对路径"):
         load_static_plugin_manifest(root)
 
 
@@ -211,7 +235,27 @@ def test_candidate_data_inventory_excludes_manifest_paths(tmp_path: Path) -> Non
     assert not (target / "oauth").exists()
 
 
-def test_static_process_declaration_fails_without_c13_root_registry(
+def test_candidate_data_copy_rejects_symlink_to_formal_storage(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "production-data"
+    target = tmp_path / "candidate-data"
+    outside = tmp_path / "formal-secret"
+    source.mkdir()
+    outside.write_text("secret", encoding="utf-8")
+    (source / "token-link").symlink_to(outside)
+
+    with pytest.raises(RuntimeError, match="不允许复制符号链接"):
+        manager_module._copy_validation_data(  # pyright: ignore[reportPrivateUsage]
+            source,
+            target,
+            (),
+        )
+
+    assert not target.exists()
+
+
+def test_static_process_declaration_must_match_c13_root_registry(
     tmp_path: Path,
 ) -> None:
     root = tmp_path / "calendar"
@@ -226,20 +270,78 @@ def test_static_process_declaration_fails_without_c13_root_registry(
         "entrypoint = 'plugin.py'\n\n"
         "[[process]]\n"
         "name = 'calendar_api'\n"
-        "command = ['python', 'run_server.py']\n"
+        "command = ['run_server.py']\n"
         "port_env = 'PORT'\n"
         "formal_port = 18000\n",
         encoding="utf-8",
     )
     manifest = load_static_plugin_manifest(root)
     generation = SimpleNamespace(static_manifest=manifest, plugin_dir=root)
-    snapshot = SimpleNamespace(mcp_server_registry=None)
+    snapshot = SimpleNamespace(
+        mcp_server_registry=None,
+        managed_process_registry=None,
+        composition_active_plugin_ids=frozenset({"calendar"}),
+    )
 
-    with pytest.raises(RuntimeError, match="process registry"):
+    with pytest.raises(RuntimeError, match="managed process 声明"):
         manager_module._validate_static_manifest_runtime(  # pyright: ignore[reportPrivateUsage]
             snapshot,
             {"calendar": generation},
         )
+
+
+def test_static_python_command_uses_only_staged_interpreter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "calendar"
+    (root / "mcp").mkdir(parents=True)
+    (root / "plugin.py").write_text("", encoding="utf-8")
+    (root / "mcp" / "run.py").write_text("", encoding="utf-8")
+    (root / "mcp" / "requirements.txt").write_text("", encoding="utf-8")
+    (root / "akashic.plugin.toml").write_text(
+        _manifest()
+        + '\n[[mcp]]\nname = "calendar"\ncommand = ["python", "mcp/run.py"]\n',
+        encoding="utf-8",
+    )
+    interpreter = root / "mcp" / ".venv" / "bin" / "python"
+    interpreter.parent.mkdir(parents=True)
+    interpreter.write_text("", encoding="utf-8")
+    interpreter.chmod(0o755)
+    hostile = tmp_path / "hostile"
+    hostile.mkdir()
+    (hostile / "python").write_text("", encoding="utf-8")
+    monkeypatch.setenv("PATH", str(hostile))
+
+    manifest = load_static_plugin_manifest(root)
+    command = materialize_static_command(root, manifest, manifest.mcp_servers[0])
+
+    assert command == (str(interpreter), "mcp/run.py")
+
+
+@pytest.mark.parametrize("python_command", ("python", "python3.12"))
+def test_static_python_command_requires_unique_declared_runtime(
+    tmp_path: Path,
+    python_command: str,
+) -> None:
+    root = tmp_path / "calendar"
+    root.mkdir()
+    (root / "plugin.py").write_text("", encoding="utf-8")
+    (root / "run.py").write_text("", encoding="utf-8")
+    (root / "akashic.plugin.toml").write_text(
+        "schema_version = 1\n"
+        "name = 'calendar'\n"
+        "version = '3.0.0'\n"
+        "api_version = 3\n"
+        "entrypoint = 'plugin.py'\n\n"
+        "[[mcp]]\n"
+        "name = 'calendar'\n"
+        f"command = ['{python_command}', 'run.py']\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="唯一绑定"):
+        load_static_plugin_manifest(root)
 
 
 @pytest.mark.parametrize(
@@ -280,6 +382,51 @@ def test_static_manifest_rejects_manifest_symlink(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="缺少静态 manifest"):
         load_static_plugin_manifest(root)
+
+
+@pytest.mark.parametrize(
+    "declaration",
+    (
+        "[validation]\nexclude_data_paths = ['.']\n",
+        "[[process]]\nname = 'api'\ncommand = ['run.py']\n"
+        "port_env = 'AKASHIC_WORKSPACE'\nformal_port = 18000\n",
+        "[[process]]\nname = 'api'\ncommand = ['run.py']\n"
+        "port_env = 'PORT'\nformal_port = 18000\nreadiness_path = '//evil'\n",
+        "[[process]]\nname = 'api'\ncommand = ['run.py']\n"
+        "port_env = 'PORT'\nformal_port = 18000\nstartup_timeout_seconds = nan\n",
+        "[[process]]\nname = 'api'\ncommand = ['run.py']\n",
+        "[[process]]\nname = 'api'\ncommand = ['run.py']\n"
+        "port_env = 'PORT'\nformal_port = 18000\n\n"
+        "[[mcp]]\nname = 'calendar'\ncommand = ['run.py']\n"
+        "endpoint_env = [{env = 'AKASHIC_WORKSPACE', process = 'api'}]\n",
+    ),
+)
+def test_static_manifest_rejects_invalid_runtime_policy_before_import(
+    tmp_path: Path,
+    declaration: str,
+) -> None:
+    root = tmp_path / "calendar"
+    root.mkdir()
+    marker = root / "imported"
+    (root / "plugin.py").write_text(
+        "from pathlib import Path\n"
+        "Path(__file__).with_name('imported').write_text('bad')\n",
+        encoding="utf-8",
+    )
+    (root / "run.py").write_text("", encoding="utf-8")
+    (root / "akashic.plugin.toml").write_text(
+        "schema_version = 1\n"
+        "name = 'calendar'\n"
+        "version = '3.0.0'\n"
+        "api_version = 3\n"
+        "entrypoint = 'plugin.py'\n\n"
+        + declaration,
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError):
+        load_static_plugin_manifest(root)
+    assert not marker.exists()
 
 
 def test_v3_static_install_stages_before_importing_plugin(
@@ -323,3 +470,111 @@ def test_v3_static_install_stages_before_importing_plugin(
     assert not (result.installed_path / "imported").exists()
     assert (result.installed_path / "akashic.plugin.toml").is_file()
     assert (result.installed_path / "mcp" / ".venv").is_dir()
+
+
+def test_v3_static_install_accepts_custom_entrypoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = tmp_path / "calendar-source"
+    repo.mkdir()
+    (repo / "entry.py").write_text("", encoding="utf-8")
+    (repo / "requirements.txt").write_text("", encoding="utf-8")
+    (repo / "akashic.plugin.toml").write_text(
+        _manifest(entrypoint="entry.py", requirements="requirements.txt"),
+        encoding="utf-8",
+    )
+    _commit(repo)
+
+    def fake_run(args: list[str], *, cwd: Path, label: str) -> None:
+        if label.endswith("venv"):
+            python_path = install_module._venv_python_path(cwd / ".venv")
+            python_path.parent.mkdir(parents=True, exist_ok=True)
+            python_path.write_text("", encoding="utf-8")
+
+    monkeypatch.setattr(install_module, "_run_command", fake_run)
+    result = install_git_plugin(
+        workspace=tmp_path / "workspace",
+        source=str(repo),
+        marketplace="lab",
+        plugins_home=tmp_path / "plugins-home",
+    )
+
+    assert (result.installed_path / "entry.py").is_file()
+    assert not (result.installed_path / "plugin.py").exists()
+
+
+@pytest.mark.parametrize("preexisting", (False, True))
+def test_v3_static_staging_failure_preserves_formal_data_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    preexisting: bool,
+) -> None:
+    repo = tmp_path / "calendar-source"
+    repo.mkdir()
+    (repo / "plugin.py").write_text("", encoding="utf-8")
+    (repo / "requirements.txt").write_text("", encoding="utf-8")
+    (repo / "akashic.plugin.toml").write_text(
+        _manifest(requirements="requirements.txt"),
+        encoding="utf-8",
+    )
+    _commit(repo)
+    workspace = tmp_path / "workspace"
+    data_path = workspace / "plugin-data" / "calendar-lab"
+    if preexisting:
+        data_path.mkdir(parents=True)
+        (data_path / "state.json").write_bytes(b"keep")
+
+    def fail_run(args: list[str], *, cwd: Path, label: str) -> None:
+        raise RuntimeError("staging failed")
+
+    monkeypatch.setattr(install_module, "_run_command", fail_run)
+    with pytest.raises(RuntimeError, match="staging failed"):
+        install_git_plugin(
+            workspace=workspace,
+            source=str(repo),
+            marketplace="lab",
+            plugins_home=tmp_path / "plugins-home",
+        )
+
+    if preexisting:
+        assert (data_path / "state.json").read_bytes() == b"keep"
+    else:
+        assert not data_path.exists()
+
+
+def test_v3_static_manifest_write_failure_removes_new_data_dir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = tmp_path / "calendar-source"
+    repo.mkdir()
+    (repo / "plugin.py").write_text("", encoding="utf-8")
+    (repo / "requirements.txt").write_text("", encoding="utf-8")
+    (repo / "akashic.plugin.toml").write_text(
+        _manifest(requirements="requirements.txt"),
+        encoding="utf-8",
+    )
+    _commit(repo)
+    workspace = tmp_path / "workspace"
+
+    def fake_run(args: list[str], *, cwd: Path, label: str) -> None:
+        if label.endswith("venv"):
+            python_path = install_module._venv_python_path(cwd / ".venv")
+            python_path.parent.mkdir(parents=True, exist_ok=True)
+            python_path.write_text("", encoding="utf-8")
+
+    def fail_manifest(*args: object, **kwargs: object) -> Path:
+        raise OSError("manifest write failed")
+
+    monkeypatch.setattr(install_module, "_run_command", fake_run)
+    monkeypatch.setattr(install_module, "upsert_plugin_manifest", fail_manifest)
+    with pytest.raises(OSError, match="manifest write failed"):
+        install_git_plugin(
+            workspace=workspace,
+            source=str(repo),
+            marketplace="lab",
+            plugins_home=tmp_path / "plugins-home",
+        )
+
+    assert not (workspace / "plugin-data" / "calendar-lab").exists()

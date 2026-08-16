@@ -140,6 +140,50 @@ def test_plugin_doctor_uses_static_custom_entrypoint(tmp_path: Path) -> None:
     assert "entry.py" in format_plugin_doctor_report(report)
 
 
+def test_plugin_doctor_custom_entrypoint_uses_its_relative_import_root(
+    tmp_path: Path,
+) -> None:
+    plugins_home = tmp_path / ".akashic-plugin"
+    workspace = tmp_path / "workspace"
+    plugin_root = plugins_home / "cache" / "github" / "nested_demo" / "1.0.0"
+    (plugin_root / "src").mkdir(parents=True)
+    (plugin_root / "src" / "constants.py").write_text(
+        "VERSION = '1.0.0'\n",
+        encoding="utf-8",
+    )
+    (plugin_root / "src" / "entry.py").write_text(
+        "from .constants import VERSION\n"
+        "api_version = 3\n"
+        "name = 'nested_demo'\n"
+        "version = VERSION\n"
+        "def apply(ctx, config): pass\n",
+        encoding="utf-8",
+    )
+    (plugin_root / "akashic.plugin.toml").write_text(
+        "schema_version = 1\n"
+        "name = 'nested_demo'\n"
+        "version = '1.0.0'\n"
+        "api_version = 3\n"
+        "entrypoint = 'src/entry.py'\n",
+        encoding="utf-8",
+    )
+    upsert_plugin_manifest(
+        "nested_demo@github",
+        enabled=True,
+        plugins_home=plugins_home,
+    )
+
+    report = run_plugin_doctor(
+        plugin_id="nested_demo@github",
+        config_path=str(_init_config(tmp_path)),
+        plugins_home=plugins_home,
+        workspace=workspace,
+    )
+
+    assert report["status"] == "healthy"
+    assert "src/entry.py" in format_plugin_doctor_report(report)
+
+
 def test_plugin_doctor_reads_latest_artifact_candidate(tmp_path: Path) -> None:
     plugins_home = tmp_path / ".akashic-plugin"
     workspace = tmp_path / "workspace"

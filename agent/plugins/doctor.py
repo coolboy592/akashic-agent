@@ -205,7 +205,7 @@ def _load_plugin_declaration(plugin_root: Path) -> PluginDeclaration:
     spec = importlib.util.spec_from_file_location(
         module_name,
         path,
-        submodule_search_locations=[str(plugin_root)],
+        submodule_search_locations=[str(path.parent)],
     )
     if spec is None or spec.loader is None:
         raise ImportError(f"无法加载 {path}")

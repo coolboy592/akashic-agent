@@ -182,6 +182,8 @@ def _require_plugin_root(path: Path) -> StaticPluginManifest | None:
     manifest_path = path / "akashic.plugin.toml"
     if manifest_path.exists() or manifest_path.is_symlink():
         return load_static_plugin_manifest(path)
+    # V2_REMOVAL(static-manifest-admission)：最后一个 v2 artifact 迁走后，
+    # plugin root 必须由静态 manifest admission；删除 plugin.py fallback。
     plugin_file = path / "plugin.py"
     if plugin_file.is_symlink():
         raise ValueError(f"installed cache plugin.py 不能是符号链接: {plugin_file}")
@@ -217,6 +219,7 @@ def _is_plugin_root(path: Path) -> bool:
     if manifest_path.exists() or manifest_path.is_symlink():
         _ = load_static_plugin_manifest(path)
         return True
+    # V2_REMOVAL(static-manifest-admission)：pure-v3 fleet 不再发现无 manifest root。
     plugin_file = path / "plugin.py"
     return not plugin_file.is_symlink() and plugin_file.is_file()
 

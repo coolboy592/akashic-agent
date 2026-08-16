@@ -333,24 +333,36 @@ def _write_manager_plugin(tmp_path: Path, version: str) -> Path:
 def _write_static_manager_plugin(tmp_path: Path, version: str) -> Path:
     plugin_dir = _plugin_dir(tmp_path / "plugins")
     (plugin_dir / "entry.py").write_text(
-        _plugin_source(version).replace(
-            "            endpoint_env=(EndpointEnv('PORT', 'calendar_api'),),\n",
-            "",
-        ),
+        _plugin_source(version),
         encoding="utf-8",
     )
+    (plugin_dir / "api.py").write_text("print('api')\n", encoding="utf-8")
+    (plugin_dir / "requirements.txt").write_text("", encoding="utf-8")
+    interpreter = plugin_dir / ".venv" / "bin" / "python"
+    interpreter.parent.mkdir(parents=True)
+    interpreter.write_text("", encoding="utf-8")
+    interpreter.chmod(0o755)
     (plugin_dir / "akashic.plugin.toml").write_text(
         "schema_version = 1\n"
         "name = \"calendar\"\n"
         f"version = \"{version}\"\n"
         "api_version = 3\n"
         "entrypoint = \"entry.py\"\n\n"
+        "[[python]]\n"
+        "requirements = \"requirements.txt\"\n\n"
         "[[mcp]]\n"
         "name = \"calendar\"\n"
         "command = [\"python\", \"mcp.py\"]\n"
         "required_tools = [\"get_events\"]\n"
         "candidate_read_only_tools = [\"get_events\"]\n"
-        f"candidate_env = {{VERSION = \"{version}\"}}\n",
+        "endpoint_env = [{env = \"PORT\", process = \"calendar_api\"}]\n"
+        f"candidate_env = {{VERSION = \"{version}\"}}\n\n"
+        "[[process]]\n"
+        "name = \"calendar_api\"\n"
+        "command = [\"python\", \"api.py\"]\n"
+        "port_env = \"PORT\"\n"
+        "formal_port = 18000\n"
+        "readiness_path = \"/health\"\n",
         encoding="utf-8",
     )
     return plugin_dir
@@ -368,14 +380,20 @@ async def test_static_manifest_is_admission_source_and_reconciles_mcp_root(
     assert generation.entrypoint == "entry.py"
     assert generation.static_manifest is not None
     assert generation.static_manifest.mcp_servers[0].name == "calendar"
+    assert generation.static_manifest.managed_processes[0].name == "calendar_api"
+    runtime_commands = dict(generation.static_runtime_commands)
+    assert runtime_commands["mcp:calendar"][0] == str(
+        plugin_dir / ".venv" / "bin" / "python"
+    )
+    assert runtime_commands["process:calendar_api"][0] == str(
+        plugin_dir / ".venv" / "bin" / "python"
+    )
     assert manager.current_snapshot is not None
     assert manager.current_snapshot.mcp_server_registry is not None
+    assert manager.current_snapshot.managed_process_registry is not None
 
     (plugin_dir / "entry.py").write_text(
-        _plugin_source("2").replace(
-            "            endpoint_env=(EndpointEnv('PORT', 'calendar_api'),),\n",
-            "",
-        ),
+        _plugin_source("2"),
         encoding="utf-8",
     )
     (plugin_dir / "akashic.plugin.toml").write_text(
@@ -390,6 +408,125 @@ async def test_static_manifest_is_admission_source_and_reconciles_mcp_root(
     assert candidate.entrypoint == "entry.py"
     assert candidate.static_manifest is not None
     await manager.discard_prepared("calendar")
+    await manager.terminate_all()
+
+
+@pytest.mark.asyncio
+async def test_static_candidate_without_formal_data_leaves_no_formal_directory(
+    tmp_path: Path,
+) -> None:
+    _ = _write_static_manager_plugin(tmp_path, "1")
+    manager = _manager(tmp_path)
+    formal_data = tmp_path / "workspace" / "plugin-data" / "calendar-builtin"
+
+    candidate = await manager.prepare_candidate("calendar")
+
+    assert candidate is not None
+    assert candidate.validation_workspace is not None
+    assert candidate.runtime_snapshot is not None
+    candidate_root = candidate.runtime_snapshot.composition_root
+    assert candidate_root is not None
+    runtime = candidate_root.root_fiber.children[0].runtime
+    assert runtime is not None and runtime.data_dir.is_dir()
+    assert candidate.validation_data_inventory == ()
+    assert not formal_data.exists()
+
+    await manager.discard_prepared("calendar")
+    assert not formal_data.exists()
+    assert not candidate.validation_workspace.parent.exists()
+    await manager.terminate_all()
+
+
+@pytest.mark.asyncio
+async def test_static_first_publication_rolls_back_new_formal_data_on_commit_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _ = _write_static_manager_plugin(tmp_path, "1")
+    manager = _manager(tmp_path)
+    formal_data = tmp_path / "workspace" / "plugin-data" / "calendar-builtin"
+    candidate = await manager.prepare_candidate("calendar")
+    assert candidate is not None
+
+    def fail_owner_commit(*_args: object) -> None:
+        raise RuntimeError("owner commit failed")
+
+    monkeypatch.setattr(
+        manager,
+        "_activate_published_generation",
+        fail_owner_commit,
+    )
+    with pytest.raises(RuntimeError, match="owner commit failed"):
+        await manager.publish_prepared("calendar")
+
+    assert manager.current_snapshot is None
+    assert not formal_data.exists()
+    assert candidate.scope.closed is True
+
+    monkeypatch.undo()
+    replacement = await manager.prepare_candidate("calendar")
+    assert replacement is not None
+    result = await manager.publish_prepared("calendar")
+    assert result["publication_state"] == "committed"
+    assert formal_data.is_dir()
+    await manager.terminate_all()
+
+
+@pytest.mark.asyncio
+async def test_static_manifest_declarations_do_not_activate_inactive_plugin(
+    tmp_path: Path,
+) -> None:
+    plugin_dir = _write_static_manager_plugin(tmp_path, "1")
+    entrypoint = plugin_dir / "entry.py"
+    entrypoint.write_text(
+        entrypoint.read_text(encoding="utf-8")
+        + "\ndef is_active(services):\n"
+        + "    return False\n",
+        encoding="utf-8",
+    )
+    manager = _manager(tmp_path)
+
+    await manager.load_all()
+
+    snapshot = manager.current_snapshot
+    assert snapshot is not None
+    assert snapshot.composition_active_plugin_ids == frozenset()
+    assert snapshot.mcp_server_registry is not None
+    assert len(snapshot.mcp_server_registry) == 0
+    assert snapshot.managed_process_registry is not None
+    assert len(snapshot.managed_process_registry) == 0
+    await manager.terminate_all()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("old", "new", "message"),
+    (
+        ('required_tools = ["get_events"]', 'required_tools = ["other"]', "MCP 声明"),
+        ("formal_port = 18000", "formal_port = 18001", "managed process 声明"),
+    ),
+)
+async def test_static_manifest_runtime_drift_excludes_failed_stable_plugin(
+    tmp_path: Path,
+    old: str,
+    new: str,
+    message: str,
+) -> None:
+    plugin_dir = _write_static_manager_plugin(tmp_path, "1")
+    manifest = plugin_dir / "akashic.plugin.toml"
+    manifest.write_text(
+        manifest.read_text(encoding="utf-8").replace(old, new),
+        encoding="utf-8",
+    )
+    manager = _manager(tmp_path)
+
+    await manager.load_all()
+
+    assert manager.current_snapshot is None
+    assert manager._active_generations == {}  # pyright: ignore[reportPrivateUsage]
+    gate = manager.latest_gate("calendar")
+    assert gate is not None and gate.status == "failed"
+    assert message in str(gate.checks[-1].evidence)
     await manager.terminate_all()
 
 
