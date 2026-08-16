@@ -91,9 +91,12 @@ workspace 仍不是完整运行环境的全部。模型 Provider credential 已�
 | `drift/drift.db` | run、step、journal 持续追加 | continuum、cursor、global note 和 self state 原位更新 | 日志可以另定 retention；cursor、journal 和下一轮选择所需状态必须恢复，不能按临时 trace 清空 |
 | `schedules.json` | 获授权的 add 创建 job | reschedule 更新同一 job；one-shot 执行完成或错过 grace 后保留为 `enabled=false` 逻辑终态；整份 JSON 以 candidate 原子替换 | 只有明确 cancel 操作可以移除 job；损坏文件不能解释成用户取消了全部任务 |
 | `proactive_quota.json` | 动作增加当前窗口计数 | 新窗口滚动时重置计数并更新当前状态 | 这是当前计数器的状态迁移，不是用户历史删除；损坏不得静默重置 |
-| `PROACTIVE_CONTEXT.md` | workspace 初始化时只在缺失时写入模板 | runtime 只读；用户或获授权文件工具可以修改规则面板 | 当前没有 runtime 自动清空或删除协议；代码升级不得用默认模板覆盖已有内容 |
+| `PROACTIVE_CONTEXT.md` | workspace 初始化时只在缺失时写入模板；Skill 可通过既有 owner 形成待合并内容 | 用户或获授权文件工具可以修改规则面板；v3 ActivityHost 仅可通过 `ProactiveDocuments` 的 invocation-bound paired intent，把获授权 merge 与 `proactive_pending.md` 同一恢复协议发布 | 当前没有 runtime 自动清空或删除协议；代码升级不得用默认模板覆盖已有内容；ActivityHost 失败只能从 pair intent 恢复 old bytes 或按已有 DB receipt forward-complete，不能回退默认模板 |
+| `proactive_pending.md` | Skill owner 追加待处理 proactive 内容 | v3 ActivityHost 仅可通过 `ProactiveDocuments` 与 `PROACTIVE_CONTEXT.md` 成对提交已授权 merge；成功后 pending 内容按 intent 固定的新 bytes 原子替换 | 只有对应 merge 的 DB receipt、pair terminal receipt 与两份文档最终 digest 一致时，才允许减少已合并 pending；失败/取消恢复 old bytes，无 receipt orphan 只清 staging、不改变正文 |
 | `plugin-data/` | 已激活插件在自己的 opaque 目录增加数据 | 由插件 schema 和 owner 决定 | 普通卸载只删除代码和能力投影，保留数据；永久删除必须使用名称不同的用户操作、影响预览、备份和再次确认 |
-| `runtime/plugin-reloads.sqlite3` | 每次热重载增加 transaction 与阶段事件 | 同一 transaction 按状态机更新当前 phase、snapshot identity 和错误 | 当前没有自动 retention；恢复和事故审计仍依赖的记录不得自动删除 |
+| `runtime/plugin-reloads.sqlite3` | 每次热重载增加 transaction 与阶段事件；首次启动 candidate/formal runtime 前固定 old/new snapshot、old/new generation、base/candidate artifact pointer 与 `runtime_owner_boot_id`；已有 candidate 时 stable watchdog 加入同一 transaction，不另建 owner | 同一 transaction 按状态机更新 phase、failure resource、recovery target/action、单调 attempt 和 retry receipt；failure 只允许 `cleanup_failed → degraded` 单调强化且 target 不可覆盖，终态只能由 exact Host retry 成功后收束；同 boot 不做进程清理，新 supervised boot 只按已记录 old boot ID 恢复 | 当前没有自动 retention；恢复和事故审计仍依赖的记录不得自动删除，artifact/Host tombstone 只在对应 retry receipt 成功后减少 |
+| `runtime/plugin-jobs/outcomes.sqlite` | generation-scoped plugin job 首次 admission INSERT semantic job/event/interval identity、exact snapshot/plugin/model generation、artifact/source/handler/lifecycle identity 与 queued 状态 | 同一 invocation 只按 queued→running→terminal/retry_pending 状态机更新 attempt、phase（handler/provider/documents）、error 与 result digest；跨 generation redelivery 复用同一 semantic key，不新建第二次 effect；documents phase 只由 ActivityHost forward recovery | 当前没有自动 retention；这是 event dedupe、取消与 crash recovery 证据，普通插件卸载、重载或日志清理不得删除。workspace 备份应以 SQLite online backup + integrity_check 保存；只有后续名称明确的 retention/插件数据管理操作可减少 |
+| `runtime/proactive-documents/intents/<invocation-id>/` | `ProactiveDocuments.prepare_pair()` 在 DB effect 前创建，保存两份 old state（bytes 或 absent marker）、完整 new bytes、expected digest、idempotency key 与 fsync receipt | 无 DB receipt 时只允许 abort 并保持正文原状态；有 DB receipt 时只允许 ordered replace/forward recovery；partial replace 依据 old bytes 恢复两份原始状态 | commit/abort terminal receipt、目标 digest 与目录 fsync 均完成后才能删除该 intent；启动恢复不得按年龄猜测 orphan。workspace 备份必须与 outcomes.sqlite、两份 Markdown 一起覆盖该目录 |
 | `runtime/plugin-rollout-fact.json` | turn 后 install/uninstall 产生一条待反馈事实 | 新结果原子替换尚未消费的旧事实 | 下一次非 programmatic 用户 turn 注入后删除；它是可重建反馈，不是会话或长期记忆 |
 | `runtime/plugin-skill-links.json` | legacy adoption 或首次插件 Skill/Drift skill 投影时创建 ownership registry；每次链接切换先原子写入含 old/new 的 pending journal | 目录项切换后原子提交 `links` 并清除对应 pending；进程重启只在实际链接仍等于 old 或 new 时收敛，用户文件、未登记软链接和第三种状态 fail-loud | 只有插件 disable/uninstall 或 generation 切换的 linker owner 可以删除已登记且 target 匹配的投影链接并移除对应 ownership；不得删除用户文件、普通目录、未登记链接或外部 canonical source。registry 是重建与恢复证据，当前没有整文件自动删除协议 |
 | `migrations.sqlite3` | Yoyo 在 migration step 成功后记录唯一 migration ID | 已应用回执保持不变；新增迁移只追加新的成功回执 | runtime 没有删除或回滚回执权限；只随用户明确删除整个 workspace 而减少，恢复依赖 workspace 备份与 SQLite 完整性检查 |
@@ -209,6 +212,7 @@ workspace 之外还有两组明确的全局状态：
 ├── sessions/                         目前只创建目录，未找到生产写入者
 ├── schedules.json
 ├── PROACTIVE_CONTEXT.md
+├── proactive_pending.md
 ├── proactive.db
 ├── wake_proactive.db                 Wake runtime 启用时
 ├── proactive_quota.json              default proactive AnyAction 启用时
@@ -251,6 +255,9 @@ workspace 之外还有两组明确的全局状态：
 ├── subagent-runs/<job-id>/            子任务产物
 ├── runtime/
 │   ├── plugin-reloads.sqlite3         插件热重载事务与恢复阶段
+│   ├── plugin-jobs/outcomes.sqlite    插件 background job 幂等与恢复状态
+│   ├── proactive-documents/
+│   │   └── intents/<invocation-id>/   paired Markdown old/new bytes 与恢复回执
 │   ├── plugin-rollout-fact.json       下一用户 turn 消费的一条派生结果
 │   └── plugin-validation/<generation>/ 候选隔离 plugin-data 副本
 ├── memes/manifest.json

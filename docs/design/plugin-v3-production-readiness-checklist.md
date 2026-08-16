@@ -112,18 +112,19 @@ Gate 报告。分支名、PR 号和浮动 ref 不能代替 commit。
 | ID | 能力 owner | 状态 | 验收 oracle | 首个真实 consumer |
 |---|---|---|---|---|
 | C11 | committed channel command catalog | `CANDIDATE` | command/provisional 独立复核 25 tests、累计 command/kernel/loader/Manager/hot-reload 339 tests、Basedpyright/compileall/diff-check 已通过；Terra xhigh review 无 P0/P1，待 Status Commands 首个 consumer Gate | Status Commands |
-| C12 | scoped MCP capability | `OPEN` | candidate port/data 隔离、readiness、route、drain、失败零残留 | Calendar MCP |
-| C13 | managed process capability | `OPEN` | start/ready/cancel/terminate/log Effect；同 generation 单实例 | Calendar MCP |
+| C12 | scoped MCP capability | `CANDIDATE` | `8653bab0` 已接入 Root-local declaration、candidate/formal MCP catalog fence、exact snapshot route、跨 boot durable recovery；C12/C13/Journal focused 44、Manager 63、Hot Reload 147、loader 59、Basedpyright/compileall/diff-check 通过，Terra xhigh 无 P0/P1；待 Calendar exact artifact Gate | Calendar MCP |
+| C13 | managed process capability | `CANDIDATE` | `8653bab0` 已接入 generation-scoped start/readiness/port/log、sibling drain、retained tombstone 与不可取消 recovery；与 C12 共用上述 313 个回归及真实 watchdog/cleanup probes，待 Calendar exact artifact Gate | Calendar MCP |
 | C14 | inbound/outbound channel capability | `OPEN` | committed binding、stop/drain/swap、失败恢复旧代、无重复发送 | Feishu / QQBot |
 | C15 | timer / proactive source / turn enqueue capability | `OPEN` | skip/failure 可区分、timer 回收、turn owner、无候选发送 | Calendar MCP |
 | C16 | v3 admission/lifecycle 收口 | `CANDIDATE` | `4ba266ad` 已通过独立 review；non-callable listener、spawn coroutine、apply signature、wrong-task lifecycle 全部 fail-loud，malformed admission 零 data-dir 写入 | Core |
-| C17 | mobile UI/query capability | `OPEN` | committed catalog、lease、bounded query、candidate 不发布 | Akasha / Observe |
+| C17 | mobile UI/query capability | `CANDIDATE` | `2c6e4f71` + `b173f551` 已通过独立 review；activation token、strict JSON、candidate 不发布与 exact lease 已由 372 个集成回归、Basedpyright/compileall/diff-check 验证，待 Akasha/Observe 迁移后进入 E1/E4 | Akasha / Observe |
 | C18 | Core-private v3 generation metadata | `CANDIDATE` | `2d9fb408` 已通过独立 review；v3 stable load、candidate clone 与 formal rebuild 不再构造或读取 `PluginContext`，59 loader + 208 Manager/hot-reload 回归通过 | Core |
 | C19 | full-fleet Health/Incident/Topology inspection | `CANDIDATE` | stable lease 按插件投影 current Fiber/Health、累计与 bounded Incident、Topology；mixed active/inactive v3 + v2 inspection 与 kernel/protocol 回归通过，独立 review 的 inactive projection P1 已关闭 | 全量 runtime |
 | C20 | Proactive 私有兼容岛 | `OPEN` | Core-private registry 只接收六个内建 module identity；外部 v2 manifest/import/discovery fail-loud | Default/Wake Proactive |
 | C21 | generation-scoped background job / LLM capability | `OPEN` | committed catalog、trigger/interval、LLM generation lease、cancel/drain、candidate 不调模型 | Emotion |
+| C22 | static v3 artifact manifest / install staging | `CANDIDATE` | 集成 head `3e1f5c10`（独立复审 head `b6967d13`）已在 import 前校验 identity/runtime/validation、custom entrypoint 与 C12/C13 descriptor，不成功 staging 不创建正式 data/artifact/pointer；candidate 缺正式 data 时只建隔离空副本，Python argv 冻结为 exact artifact `.venv`；final focused 42、累计相关回归 440、Basedpyright/compileall/diff-check 通过，Terra xhigh 无 P0/P1。C12b/C13b Host 真消费该 argv 前不宣称 runtime activation 完成 | Calendar MCP / 全部 external v3 |
 
-实现原则：C11～C17、C21 只由表中的首个真实 consumer 拉动，不提前复制
+实现原则：C11～C17、C21～C22 只由表中的首个真实 consumer 拉动，不提前复制
 `commands()/mcp_servers()/managed_services()/channels()/jobs()/proactive_*()/mobile_ui()` 旧方法。
 
 ## 3. 每个插件的完成定义
@@ -131,6 +132,7 @@ Gate 报告。分支名、PR 号和浮动 ref 不能代替 commit。
 每行插件只有同时满足以下检查项才能进入 `CANDIDATE`：
 
 - [ ] canonical source、base commit 和 candidate commit 已固定；
+- [ ] external v3 artifact 有静态 `akashic.plugin.toml`，安装期不 import/执行 plugin；
 - [ ] 模块只暴露 `api_version = 3` 与精确 `apply(ctx, config)`；
 - [ ] capability、Service 依赖、listener 顺序、静态投影和 data/workspace roots 声明完整；
 - [ ] `apply()` 在 candidate 环境不写正式 workspace、不发送、不占正式 endpoint；
@@ -274,7 +276,7 @@ E1～E3 使用一次性 workspace 和受控端点。E4 只能使用经过校验�
 
 - [x] W0：提交本清单，冻结状态定义、数据边界和 E2E 批次；
 - [ ] W1：完成 C16、C18、C19，并复核 C01～C10；
-- [ ] W2：以真实 consumer 依次完成 C11～C17；
+- [ ] W2：以真实 consumer 依次完成 C11～C17、C21～C22；
 - [ ] W3：并行迁移 lifecycle/metadata/command 插件；
 - [ ] W4：并行迁移 MCP/process/channel 插件；
 - [ ] W5：迁移 Akasha、Proactive Feedback，并建立 C20；
