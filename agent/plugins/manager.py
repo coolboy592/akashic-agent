@@ -1844,7 +1844,8 @@ class PluginManager:
             "telegram_bot_commands",
         )
         exclusive_endpoint_changed = bool(old_services or old_channels)
-        endpoint_changed = exclusive_endpoint_changed or old_commands != new_commands
+        command_catalog_changed = old_commands != new_commands
+        publication_gated = exclusive_endpoint_changed or command_catalog_changed
         from agent.plugins.snapshot import get_current_runtime_lease
 
         if exclusive_endpoint_changed and get_current_runtime_lease() is not None:
@@ -1853,18 +1854,18 @@ class PluginManager:
             raise RuntimeError("持有 RuntimeSnapshot lease 时不能切换独占端点")
         quiesced = (
             self._snapshot_store.pause_admission()
-            if endpoint_changed
+            if publication_gated
             else None
         )
         endpoints_switched = False
         transaction = None
         try:
             if quiesced is not None:
-                if self._endpoint_quiescer is not None:
+                if exclusive_endpoint_changed and self._endpoint_quiescer is not None:
                     await self._endpoint_quiescer()
                 if exclusive_endpoint_changed:
                     await self._snapshot_store.wait_for_no_leases(quiesced)
-            if endpoint_changed:
+            if exclusive_endpoint_changed:
                 await self._switch_plugin_endpoints(
                     plugin_id,
                     old_services,
@@ -1872,7 +1873,7 @@ class PluginManager:
                     old_channels,
                     (),
                     old_commands,
-                    new_commands,
+                    old_commands,
                 )
                 endpoints_switched = True
             self._snapshot_skill_catalogs[snapshot.snapshot_id] = catalog_id
@@ -1891,7 +1892,7 @@ class PluginManager:
                         old_services,
                         (),
                         old_channels,
-                        new_commands,
+                        old_commands,
                         old_commands,
                     )
                 except BaseException as error:
@@ -1903,7 +1904,7 @@ class PluginManager:
                 _ = self._snapshot_skill_catalogs.pop(snapshot.snapshot_id, None)
                 self._skill_host.close(catalog_id)
                 await self._dispose_unreferenced_composition_root(snapshot)
-            if self._endpoint_resumer is not None and quiesced is not None:
+            if self._endpoint_resumer is not None and exclusive_endpoint_changed:
                 await self._endpoint_resumer()
             if endpoint_error is not None:
                 raise RuntimeError("禁用插件后旧端点恢复失败") from endpoint_error
@@ -1914,13 +1915,42 @@ class PluginManager:
         try:
             assert transaction is not None
             _, commit_cancelled = await _complete_critical(
-                self._snapshot_store.commit(
+                self._commit_snapshot_with_command_catalog(
                     transaction,
+                    plugin_id=plugin_id,
+                    old_commands=old_commands,
+                    new_commands=new_commands,
+                    promote_latest=False,
                     after_open=lambda: self._retire_generation(active),
                 )
             )
         except BaseException as error:
             commit_error = error
+        if commit_error is not None:
+            rollback_error: BaseException | None = None
+            if endpoints_switched:
+                try:
+                    await self._switch_plugin_endpoints(
+                        plugin_id,
+                        {},
+                        old_services,
+                        (),
+                        old_channels,
+                        old_commands,
+                        old_commands,
+                    )
+                except BaseException as error:
+                    rollback_error = error
+            if self._snapshot_store.pending_candidate is snapshot:
+                await self._snapshot_store.abort(transaction)
+            if self._endpoint_resumer is not None and exclusive_endpoint_changed:
+                await self._endpoint_resumer()
+            if rollback_error is not None:
+                raise RuntimeError(
+                    "禁用插件发布失败后旧端点恢复失败"
+                ) from rollback_error
+            raise commit_error
+
         _ = self._active_generations.pop(plugin_id)
         self._channels = [
             channel
@@ -1928,10 +1958,8 @@ class PluginManager:
             for channel in generation.contributions.channels
         ]
         resume_cancelled = False
-        if self._endpoint_resumer is not None and quiesced is not None:
+        if self._endpoint_resumer is not None and exclusive_endpoint_changed:
             _, resume_cancelled = await _complete_critical(self._endpoint_resumer())
-        if commit_error is not None:
-            raise commit_error
         if commit_cancelled or resume_cancelled:
             raise asyncio.CancelledError
         result: dict[str, object] = {
@@ -1980,6 +2008,82 @@ class PluginManager:
             if self._channel_switcher is None:
                 raise RuntimeError("Channel 宿主未绑定")
             await self._channel_switcher(plugin_id, old_channels, new_channels)
+
+    async def _commit_snapshot_with_command_catalog(
+        self,
+        transaction: SnapshotTransaction,
+        *,
+        plugin_id: str,
+        old_commands: tuple[tuple[str, str], ...],
+        new_commands: tuple[tuple[str, str], ...],
+        promote_latest: bool,
+        before_open: Callable[[], None] | None = None,
+        after_open: Callable[[], None] | None = None,
+    ) -> SnapshotTransaction:
+        """Publish one snapshot and expose its bot command catalog atomically."""
+
+        # 1. Keep the original one-step path when no external catalog changes.
+        if old_commands == new_commands:
+            if promote_latest:
+                return await self._snapshot_store.promote_latest(
+                    before_open=before_open,
+                    after_open=after_open,
+                )
+            await self._snapshot_store.commit(
+                transaction,
+                before_open=before_open,
+                after_open=after_open,
+            )
+            return transaction
+
+        # 2. Move to a closed provisional pointer before publishing externally.
+        provisional = (
+            await self._snapshot_store.promote_latest_provisional()
+            if promote_latest
+            else transaction
+        )
+        if not promote_latest:
+            await self._snapshot_store.commit_provisional(provisional)
+
+        try:
+            await self._switch_plugin_endpoints(
+                plugin_id,
+                {},
+                {},
+                (),
+                (),
+                old_commands,
+                new_commands,
+            )
+            await self._snapshot_store.finalize_provisional(
+                provisional,
+                before_open=before_open,
+                after_open=after_open,
+            )
+        except BaseException:
+            rollback_error: BaseException | None = None
+            try:
+                await self._switch_plugin_endpoints(
+                    plugin_id,
+                    {},
+                    {},
+                    (),
+                    (),
+                    new_commands,
+                    old_commands,
+                )
+            except BaseException as caught:
+                rollback_error = caught
+            await self._snapshot_store.rollback_provisional(
+                provisional,
+                keep_candidate_latest=promote_latest,
+            )
+            if rollback_error is not None:
+                raise RuntimeError(
+                    "bot command catalog 发布失败后旧目录恢复失败"
+                ) from rollback_error
+            raise
+        return provisional
 
     async def _compile_topology_snapshot(
         self,
@@ -2076,9 +2180,8 @@ class PluginManager:
             exclusive_endpoint_changed = (
                 old_services != new_services or old_channels != new_channels
             )
-            endpoint_changed = (
-                exclusive_endpoint_changed or old_commands != new_commands
-            )
+            command_catalog_changed = old_commands != new_commands
+            publication_gated = exclusive_endpoint_changed or command_catalog_changed
 
             skill_linker, stable_skill_plugins, target_skill_plugins = (
                 self._prepare_skill_links_for_promotion(generation, ready.snapshot)
@@ -2089,13 +2192,13 @@ class PluginManager:
                 ready.snapshot
             )
             quiesced_snapshot = (
-                self._snapshot_store.pause_admission() if endpoint_changed else None
+                self._snapshot_store.pause_admission() if publication_gated else None
             )
             endpoints_switched = False
             runtime_restore_started = False
-            if endpoint_changed:
+            if publication_gated:
                 try:
-                    if self._endpoint_quiescer is not None:
+                    if exclusive_endpoint_changed and self._endpoint_quiescer is not None:
                         await self._endpoint_quiescer()
                     if quiesced_snapshot is not None and exclusive_endpoint_changed:
                         await self._snapshot_store.wait_for_no_leases(quiesced_snapshot)
@@ -2115,19 +2218,23 @@ class PluginManager:
                         ready.snapshot,
                         "telegram_bot_commands",
                     )
-                    await self._switch_plugin_endpoints(
-                        plugin_id,
-                        old_services,
-                        new_services,
-                        old_channels,
-                        new_channels,
-                        old_commands,
-                        new_commands,
-                    )
-                    endpoints_switched = True
+                    if exclusive_endpoint_changed:
+                        await self._switch_plugin_endpoints(
+                            plugin_id,
+                            old_services,
+                            new_services,
+                            old_channels,
+                            new_channels,
+                            old_commands,
+                            old_commands,
+                        )
+                        endpoints_switched = True
                 except BaseException:
                     await self._snapshot_store.resume(quiesced_snapshot)
-                    if self._endpoint_resumer is not None:
+                    if (
+                        exclusive_endpoint_changed
+                        and self._endpoint_resumer is not None
+                    ):
                         await self._endpoint_resumer()
                     if runtime_restore_started and self._ready_candidate is ready:
                         _ = await self._drop_ready(plugin_id)
@@ -2196,7 +2303,15 @@ class PluginManager:
                 self._drain_transactions[previous_snapshot.snapshot_id] = tx_id
             try:
                 transaction, cancelled = await _complete_critical(
-                    self._snapshot_store.promote_latest(
+                    self._commit_snapshot_with_command_catalog(
+                        SnapshotTransaction(
+                            previous=previous_snapshot,
+                            candidate=ready.snapshot,
+                        ),
+                        plugin_id=plugin_id,
+                        old_commands=old_commands,
+                        new_commands=new_commands,
+                        promote_latest=True,
                         before_open=before_open,
                         after_open=after_open,
                     )
@@ -2217,7 +2332,7 @@ class PluginManager:
                             old_services,
                             new_channels,
                             old_channels,
-                            new_commands,
+                            old_commands,
                             old_commands,
                         )
                     except BaseException as error:
@@ -2231,7 +2346,10 @@ class PluginManager:
                         None,
                     )
                 await self._snapshot_store.resume(quiesced_snapshot)
-                if self._endpoint_resumer is not None and endpoint_changed:
+                if (
+                    self._endpoint_resumer is not None
+                    and exclusive_endpoint_changed
+                ):
                     await self._endpoint_resumer()
                 if self._ready_candidate is ready:
                     _ = await self._drop_ready(plugin_id)
@@ -2246,7 +2364,7 @@ class PluginManager:
                 raise
             self._ready_candidate = None
             self._track_reload_drain(generation, transaction.previous)
-            if self._endpoint_resumer is not None and endpoint_changed:
+            if self._endpoint_resumer is not None and exclusive_endpoint_changed:
                 await self._endpoint_resumer()
             assert link_result is not None
             logger.info(
@@ -2678,8 +2796,9 @@ class PluginManager:
         exclusive_endpoint_changed = (
             old_services != new_services or old_channels != new_channels
         )
-        endpoint_changed = not stage_latest and (
-            exclusive_endpoint_changed or old_commands != new_commands
+        command_catalog_changed = old_commands != new_commands
+        publication_gated = not stage_latest and (
+            exclusive_endpoint_changed or command_catalog_changed
         )
         if stage_latest and production_endpoint_changed:
             self._reload_journal.annotate(
@@ -2723,7 +2842,7 @@ class PluginManager:
                 )
 
         quiesced_snapshot: RuntimeSnapshot | None = None
-        if endpoint_changed:
+        if publication_gated:
             from agent.plugins.snapshot import get_current_runtime_lease
 
             if exclusive_endpoint_changed and get_current_runtime_lease() is not None:
@@ -2735,14 +2854,14 @@ class PluginManager:
                 raise RuntimeError(error_text)
             quiesced_snapshot = self._snapshot_store.pause_admission()
             try:
-                if self._endpoint_quiescer is not None:
+                if exclusive_endpoint_changed and self._endpoint_quiescer is not None:
                     await self._endpoint_quiescer()
                 if quiesced_snapshot is not None and exclusive_endpoint_changed:
                     await self._snapshot_store.wait_for_no_leases(quiesced_snapshot)
             except BaseException as error:
                 error_text = str(error) or type(error).__name__
                 await self._snapshot_store.resume(quiesced_snapshot)
-                if self._endpoint_resumer is not None:
+                if exclusive_endpoint_changed and self._endpoint_resumer is not None:
                     await self._endpoint_resumer()
                 await self.discard_prepared(
                     plugin_id,
@@ -2750,7 +2869,7 @@ class PluginManager:
                 )
                 raise
         endpoints_switched = False
-        if endpoint_changed:
+        if exclusive_endpoint_changed and not stage_latest:
             try:
                 await self._switch_plugin_endpoints(
                     plugin_id,
@@ -2759,7 +2878,7 @@ class PluginManager:
                     old_channels,
                     new_channels,
                     old_commands,
-                    new_commands,
+                    old_commands,
                 )
                 endpoints_switched = True
             except (asyncio.CancelledError, Exception) as error:
@@ -2811,7 +2930,7 @@ class PluginManager:
                         old_services,
                         new_channels,
                         old_channels,
-                        new_commands,
+                        old_commands,
                         old_commands,
                     )
                 except BaseException as error:
@@ -2821,7 +2940,7 @@ class PluginManager:
                 transaction,
                 error="post-publish invariant failed",
             )
-            if self._endpoint_resumer is not None:
+            if self._endpoint_resumer is not None and exclusive_endpoint_changed:
                 await self._endpoint_resumer()
             if invariant_endpoint_error is not None:
                 raise RuntimeError(
@@ -2855,7 +2974,7 @@ class PluginManager:
                             old_services,
                             new_channels,
                             old_channels,
-                            new_commands,
+                            old_commands,
                             old_commands,
                         )
                     except BaseException as rollback_error:
@@ -2865,7 +2984,7 @@ class PluginManager:
                     transaction,
                     error=f"production_rebuild: {error_text}",
                 )
-                if self._endpoint_resumer is not None:
+                if self._endpoint_resumer is not None and exclusive_endpoint_changed:
                     await self._endpoint_resumer()
                 if production_endpoint_error is not None:
                     raise RuntimeError(
@@ -2919,8 +3038,12 @@ class PluginManager:
                 )
             else:
                 _, commit_cancelled = await _complete_critical(
-                    self._snapshot_store.commit(
+                    self._commit_snapshot_with_command_catalog(
                         transaction,
+                        plugin_id=plugin_id,
+                        old_commands=old_commands,
+                        new_commands=new_commands,
+                        promote_latest=False,
                         before_open=open_candidate,
                         after_open=(
                             None
@@ -2952,7 +3075,7 @@ class PluginManager:
                         old_services,
                         new_channels,
                         old_channels,
-                        new_commands,
+                        old_commands,
                         old_commands,
                     )
                 except BaseException as error:
@@ -2962,7 +3085,7 @@ class PluginManager:
                 transaction,
                 error=str(commit_error) or type(commit_error).__name__,
             )
-            if self._endpoint_resumer is not None:
+            if self._endpoint_resumer is not None and exclusive_endpoint_changed:
                 await self._endpoint_resumer()
             if commit_endpoint_error is not None:
                 raise RuntimeError(
@@ -3009,7 +3132,7 @@ class PluginManager:
             for channel in item.contributions.channels
         ]
         resume_cancelled = False
-        if self._endpoint_resumer is not None and quiesced_snapshot is not None:
+        if self._endpoint_resumer is not None and exclusive_endpoint_changed:
             _, resume_cancelled = await _complete_critical(self._endpoint_resumer())
         if commit_error is not None:
             raise commit_error

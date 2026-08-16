@@ -173,6 +173,78 @@ async def test_plugin_commands_reject_names_outside_channel_contract(
     await root.dispose()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("name", "aliases", "match"),
+    (("stop", (), "Core 保留"), ("hello", ("stop",), "别名由 Core 保留")),
+)
+async def test_plugin_commands_reject_core_reserved_names(
+    tmp_path: Path,
+    name: str,
+    aliases: tuple[str, ...],
+    match: str,
+) -> None:
+    root = CompositionRoot("commands")
+    commands = PluginCommands()
+    _ = await root.context.provide(COMMANDS, commands)
+    runtime = PluginRuntime(
+        plugin_id="command-probe",
+        plugin_dir=tmp_path / "plugin",
+        data_dir=tmp_path / "data",
+        workspace=tmp_path,
+        config=None,
+    )
+
+    async def plugin(ctx) -> None:
+        await ctx.require(COMMANDS).register(
+            ctx,
+            CommandDefinition(
+                name=name,
+                description="reserved",
+                handler=lambda _invocation: CommandResult("success", "ok"),
+                aliases=aliases,
+            ),
+        )
+
+    fiber = await root.mount(plugin, name="command-probe", runtime=runtime)
+    assert fiber.state.value == "failed"
+    assert match in (root.receipt().fibers[0].error or "")
+    assert not root.receipt().ready
+    await root.dispose()
+
+
+@pytest.mark.asyncio
+async def test_plugin_commands_reject_channel_description_over_256_chars(
+    tmp_path: Path,
+) -> None:
+    root = CompositionRoot("commands")
+    commands = PluginCommands()
+    _ = await root.context.provide(COMMANDS, commands)
+    runtime = PluginRuntime(
+        plugin_id="command-probe",
+        plugin_dir=tmp_path / "plugin",
+        data_dir=tmp_path / "data",
+        workspace=tmp_path,
+        config=None,
+    )
+
+    async def plugin(ctx) -> None:
+        await ctx.require(COMMANDS).register(
+            ctx,
+            CommandDefinition(
+                name="hello",
+                description="x" * 257,
+                handler=lambda _invocation: CommandResult("success", "ok"),
+            ),
+        )
+
+    fiber = await root.mount(plugin, name="command-probe", runtime=runtime)
+    assert fiber.state.value == "failed"
+    assert "超过 256 字符" in (root.receipt().fibers[0].error or "")
+    assert not root.receipt().ready
+    await root.dispose()
+
+
 def test_command_digest_covers_every_descriptor_field() -> None:
     async def handler(_invocation):
         return CommandResult("success", "ok")
@@ -307,8 +379,33 @@ async def test_manager_keeps_candidate_commands_private_until_promotion(
     assert old_snapshot is not None and old_snapshot.command_registry is not None
     assert manager.telegram_bot_commands == [("hello", "old description")]
     assert manager.mobile_bot_commands == [("hello", "old description")]
-    endpoint_switcher = AsyncMock()
+    endpoint_calls: list[tuple[tuple[str, str], ...]] = []
+
+    async def endpoint_switcher(
+        _plugin_id,
+        _old_services,
+        _new_services,
+        _old_channels,
+        _new_channels,
+        _old_commands,
+        new_commands,
+    ) -> None:
+        provisional = manager.latest_snapshot
+        assert provisional is not None and provisional is not old_snapshot
+        assert manager.current_snapshot is old_snapshot
+        assert provisional.accepting_leases is False
+        assert old_snapshot.state == "committed"
+        assert old_snapshot.accepting_leases is False
+        assert manager.telegram_bot_commands == [("hello", "old description")]
+        assert manager.mobile_bot_commands == [("hello", "old description")]
+        with pytest.raises(RuntimeError, match="暂停接收"):
+            manager.snapshot_store.lease()
+        endpoint_calls.append(new_commands)
+
+    quiesce = AsyncMock()
+    resume = AsyncMock()
     manager.bind_endpoint_switcher(endpoint_switcher)
+    manager.bind_endpoint_admission(quiesce=quiesce, resume=resume)
 
     (plugin_dir / "plugin.py").write_text(
         _command_plugin("new description", "new"),
@@ -325,16 +422,66 @@ async def test_manager_keeps_candidate_commands_private_until_promotion(
     assert manager.telegram_bot_commands == [("hello", "new description")]
     assert manager.mobile_bot_commands == [("hello", "new description")]
     assert all(name != "hi" for name, _description in manager.telegram_bot_commands)
-    endpoint_switcher.assert_awaited_once()
-    assert endpoint_switcher.await_args.args[-2:] == (
-        (("hello", "old description"),),
-        (("hello", "new description"),),
-    )
+    assert endpoint_calls == [(('hello', 'new description'),)]
+    quiesce.assert_not_awaited()
+    resume.assert_not_awaited()
     root = manager.current_snapshot.composition_root
     assert root is not None
     await manager.terminate_all()
     assert root.receipt().effects == ()
     assert root.receipt().services == ()
+
+
+@pytest.mark.asyncio
+async def test_command_catalog_failure_restores_old_stable_and_generation(
+    tmp_path: Path,
+) -> None:
+    plugin_dir = _write_plugin(
+        tmp_path / "plugins",
+        "commands_v3",
+        _command_plugin("old description", "old"),
+    )
+    manager = _manager(tmp_path)
+    await manager.load_all()
+    old_snapshot = manager.current_snapshot
+    old_generation = manager.generation("commands_v3")
+    assert old_snapshot is not None and old_generation is not None
+    published: list[tuple[tuple[str, str], ...]] = []
+
+    async def endpoint_switcher(
+        _plugin_id,
+        _old_services,
+        _new_services,
+        _old_channels,
+        _new_channels,
+        _old_commands,
+        new_commands,
+    ) -> None:
+        published.append(new_commands)
+        if new_commands == (("hello", "new description"),):
+            raise RuntimeError("telegram publication failed")
+
+    manager.bind_endpoint_switcher(endpoint_switcher)
+    (plugin_dir / "plugin.py").write_text(
+        _command_plugin("new description", "new"),
+        encoding="utf-8",
+    )
+    assert await manager.prepare_candidate("commands_v3") is not None
+
+    with pytest.raises(RuntimeError, match="telegram publication failed"):
+        await manager.publish_prepared("commands_v3")
+
+    assert published == [
+        (("hello", "new description"),),
+        (("hello", "old description"),),
+    ]
+    assert manager.current_snapshot is old_snapshot
+    assert manager.generation("commands_v3") is old_generation
+    assert manager.telegram_bot_commands == [("hello", "old description")]
+    lease = manager.snapshot_store.lease()
+    assert lease.snapshot is old_snapshot
+    await lease.release()
+    await manager.terminate_all()
 
 
 @pytest.mark.asyncio
@@ -384,6 +531,25 @@ async def test_v2_only_command_collision_prevents_stable_publish(
 
     assert manager.current_snapshot is None
     assert manager.loaded_count == 0
+
+
+@pytest.mark.asyncio
+async def test_v2_command_cannot_claim_core_stop_namespace(tmp_path: Path) -> None:
+    _write_plugin(
+        tmp_path / "plugins",
+        "legacy",
+        "from agent.plugins import Plugin\n"
+        "class Legacy(Plugin):\n"
+        "    name = 'legacy'\n"
+        "    def telegram_bot_commands(self): return [('stop', 'legacy')]\n",
+    )
+    manager = _manager(tmp_path)
+
+    await manager.load_all()
+
+    assert manager.current_snapshot is None
+    assert manager.loaded_count == 0
+    assert manager.telegram_bot_commands == []
 
 
 class _CommandProvider(ProviderContextBudgetStub):

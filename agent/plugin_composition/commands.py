@@ -20,6 +20,8 @@ CommandResultKind = Literal["success", "error"]
 
 _COMMAND_NAME = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
 _LEGACY_COMMAND_NAME = re.compile(r"^[a-z][a-z0-9_-]*$")
+_RESERVED_COMMAND_NAMES = frozenset({"stop"})
+_MAX_COMMAND_DESCRIPTION_LENGTH = 256
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,6 +141,11 @@ class CommandRegistry:
                 raw_name
             ):
                 raise ValueError(f"Legacy Command name 无效: {raw_name}")
+            if raw_name in _RESERVED_COMMAND_NAMES:
+                raise CompositionError(
+                    "RESERVED_PLUGIN_COMMAND",
+                    f"Plugin Command 名称由 Core 保留: {raw_name}",
+                )
             previous = owners.get(raw_name)
             if previous is not None:
                 raise CompositionError(
@@ -310,10 +317,19 @@ def _validate_definition(definition: CommandDefinition) -> CommandDefinition:
         definition.name
     ):
         raise ValueError(f"Command name 无效: {definition.name}")
+    if definition.name in _RESERVED_COMMAND_NAMES:
+        raise CompositionError(
+            "RESERVED_PLUGIN_COMMAND",
+            f"Plugin Command 名称由 Core 保留: {definition.name}",
+        )
     if not isinstance(definition.description, str):
         raise TypeError(f"Command description 必须是字符串: {definition.name}")
     if not definition.description.strip():
         raise ValueError(f"Command description 不能为空: {definition.name}")
+    if len(definition.description) > _MAX_COMMAND_DESCRIPTION_LENGTH:
+        raise ValueError(
+            f"Command description 超过 256 字符: {definition.name}"
+        )
     if not callable(definition.handler):
         raise TypeError(f"Command handler 必须可调用: {definition.name}")
     if not isinstance(definition.aliases, tuple):
@@ -324,6 +340,11 @@ def _validate_definition(definition: CommandDefinition) -> CommandDefinition:
     for alias in aliases:
         if not isinstance(alias, str) or not _COMMAND_NAME.fullmatch(alias):
             raise ValueError(f"Command alias 无效: {alias}")
+        if alias in _RESERVED_COMMAND_NAMES:
+            raise CompositionError(
+                "RESERVED_PLUGIN_COMMAND",
+                f"Plugin Command 别名由 Core 保留: {alias}",
+            )
     if definition.input_hint is not None:
         if not isinstance(definition.input_hint, str):
             raise TypeError(f"Command input_hint 必须是字符串: {definition.name}")

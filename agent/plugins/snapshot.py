@@ -461,6 +461,7 @@ class RuntimeSnapshotStore:
         self._latest: RuntimeSnapshot | None = None
         self._snapshots: dict[str, RuntimeSnapshot] = {}
         self._pending: SnapshotTransaction | None = None
+        self._provisional: SnapshotTransaction | None = None
         self._on_drained = on_drained
         self._token = object()
         self._condition = asyncio.Condition()
@@ -543,7 +544,11 @@ class RuntimeSnapshotStore:
         )
 
     def install(self, snapshot: RuntimeSnapshot) -> None:
-        if self._current is not None or self._pending is not None:
+        if (
+            self._current is not None
+            or self._pending is not None
+            or self._provisional is not None
+        ):
             raise RuntimeError("RuntimeSnapshotStore 已安装初始快照")
         self._validate_composition(snapshot)
         self._adopt(snapshot)
@@ -558,7 +563,7 @@ class RuntimeSnapshotStore:
         *,
         admission_gated: bool = False,
     ) -> SnapshotTransaction:
-        if self._pending is not None:
+        if self._pending is not None or self._provisional is not None:
             raise RuntimeError("已有 RuntimeSnapshot 发布事务")
         if self.unpromoted_candidate is not None:
             raise RuntimeError("已有 RuntimeSnapshot 候选等待 promote/discard")
@@ -620,6 +625,120 @@ class RuntimeSnapshotStore:
         async with self._condition:
             self._condition.notify_all()
 
+    async def commit_provisional(
+        self,
+        transaction: SnapshotTransaction,
+    ) -> None:
+        """Stage a closed candidate without exposing it as the published stable."""
+
+        # 1. Validate and close both sides before the external publication step.
+        self._require_pending(transaction)
+        self._validate_composition(transaction.candidate)
+        transaction.candidate.state = "committed"
+        transaction.candidate.accepting_leases = False
+        if transaction.previous is not None:
+            transaction.previous.accepting_leases = False
+
+        # 2. Keep discovery pinned to the old stable while retaining the target.
+        self._latest = transaction.candidate
+        self._pending = None
+        self._provisional = transaction
+        async with self._condition:
+            self._condition.notify_all()
+
+    async def promote_latest_provisional(self) -> SnapshotTransaction:
+        """Stage a sealed latest candidate without exposing it as stable."""
+
+        # 1. Validate the exact closed latest candidate before moving the pointer.
+        if self._provisional is not None:
+            raise RuntimeError("已有 RuntimeSnapshot provisional 发布事务")
+        candidate = self.unpromoted_candidate
+        if candidate is None:
+            raise RuntimeError("没有等待 promote 的 RuntimeSnapshot 候选")
+        if candidate.accepting_leases:
+            raise RuntimeError("promote 前必须先暂停 candidate lease admission")
+        self._validate_composition(candidate, require_validation=True)
+
+        # 2. Keep the old stable visible but closed until the external step settles.
+        previous = self._current
+        if previous is not None:
+            previous.accepting_leases = False
+        transaction = SnapshotTransaction(previous=previous, candidate=candidate)
+        self._latest = candidate
+        candidate.accepting_leases = False
+        self._provisional = transaction
+        async with self._condition:
+            self._condition.notify_all()
+        return transaction
+
+    async def finalize_provisional(
+        self,
+        transaction: SnapshotTransaction,
+        *,
+        before_open: Callable[[], None] | None = None,
+        after_open: Callable[[], None] | None = None,
+    ) -> None:
+        """Open a provisional stable and retire its rollback snapshot."""
+
+        # 1. Complete fallible projection work while the old stable stays visible.
+        self._require_provisional(transaction)
+        self._validate_composition(transaction.candidate)
+        if before_open is not None:
+            before_open()
+
+        # 2. Switch the stable pointer synchronously around the owner callback.
+        transaction.candidate.state = "committed"
+        previous = transaction.previous
+        self._current = transaction.candidate
+        try:
+            if after_open is not None:
+                after_open()
+        except BaseException:
+            self._current = previous
+            raise
+
+        # 3. Open the new stable only after all publication work succeeded.
+        transaction.candidate.accepting_leases = True
+        if previous is not None:
+            previous.state = "retired"
+            previous.accepting_leases = False
+        self._provisional = None
+        if previous is not None:
+            self._schedule_drain(previous)
+        async with self._condition:
+            self._condition.notify_all()
+
+    async def rollback_provisional(
+        self,
+        transaction: SnapshotTransaction,
+        *,
+        keep_candidate_latest: bool,
+    ) -> None:
+        """Restore the previous stable before disposing or retrying the candidate."""
+
+        # 1. Reopen the old pointer; the candidate was never publicly current.
+        self._require_provisional(transaction)
+        candidate = transaction.candidate
+        previous = transaction.previous
+        if self._current is not previous:
+            raise RuntimeError("RuntimeSnapshot provisional stable 指针已漂移")
+        if previous is not None:
+            previous.state = "committed"
+            previous.accepting_leases = True
+        self._provisional = None
+
+        # 2. Either retain latest for normal discard or restore the pending transaction.
+        candidate.accepting_leases = False
+        if keep_candidate_latest:
+            candidate.state = "committed"
+            self._latest = candidate
+        else:
+            candidate.state = "validating"
+            self._latest = previous
+            self._pending = transaction
+        async with self._condition:
+            self._condition.notify_all()
+
     async def promote_latest(
         self,
         *,
@@ -629,6 +748,8 @@ class RuntimeSnapshotStore:
         """Atomically make the ready latest snapshot stable and retire the old stable."""
 
         # 1. Switch the public pointer without rebuilding the validated snapshot.
+        if self._provisional is not None:
+            raise RuntimeError("RuntimeSnapshot provisional 发布事务尚未结束")
         candidate = self.unpromoted_candidate
         if candidate is None:
             raise RuntimeError("没有等待 promote 的 RuntimeSnapshot 候选")
@@ -672,6 +793,8 @@ class RuntimeSnapshotStore:
         """Discard the ready latest snapshot without changing stable."""
 
         # 1. Remove candidate admission once; retries resume its failed drain.
+        if self._provisional is not None:
+            raise RuntimeError("RuntimeSnapshot provisional 发布事务尚未结束")
         candidate = self.unpromoted_candidate
         if candidate is None:
             if expected is None or expected.state != "aborted":
@@ -807,7 +930,7 @@ class RuntimeSnapshotStore:
                 await self._condition.wait()
 
     async def close(self) -> None:
-        if self._pending is not None:
+        if self._pending is not None or self._provisional is not None:
             raise RuntimeError("RuntimeSnapshot 发布事务尚未结束")
         leased = [
             snapshot.snapshot_id
@@ -971,6 +1094,10 @@ class RuntimeSnapshotStore:
     def _require_pending(self, transaction: SnapshotTransaction) -> None:
         if self._pending is not transaction:
             raise RuntimeError("RuntimeSnapshot 发布事务已失效")
+
+    def _require_provisional(self, transaction: SnapshotTransaction) -> None:
+        if self._provisional is not transaction:
+            raise RuntimeError("RuntimeSnapshot provisional 发布事务已失效")
 
     def _adopt(self, snapshot: RuntimeSnapshot) -> None:
         snapshot.claim(self._token)

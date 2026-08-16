@@ -91,8 +91,10 @@ def _write_installed_artifact(
     tmp_path: Path,
     artifact_id: str,
     source: str,
+    *,
+    plugin_name: str = "installed_snapshot",
 ) -> tuple[Path, Path]:
-    plugin_base = tmp_path / "home" / "cache" / "lab" / "installed_snapshot"
+    plugin_base = tmp_path / "home" / "cache" / "lab" / plugin_name
     artifact = plugin_base / ".artifacts" / artifact_id
     artifact.mkdir(parents=True)
     _ = (artifact / "plugin.py").write_text(source, encoding="utf-8")
@@ -1546,6 +1548,64 @@ async def test_runtime_snapshot_promotion_callback_failure_is_retryable(
 
 
 @pytest.mark.asyncio
+async def test_runtime_snapshot_provisional_promotion_can_finalize_or_rollback(
+    tmp_path: Path,
+) -> None:
+    _write_plugin(
+        tmp_path / "plugins",
+        "snapshot_provisional",
+        "from agent.plugins import Plugin\n"
+        "class SnapshotProvisionalPlugin(Plugin):\n"
+        "    name = 'snapshot_provisional'\n",
+    )
+    manager = _manager(tmp_path)
+    await manager.load_all()
+    active = manager.generation("snapshot_provisional")
+    prepared = await manager.prepare_candidate("snapshot_provisional")
+    assert active is not None and prepared is not None
+    compiler = RuntimeSnapshotCompiler()
+    stable = compiler.compile(
+        {"snapshot_provisional": active},
+        snapshot_revision="stable",
+    )
+    latest = compiler.compile(
+        {"snapshot_provisional": prepared},
+        snapshot_revision="latest",
+    )
+    store = RuntimeSnapshotStore()
+    store.install(stable)
+    await store.commit_latest(store.begin_publish(latest))
+    store.pause_candidate_admission(latest)
+
+    transaction = await store.promote_latest_provisional()
+
+    assert store.current is stable
+    assert store.latest is latest
+    assert stable.state == "committed"
+    assert not stable.accepting_leases
+    assert not latest.accepting_leases
+    with pytest.raises(RuntimeError, match="暂停接收"):
+        store.lease()
+
+    await store.rollback_provisional(transaction, keep_candidate_latest=True)
+    assert store.stable is stable
+    assert store.latest is latest
+    assert stable.accepting_leases
+    assert not latest.accepting_leases
+
+    transaction = await store.promote_latest_provisional()
+    await store.finalize_provisional(transaction)
+    assert store.stable is latest
+    assert latest.accepting_leases
+    assert stable.state == "retired"
+
+    await store.retry_drains()
+    await store.close()
+    await manager.discard_prepared("snapshot_provisional")
+    await manager.terminate_all()
+
+
+@pytest.mark.asyncio
 async def test_runtime_snapshot_candidate_admission_is_sealed_before_drain(
     tmp_path: Path,
 ) -> None:
@@ -1668,6 +1728,95 @@ def _installed_snapshot_source(
         f"{skill_roots}"
         f"{activate}"
     )
+
+
+def _installed_command_source(description: str) -> str:
+    return (
+        "from agent.plugin_composition import COMMANDS, CommandDefinition, CommandResult\n"
+        "api_version = 3\n"
+        "name = 'installed_commands'\n"
+        "version = '1.0.0'\n"
+        "inject = (COMMANDS,)\n"
+        "async def apply(ctx, config):\n"
+        "    async def handler(invocation):\n"
+        "        return CommandResult('success', invocation.raw_input or 'ok')\n"
+        "    await ctx.require(COMMANDS).register(ctx, CommandDefinition(\n"
+        f"        name='hello', description={description!r}, handler=handler))\n"
+    )
+
+
+@pytest.mark.asyncio
+async def test_installed_command_catalog_publishes_only_after_provisional_pointer(
+    tmp_path: Path,
+) -> None:
+    plugin_base, _ = _write_installed_artifact(
+        tmp_path,
+        "1.0.0-aaaa",
+        _installed_command_source("old description"),
+        plugin_name="installed_commands",
+    )
+    _, _ = _write_installed_artifact(
+        tmp_path,
+        "2.0.0-bbbb",
+        _installed_command_source("new description"),
+        plugin_name="installed_commands",
+    )
+    stable_pointer = ArtifactPointer(".artifacts/1.0.0-aaaa")
+    latest_pointer = ArtifactPointer(".artifacts/2.0.0-bbbb")
+    _ = write_pointers(plugin_base, stable=stable_pointer, latest=stable_pointer)
+    write_plugin_manifest(
+        {"installed_commands@lab": True},
+        plugins_home=tmp_path / "home",
+    )
+    manager = PluginManager(
+        plugin_dirs=[],
+        event_bus=EventBus(),
+        workspace=tmp_path / "workspace",
+        installed_cache_root=tmp_path / "home" / "cache",
+    )
+    await manager.load_all()
+    old_snapshot = manager.current_snapshot
+    assert old_snapshot is not None
+    calls: list[tuple[tuple[str, str], ...]] = []
+
+    async def switcher(
+        _plugin_id,
+        _old_services,
+        _new_services,
+        _old_channels,
+        _new_channels,
+        _old_commands,
+        new_commands,
+    ) -> None:
+        provisional = manager.latest_snapshot
+        assert provisional is not None and provisional is not old_snapshot
+        assert manager.current_snapshot is old_snapshot
+        assert not provisional.accepting_leases
+        assert old_snapshot.state == "committed"
+        assert manager.telegram_bot_commands == [("hello", "old description")]
+        assert manager.mobile_bot_commands == [("hello", "old description")]
+        assert read_pointer(plugin_base, "stable") == stable_pointer
+        calls.append(new_commands)
+
+    quiesce = AsyncMock()
+    resume = AsyncMock()
+    manager.bind_endpoint_switcher(switcher)
+    manager.bind_endpoint_admission(quiesce=quiesce, resume=resume)
+    _ = write_pointers(plugin_base, stable=stable_pointer, latest=latest_pointer)
+
+    assert (await manager.reconcile_changed())[0]["publication_state"] == "latest_ready"
+    assert calls == []
+    promoted = await manager.switch_ready("installed_commands@lab")
+
+    assert promoted["publication_state"] == "promoted"
+    assert calls == [(("hello", "new description"),)]
+    assert read_pointer(plugin_base, "stable") == latest_pointer
+    assert manager.current_snapshot is not None
+    assert manager.current_snapshot.accepting_leases
+    quiesce.assert_not_awaited()
+    resume.assert_not_awaited()
+    await manager.snapshot_store.retry_drains()
+    await manager.terminate_all()
 
 
 @pytest.mark.asyncio
