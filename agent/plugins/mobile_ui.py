@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from typing import Protocol, cast
@@ -241,6 +242,8 @@ class PluginMobileUiProvider:
                         "插件同时存在 v2 与 v3 Mobile UI contribution: "
                         f"{generation.plugin_id}"
                     )
+                if not binding.is_live():
+                    return None
                 return None if not binding.available() else binding
 
         # 2. v2 remains a frozen compatibility triple until its consumer moves.
@@ -367,13 +370,24 @@ def _normalize_rpc_result(
 ) -> dict[str, object]:
     """校验并规范化插件 RPC 返回对象。"""
 
-    # 1. 校验返回结构和 JSON 可编码性
+    # 1. 校验返回结构和严格 JSON 值域
     if not isinstance(result, Mapping):
         raise TypeError(f"插件 mobile UI RPC 必须返回对象: {plugin_id}.{method}")
     mapping = cast(Mapping[object, object], result)
-    if any(not isinstance(key, str) for key in mapping):
-        raise TypeError(f"插件 mobile UI RPC 返回键必须是字符串: {plugin_id}.{method}")
-    normalized = {cast(str, key): value for key, value in mapping.items()}
+    normalized: dict[str, object] = {}
+    active_containers: set[int] = set()
+    for key, value in mapping.items():
+        if not isinstance(key, str):
+            raise TypeError(
+                f"插件 mobile UI RPC 返回键必须是字符串: {plugin_id}.{method}"
+            )
+        _validate_json_value(
+            value,
+            plugin_id=plugin_id,
+            method=method,
+            active_containers=active_containers,
+        )
+        normalized[key] = value
     encoded = json.dumps(
         normalized,
         ensure_ascii=False,
@@ -385,3 +399,54 @@ def _normalize_rpc_result(
     if len(encoded.encode("utf-8")) > 192 * 1024:
         raise ValueError(f"插件 mobile UI RPC 返回超过 192 KiB: {plugin_id}.{method}")
     return normalized
+
+
+def _validate_json_value(
+    value: object,
+    *,
+    plugin_id: str,
+    method: str,
+    active_containers: set[int],
+) -> None:
+    """Reject values outside the finite, recursively JSON-compatible result ABI."""
+
+    if value is None or isinstance(value, (bool, int, str)):
+        return
+    if isinstance(value, float):
+        if math.isfinite(value):
+            return
+        raise TypeError(
+            f"插件 mobile UI RPC 返回浮点数必须有限: {plugin_id}.{method}"
+        )
+    if not isinstance(value, (list, dict)):
+        raise TypeError(
+            f"插件 mobile UI RPC 返回值不是严格 JSON 类型: {plugin_id}.{method}"
+        )
+    container_id = id(value)
+    if container_id in active_containers:
+        raise TypeError(f"插件 mobile UI RPC 返回值存在循环: {plugin_id}.{method}")
+    active_containers.add(container_id)
+    try:
+        if isinstance(value, list):
+            for item in value:
+                _validate_json_value(
+                    item,
+                    plugin_id=plugin_id,
+                    method=method,
+                    active_containers=active_containers,
+                )
+            return
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise TypeError(
+                    "插件 mobile UI RPC 嵌套对象键必须是字符串: "
+                    f"{plugin_id}.{method}"
+                )
+            _validate_json_value(
+                item,
+                plugin_id=plugin_id,
+                method=method,
+                active_containers=active_containers,
+            )
+    finally:
+        active_containers.remove(container_id)

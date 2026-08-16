@@ -345,6 +345,13 @@ class FiberHandle:
         reject_executor_context_access()
         return self._fiber.state
 
+    @property
+    def activation_token(self) -> object | None:
+        """返回当前 Fiber activation 的不透明身份令牌。"""
+
+        reject_executor_context_access()
+        return self._fiber._activation_token
+
     async def restart(self) -> None:
         reject_executor_context_access()
         await self._fiber.restart()
@@ -422,6 +429,7 @@ class Fiber:
         self._task_failures: dict[str, str] = {}
         self.static_active = static_active
         self._epoch: tuple[tuple[str, int], ...] | None = () if is_root else None
+        self._activation_token: object | None = object() if is_root else None
         self._transition = asyncio.Lock()
         self._transition_owner: asyncio.Task[object] | None = None
         self._dispose_requested = False
@@ -523,6 +531,7 @@ class Fiber:
     ) -> None:
         # 1. Freeze the dependency values for this activation.
         self.state = FiberState.LOADING
+        self._activation_token = object()
         self.dependency_store = providers
         self.error = None
         await self.root._notify_status(self)
@@ -566,6 +575,7 @@ class Fiber:
 
     async def _unload(self, *, next_state: FiberState) -> None:
         # 1. Make owned services unavailable before dependents clean up.
+        self._activation_token = None
         self.state = FiberState.UNLOADING
         await self.root._notify_status(self)
         errors: list[BaseException] = []

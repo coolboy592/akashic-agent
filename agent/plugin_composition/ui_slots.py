@@ -9,8 +9,13 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Literal, Protocol, cast
 
-from agent.plugin_composition.context import Context
-from agent.plugin_composition.model import CompositionError, PluginRuntime, ServiceKey
+from agent.plugin_composition.context import Context, FiberHandle
+from agent.plugin_composition.model import (
+    CompositionError,
+    FiberState,
+    PluginRuntime,
+    ServiceKey,
+)
 from agent.plugins.generation import MobileUiAsset
 
 
@@ -86,6 +91,19 @@ class MobileUiBinding:
     asset: MobileUiAsset
     query: MobileUiQueryHandler
     available: Callable[[], bool]
+    owner_fiber: FiberHandle | None = None
+    activation_token: object | None = None
+
+    def is_live(self) -> bool:
+        """Return whether this binding still belongs to its active Fiber activation."""
+
+        if self.owner_fiber is None:
+            return True
+        return (
+            self.activation_token is not None
+            and self.owner_fiber.state is FiberState.ACTIVE
+            and self.owner_fiber.activation_token is self.activation_token
+        )
 
 
 class MobileUiRegistry(Mapping[str, MobileUiBinding]):
@@ -192,6 +210,13 @@ class PluginUiSlots:
         if navigation is not None and not isinstance(navigation, MobileUiNavigation):
             raise TypeError("插件 Mobile UI navigation 必须是 MobileUiNavigation")
         runtime = ctx.runtime
+        owner_fiber = ctx.fiber
+        activation_token = owner_fiber.activation_token
+        if activation_token is None:
+            raise CompositionError(
+                "INACTIVE_FIBER",
+                f"{runtime.plugin_id} 当前 Fiber 没有 active activation",
+            )
         asset = resolve_mobile_ui_asset(
             runtime.plugin_dir,
             module=definition.module,
@@ -216,6 +241,8 @@ class PluginUiSlots:
             asset=asset,
             query=cast(MobileUiQueryHandler, query),
             available=_always_available if available is None else available,
+            owner_fiber=owner_fiber,
+            activation_token=activation_token,
         )
         _ = await ctx.effect(
             lambda: self._register(runtime.plugin_id, binding),
@@ -274,9 +301,7 @@ class PluginUiSlots:
         )
 
         def cleanup() -> None:
-            removed = self._registrations.pop(token, None)
-            if removed is not None:
-                self._frozen = None
+            _ = self._registrations.pop(token, None)
 
         return cleanup
 

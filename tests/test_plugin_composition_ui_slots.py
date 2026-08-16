@@ -17,7 +17,10 @@ from agent.plugin_composition import (
     resolve_mobile_ui_asset,
 )
 from agent.plugins.manager import PluginManager
-from agent.plugins.mobile_ui import PluginMobileUiProvider
+from agent.plugins.mobile_ui import (
+    MobileUiPluginUnavailable,
+    PluginMobileUiProvider,
+)
 from agent.plugins.registry import plugin_registry
 from bus.event_bus import EventBus
 
@@ -105,7 +108,9 @@ async def test_ui_slots_freeze_descriptor_and_effect_cleanup(tmp_path: Path) -> 
     assert registry.identity
 
     await fiber.dispose()
-    assert len(slots.freeze()) == 0
+    assert slots.freeze() is registry
+    assert len(registry) == 1
+    assert not registry["probe"].is_live()
     await root.dispose()
 
 
@@ -282,6 +287,71 @@ def _plugin_source(version: str) -> str:
         "        query=query,\n"
         "    )\n"
     )
+
+
+def _nested_plugin_source() -> str:
+    return (
+        "from agent.plugin_composition import UI_SLOTS, MobileUiDefinition\n"
+        "api_version = 3\n"
+        "name = 'ui_probe'\n"
+        "version = '1'\n"
+        "inject = (UI_SLOTS,)\n"
+        "child_handle = None\n"
+        "def query(method, payload, *, session_id, turn_id):\n"
+        "    return {'status': 'ready', 'method': method}\n"
+        "async def register_mobile(ctx):\n"
+        "    await ctx.require(UI_SLOTS).register_mobile(\n"
+        "        ctx, MobileUiDefinition(module='mobile.js', slots=('drawer.panel',)),\n"
+        "        query=query,\n"
+        "    )\n"
+        "async def apply(ctx, config):\n"
+        "    global child_handle\n"
+        "    child_handle = await ctx.mount(\n"
+        "        register_mobile, name='mobile-nested', inject=(UI_SLOTS,),\n"
+        "    )\n"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transition", ("dispose", "restart"))
+async def test_published_snapshot_hides_nested_fiber_after_transition(
+    tmp_path: Path,
+    transition: str,
+) -> None:
+    plugin_dir = _write_plugin(tmp_path / "plugins", "ui_probe", _nested_plugin_source())
+    (plugin_dir / "mobile.js").write_text("export const nested = true;\n", encoding="utf-8")
+    manager = _manager(tmp_path)
+    await manager.load_all()
+
+    generation = manager.generation("ui_probe")
+    snapshot = manager.current_snapshot
+    assert generation is not None and snapshot is not None
+    root = snapshot.composition_root
+    assert root is not None
+    child = cast(Any, generation.instance.module).child_handle
+    assert child is not None
+    provider = PluginMobileUiProvider(manager)
+    assert provider.catalog()["items"]
+
+    if transition == "dispose":
+        await child.dispose()
+    else:
+        await child.restart()
+        assert any(
+            "已冻结" in (fiber.error or "") for fiber in root.receipt().fibers
+        )
+
+    assert provider.catalog()["items"] == []
+    with pytest.raises(MobileUiPluginUnavailable):
+        await provider.query(
+            "ui_probe",
+            generation.source_revision,
+            "probe.current",
+            {},
+            session_id=None,
+            turn_id=None,
+        )
+    await manager.terminate_all()
 
 
 @pytest.mark.asyncio

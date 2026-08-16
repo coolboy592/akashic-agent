@@ -343,6 +343,7 @@ async def test_mobile_ui_rpc_failure_isolated_from_transport() -> None:
     (
         [],
         {1: "value"},
+        {"value": {1: "nested"}},
         {"value": object()},
         {"value": "x" * (193 * 1024)},
         _ExplodingMapping(),
