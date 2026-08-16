@@ -19,6 +19,12 @@ from agent.control.models import (
 )
 from agent.control.runtime import ConversationRuntime, TurnHandle
 from agent.looping.core import AgentLoop
+from agent.plugin_composition.channels import (
+    DeliveryStatus as ChannelDeliveryStatus,
+    InboundEnvelope,
+    InboundOwner,
+    OutboundEnvelope,
+)
 from bus.events import InboundMessage, OutboundMessage, TurnTerminalStatus
 from bus.queue import MessageBus
 from core.common.diagnostic_log import turn_milestone
@@ -43,9 +49,13 @@ class PassiveMessageWorker:
         self._runtime = runtime
         self._legacy_loop = legacy_loop
         self._running = False
-        self._lane_queues: dict[str, asyncio.Queue[InboundMessage | object]] = {}
+        self._lane_queues: dict[
+            str,
+            asyncio.Queue[InboundMessage | InboundEnvelope | object],
+        ] = {}
         self._lane_tasks: dict[str, asyncio.Task[None]] = {}
         self._result_tasks: set[asyncio.Task[None]] = set()
+        self._channel_result_tasks: dict[asyncio.Task[None], TurnHandle] = {}
 
     async def run(self) -> None:
         self._running = True
@@ -69,13 +79,16 @@ class PassiveMessageWorker:
                     *tuple(self._lane_tasks.values()),
                     return_exceptions=True,
                 )
+            await self._drain_channel_lane_queues()
             self._lane_tasks.clear()
             self._lane_queues.clear()
-            for task in tuple(self._result_tasks):
+            await self._interrupt_channel_results()
+            for task in tuple(self._result_tasks - self._channel_result_tasks.keys()):
                 task.cancel()
             if self._result_tasks:
                 await asyncio.gather(*tuple(self._result_tasks), return_exceptions=True)
             self._result_tasks.clear()
+            self._channel_result_tasks.clear()
 
     def _enqueue(self, item: object) -> None:
         key = cast(Any, item).session_key
@@ -91,7 +104,7 @@ class PassiveMessageWorker:
     async def _run_lane(
         self,
         key: str,
-        queue: asyncio.Queue[InboundMessage | object],
+        queue: asyncio.Queue[InboundMessage | InboundEnvelope | object],
     ) -> None:
         """串行执行单 thread 队列，并隔离单条消息失败。"""
 
@@ -99,7 +112,10 @@ class PassiveMessageWorker:
             item = await queue.get()
             while True:
                 try:
-                    if isinstance(item, InboundMessage):
+                    if isinstance(item, InboundEnvelope):
+                        result_task = await self._admit_channel_envelope(item)
+                        await asyncio.shield(result_task)
+                    elif isinstance(item, InboundMessage):
                         result_task = await self._admit_message(item)
                         if result_task is not None:
                             await result_task
@@ -107,6 +123,14 @@ class PassiveMessageWorker:
                         await self._legacy_loop._run_inbound_turn(cast(Any, item))
                     break
                 except asyncio.CancelledError:
+                    if (
+                        isinstance(item, InboundEnvelope)
+                        and item.owner is InboundOwner.LANE
+                    ):
+                        await self._bus.release_channel_inbound(
+                            item,
+                            InboundOwner.LANE,
+                        )
                     raise
                 except _TerminalHandoffRetainedError as error:
                     # 终态已持久化，只重投同一权威 terminal；同 session 后续消息
@@ -120,6 +144,8 @@ class PassiveMessageWorker:
                     await asyncio.sleep(_TERMINAL_LANE_RETRY_DELAY)
                 except Exception:
                     logger.exception("passive lane message failed thread=%s", key)
+                    if isinstance(item, InboundEnvelope) and item.owner is not InboundOwner.CLOSED:
+                        await self._bus.release_channel_inbound(item, item.owner)
                     break
             if queue.empty():
                 task = asyncio.current_task()
@@ -134,6 +160,164 @@ class PassiveMessageWorker:
         result_task = await self._admit_message(item)
         if result_task is not None:
             await result_task
+
+    async def _admit_channel_envelope(
+        self,
+        envelope: InboundEnvelope,
+    ) -> asyncio.Task[None]:
+        """Transfer one exact Channel lease into a ConversationRuntime turn."""
+
+        # 1. Lane owns the accepted envelope until the runtime handle exists.
+        envelope.handoff(InboundOwner.LANE, InboundOwner.LOOP)
+        transferred = False
+        try:
+            message = envelope.message
+            request = TurnRequest(
+                envelope.session_key,
+                message.content,
+                {
+                    "channel": message.channel,
+                    "chatId": message.chat_id,
+                    "sender": message.sender,
+                    "media": [],
+                    "inputTimestamp": message.timestamp.isoformat(),
+                    "inboundMetadata": dict(message.metadata),
+                    "channelMessageId": envelope.message_id,
+                    "channelSnapshotId": envelope.snapshot_id,
+                    "channelGenerationId": envelope.generation_id,
+                    "channelBindingToken": envelope.binding_token,
+                },
+            )
+
+            # 2. Capacity waits retain the exact old binding; they never reacquire current.
+            while True:
+                try:
+                    handle = await self._runtime.start_turn(
+                        request,
+                        runtime_snapshot_lease=cast(
+                            Any,
+                            envelope.lease.snapshot_lease,
+                        ),
+                    )
+                    break
+                except ThreadBusyError:
+                    await self._runtime.wait_thread_available(envelope.session_key)
+                except ControlAdmissionError:
+                    if self._runtime.admission_request_never_fits(request):
+                        handle = await self._runtime.reject_never_fit_turn(request)
+                        break
+                    await self._runtime.wait_capacity_available(request)
+                except RuntimeClosedError:
+                    await self._runtime.wait_until_accepting_turns()
+
+            # 3. The result task owns delivery and terminal lease release.
+            task = asyncio.create_task(
+                self._finish_channel_envelope(envelope, handle),
+                name=f"channel-passive-result:{handle.id}",
+            )
+            self._result_tasks.add(task)
+            self._channel_result_tasks[task] = handle
+
+            def forget(completed: asyncio.Task[None]) -> None:
+                self._result_tasks.discard(completed)
+                self._channel_result_tasks.pop(completed, None)
+
+            task.add_done_callback(forget)
+            transferred = True
+            return task
+        finally:
+            if not transferred:
+                await self._bus.release_channel_inbound(envelope, InboundOwner.LOOP)
+
+    async def _finish_channel_envelope(
+        self,
+        envelope: InboundEnvelope,
+        handle: TurnHandle,
+    ) -> None:
+        """Await the turn and settle one exact non-retryable provider delivery."""
+
+        try:
+            result = await handle.result()
+            legacy_view = InboundMessage(
+                channel=envelope.channel,
+                sender=envelope.sender,
+                chat_id=envelope.chat_id,
+                content=envelope.content,
+                timestamp=envelope.timestamp,
+                metadata=dict(envelope.metadata),
+            )
+            terminal = self._terminal_outbound(legacy_view, result)
+            delivery_id = result.id
+            receipt = await self._bus.publish_channel_outbound_awaited(
+                OutboundEnvelope(
+                    logical_delivery_id=delivery_id,
+                    delivery_id=delivery_id,
+                    attempt_sequence=1,
+                    snapshot_id=envelope.snapshot_id,
+                    generation_id=envelope.generation_id,
+                    binding_token=envelope.binding_token,
+                    channel=envelope.channel,
+                    recipient=envelope.chat_id,
+                    body=terminal.content,
+                    metadata=dict(terminal.metadata),
+                ),
+                envelope.lease,
+            )
+            if receipt.status is not ChannelDeliveryStatus.DELIVERED:
+                logger.error(
+                    "v3 channel terminal settled channel=%s delivery_id=%s status=%s error=%s",
+                    envelope.channel,
+                    receipt.delivery_id,
+                    receipt.status.value,
+                    receipt.error,
+                )
+        finally:
+            await self._bus.complete_inbound(envelope)
+
+    async def _drain_channel_lane_queues(self) -> None:
+        """Close every v3 envelope still owned by a stopped lane."""
+
+        for queue in self._lane_queues.values():
+            retained: list[object] = []
+            while True:
+                try:
+                    item = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                if isinstance(item, InboundEnvelope):
+                    await self._bus.release_channel_inbound(
+                        item,
+                        InboundOwner.LANE,
+                    )
+                else:
+                    retained.append(item)
+            for item in retained:
+                queue.put_nowait(item)
+
+    async def _interrupt_channel_results(self) -> None:
+        """Make every running v3 turn terminal before releasing its exact lease."""
+
+        owned = tuple(self._channel_result_tasks.items())
+        failures: list[Exception] = []
+        for task, handle in owned:
+            if task.done():
+                continue
+            try:
+                await handle.interrupt()
+            except Exception as error:
+                failures.append(error)
+        if owned:
+            results = await asyncio.gather(
+                *(task for task, _ in owned),
+                return_exceptions=True,
+            )
+            failures.extend(
+                result
+                for result in results
+                if isinstance(result, Exception)
+            )
+        if failures:
+            raise ExceptionGroup("v3 Channel turn cleanup 失败", failures)
 
     async def _admit_message(
         self,

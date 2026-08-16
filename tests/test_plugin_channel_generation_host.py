@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from types import ModuleType, SimpleNamespace
 from typing import Any, cast
 
@@ -9,15 +10,22 @@ import pytest
 
 from agent.plugin_composition.channels import (
     ChannelCapability,
+    ChannelDeliveryReceipt,
     ChannelDefinition,
     ChannelFactoryFreezeInput,
     ChannelReady,
+    ChannelInboundMessage,
+    InboundIdentity,
     CredentialRef,
     DeliveryStatus,
+    InboundEnvelope,
+    InboundOwner,
+    OutboundEnvelope,
     PluginChannels,
     ProviderClientFactory,
     ProviderDeliveryReceipt,
     ProviderDeliveryRequest,
+    RawInbound,
     StopReceipt,
     _freeze_plugin_channels,
     channel_config_revision,
@@ -29,6 +37,7 @@ from agent.plugins.channel_generation_host import (
 )
 from agent.plugins.composable import ComposablePlugin
 from agent.plugins.generation import GateResult, PluginContributions, PluginGeneration
+from bus.queue import MessageBus
 
 
 @dataclass
@@ -177,6 +186,9 @@ async def _make_snapshot(
     cancel_factory: bool = False,
     fail_after: int | None = None,
     factory_events: list[str] | None = None,
+    capabilities: frozenset[ChannelCapability] = frozenset(
+        {ChannelCapability.OUTBOUND}
+    ),
 ) -> tuple[Any, dict[str, ClientFactory], dict[str, Adapter]]:
     module = module or _module(adapter_cls=adapter_cls)
     plugin = ComposablePlugin.from_module(module)
@@ -219,9 +231,13 @@ async def _make_snapshot(
             cast(Any, Context()),
             ChannelDefinition(
                 name=channel_name,
-                capabilities=frozenset({ChannelCapability.OUTBOUND}),
+                capabilities=capabilities,
                 factory_export="make_adapter",
-                inbound_identity=None,
+                inbound_identity=(
+                    InboundIdentity.PROVIDER_MESSAGE_ID
+                    if ChannelCapability.INBOUND in capabilities
+                    else None
+                ),
                 credential_paths=("app_secret",),
             ),
         )
@@ -333,6 +349,368 @@ async def test_exact_binding_lease_blocks_stop_until_snapshot_fork_closes() -> N
     assert not owner.active
     assert source.active
     assert len(source.forks) == 1 and not source.forks[0].active
+    await stop
+
+
+@pytest.mark.asyncio
+async def test_exact_binding_lease_dispatches_one_outbound_envelope() -> None:
+    snapshot, factories, adapters = await _make_snapshot()
+    host = _host()
+    generation = await host.start(snapshot, factories)
+    generation.open_admission()
+    source = _FakeSnapshotLease(snapshot)
+    owner = host.acquire_binding(cast(Any, source), "feishu")
+    envelope = OutboundEnvelope(
+        logical_delivery_id="d1",
+        delivery_id="d1",
+        attempt_sequence=1,
+        snapshot_id=snapshot.snapshot_id,
+        generation_id="gen-1",
+        binding_token=owner.binding_token,
+        channel="feishu",
+        recipient="u",
+        body="hi",
+        metadata={},
+    )
+    for adapter in adapters.values():
+        adapter.release.set()
+
+    receipt = await host.dispatch_outbound(envelope, owner)
+
+    assert receipt == ChannelDeliveryReceipt(
+        "d1",
+        DeliveryStatus.DELIVERED,
+        ("p1",),
+    )
+    assert tuple(adapters.values())[0].deliveries == ["d1"]
+    await owner.aclose()
+    await generation.stop()
+
+
+@pytest.mark.asyncio
+async def test_outbound_dispatch_rejects_foreign_host_binding() -> None:
+    snapshot, factories, _ = await _make_snapshot()
+    host = _host()
+    generation = await host.start(snapshot, factories)
+    generation.open_admission()
+    owner = host.acquire_binding(cast(Any, _FakeSnapshotLease(snapshot)), "feishu")
+    envelope = OutboundEnvelope(
+        logical_delivery_id="d1",
+        delivery_id="d1",
+        attempt_sequence=1,
+        snapshot_id=snapshot.snapshot_id,
+        generation_id="gen-1",
+        binding_token=owner.binding_token,
+        channel="feishu",
+        recipient="u",
+        body="hi",
+        metadata={},
+    )
+
+    with pytest.raises(RuntimeError, match="不属于当前 Host"):
+        await _host().dispatch_outbound(envelope, owner)
+
+    await owner.aclose()
+    await generation.stop()
+
+
+@pytest.mark.asyncio
+async def test_formal_ingress_acquires_exact_binding_and_deduplicates() -> None:
+    snapshot, factories, adapters = await _make_snapshot(
+        capabilities=frozenset(
+            {ChannelCapability.INBOUND, ChannelCapability.OUTBOUND}
+        )
+    )
+    sources: list[_FakeSnapshotLease] = []
+
+    async def acquire() -> _FakeSnapshotLease:
+        source = _FakeSnapshotLease(snapshot)
+        sources.append(source)
+        return source
+
+    bus = MessageBus()
+    host = _host(snapshot_lease_acquirer=acquire)
+    host.bind_inbound_publisher(bus.publish_channel_inbound)
+    generation = await host.start(snapshot, factories)
+    generation.open_admission()
+    adapter = tuple(adapters.values())[0]
+    assert adapter.context.ingress is not None
+    raw = RawInbound(
+        message_id="provider-message-1",
+        message=ChannelInboundMessage(
+            channel="feishu",
+            sender="user",
+            chat_id="chat",
+            content="hello",
+            timestamp=datetime.now(timezone.utc),
+            metadata={},
+        ),
+    )
+
+    assert await adapter.context.ingress.admit(raw) is True
+    assert await adapter.context.ingress.admit(raw) is False
+    assert len(sources) == 1 and not sources[0].active
+    assert len(sources[0].forks) == 1 and sources[0].forks[0].active
+    envelope = await bus.consume_inbound()
+    assert envelope.message_id == raw.message_id  # type: ignore[union-attr]
+    await bus.release_channel_inbound(envelope, InboundOwner.LANE)  # type: ignore[arg-type]
+    assert not sources[0].forks[0].active
+
+    await generation.stop()
+
+
+@pytest.mark.asyncio
+async def test_outbound_only_binding_rejects_ingress_before_runtime_ports() -> None:
+    snapshot, factories, adapters = await _make_snapshot()
+    acquired = 0
+
+    async def acquire() -> _FakeSnapshotLease:
+        nonlocal acquired
+        acquired += 1
+        return _FakeSnapshotLease(snapshot)
+
+    published: list[InboundEnvelope] = []
+
+    async def publish(envelope: InboundEnvelope) -> None:
+        published.append(envelope)
+
+    host = _host(snapshot_lease_acquirer=acquire)
+    host.bind_inbound_publisher(publish)
+    generation = await host.start(snapshot, factories)
+    generation.open_admission()
+    raw = RawInbound(
+        message_id="provider-message-outbound-only",
+        message=ChannelInboundMessage(
+            channel="feishu",
+            sender="user",
+            chat_id="chat",
+            content="hello",
+            timestamp=datetime.now(timezone.utc),
+            metadata={},
+        ),
+    )
+
+    assert tuple(adapters.values())[0].context.ingress is None
+
+    assert acquired == 0
+    assert published == []
+    await generation.stop()
+
+
+@pytest.mark.asyncio
+async def test_formal_ingress_rejects_different_stable_snapshot_and_releases_claim() -> None:
+    snapshot, factories, adapters = await _make_snapshot(
+        capabilities=frozenset(
+            {ChannelCapability.INBOUND, ChannelCapability.OUTBOUND}
+        )
+    )
+    other_snapshot = SimpleNamespace(snapshot_id="other-snapshot", generations={})
+    wrong = _FakeSnapshotLease(other_snapshot)
+    right = _FakeSnapshotLease(snapshot)
+    acquired = [wrong, right]
+
+    async def acquire() -> _FakeSnapshotLease:
+        return acquired.pop(0)
+
+    bus = MessageBus()
+    host = _host(snapshot_lease_acquirer=acquire)
+    host.bind_inbound_publisher(bus.publish_channel_inbound)
+    generation = await host.start(snapshot, factories)
+    generation.open_admission()
+    raw = RawInbound(
+        message_id="provider-message-race",
+        message=ChannelInboundMessage(
+            channel="feishu",
+            sender="user",
+            chat_id="chat",
+            content="hello",
+            timestamp=datetime.now(timezone.utc),
+            metadata={},
+        ),
+    )
+    adapter = tuple(adapters.values())[0]
+
+    with pytest.raises(RuntimeError, match="stable snapshot 不一致"):
+        await adapter.context.ingress.admit(raw)
+
+    assert not wrong.active
+    assert await adapter.context.ingress.admit(raw) is True
+    envelope = await bus.consume_inbound()
+    assert isinstance(envelope, InboundEnvelope)
+    await bus.release_channel_inbound(envelope, InboundOwner.LANE)
+    await generation.stop()
+
+
+@pytest.mark.asyncio
+async def test_formal_ingress_scopes_dedupe_by_provider_identity_and_persists_mapping() -> None:
+    snapshot, factories, adapters = await _make_snapshot(
+        capabilities=frozenset(
+            {ChannelCapability.INBOUND, ChannelCapability.OUTBOUND}
+        )
+    )
+    mapping: dict[tuple[str, str], str] = {}
+
+    async def acquire() -> _FakeSnapshotLease:
+        return _FakeSnapshotLease(snapshot)
+
+    async def remember(channel: str, identity: str, recipient: str) -> None:
+        mapping[(channel, identity)] = recipient
+
+    host = _host(
+        snapshot_lease_acquirer=acquire,
+        identity_resolver=lambda channel, identity: mapping.get((channel, identity)),
+        identity_rememberer=remember,
+    )
+    bus = MessageBus()
+    host.bind_inbound_publisher(bus.publish_channel_inbound)
+    generation = await host.start(snapshot, factories)
+    generation.open_admission()
+    ingress = tuple(adapters.values())[0].context.ingress
+    identity = tuple(adapters.values())[0].context.identity
+    assert ingress is not None and identity is not None
+
+    def raw(provider: str, recipient: str) -> RawInbound:
+        return RawInbound(
+            message_id="same-provider-message-id",
+            provider_identity=provider,
+            recipient=recipient,
+            message=ChannelInboundMessage(
+                channel="feishu",
+                sender=provider,
+                chat_id=recipient,
+                content="hello",
+                timestamp=datetime.now(timezone.utc),
+                metadata={},
+            ),
+        )
+
+    assert await ingress.admit(raw("open-a", "chat-a")) is True
+    assert await ingress.admit(raw("open-b", "chat-b")) is True
+    assert identity.resolve("open-a") == "chat-a"
+    assert identity.resolve("open-b") == "chat-b"
+    first = await bus.consume_inbound()
+    second = await bus.consume_inbound()
+    assert isinstance(first, InboundEnvelope)
+    assert isinstance(second, InboundEnvelope)
+    await bus.release_channel_inbound(first, InboundOwner.LANE)
+    await bus.release_channel_inbound(second, InboundOwner.LANE)
+    await generation.stop()
+
+
+@pytest.mark.asyncio
+async def test_identity_write_failure_releases_dedupe_claim_before_snapshot_acquire() -> None:
+    snapshot, factories, adapters = await _make_snapshot(
+        capabilities=frozenset(
+            {ChannelCapability.INBOUND, ChannelCapability.OUTBOUND}
+        )
+    )
+    acquire_calls = 0
+    fail = True
+
+    async def acquire() -> _FakeSnapshotLease:
+        nonlocal acquire_calls
+        acquire_calls += 1
+        return _FakeSnapshotLease(snapshot)
+
+    async def remember(_channel: str, _identity: str, _recipient: str) -> None:
+        nonlocal fail
+        if fail:
+            fail = False
+            raise OSError("identity store unavailable")
+
+    host = _host(
+        snapshot_lease_acquirer=acquire,
+        identity_resolver=lambda _channel, _identity: None,
+        identity_rememberer=remember,
+    )
+    bus = MessageBus()
+    host.bind_inbound_publisher(bus.publish_channel_inbound)
+    generation = await host.start(snapshot, factories)
+    generation.open_admission()
+    ingress = tuple(adapters.values())[0].context.ingress
+    assert ingress is not None
+    raw = RawInbound(
+        message_id="identity-retry",
+        provider_identity="open-id",
+        recipient="chat-id",
+        message=ChannelInboundMessage(
+            channel="feishu",
+            sender="open-id",
+            chat_id="chat-id",
+            content="hello",
+            timestamp=datetime.now(timezone.utc),
+            metadata={},
+        ),
+    )
+
+    with pytest.raises(OSError, match="identity store unavailable"):
+        await ingress.admit(raw)
+
+    assert acquire_calls == 1
+    assert await ingress.admit(raw) is True
+    assert acquire_calls == 2
+    envelope = await bus.consume_inbound()
+    assert isinstance(envelope, InboundEnvelope)
+    await bus.release_channel_inbound(envelope, InboundOwner.LANE)
+    await generation.stop()
+
+
+@pytest.mark.asyncio
+async def test_identity_write_is_owned_by_binding_drain_during_publication() -> None:
+    snapshot, factories, adapters = await _make_snapshot(
+        capabilities=frozenset(
+            {ChannelCapability.INBOUND, ChannelCapability.OUTBOUND}
+        )
+    )
+    remember_started = asyncio.Event()
+    remember_release = asyncio.Event()
+    mapping: dict[str, str] = {}
+
+    async def acquire() -> _FakeSnapshotLease:
+        return _FakeSnapshotLease(snapshot)
+
+    async def remember(_channel: str, identity: str, recipient: str) -> None:
+        remember_started.set()
+        await remember_release.wait()
+        mapping[identity] = recipient
+
+    host = _host(
+        snapshot_lease_acquirer=acquire,
+        identity_resolver=lambda _channel, identity: mapping.get(identity),
+        identity_rememberer=remember,
+    )
+    bus = MessageBus()
+    host.bind_inbound_publisher(bus.publish_channel_inbound)
+    generation = await host.start(snapshot, factories)
+    generation.open_admission()
+    ingress = tuple(adapters.values())[0].context.ingress
+    assert ingress is not None
+    raw = RawInbound(
+        message_id="publication-race",
+        provider_identity="open-id",
+        recipient="chat-id",
+        message=ChannelInboundMessage(
+            channel="feishu",
+            sender="open-id",
+            chat_id="chat-id",
+            content="hello",
+            timestamp=datetime.now(timezone.utc),
+            metadata={},
+        ),
+    )
+
+    admission = asyncio.create_task(ingress.admit(raw))
+    await remember_started.wait()
+    stop = asyncio.create_task(generation.stop())
+    await asyncio.sleep(0)
+    assert not stop.done()
+
+    remember_release.set()
+    assert await admission is True
+    assert mapping == {"open-id": "chat-id"}
+    envelope = await bus.consume_inbound()
+    assert isinstance(envelope, InboundEnvelope)
+    await bus.release_channel_inbound(envelope, InboundOwner.LANE)
     await stop
 
 

@@ -6,6 +6,7 @@ import logging
 import re
 import sqlite3
 import threading
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -594,6 +595,21 @@ class SessionStore:
             self._conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_session_admissions_session
                 ON session_admissions(session_key)
+                """)
+            self._conn.execute("""
+                CREATE TABLE IF NOT EXISTS channel_identities (
+                    channel    TEXT NOT NULL,
+                    identity   TEXT NOT NULL,
+                    chat_id    TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(channel, identity)
+                )
+                """)
+            self._conn.execute("""
+                CREATE TABLE IF NOT EXISTS channel_identity_migrations (
+                    channel     TEXT PRIMARY KEY,
+                    migrated_at TEXT NOT NULL
+                )
                 """)
             # SessionStore owns this fresh runtime audit schema; it is not a
             # user-data migration and is created before any management command.
@@ -3216,6 +3232,11 @@ class SessionStore:
                             f"WHERE session_key IN ({placeholders})",
                             targets,
                         )
+                    self._conn.execute(
+                        f"DELETE FROM channel_identities "
+                        f"WHERE (channel || ':' || chat_id) IN ({placeholders})",
+                        targets,
+                    )
                     cur = self._conn.execute(
                         f"DELETE FROM sessions WHERE key IN ({placeholders})",
                         targets,
@@ -3455,7 +3476,13 @@ class SessionStore:
         like_key = f"{channel}:%"
         with self._lock:
             rows = self._conn.execute(
-                "SELECT key, metadata FROM sessions WHERE key LIKE ?", (like_key,)
+                """
+                SELECT key, metadata, updated_at
+                FROM sessions
+                WHERE key LIKE ?
+                ORDER BY updated_at ASC, key ASC
+                """,
+                (like_key,),
             ).fetchall()
         results: list[dict[str, Any]] = []
         for row in rows:
@@ -3466,9 +3493,124 @@ class SessionStore:
                     "key": key,
                     "chat_id": chat_id,
                     "metadata": _decode_session_metadata(row["metadata"], key),
+                    "updated_at": str(row["updated_at"]),
                 }
             )
         return results
+
+    def get_channel_identities(self, channel: str) -> dict[str, str]:
+        """Return the unique durable identity owner for one channel."""
+
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT identity, chat_id
+                FROM channel_identities
+                WHERE channel = ?
+                ORDER BY identity
+                """,
+                (channel,),
+            ).fetchall()
+        return {str(row["identity"]): str(row["chat_id"]) for row in rows}
+
+    def channel_identity_migration_completed(self, channel: str) -> bool:
+        """Return whether legacy metadata has already lost routing authority."""
+
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM channel_identity_migrations WHERE channel = ?",
+                (channel,),
+            ).fetchone()
+        return row is not None
+
+    def seed_channel_identities(
+        self,
+        channel: str,
+        mapping: Mapping[str, tuple[str, str]],
+    ) -> None:
+        """Copy legacy metadata once without deleting any historical field."""
+
+        with self._lock:
+            with self._conn:
+                self._conn.execute("BEGIN IMMEDIATE")
+                migrated = self._conn.execute(
+                    "SELECT 1 FROM channel_identity_migrations WHERE channel = ?",
+                    (channel,),
+                ).fetchone()
+                if migrated is not None:
+                    return
+                self._conn.executemany(
+                    """
+                    INSERT INTO channel_identities(channel, identity, chat_id, updated_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        (channel, identity, chat_id, updated_at)
+                        for identity, (chat_id, updated_at) in mapping.items()
+                    ),
+                )
+                self._conn.execute(
+                    """
+                    INSERT INTO channel_identity_migrations(channel, migrated_at)
+                    VALUES (?, ?)
+                    """,
+                    (channel, datetime.now(UTC).isoformat()),
+                )
+
+    def persist_channel_identity(
+        self,
+        *,
+        channel: str,
+        identity: str,
+        chat_id: str,
+        session_key: str,
+        created_at: str,
+        updated_at: str,
+        metadata: Mapping[str, Any],
+    ) -> str | None:
+        """Atomically update target Session metadata and the unique identity row."""
+
+        metadata_payload = json.dumps(dict(metadata), ensure_ascii=False)
+        with self._lock:
+            with self._conn:
+                self._conn.execute("BEGIN IMMEDIATE")
+                previous = self._conn.execute(
+                    """
+                    SELECT chat_id FROM channel_identities
+                    WHERE channel = ? AND identity = ?
+                    """,
+                    (channel, identity),
+                ).fetchone()
+                self._conn.execute(
+                    """
+                    INSERT INTO sessions (
+                        key, created_at, updated_at, last_consolidated, metadata
+                    ) VALUES (?, ?, ?, 0, ?)
+                    ON CONFLICT(key) DO UPDATE SET
+                        updated_at = excluded.updated_at,
+                        metadata = excluded.metadata
+                    """,
+                    (session_key, created_at, updated_at, metadata_payload),
+                )
+                self._conn.execute(
+                    """
+                    INSERT INTO channel_identities(channel, identity, chat_id, updated_at)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(channel, identity) DO UPDATE SET
+                        chat_id = excluded.chat_id,
+                        updated_at = excluded.updated_at
+                    """,
+                    (channel, identity, chat_id, updated_at),
+                )
+                self._conn.execute(
+                    """
+                    INSERT INTO channel_identity_migrations(channel, migrated_at)
+                    VALUES (?, ?)
+                    ON CONFLICT(channel) DO NOTHING
+                    """,
+                    (channel, updated_at),
+                )
+        return None if previous is None else str(previous["chat_id"])
 
     def count_messages(self, session_key: str) -> int:
         with self._lock:

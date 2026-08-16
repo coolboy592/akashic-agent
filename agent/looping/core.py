@@ -40,6 +40,7 @@ from agent.model_runtime.session_selection import (
 from agent.retrieval.default_pipeline import DefaultMemoryRetrievalPipeline
 from agent.retrieval.protocol import MemoryRetrievalPipeline
 from agent.turns.outbound import BusOutboundPort
+from agent.plugin_composition.channels import InboundEnvelope, InboundOwner
 
 # 为保持兼容重新导出：现有调用方从 core.py 导入这些名称。
 __all__ = [
@@ -479,6 +480,14 @@ class AgentLoop:
                     )
                 except asyncio.TimeoutError:
                     continue
+                if isinstance(item, InboundEnvelope):
+                    await self.bus.release_channel_inbound(
+                        item,
+                        InboundOwner.LANE,
+                    )
+                    raise RuntimeError(
+                        "v3 Channel inbound 必须由 PassiveMessageWorker 消费"
+                    )
                 await self._run_inbound_turn(item)
         finally:
             self._running = False
@@ -1011,6 +1020,29 @@ class AgentLoop:
             process_kwargs: dict[str, str] = {}
             if execution_turn_id is not None:
                 process_kwargs["execution_turn_id"] = execution_turn_id
+            from agent.plugins.snapshot import get_current_runtime_lease
+
+            bound_lease = get_current_runtime_lease()
+            if bound_lease is not None:
+                snapshot = bound_lease.snapshot
+                if bound_lease.validation_candidate_plugin_ids:
+                    if not isinstance(msg, InboundMessage):
+                        raise RuntimeError(
+                            "latest candidate 只接受普通 inbound message"
+                        )
+                    _disable_candidate_side_effect_tools(
+                        msg,
+                        bound_lease.validation_candidate_plugin_ids,
+                        snapshot.tool_registry,
+                        snapshot,
+                    )
+                return await self._process(
+                    msg,
+                    session_key=session_key,
+                    busy_session_key=busy_session_key,
+                    dispatch_outbound=dispatch_outbound,
+                    **process_kwargs,
+                )
             if store is None or store.current is None:
                 if runtime_selector != "stable":
                     raise RuntimeError("latest RuntimeSnapshot 不可用")

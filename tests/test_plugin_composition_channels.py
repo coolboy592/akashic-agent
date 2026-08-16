@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -353,6 +355,8 @@ def test_channel_factory_context_freezes_config_and_credential_refs() -> None:
         config=raw,
         credentials={"token": CredentialRef(("token",))},
         provider_client_factory=ProviderFactory(),
+        ingress=SimpleNamespace(admit=AsyncMock()),
+        identity=None,
     )
 
     raw["options"] = {"retry": [99]}
@@ -368,6 +372,8 @@ def test_channel_factory_context_freezes_config_and_credential_refs() -> None:
             config={},
             credentials={"token": CredentialRef(("other",))},
             provider_client_factory=ProviderFactory(),
+            ingress=SimpleNamespace(admit=AsyncMock()),
+            identity=None,
         )
 
 

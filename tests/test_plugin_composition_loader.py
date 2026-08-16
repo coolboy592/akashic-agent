@@ -148,20 +148,6 @@ async def test_v3_channel_registry_redacts_candidate_credentials_before_import(
     config_path.write_bytes(original_config)
     manager = _manager(tmp_path)
 
-    class ProviderFactory:
-        async def create(self, credentials: Any) -> object:
-            return object()
-
-        async def aclose(self) -> None:
-            return None
-
-    manager.bind_channel_provider_factory_resolver(
-        lambda snapshot: {
-            descriptor.name: ProviderFactory()
-            for descriptor in cast(Any, snapshot.channel_registry).descriptors
-        }
-    )
-
     await manager.load_all()
 
     stable = manager.current_snapshot

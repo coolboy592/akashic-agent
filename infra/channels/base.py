@@ -8,8 +8,6 @@ from uuid import uuid4
 
 from session.manager import SessionManager
 
-_MISSING_METADATA = object()
-
 
 class AttachmentStore:
     """为 channel 媒体文件提供统一的持久化落盘目录。"""
@@ -93,39 +91,46 @@ class SessionIdentityIndex:
 
     def rebuild(self) -> dict[str, str]:
         self.mapping.clear()
+        durable = self._session_manager.get_channel_identities(self._channel)
+        if self._session_manager.channel_identity_migration_completed(self._channel):
+            self.mapping.update(durable)
+            return dict(self.mapping)
+        seeded: dict[str, tuple[str, str]] = {}
         for entry in self._session_manager.get_channel_metadata(self._channel):
             raw_value = entry["metadata"].get(self._metadata_key)
             if not isinstance(raw_value, str):
                 continue
             normalized = self._normalize(raw_value)
             if normalized:
-                self.mapping[normalized] = entry["chat_id"]
+                seeded[normalized] = (
+                    entry["chat_id"],
+                    entry["updated_at"],
+                )
+        self._session_manager.seed_channel_identities(self._channel, seeded)
+        self.mapping.update(
+            self._session_manager.get_channel_identities(self._channel)
+        )
         return dict(self.mapping)
 
     def resolve(self, identity: str) -> str | None:
         normalized = self._normalize(identity)
         if not normalized:
             return None
+        durable = self._session_manager.get_channel_identities(self._channel)
+        self.mapping.clear()
+        self.mapping.update(durable)
         return self.mapping.get(normalized)
 
     async def remember(self, identity: str, chat_id: str) -> None:
         normalized = self._normalize(identity)
         if not normalized:
             return
-        session = self._session_manager.get_or_create(f"{self._channel}:{chat_id}")
-        if session.metadata.get(self._metadata_key) == normalized:
-            self.mapping[normalized] = chat_id
-            return
-        previous = session.metadata.get(self._metadata_key, _MISSING_METADATA)
-        session.metadata[self._metadata_key] = normalized
-        try:
-            await self._session_manager.save_async(session)
-        except BaseException:
-            if previous is _MISSING_METADATA:
-                session.metadata.pop(self._metadata_key, None)
-            else:
-                session.metadata[self._metadata_key] = previous
-            raise
+        await self._session_manager.remember_channel_identity(
+            channel=self._channel,
+            identity=normalized,
+            chat_id=chat_id,
+            metadata_key=self._metadata_key,
+        )
         self.mapping[normalized] = chat_id
 
     def _normalize(self, value: str) -> str:

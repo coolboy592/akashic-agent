@@ -7,7 +7,7 @@ import time
 from collections import OrderedDict
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
-from typing import Any, Callable, cast
+from typing import TYPE_CHECKING, Any, Callable, cast
 
 from agent.control.errors import (
     ControlAdmissionError,
@@ -43,6 +43,9 @@ from agent.restart import RestartCoordinator
 from core.common.diagnostic_log import turn_milestone
 from session.store import SessionStore
 from agent.looping.interrupt import InterruptResult
+
+if TYPE_CHECKING:
+    from agent.plugins.snapshot import RuntimeSnapshotLease
 
 logger = logging.getLogger(__name__)
 _STREAM_END = object()
@@ -274,7 +277,12 @@ class ConversationRuntime:
                 len(recovered),
             )
 
-    async def start_turn(self, request: TurnRequest) -> TurnHandle:
+    async def start_turn(
+        self,
+        request: TurnRequest,
+        *,
+        runtime_snapshot_lease: RuntimeSnapshotLease | None = None,
+    ) -> TurnHandle:
         """拒绝 active thread，否则恢复未完成 interaction 并创建新 attempt。"""
 
         # 1. 在唯一 owner 处检查 thread 与控制面容量；拒绝不写 SessionStore。
@@ -351,6 +359,7 @@ class ConversationRuntime:
                 turn_id,
                 attempt_replay=attempt_replay,
                 prior_tool_chain=prior_tool_chain,
+                runtime_snapshot_lease=runtime_snapshot_lease,
             ),
             name=f"conversation-turn:{turn_id}",
         )
@@ -827,6 +836,7 @@ class ConversationRuntime:
         *,
         attempt_replay: list[dict[str, Any]],
         prior_tool_chain: list[dict[str, Any]],
+        runtime_snapshot_lease: RuntimeSnapshotLease | None,
     ) -> None:
         """执行已按 thread 和容量准入的 turn，并保证只写一个终态。"""
 
@@ -920,7 +930,20 @@ class ConversationRuntime:
                 )
 
             execution_request.metadata["_controlItemEvent"] = publish_item
-            execution = await self._executor(execution_request)
+            snapshot_token = None
+            if runtime_snapshot_lease is not None:
+                if not runtime_snapshot_lease.active:
+                    raise RuntimeError("turn exact RuntimeSnapshot lease 已关闭")
+                from agent.plugins.snapshot import bind_runtime_snapshot
+
+                snapshot_token = bind_runtime_snapshot(runtime_snapshot_lease)
+            try:
+                execution = await self._executor(execution_request)
+            finally:
+                if snapshot_token is not None:
+                    from agent.plugins.snapshot import reset_runtime_snapshot
+
+                    reset_runtime_snapshot(snapshot_token)
             await self._turn_input_sources[turn_id].lock()
             if open_item_ids:
                 raise RuntimeError(

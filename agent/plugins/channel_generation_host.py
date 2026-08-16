@@ -11,21 +11,29 @@ import hashlib
 import inspect
 import json
 import uuid
-from collections.abc import Awaitable, Callable, Mapping
+from collections import deque
+from collections.abc import Awaitable, Callable, Coroutine, Mapping
 from dataclasses import dataclass, field
 from types import ModuleType
 from typing import TYPE_CHECKING, Any, cast
 
 from agent.plugin_composition.channels import (
     ChannelAdapter,
+    ChannelCapability,
     ChannelCleanupFailure,
+    ChannelDeliveryReceipt,
     ChannelFactoryContext,
     ChannelReady,
     ChannelRegistrySnapshot,
     CredentialRef,
+    InboundEnvelope,
+    InboundIdentity,
+    InboundOwner,
+    OutboundEnvelope,
     ProviderClientFactory,
     ProviderDeliveryReceipt,
     ProviderDeliveryRequest,
+    RawInbound,
     StopReceipt,
     channel_config_revision,
 )
@@ -37,6 +45,10 @@ if TYPE_CHECKING:
 BeforeStartCallback = Callable[["ChannelStartRecord"], Awaitable[None]]
 ConfigRevisionChecker = Callable[["ChannelStartRecord"], Awaitable[None]]
 FailureCallback = Callable[["ChannelCleanupTombstone"], Awaitable[None] | None]
+SnapshotLeaseAcquirer = Callable[[], Awaitable["RuntimeSnapshotLease"]]
+InboundPublisher = Callable[[InboundEnvelope], Awaitable[None]]
+IdentityResolver = Callable[[str, str], str | None]
+IdentityRememberer = Callable[[str, str, str], Coroutine[object, object, None]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,6 +120,8 @@ class _ChannelBindingState:
     plugin_id: str
     generation_id: str
     channel_name: str
+    capabilities: tuple[ChannelCapability, ...]
+    inbound_identity: InboundIdentity | None
     module: ModuleType
     artifact_pointer: str
     factory: Callable[[ChannelFactoryContext], ChannelAdapter] | None
@@ -139,6 +153,8 @@ class _ChannelBindingState:
     adapter_stop_succeeded: bool = False
     factory_close_settled: bool = False
     factory_close_succeeded: bool = False
+    inbound_message_ids: deque[tuple[str, str]] = field(default_factory=deque)
+    inbound_message_id_set: set[tuple[str, str]] = field(default_factory=set)
 
     def __post_init__(self) -> None:
         self.drain_event.set()
@@ -249,6 +265,36 @@ class ChannelBindingLease:
     def active(self) -> bool:
         return not self._closed
 
+    async def deliver(self, envelope: OutboundEnvelope) -> ChannelDeliveryReceipt:
+        """Deliver one envelope through this exact retained binding."""
+
+        if self._closed:
+            raise RuntimeError("Channel binding lease 已关闭")
+        if not isinstance(envelope, OutboundEnvelope):
+            raise TypeError("channel outbound 只接受 OutboundEnvelope")
+        if (
+            envelope.snapshot_id != self.snapshot_id
+            or envelope.generation_id != self.generation_id
+            or envelope.channel != self.channel_name
+            or envelope.binding_token != self.binding_token
+        ):
+            raise RuntimeError("OutboundEnvelope 与 exact Channel binding 不一致")
+        receipt = await self._host._deliver(
+            self._key,
+            ProviderDeliveryRequest(
+                binding_token=self.binding_token,
+                delivery_id=envelope.delivery_id,
+                recipient=envelope.recipient,
+                body=envelope.body,
+            ),
+        )
+        return ChannelDeliveryReceipt(
+            delivery_id=receipt.delivery_id,
+            status=receipt.status,
+            provider_ids=receipt.provider_ids,
+            error=receipt.error,
+        )
+
     async def aclose(self) -> None:
         """Release both owners completely before propagating caller cancellation."""
 
@@ -266,6 +312,36 @@ class ChannelBindingLease:
             self._binding_released = True
         await self.snapshot_lease.release()
         self._closed = True
+
+
+class _ChannelIngress:
+    """Admit provider text into one exact formal binding."""
+
+    def __init__(
+        self,
+        host: ChannelGenerationHost,
+        key: tuple[str, str],
+    ) -> None:
+        self._host = host
+        self._key = key
+
+    async def admit(self, raw: RawInbound) -> bool:
+        return await self._host._admit_inbound(self._key, raw)
+
+
+class _ChannelIdentity:
+    """Resolve recipients through the Core-owned durable identity index."""
+
+    def __init__(
+        self,
+        host: ChannelGenerationHost,
+        key: tuple[str, str],
+    ) -> None:
+        self._host = host
+        self._key = key
+
+    def resolve(self, provider_identity: str) -> str | None:
+        return self._host._resolve_identity(self._key, provider_identity)
 
 
 class ChannelGeneration:
@@ -327,6 +403,9 @@ class ChannelGenerationHost:
         on_before_start: BeforeStartCallback,
         config_revision_checker: ConfigRevisionChecker,
         on_failure: FailureCallback,
+        snapshot_lease_acquirer: SnapshotLeaseAcquirer | None = None,
+        identity_resolver: IdentityResolver | None = None,
+        identity_rememberer: IdentityRememberer | None = None,
     ) -> None:
         if not callable(on_before_start):
             raise TypeError("on_before_start 必须是 async callback")
@@ -334,13 +413,36 @@ class ChannelGenerationHost:
             raise TypeError("config_revision_checker 必须是 async callback")
         if not callable(on_failure):
             raise TypeError("on_failure 必须可调用")
+        if snapshot_lease_acquirer is not None and not callable(
+            snapshot_lease_acquirer
+        ):
+            raise TypeError("snapshot_lease_acquirer 必须可调用")
+        if (identity_resolver is None) != (identity_rememberer is None):
+            raise TypeError("identity resolver/rememberer 必须同时绑定")
+        if identity_resolver is not None and not callable(identity_resolver):
+            raise TypeError("identity_resolver 必须可调用")
+        if identity_rememberer is not None and not callable(identity_rememberer):
+            raise TypeError("identity_rememberer 必须可调用")
         self._on_before_start = on_before_start
         self._config_revision_checker = config_revision_checker
         self._on_failure = on_failure
+        self._snapshot_lease_acquirer = snapshot_lease_acquirer
+        self._inbound_publisher: InboundPublisher | None = None
+        self._identity_resolver = identity_resolver
+        self._identity_rememberer = identity_rememberer
         self._bindings: dict[tuple[str, str], _ChannelBindingState] = {}
         self._tombstones: dict[tuple[str, str], ChannelCleanupTombstone] = {}
         self._start_counts: dict[tuple[str, str], int] = {}
         self._locks: dict[str, asyncio.Lock] = {}
+
+    def bind_inbound_publisher(self, publisher: InboundPublisher) -> None:
+        """Bind the sole MessageBus inbound admission callback."""
+
+        if not callable(publisher):
+            raise TypeError("Channel inbound publisher 必须可调用")
+        if self._inbound_publisher is not None:
+            raise RuntimeError("Channel inbound publisher 已绑定")
+        self._inbound_publisher = publisher
 
     async def start(
         self,
@@ -623,6 +725,119 @@ class ChannelGenerationHost:
         state.drain_event.clear()
         return ChannelBindingLease(self, key, forked)
 
+    async def dispatch_outbound(
+        self,
+        envelope: OutboundEnvelope,
+        binding: object,
+    ) -> ChannelDeliveryReceipt:
+        """Dispatch through one lease created by this exact Host."""
+
+        if not isinstance(binding, ChannelBindingLease) or binding._host is not self:
+            raise RuntimeError("v3 Channel outbound binding 不属于当前 Host")
+        return await binding.deliver(envelope)
+
+    async def _admit_inbound(
+        self,
+        key: tuple[str, str],
+        raw: RawInbound,
+    ) -> bool:
+        """Acquire, enqueue, and retain one deduplicated exact inbound lease."""
+
+        if not isinstance(raw, RawInbound):
+            raise TypeError("Channel ingress 只接受 RawInbound")
+        state = self._binding(key)
+        if (
+            ChannelCapability.INBOUND not in state.capabilities
+            or state.inbound_identity is not InboundIdentity.PROVIDER_MESSAGE_ID
+        ):
+            raise RuntimeError("channel 未声明可用的 inbound capability")
+        if raw.message.channel != state.channel_name:
+            raise RuntimeError("RawInbound channel 与 exact binding 不一致")
+        if not state.admission_open or state.stopping or state.stopped:
+            raise RuntimeError("channel admission 已关闭")
+        provider_scope = raw.provider_identity or ""
+        dedupe_key = (provider_scope, raw.message_id)
+        if dedupe_key in state.inbound_message_id_set:
+            return False
+        acquirer = self._snapshot_lease_acquirer
+        publisher = self._inbound_publisher
+        if acquirer is None or publisher is None:
+            raise RuntimeError("Channel ingress runtime ports 未绑定")
+
+        # 1. Claim before any await so concurrent duplicate callbacks serialize.
+        state.inbound_message_id_set.add(dedupe_key)
+        state.inbound_message_ids.append(dedupe_key)
+        accepted = False
+        binding: ChannelBindingLease | None = None
+        try:
+            source = await acquirer()
+            try:
+                if source.snapshot.snapshot_id != key[0]:
+                    raise RuntimeError("Channel ingress 与当前 stable snapshot 不一致")
+                binding = self.acquire_binding(source, state.channel_name)
+            finally:
+                release = asyncio.create_task(
+                    source.release(),
+                    name=f"channel-ingress-source-release:{state.channel_name}",
+                )
+                await _await_task_after_cancellation(release)
+            if raw.provider_identity is not None:
+                rememberer = self._identity_rememberer
+                if rememberer is None or raw.recipient is None:
+                    raise RuntimeError("Channel identity runtime port 未绑定")
+                identity_task = asyncio.create_task(
+                    rememberer(
+                        state.channel_name,
+                        raw.provider_identity,
+                        raw.recipient,
+                    ),
+                    name=f"channel-identity-remember:{state.channel_name}",
+                )
+                await _await_task_after_cancellation(identity_task)
+            envelope = InboundEnvelope(
+                message_id=raw.message_id,
+                snapshot_id=binding.snapshot_id,
+                generation_id=binding.generation_id,
+                binding_token=binding.binding_token,
+                message=raw.message,
+                lease=binding,
+            )
+            try:
+                await publisher(envelope)
+            except BaseException:
+                if envelope.owner is InboundOwner.INGRESS:
+                    await envelope.close(InboundOwner.INGRESS)
+                raise
+            accepted = True
+            while len(state.inbound_message_ids) > 500:
+                expired = state.inbound_message_ids.popleft()
+                state.inbound_message_id_set.remove(expired)
+            return True
+        finally:
+            if not accepted:
+                state.inbound_message_id_set.discard(dedupe_key)
+                try:
+                    state.inbound_message_ids.remove(dedupe_key)
+                except ValueError:
+                    pass
+                if binding is not None and binding.active:
+                    await binding.aclose()
+
+    def _resolve_identity(
+        self,
+        key: tuple[str, str],
+        provider_identity: str,
+    ) -> str | None:
+        """Resolve only while the exact binding still accepts work."""
+
+        state = self._binding(key)
+        if not state.admission_open or state.stopping or state.stopped:
+            raise RuntimeError("channel admission 已关闭")
+        resolver = self._identity_resolver
+        if resolver is None:
+            raise RuntimeError("Channel identity runtime port 未绑定")
+        return resolver(state.channel_name, provider_identity)
+
     async def _materialize_binding(
         self,
         snapshot: Any,
@@ -662,6 +877,8 @@ class ChannelGenerationHost:
             plugin_id=descriptor.owner,
             generation_id=generation.generation_id,
             channel_name=descriptor.name,
+            capabilities=descriptor.capabilities,
+            inbound_identity=descriptor.inbound_identity,
             module=module,
             artifact_pointer=str(generation.plugin_dir),
             factory=None,
@@ -718,6 +935,17 @@ class ChannelGenerationHost:
             config=state.config,
             credentials=credentials,
             provider_client_factory=state.provider_client_factory,
+            ingress=(
+                _ChannelIngress(self, key)
+                if ChannelCapability.INBOUND in state.capabilities
+                else None
+            ),
+            identity=(
+                _ChannelIdentity(self, key)
+                if ChannelCapability.INBOUND in state.capabilities
+                and self._identity_resolver is not None
+                else None
+            ),
         )
         try:
             adapter = state.factory(state.factory_context)

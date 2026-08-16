@@ -199,6 +199,7 @@ class ChannelRegistrySnapshot:
     root_instance_token: object  # exact Root fence; excluded from identity
 
 class ProviderClient(Protocol):
+    def credential(self, ref: CredentialRef) -> str: ...
     async def aclose(self) -> None: ...
 
 class ProviderClientFactory(Protocol):
@@ -240,7 +241,7 @@ class StreamSubscription(Protocol):
     async def close(self) -> None: ...
 
 class ChannelIngress(Protocol):
-    async def admit(self, raw: RawInbound) -> InboundEnvelope: ...
+    async def admit(self, raw: RawInbound) -> bool: ...  # accepted or duplicate
 
 class BusOutboundPort(Protocol):
     async def dispatch(
@@ -311,12 +312,8 @@ class ChannelFactoryContext:
     config: Mapping[str, JsonValue | CredentialRef]
     credentials: Mapping[str, CredentialRef]
     provider_client_factory: ProviderClientFactory
-
-@dataclass(frozen=True, slots=True)
-class ChannelRuntimePorts:  # C14c
-    identity: ChannelIdentityPort
-    ingress: ChannelIngress
-    outbound: BusOutboundPort
+    ingress: ChannelIngress | None
+    identity: ChannelIdentityPort | None
 
 @dataclass(frozen=True, slots=True)
 class ChannelPresentationPorts:  # C14d
@@ -446,7 +443,13 @@ candidate、factory 调用与 `start()` 之前的 credential resolution/client c
    `ChannelIdentityPort` 是 provider identity 与可主动发送 recipient 映射的唯一读取面，不暴露 Session repository；
    `ChannelIngress.admit()` 根据 `RawInbound.provider_identity/recipient` 在同一 Core acceptance 临界段提交 mapping，
    写入失败时不得返回 envelope 或进入 Bus，stop/drain 后旧 binding 不得再写。Feishu 的 `ou_` 反查必须经该 port，不能让 adapter 重获
-   `SessionManager` 或自行扫描 Session metadata。
+   `SessionManager` 或自行扫描 Session metadata。权威 owner 是 `sessions.db/channel_identities` 的
+   `(channel, identity)` 唯一行；Session metadata 只作为旧版本非破坏迁移输入。首次 rebuild 仅在该 channel 尚无 durable
+   migration marker 时按 `updated_at,key` 稳定顺序 seed，并在同一事务写入 marker；之后即使用户显式删除使权威表变空，
+   包括重启在内也只读权威表，不再按重复 metadata 的扫描顺序裁决或复活 recipient。
+   `remember()` 必须把目标 Session metadata 与唯一 identity 行放在同一 SQLite transaction；事务失败时不得留下新 Session
+   行、cache 或 index 变化，已有 Session metadata/cache 也保持原值。并发 move 最终只能留下一个权威 recipient；历史 metadata
+   不自动删除，因为普通 channel admission 无权减少既有 Session 状态。
 9. 附件暂不属于 C14a～C14d。当前 `AttachmentStore`/Session 只保存路径，没有可证明的 adopt/ref-count/GC owner；
    在独立 persistence 合同确认 immutable artifact、Session adoption、失败清理和恢复证据前，不得新增
    attachment DTO、lease 或 import port 公共承诺。首批 Feishu/QQBot v3 adapter 遇到附件输入返回
@@ -570,7 +573,7 @@ provider network。promotion 本身只切 endpoint/registration，不发送业�
     最老 id 和进程重启后的 provider redelivery 都允许再次进入，合同不伪称 durable/process-lifetime exactly-once。
 11. inbound envelope 构造后先处于 `INGRESS/ADMITTED`，随后固定四个处理态
     `BUS_QUEUED → LANE_QUEUED → RUNNING → TERMINAL`。可执行入口固定为
-    `ChannelIngress.admit(raw_message) -> InboundEnvelope`（取得 exact public stable lease）、
+    `ChannelIngress.admit(raw_message) -> bool`（内部取得 exact public stable lease；`False` 仅表示 bounded duplicate）、
     `MessageBus.enqueue_inbound(envelope)`（成功后取得 BUS_QUEUED owner）、
     `PassiveMessageWorker.accept(envelope)`（取得 LANE_QUEUED owner）与
     `AgentLoop.react_envelope(envelope)`（取得 RUNNING owner并绑定 envelope lease）。每次通过
@@ -657,6 +660,10 @@ provider 调用已明确成功时标 `DELIVERED`；旧 `FAILED` 只有 adapter �
   admission/cleanup-pending；阻塞 inbound/outbound adapter 时 stop 必须等待 drain；
 - ingress：old message 入队、worker 阻塞、hot switch 后仍绑定 old snapshot；bounded dedupe window 内相同 message id
   只产生一个 Turn；该 Turn 在 swap 后恢复生成的 normal/error/cancel response 仍携带 old binding token；
+- identity：legacy Session metadata 只 seed 一次并留下 durable marker；同 identity 从 old recipient move 到 new 后重启仍解析 new，权威表恰一行；
+  并发 move 仍只有一个 durable owner；新 recipient 与已有 Session 两种 SQLite failure 都断言 identity row、Session row/cache、
+  in-memory index 保持提交前状态；move old→new 后显式删除 new，重启不得从 old metadata 复活；identity write 阻塞时
+  close/drain 必须等待 exact binding，不得在 stop 后写入；
 - dedupe：同 account/binding 最近 500 个 id 去重；enqueue-before-handoff failure 释放 claim；第 501 个淘汰最老项的
   bounded 行为显式可见；重复 `/stop` 在窗口内只有一次 control/outbound；
 - queue：old outbound 在切换前入队但阻塞 dispatch，swap 后仍由 old binding token 发送；worker/Bus stop 逐条释放

@@ -566,6 +566,12 @@ def build_core_runtime(
         ),
         installed_cache_root=plugins_root() / "cache",
     )
+    bus.bind_channel_outbound_dispatcher(
+        plugin_manager.channel_generation_host.dispatch_outbound
+    )
+    plugin_manager.channel_generation_host.bind_inbound_publisher(
+        bus.publish_channel_inbound
+    )
     loop.bind_runtime_snapshot_store(plugin_manager.snapshot_store)
     workspace_mcp_watcher = WorkspaceMcpWatcher(
         plugin_manager,

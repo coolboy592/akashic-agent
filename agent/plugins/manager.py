@@ -61,6 +61,7 @@ from agent.plugins.channel_generation_host import (
     ChannelGenerationHost,
     ChannelStartRecord,
 )
+from agent.plugins.channel_credentials import CoreProviderClientFactory
 
 from agent.plugins.manifest import (
     ensure_workspace_plugin_data_dir,
@@ -95,6 +96,7 @@ from agent.lifecycle.types import (
     PreToolCtx,
     PromptRenderCtx,
 )
+from infra.channels.base import SessionIdentityIndex
 from agent.plugins.registry import MetadataKind, PluginEventType, plugin_registry
 from agent.plugins.artifacts import (
     ArtifactPointer,
@@ -381,11 +383,15 @@ class PluginManager:
                 Mapping[str, ProviderClientFactory],
             ]
             | None
-        ) = None
+        ) = self._default_channel_provider_factories
+        self._channel_identity_indexes: dict[str, SessionIdentityIndex] = {}
         self._channel_generation_host = ChannelGenerationHost(
             on_before_start=self._reserve_channel_binding,
             config_revision_checker=self._check_channel_config_revision,
             on_failure=self._on_channel_cleanup_failure,
+            snapshot_lease_acquirer=self._snapshot_store.acquire,
+            identity_resolver=self._resolve_channel_identity,
+            identity_rememberer=self._remember_channel_identity,
         )
         self._active_channel_generation: ChannelGeneration | None = None
         self._active_channel_catalog_identity: str | None = None
@@ -824,6 +830,52 @@ class PluginManager:
             raise TypeError("channel provider factory resolver 必须可调用")
         self._channel_provider_factory_resolver = resolver
 
+    def _channel_identity_index(self, channel: str) -> SessionIdentityIndex:
+        """Return the Core-owned durable identity index for one channel."""
+
+        current = self._channel_identity_indexes.get(channel)
+        if current is not None:
+            return current
+        if self._session_manager is None:
+            raise RuntimeError("v3 Channel identity 需要 SessionManager")
+        metadata_key = {
+            "feishu": "feishu_open_id",
+            "telegram": "username",
+            "qq": "user_id",
+        }.get(channel, "provider_identity")
+        normalizer = str.lower if channel == "telegram" else None
+        current = SessionIdentityIndex(
+            self._session_manager,
+            channel=channel,
+            metadata_key=metadata_key,
+            normalizer=normalizer,
+        )
+        _ = current.rebuild()
+        self._channel_identity_indexes[channel] = current
+        return current
+
+    def _resolve_channel_identity(
+        self,
+        channel: str,
+        provider_identity: str,
+    ) -> str | None:
+        """Resolve a proactive recipient without exposing SessionManager."""
+
+        return self._channel_identity_index(channel).resolve(provider_identity)
+
+    async def _remember_channel_identity(
+        self,
+        channel: str,
+        provider_identity: str,
+        recipient: str,
+    ) -> None:
+        """Persist identity mapping before accepting the inbound envelope."""
+
+        await self._channel_identity_index(channel).remember(
+            provider_identity,
+            recipient,
+        )
+
     @property
     def channel_generation_host(self) -> ChannelGenerationHost:
         return self._channel_generation_host
@@ -855,6 +907,29 @@ class PluginManager:
         if not isinstance(factories, Mapping):
             raise TypeError("channel provider factory resolver 必须返回 mapping")
         return factories
+
+    @staticmethod
+    def _default_channel_provider_factories(
+        snapshot: RuntimeSnapshot,
+    ) -> Mapping[str, ProviderClientFactory]:
+        """Build one formal credential owner for every frozen channel."""
+
+        registry = snapshot.channel_registry
+        if registry is None:
+            return {}
+        result: dict[str, ProviderClientFactory] = {}
+        for descriptor in registry.descriptors:
+            generation = snapshot.generations.get(descriptor.owner)
+            if generation is None:
+                raise RuntimeError(
+                    f"channel owner generation 缺失: {descriptor.owner}"
+                )
+            result[descriptor.name] = CoreProviderClientFactory(
+                generation.data_dir / "config.local.toml",
+                descriptor.credential_paths,
+                generation.config_revision,
+            )
+        return result
 
     def _prepare_channel_publication(
         self,

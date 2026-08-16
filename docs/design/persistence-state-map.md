@@ -60,6 +60,8 @@ workspace 仍不是完整运行环境的全部。模型 Provider credential 已�
 |---|---|---|---|
 | `sessions.db/messages` | 每次持久化一批新消息时 INSERT；同一 session 的 `seq` 单调增加且不复用 | 正常收发不改旧正文；当前代码存在显式 `update_message`，但它是否属于获授权产品语义仍待确认 | 只有用户主动撤销消息或删除会话/线程，管理命令才能 DELETE；带 `control_turn_id` 的显式 interaction 只能整组原子撤销，并声明目标、cascade、备份和审计 |
 | `sessions.db/sessions` | 新 session INSERT；已有 session 的新消息仍追加到 `messages` | 允许更新名称、时间、高水位、当前 compaction generation 和主动流程时间等 session metadata；`last_consolidated` 只能由 checkpoint 提交事务推进 | 只有用户主动删除 session/thread 时，由 session 管理边界级联删除 |
+| `sessions.db/channel_identities` | 首次 v3 channel identity admission 为 `(channel, identity)` INSERT 唯一 recipient；旧 Session metadata 只在 `channel_identity_migrations` 尚无对应 marker 时按稳定顺序非破坏 seed | provider identity move 只原位替换同一唯一行的 `chat_id/updated_at`，并与目标 Session metadata 在同一 SQLite transaction 提交；重启与主动发送只读该表，不再扫描重复 metadata 裁决 | 只有用户显式删除对应 `channel:chat_id` Session 时，Session 删除审计事务才级联删除指向该 recipient 的行；删除前整库 backup 同时保存 identity，普通 turn、插件卸载和 candidate discard 无权减少 |
+| `sessions.db/channel_identity_migrations` | 每个 channel 首次 legacy seed 或首次正式 identity write 时 INSERT 一条 durable marker | marker 不原位更新；它证明旧 Session metadata 已永久失去路由裁决权，即使当前 identity 表为空也不得重新 seed | 普通 Session 删除、插件卸载和 workspace 维护不得删除；只随用户明确删除/恢复整个 workspace 而减少，整库 backup 是恢复证据 |
 | `sessions.db/session_compactions` | 每次 committed compaction INSERT 新 generation，保存 lineage、source_ref、canonical `source_plan_digest`、tail、summary、usage 和模型容量；included 必须与 receipt digest 相等，excluded 仍写 session-local digest ledger | 只允许设置 `invalidated_at/invalidated_reason` 逻辑失效字段；generation、provenance、source_plan_digest、summary 和 tail 不原位改写；缺列非空旧 schema 不回填 | session 删除 cascade；用户删除 interaction 时失效命中 generation 及 descendants，物理删除没有普通运行协议 |
 | `sessions.db/session_compaction_prepares` | Included compaction 在跨文件 receipt/Markdown effect 前 INSERT 一条 incarnation-scoped durable prepare，固定 source seq/message IDs 与 retained tail | 同一 source_ref/generation 只能幂等复用完全相同的 fence identity；prepared_at 不改变 source identity | 无 receipt 的 pre-effect orphan 只由 compaction recovery 清除；pending 时 message/interaction/session destructive mutation 必须阻断并返回带 audit identity 的 409；session 管理删除可按同一 SessionDB 事务 cascade prepare |
 | `sessions.db/turns` | 新 turn 先 INSERT 为 queued | 按状态机更新 items、usage、error、final response 和终态；这是同一 turn 的进展，不是改写对话正文 | 当前只有显式 thread/session 删除路径可以减少；是否另设 retention 仍待确认 |
@@ -278,6 +280,8 @@ workspace 之外还有两组明确的全局状态：
 | 表 | 写入 owner | 上层使用者 | 代码事实 |
 |---|---|---|---|
 | `sessions` | `session.store.SessionStore`，由 `SessionManager` 协调 | channel、AgentLoop、presence、dashboard | session metadata、时间、高水位和当前 compaction generation |
+| `channel_identities` | `SessionStore` 原子事务，由 `SessionManager`/Core Channel Host 协调 | v3 channel inbound 与 proactive recipient resolve | `(channel, identity)` 唯一 durable recipient；legacy Session metadata 只作一次性迁移输入，显式 Session 删除由同一审计事务级联并可从整库 backup 恢复 |
+| `channel_identity_migrations` | `SessionStore` | v3 channel identity rebuild | 每个 channel 的一次性 migration marker；identity 表删除到空也禁止重新扫描 legacy metadata |
 | `session_compactions` | `session.store.SessionStore`，由 Core checkpoint owner 请求 | prompt replay、Markdown reconciliation、删除恢复 | append-only generation lineage、source provenance、retained tail、summary、usage 和失效状态 |
 | `messages` | `SessionStore` | prompt 历史、dashboard、Akasha、检索工具 | 原始 user/assistant/tool 消息和单调 `seq` |
 | `turns` | control/runtime 持久化路径 | 控制面、恢复和审计 | turn 输入、items、usage、error、final response 与终态 |

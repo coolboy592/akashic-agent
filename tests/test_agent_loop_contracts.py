@@ -4,7 +4,7 @@ import asyncio
 from collections.abc import Coroutine
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 from unittest.mock import AsyncMock
 
 import pytest
@@ -13,6 +13,7 @@ from agent.control.context import running_turn_id
 from agent.looping.core import AgentLoop
 from agent.looping.ports import LLMConfig
 from agent.looping.session_lane import SessionLaneRegistry
+from agent.plugins.snapshot import bind_runtime_snapshot, reset_runtime_snapshot
 from bus.event_bus import EventBus
 from bus.events import InboundMessage, OutboundMessage, SpawnCompletionItem
 from bus.events_lifecycle import TurnStarted
@@ -23,6 +24,41 @@ from core.error_context import (
     current_session_key,
 )
 from session.store import SessionStore
+
+
+@pytest.mark.asyncio
+async def test_runtime_admission_reuses_exact_task_bound_snapshot() -> None:
+    old_snapshot = SimpleNamespace(snapshot_id="old", tool_registry=None)
+    lease = SimpleNamespace(
+        active=True,
+        snapshot=old_snapshot,
+        validation_candidate_plugin_ids=frozenset(),
+    )
+    store = SimpleNamespace(
+        current=SimpleNamespace(snapshot_id="new"),
+        acquire=AsyncMock(side_effect=AssertionError("must not reacquire current")),
+    )
+    loop = AgentLoop.__new__(AgentLoop)
+    loop._session_lanes = SessionLaneRegistry()
+    loop._runtime_snapshot_store = store
+
+    async def process(_item: object, **_kwargs: object) -> str:
+        from agent.plugins.snapshot import get_current_runtime_snapshot
+
+        snapshot = get_current_runtime_snapshot()
+        assert snapshot is old_snapshot
+        return snapshot.snapshot_id
+
+    loop._process = process
+    item = SimpleNamespace(session_key="feishu:chat")
+    token = bind_runtime_snapshot(cast(Any, lease))
+    try:
+        result = await loop._process_with_runtime_admission(cast(Any, item))
+    finally:
+        reset_runtime_snapshot(token)
+
+    assert result == "old"
+    store.acquire.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -224,7 +260,25 @@ def _real_path_loop(
     loop.tools = SimpleNamespace(get_tool=lambda _name: None)
     loop._session_lanes = SessionLaneRegistry()
     loop._runtime_snapshot_store = None
-    loop._react = core_process
+    loop._passive_pipeline = SimpleNamespace(
+        run_command=AsyncMock(return_value=None),
+    )
+
+    async def react(
+        message: InboundMessage,
+        key: str,
+        *,
+        dispatch_outbound: bool,
+        command_admitted: bool,
+    ) -> OutboundMessage:
+        _ = command_admitted
+        return await core_process(  # type: ignore[operator]
+            message,
+            key,
+            dispatch_outbound=dispatch_outbound,
+        )
+
+    loop._react = react
     loop._processing_state = None
     loop._active_tasks = {}
     loop._active_turn_states = {}

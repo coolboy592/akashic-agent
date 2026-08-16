@@ -4,6 +4,7 @@ import asyncio
 import gc
 import logging
 import weakref
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -12,10 +13,94 @@ import pytest
 
 from agent.control.models import TurnRequest, TurnStatus
 from agent.control.runtime import ConversationRuntime
+from agent.plugin_composition.channels import (
+    ChannelInboundMessage,
+    ChannelDeliveryReceipt,
+    DeliveryStatus,
+    InboundEnvelope,
+    InboundOwner,
+    InboundState,
+    OutboundEnvelope,
+)
 from bus.events import InboundMessage, OutboundMessage
 from bus.queue import MessageBus
 from session.manager import SessionManager
 from session.store import SessionStore
+
+
+def _v3_outbound() -> tuple[OutboundEnvelope, SimpleNamespace]:
+    envelope = OutboundEnvelope(
+        logical_delivery_id="delivery-1",
+        delivery_id="delivery-1",
+        attempt_sequence=1,
+        snapshot_id="snapshot-1",
+        generation_id="generation-1",
+        binding_token="binding-1",
+        channel="feishu",
+        recipient="chat-1",
+        body="hello",
+        metadata={"kind": "final"},
+    )
+    binding = SimpleNamespace(
+        snapshot_id="snapshot-1",
+        generation_id="generation-1",
+        binding_token="binding-1",
+        channel_name="feishu",
+        active=True,
+    )
+    return envelope, binding
+
+
+class _InboundLease:
+    def __init__(self, close_gate: asyncio.Event | None = None) -> None:
+        self.snapshot_id = "snapshot-1"
+        self.generation_id = "generation-1"
+        self.binding_token = "binding-1"
+        self.channel_name = "feishu"
+        self.snapshot_lease = SimpleNamespace(
+            active=True,
+            snapshot=SimpleNamespace(snapshot_id=self.snapshot_id),
+            validation_candidate_plugin_ids=frozenset(),
+        )
+        self.closed = 0
+        self.closed_event = asyncio.Event()
+        self.close_gate = close_gate
+        self.close_started = asyncio.Event()
+
+    @property
+    def active(self) -> bool:
+        return self.closed == 0
+
+    async def aclose(self) -> None:
+        self.close_started.set()
+        if self.close_gate is not None:
+            await self.close_gate.wait()
+        self.closed += 1
+        self.closed_event.set()
+
+
+def _v3_inbound(
+    close_gate: asyncio.Event | None = None,
+    *,
+    message_id: str = "message-1",
+) -> tuple[InboundEnvelope, _InboundLease]:
+    lease = _InboundLease(close_gate)
+    envelope = InboundEnvelope(
+        message_id=message_id,
+        snapshot_id=lease.snapshot_id,
+        generation_id=lease.generation_id,
+        binding_token=lease.binding_token,
+        message=ChannelInboundMessage(
+            channel="feishu",
+            sender="user-1",
+            chat_id="chat-1",
+            content="hello",
+            timestamp=datetime.now(timezone.utc),
+            metadata={},
+        ),
+        lease=lease,
+    )
+    return envelope, lease
 
 
 @pytest.mark.asyncio
@@ -444,3 +529,411 @@ async def test_awaited_outbound_receipt_settled_false_on_dispatch_cancel() -> No
     assert (await pending) is False
     assert bus._pending_outbound_receipts == set()
     release.set()
+
+
+@pytest.mark.asyncio
+async def test_v3_channel_outbound_returns_exact_provider_receipt_once() -> None:
+    bus = MessageBus()
+    envelope, binding = _v3_outbound()
+    calls = 0
+
+    async def deliver(
+        received: OutboundEnvelope,
+        owner: Any,
+    ) -> ChannelDeliveryReceipt:
+        nonlocal calls
+        calls += 1
+        assert received is envelope
+        assert owner is binding
+        return ChannelDeliveryReceipt(
+            delivery_id=received.delivery_id,
+            status=DeliveryStatus.DELIVERED,
+            provider_ids=("provider-1",),
+        )
+
+    bus.bind_channel_outbound_dispatcher(deliver)
+    dispatch = asyncio.create_task(bus.dispatch_outbound())
+    receipt = await bus.publish_channel_outbound_awaited(envelope, binding)
+    assert receipt.status is DeliveryStatus.DELIVERED
+    assert receipt.provider_ids == ("provider-1",)
+    assert calls == 1
+    bus.stop()
+    await dispatch
+
+
+@pytest.mark.asyncio
+async def test_v3_channel_outbound_exception_is_unknown_without_retry() -> None:
+    bus = MessageBus()
+    envelope, binding = _v3_outbound()
+    calls = 0
+
+    async def fail_after_effect(
+        _received: OutboundEnvelope,
+        _owner: Any,
+    ) -> ChannelDeliveryReceipt:
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("provider receipt lost")
+
+    bus.bind_channel_outbound_dispatcher(fail_after_effect)
+    dispatch = asyncio.create_task(bus.dispatch_outbound())
+    receipt = await bus.publish_channel_outbound_awaited(envelope, binding)
+    assert receipt.status is DeliveryStatus.UNKNOWN
+    assert receipt.error == "provider receipt lost"
+    assert calls == 1
+    bus.stop()
+    await dispatch
+
+
+@pytest.mark.asyncio
+async def test_v3_channel_outbound_cancel_waits_for_provider_settlement() -> None:
+    bus = MessageBus()
+    envelope, binding = _v3_outbound()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def blocked_delivery(
+        received: OutboundEnvelope,
+        _owner: Any,
+    ) -> ChannelDeliveryReceipt:
+        nonlocal calls
+        calls += 1
+        entered.set()
+        await release.wait()
+        return ChannelDeliveryReceipt(
+            received.delivery_id,
+            DeliveryStatus.DELIVERED,
+        )
+
+    bus.bind_channel_outbound_dispatcher(blocked_delivery)
+    dispatch = asyncio.create_task(bus.dispatch_outbound())
+    pending = asyncio.create_task(
+        bus.publish_channel_outbound_awaited(envelope, binding)
+    )
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    pending.cancel()
+    await asyncio.sleep(0)
+    assert not pending.done()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await pending
+    assert calls == 1
+    assert bus._pending_channel_receipts == set()
+    bus.stop()
+    await dispatch
+
+
+@pytest.mark.asyncio
+async def test_v3_channel_queued_receipt_rejected_on_bus_close() -> None:
+    bus = MessageBus()
+    envelope, binding = _v3_outbound()
+    pending = asyncio.create_task(
+        bus.publish_channel_outbound_awaited(envelope, binding)
+    )
+    await asyncio.sleep(0)
+    assert len(bus._pending_channel_receipts) == 1
+    await bus.aclose()
+    receipt = await pending
+    assert receipt.status is DeliveryStatus.REJECTED
+    assert bus._pending_channel_receipts == set()
+
+
+@pytest.mark.asyncio
+async def test_v3_channel_publish_after_bus_close_is_immediately_rejected() -> None:
+    bus = MessageBus()
+    envelope, binding = _v3_outbound()
+    calls = 0
+
+    async def deliver(
+        _received: OutboundEnvelope,
+        _owner: Any,
+    ) -> ChannelDeliveryReceipt:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("closed bus must not dispatch")
+
+    bus.bind_channel_outbound_dispatcher(deliver)
+    await bus.aclose()
+
+    receipt = await bus.publish_channel_outbound_awaited(envelope, binding)
+
+    assert receipt.status is DeliveryStatus.REJECTED
+    assert calls == 0
+    assert bus.outbound_size == 0
+    await bus.dispatch_outbound()
+    assert calls == 0
+
+
+@pytest.mark.asyncio
+async def test_v3_channel_publish_blocked_at_lane_is_rejected_by_concurrent_close() -> None:
+    bus = MessageBus()
+    envelope, binding = _v3_outbound()
+    key, state = bus._chat_lane._acquire_state(
+        envelope.channel,
+        envelope.recipient,
+    )
+    try:
+        await state.condition.acquire()
+        pending = asyncio.create_task(
+            bus.publish_channel_outbound_awaited(envelope, binding)
+        )
+        await asyncio.sleep(0)
+        closing = asyncio.create_task(bus.aclose())
+        await asyncio.sleep(0)
+        assert not pending.done()
+        state.condition.release()
+        await closing
+        receipt = await pending
+    finally:
+        if state.condition.locked():
+            state.condition.release()
+        bus._chat_lane._release_state(key, state)
+
+    assert receipt.status is DeliveryStatus.REJECTED
+    assert bus.outbound_size == 0
+
+
+@pytest.mark.asyncio
+async def test_v3_channel_inbound_transfers_bus_lane_loop_and_closes_once() -> None:
+    bus = MessageBus()
+    envelope, lease = _v3_inbound()
+
+    await bus.publish_channel_inbound(envelope)
+    assert (envelope.owner, envelope.state) == (
+        InboundOwner.BUS,
+        InboundState.BUS_QUEUED,
+    )
+    consumed = await bus.consume_inbound()
+    assert consumed is envelope
+    assert (envelope.owner, envelope.state) == (
+        InboundOwner.LANE,
+        InboundState.LANE_QUEUED,
+    )
+    envelope.handoff(InboundOwner.LANE, InboundOwner.LOOP)
+    await bus.complete_inbound(envelope)
+    assert (envelope.owner, envelope.state) == (
+        InboundOwner.CLOSED,
+        InboundState.TERMINAL,
+    )
+    assert lease.closed == 1
+
+
+@pytest.mark.asyncio
+async def test_v3_channel_inbound_bus_close_releases_queued_exact_lease() -> None:
+    bus = MessageBus()
+    envelope, lease = _v3_inbound()
+    await bus.publish_channel_inbound(envelope)
+
+    await bus.aclose()
+
+    assert envelope.state is InboundState.TERMINAL
+    assert lease.closed == 1
+    assert bus.inbound_size == 0
+
+
+@pytest.mark.asyncio
+async def test_v3_channel_inbound_blocked_at_lane_is_closed_by_concurrent_bus_close() -> None:
+    bus = MessageBus()
+    envelope, lease = _v3_inbound()
+    key, state = bus._chat_lane._acquire_state(
+        envelope.channel,
+        envelope.chat_id,
+    )
+    try:
+        await state.condition.acquire()
+        pending = asyncio.create_task(bus.publish_channel_inbound(envelope))
+        await asyncio.sleep(0)
+        await bus.aclose()
+        state.condition.release()
+        with pytest.raises(RuntimeError, match="已关闭"):
+            await pending
+    finally:
+        if state.condition.locked():
+            state.condition.release()
+        bus._chat_lane._release_state(key, state)
+
+    assert envelope.state is InboundState.TERMINAL
+    assert lease.closed == 1
+    assert bus.inbound_size == 0
+
+
+@pytest.mark.asyncio
+async def test_v3_channel_bus_close_cancellation_drains_every_queued_lease() -> None:
+    bus = MessageBus()
+    close_gate = asyncio.Event()
+    first, first_lease = _v3_inbound(close_gate, message_id="message-1")
+    second, second_lease = _v3_inbound(message_id="message-2")
+    await bus.publish_channel_inbound(first)
+    await bus.publish_channel_inbound(second)
+
+    closing = asyncio.create_task(bus.aclose())
+    await first_lease.close_started.wait()
+    closing.cancel()
+    await asyncio.sleep(0)
+    assert not closing.done()
+    close_gate.set()
+    with pytest.raises(asyncio.CancelledError):
+        await closing
+
+    assert first.state is InboundState.TERMINAL
+    assert second.state is InboundState.TERMINAL
+    assert first_lease.closed == second_lease.closed == 1
+    assert bus.inbound_size == 0
+
+
+@pytest.mark.asyncio
+async def test_v3_channel_inbound_release_cancellation_clears_lane_before_return() -> None:
+    bus = MessageBus()
+    close_gate = asyncio.Event()
+    envelope, lease = _v3_inbound(close_gate)
+    await bus.publish_channel_inbound(envelope)
+    assert await bus.consume_inbound() is envelope
+
+    releasing = asyncio.create_task(
+        bus.release_channel_inbound(envelope, InboundOwner.LANE)
+    )
+    await lease.close_started.wait()
+    releasing.cancel()
+    await asyncio.sleep(0)
+    assert not releasing.done()
+    close_gate.set()
+    with pytest.raises(asyncio.CancelledError):
+        await releasing
+
+    assert envelope.state is InboundState.TERMINAL
+    assert lease.closed == 1
+    assert bus._chat_lane._states == {}
+
+    completed = False
+
+    async def mark_completed() -> None:
+        nonlocal completed
+        completed = True
+
+    await asyncio.wait_for(
+        bus._chat_lane.run_non_passive(
+            envelope.channel,
+            envelope.chat_id,
+            mark_completed,
+        ),
+        timeout=1,
+    )
+    assert completed
+
+
+@pytest.mark.asyncio
+async def test_v3_channel_worker_preserves_exact_binding_through_terminal_delivery(
+    tmp_path: Path,
+) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    seen_request: list[TurnRequest] = []
+
+    async def execute(request: TurnRequest) -> str:
+        from agent.plugins.snapshot import get_current_runtime_snapshot
+
+        assert get_current_runtime_snapshot() is not None
+        assert get_current_runtime_snapshot().snapshot_id == "snapshot-1"
+        seen_request.append(request)
+        return f"echo:{request.input}"
+
+    runtime = ConversationRuntime(store, execute)
+    bus = MessageBus()
+    delivered: list[tuple[OutboundEnvelope, object]] = []
+
+    async def dispatch(
+        envelope: OutboundEnvelope,
+        binding: object,
+    ) -> ChannelDeliveryReceipt:
+        delivered.append((envelope, binding))
+        return ChannelDeliveryReceipt(
+            envelope.delivery_id,
+            DeliveryStatus.DELIVERED,
+            ("provider-1",),
+        )
+
+    bus.bind_channel_outbound_dispatcher(dispatch)
+    from bootstrap.passive_worker import PassiveMessageWorker
+
+    worker = PassiveMessageWorker(bus, runtime, cast(Any, object()))
+    worker_task = asyncio.create_task(worker.run())
+    dispatch_task = asyncio.create_task(bus.dispatch_outbound())
+    envelope, lease = _v3_inbound()
+
+    await bus.publish_channel_inbound(envelope)
+    await asyncio.wait_for(lease.closed_event.wait(), timeout=2)
+    while envelope.state is not InboundState.TERMINAL:
+        await asyncio.sleep(0)
+
+    assert len(seen_request) == 1
+    assert seen_request[0].metadata["channelBindingToken"] == lease.binding_token
+    assert len(delivered) == 1
+    outbound, binding = delivered[0]
+    assert outbound.body == "echo:hello"
+    assert outbound.snapshot_id == lease.snapshot_id
+    assert outbound.generation_id == lease.generation_id
+    assert outbound.binding_token == lease.binding_token
+    assert binding is lease
+    assert envelope.state is InboundState.TERMINAL
+    assert lease.closed == 1
+
+    worker.stop()
+    bus.stop()
+    await worker_task
+    await dispatch_task
+    await runtime.shutdown()
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_v3_channel_worker_cancel_closes_running_and_lane_queued_leases(
+    tmp_path: Path,
+) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    started = asyncio.Event()
+    never = asyncio.Event()
+
+    async def execute(_request: TurnRequest) -> str:
+        started.set()
+        await never.wait()
+        return "unreachable"
+
+    runtime = ConversationRuntime(store, execute)
+    bus = MessageBus()
+
+    async def dispatch(
+        envelope: OutboundEnvelope,
+        _binding: object,
+    ) -> ChannelDeliveryReceipt:
+        return ChannelDeliveryReceipt(
+            envelope.delivery_id,
+            DeliveryStatus.DELIVERED,
+        )
+
+    bus.bind_channel_outbound_dispatcher(dispatch)
+    from bootstrap.passive_worker import PassiveMessageWorker
+
+    worker = PassiveMessageWorker(bus, runtime, cast(Any, object()))
+    worker_task = asyncio.create_task(worker.run())
+    dispatch_task = asyncio.create_task(bus.dispatch_outbound())
+    first, first_lease = _v3_inbound(message_id="message-1")
+    second, second_lease = _v3_inbound(message_id="message-2")
+    await bus.publish_channel_inbound(first)
+    await bus.publish_channel_inbound(second)
+    await asyncio.wait_for(started.wait(), timeout=1)
+
+    worker_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(worker_task, timeout=2)
+
+    assert first.state is InboundState.TERMINAL
+    assert second.state is InboundState.TERMINAL
+    assert first_lease.closed == second_lease.closed == 1
+    assert worker._lane_tasks == {}
+    assert worker._lane_queues == {}
+    assert worker._channel_result_tasks == {}
+
+    bus.stop()
+    await dispatch_task
+    await runtime.shutdown()
+    store.close()

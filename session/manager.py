@@ -674,3 +674,51 @@ class SessionManager:
 
     def get_channel_metadata(self, channel: str) -> list[dict[str, Any]]:
         return self._store.get_channel_metadata(channel)
+
+    def get_channel_identities(self, channel: str) -> dict[str, str]:
+        return self._store.get_channel_identities(channel)
+
+    def channel_identity_migration_completed(self, channel: str) -> bool:
+        return self._store.channel_identity_migration_completed(channel)
+
+    def seed_channel_identities(
+        self,
+        channel: str,
+        mapping: Mapping[str, tuple[str, str]],
+    ) -> None:
+        self._store.seed_channel_identities(channel, mapping)
+
+    async def remember_channel_identity(
+        self,
+        *,
+        channel: str,
+        identity: str,
+        chat_id: str,
+        metadata_key: str,
+    ) -> None:
+        """Atomically move one durable identity to its target Session."""
+
+        session_key = f"{channel}:{chat_id}"
+        async with self._lock(session_key):
+            # 1. Build a transient Session without creating a durable row.
+            stored = self._store.get_session_meta(session_key)
+            session = Session(session_key) if stored is None else self.get_existing(session_key)
+            updated_at = datetime.now(UTC)
+            metadata = dict(session.metadata)
+            metadata[metadata_key] = identity
+
+            # 2. Commit the Session metadata and unique identity owner together.
+            _ = self._store.persist_channel_identity(
+                channel=channel,
+                identity=identity,
+                chat_id=chat_id,
+                session_key=session.key,
+                created_at=session.created_at.isoformat(),
+                updated_at=updated_at.isoformat(),
+                metadata=metadata,
+            )
+
+            # 3. Adopt the committed state only after SQLite succeeds.
+            session.metadata = metadata
+            session.updated_at = updated_at
+            self._cache[session.key] = session

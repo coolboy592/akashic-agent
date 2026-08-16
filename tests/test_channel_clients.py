@@ -43,6 +43,8 @@ class _SessionManager:
         self.workspace = workspace
         self.sessions = {}
         self.saved = []
+        self.channel_identities: dict[str, dict[str, str]] = {}
+        self.channel_identity_migrations: set[str] = set()
 
     def get_or_create(self, key: str):
         return self.sessions.setdefault(key, SimpleNamespace(key=key, metadata={}))
@@ -52,6 +54,37 @@ class _SessionManager:
 
     def get_channel_metadata(self, channel: str):
         return []
+
+    def get_channel_identities(self, channel: str) -> dict[str, str]:
+        return dict(self.channel_identities.get(channel, {}))
+
+    def channel_identity_migration_completed(self, channel: str) -> bool:
+        return channel in self.channel_identity_migrations
+
+    def seed_channel_identities(
+        self,
+        channel: str,
+        mapping: dict[str, tuple[str, str]],
+    ) -> None:
+        self.channel_identities.setdefault(
+            channel,
+            {identity: chat_id for identity, (chat_id, _updated_at) in mapping.items()},
+        )
+        self.channel_identity_migrations.add(channel)
+
+    async def remember_channel_identity(
+        self,
+        *,
+        channel: str,
+        identity: str,
+        chat_id: str,
+        metadata_key: str,
+    ) -> None:
+        session = self.get_or_create(f"{channel}:{chat_id}")
+        session.metadata[metadata_key] = identity
+        self.channel_identities.setdefault(channel, {})[identity] = chat_id
+        self.channel_identity_migrations.add(channel)
+        self.saved.append(session.key)
 
 
 def _import_telegram_channel(monkeypatch: pytest.MonkeyPatch):
@@ -493,7 +526,7 @@ async def test_telegram_channel_paths(monkeypatch: pytest.MonkeyPatch, tmp_path:
     assert bus.inbound[-1].metadata["document_filename"] == "a.md"
 
     assert channel._resolve_chat_id("123") == "123"
-    channel.user_map["alice"] = "456"
+    await channel._identity_index.remember("alice", "456")
     assert channel._resolve_chat_id("@Alice") == "456"
     with pytest.raises(ValueError):
         channel._resolve_chat_id("@missing")
@@ -639,7 +672,7 @@ async def test_telegram_channel_paths(monkeypatch: pytest.MonkeyPatch, tmp_path:
     assert "工具结尾" in long_text and "工具开头" not in long_text
     assert "回复结尾" in long_text and "回复开头" not in long_text
     assert "<blockquote>" in long_html and "<pre>" in long_html
-    channel.user_map["group"] = "-1001"
+    await channel._identity_index.remember("group", "-1001")
     assert channel.create_stream_sender("@group") is None
     await channel._on_response(
         OutboundMessage(

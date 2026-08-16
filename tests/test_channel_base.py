@@ -1,9 +1,11 @@
+import asyncio
 from pathlib import Path
 
 import pytest
 
 from infra.channels.base import AttachmentStore, MessageDeduper, SessionIdentityIndex
 from session.manager import SessionManager
+from session.store import SessionStore
 
 
 def test_attachment_store_writes_under_configured_root(tmp_path: Path):
@@ -76,15 +78,130 @@ async def test_session_identity_index_rebuilds_and_persists_metadata(tmp_path: P
 async def test_session_identity_index_rolls_back_failed_metadata_save(tmp_path: Path):
     manager = SessionManager(tmp_path)
 
-    async def fail_save(_session):
+    def fail_persist(**_kwargs: object) -> None:
         raise OSError("metadata store unavailable")
 
-    manager.save_async = fail_save  # type: ignore[method-assign]
+    manager.control_store.persist_channel_identity = fail_persist  # type: ignore[method-assign]
     index = SessionIdentityIndex(manager, channel="telegram", metadata_key="username")
-    session = manager.get_or_create("telegram:123")
 
     with pytest.raises(OSError, match="metadata store unavailable"):
         await index.remember("alice", "123")
 
     assert index.mapping == {}
-    assert session.metadata == {}
+    assert manager.get_channel_identities("telegram") == {}
+    assert manager.control_store.get_session_meta("telegram:123") is None
+    assert "telegram:123" not in manager._cache
+
+
+@pytest.mark.asyncio
+async def test_session_identity_index_preserves_existing_session_on_failure(
+    tmp_path: Path,
+) -> None:
+    manager = SessionManager(tmp_path)
+    session = manager.get_or_create("telegram:123")
+    session.metadata["marker"] = "before"
+    manager.save(session)
+
+    def fail_persist(**_kwargs: object) -> None:
+        raise OSError("metadata store unavailable")
+
+    manager.control_store.persist_channel_identity = fail_persist  # type: ignore[method-assign]
+    index = SessionIdentityIndex(manager, channel="telegram", metadata_key="username")
+
+    with pytest.raises(OSError, match="metadata store unavailable"):
+        await index.remember("alice", "123")
+
+    assert index.mapping == {}
+    assert session.metadata == {"marker": "before"}
+    assert manager.control_store.get_session_meta("telegram:123")["metadata"] == {
+        "marker": "before"
+    }
+
+
+@pytest.mark.asyncio
+async def test_session_identity_index_keeps_latest_owner_across_restart(
+    tmp_path: Path,
+) -> None:
+    manager = SessionManager(tmp_path)
+    manager.get_or_create("feishu:new")
+    index = SessionIdentityIndex(
+        manager,
+        channel="feishu",
+        metadata_key="feishu_open_id",
+    )
+
+    await index.remember("open-id", "old")
+    await index.remember("open-id", "new")
+
+    assert manager.get_channel_identities("feishu") == {"open-id": "new"}
+    manager.close()
+
+    reopened = SessionManager(tmp_path)
+    rebuilt = SessionIdentityIndex(
+        reopened,
+        channel="feishu",
+        metadata_key="feishu_open_id",
+    )
+
+    assert rebuilt.rebuild() == {"open-id": "new"}
+    assert rebuilt.resolve("open-id") == "new"
+    assert reopened.get_channel_identities("feishu") == {"open-id": "new"}
+    reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_session_identity_index_concurrent_move_has_one_durable_owner(
+    tmp_path: Path,
+) -> None:
+    manager = SessionManager(tmp_path)
+    index = SessionIdentityIndex(
+        manager,
+        channel="feishu",
+        metadata_key="feishu_open_id",
+    )
+
+    await asyncio.gather(
+        index.remember("open-id", "first"),
+        index.remember("open-id", "second"),
+    )
+
+    durable = manager.get_channel_identities("feishu")
+    assert durable in ({"open-id": "first"}, {"open-id": "second"})
+    assert index.mapping == durable
+    manager.close()
+
+
+@pytest.mark.asyncio
+async def test_session_delete_removes_identity_owner_and_backup_can_restore_it(
+    tmp_path: Path,
+) -> None:
+    manager = SessionManager(tmp_path)
+    index = SessionIdentityIndex(
+        manager,
+        channel="feishu",
+        metadata_key="feishu_open_id",
+    )
+    await index.remember("open-id", "old")
+    await index.remember("open-id", "new")
+
+    audit = manager.delete_session_with_audit("feishu:new")
+
+    assert audit.result == "committed"
+    assert manager.get_channel_identities("feishu") == {}
+    assert index.resolve("open-id") is None
+    assert audit.backup_path is not None
+    backup = SessionStore(audit.backup_path)
+    assert backup.get_channel_identities("feishu") == {"open-id": "new"}
+    backup.close()
+    manager.close()
+
+    reopened = SessionManager(tmp_path)
+    rebuilt = SessionIdentityIndex(
+        reopened,
+        channel="feishu",
+        metadata_key="feishu_open_id",
+    )
+    assert rebuilt.rebuild() == {}
+    assert reopened.channel_identity_migration_completed("feishu") is True
+    assert rebuilt.resolve("open-id") is None
+    reopened.close()

@@ -134,13 +134,33 @@ class InboundState(StrEnum):
 
 
 class ChannelBindingLease(Protocol):
-    snapshot_lease: object
-    snapshot_id: str
-    generation_id: str
-    channel_name: str
-    binding_token: str
+    @property
+    def snapshot_lease(self) -> object: ...
+
+    @property
+    def snapshot_id(self) -> str: ...
+
+    @property
+    def generation_id(self) -> str: ...
+
+    @property
+    def channel_name(self) -> str: ...
+
+    @property
+    def binding_token(self) -> str: ...
+
+    @property
+    def active(self) -> bool: ...
 
     async def aclose(self) -> None: ...
+
+
+class ChannelIngressPort(Protocol):
+    async def admit(self, raw: RawInbound) -> bool: ...
+
+
+class ChannelIdentityPort(Protocol):
+    def resolve(self, provider_identity: str) -> str | None: ...
 
 
 @dataclass(slots=True, kw_only=True)
@@ -186,6 +206,37 @@ class InboundEnvelope:
             raise ValueError("InboundEnvelope binding_token 与 lease 不一致")
         if self.lease.channel_name != self.message.channel:
             raise ValueError("InboundEnvelope channel 与 lease 不一致")
+
+    @property
+    def channel(self) -> str:
+        return self.message.channel
+
+    @property
+    def sender(self) -> str:
+        return self.message.sender
+
+    @property
+    def chat_id(self) -> str:
+        return self.message.chat_id
+
+    @property
+    def content(self) -> str:
+        return self.message.content
+
+    @property
+    def timestamp(self) -> datetime:
+        return self.message.timestamp
+
+    @property
+    def metadata(self) -> Mapping[str, JsonValue]:
+        return self.message.metadata
+
+    @property
+    def session_key(self) -> str:
+        override = self.message.metadata.get("session_key_override")
+        if isinstance(override, str) and override.strip():
+            return override.strip()
+        return f"{self.channel}:{self.chat_id}"
 
     def handoff(
         self,
@@ -260,6 +311,8 @@ class RawInbound:
             _text(self.provider_identity, "provider_identity")
         if self.recipient is not None:
             _text(self.recipient, "recipient")
+        if (self.provider_identity is None) != (self.recipient is None):
+            raise ValueError("provider_identity 与 recipient 必须同时提供")
 
 
 @dataclass(frozen=True, slots=True)
@@ -370,6 +423,8 @@ class CredentialRef:
 
 
 class ProviderClient(Protocol):
+    def credential(self, ref: CredentialRef) -> str: ...
+
     async def aclose(self) -> None: ...
 
 
@@ -390,6 +445,8 @@ class ChannelFactoryContext:
     config: Mapping[str, object]
     credentials: Mapping[str, CredentialRef]
     provider_client_factory: ProviderClientFactory
+    ingress: ChannelIngressPort | None
+    identity: ChannelIdentityPort | None
 
     def __post_init__(self) -> None:
         _text(self.snapshot_id, "snapshot_id")
@@ -399,6 +456,14 @@ class ChannelFactoryContext:
         if not isinstance(config, Mapping):
             raise TypeError("channel factory config 必须是 mapping")
         credentials = _credential_refs(self.credentials)
+        if self.ingress is not None and not callable(
+            getattr(self.ingress, "admit", None)
+        ):
+            raise TypeError("channel factory ingress 必须提供 admit(raw)")
+        if self.identity is not None and not callable(
+            getattr(self.identity, "resolve", None)
+        ):
+            raise TypeError("channel factory identity 必须提供 resolve(identity)")
         object.__setattr__(self, "config", config)
         object.__setattr__(self, "credentials", credentials)
 
@@ -1113,6 +1178,8 @@ __all__ = [
     "ChannelCleanupFailure",
     "ChannelDeliveryReceipt",
     "ChannelFactoryContext",
+    "ChannelIngressPort",
+    "ChannelIdentityPort",
     "ChannelReady",
     "ChannelInboundMessage",
     "CredentialRef",

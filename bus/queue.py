@@ -8,6 +8,14 @@ from typing import TypeVar
 from typing import Protocol, cast
 from uuid import uuid4
 
+from agent.plugin_composition.channels import (
+    ChannelDeliveryReceipt,
+    DeliveryStatus as ChannelDeliveryStatus,
+    InboundEnvelope,
+    InboundOwner,
+    InboundState,
+    OutboundEnvelope,
+)
 from bus.events import InboundItem, InboundMessage, OutboundMessage
 
 logger = logging.getLogger(__name__)
@@ -141,6 +149,32 @@ class _AwaitedOutbound:
 
     message: OutboundMessage
     receipt: "asyncio.Future[bool]"
+
+
+class _ChannelBindingOwner(Protocol):
+    @property
+    def snapshot_id(self) -> str: ...
+
+    @property
+    def generation_id(self) -> str: ...
+
+    @property
+    def channel_name(self) -> str: ...
+
+    @property
+    def binding_token(self) -> str: ...
+
+    @property
+    def active(self) -> bool: ...
+
+
+@dataclass
+class _AwaitedChannelOutbound:
+    """Retain an exact binding owner until a tri-state provider receipt settles."""
+
+    envelope: OutboundEnvelope
+    binding: _ChannelBindingOwner
+    receipt: "asyncio.Future[ChannelDeliveryReceipt]"
 
 
 class ChatLane:
@@ -327,10 +361,10 @@ class MessageBus:
     """在单用户 Companion 内传递消息，并持有 mobile handoff 的删除责任。"""
 
     def __init__(self, chat_lane: ChatLane | None = None) -> None:
-        self._inbound: asyncio.Queue[InboundItem] = asyncio.Queue()
-        self._outbound: asyncio.Queue[OutboundMessage | _AwaitedOutbound] = (
-            asyncio.Queue()
-        )
+        self._inbound: asyncio.Queue[InboundItem | InboundEnvelope] = asyncio.Queue()
+        self._outbound: asyncio.Queue[
+            OutboundMessage | _AwaitedOutbound | _AwaitedChannelOutbound
+        ] = asyncio.Queue()
         self._inbound_accepted: dict[int, _InboundOwner] = {}
         self._inbound_cleanup_tasks: dict[int, asyncio.Task[None]] = {}
         self._inbound_cleanup_error: BaseException | None = None
@@ -342,11 +376,23 @@ class MessageBus:
         self._chat_lane = chat_lane or ChatLane()
         self._running = False
         self._outbound_dispatch_stopped = False
+        self._outbound_closed = False
+        self._close_task: asyncio.Task[None] | None = None
         self._delivery_observer: (
             Callable[[OutboundMessage, bool], Awaitable[None]] | None
         ) = None
         self._durable_inbound_store: DurableInboundStore | None = None
         self._pending_outbound_receipts: set[asyncio.Future[bool]] = set()
+        self._pending_channel_receipts: set[
+            asyncio.Future[ChannelDeliveryReceipt]
+        ] = set()
+        self._channel_outbound_dispatcher: (
+            Callable[
+                [OutboundEnvelope, _ChannelBindingOwner],
+                Awaitable[ChannelDeliveryReceipt],
+            ]
+            | None
+        ) = None
 
     def bind_durable_inbound_store(self, store: DurableInboundStore) -> None:
         """在 channel 启动前绑定一次由 session 持有的 handoff store。"""
@@ -423,10 +469,59 @@ class MessageBus:
             raise RuntimeError("outbound delivery observer 已绑定")
         self._delivery_observer = callback
 
+    def bind_channel_outbound_dispatcher(
+        self,
+        callback: Callable[
+            [OutboundEnvelope, _ChannelBindingOwner],
+            Awaitable[ChannelDeliveryReceipt],
+        ],
+    ) -> None:
+        """Bind the sole exact-binding v3 Channel delivery owner."""
+
+        if not callable(callback):
+            raise TypeError("v3 Channel outbound dispatcher 必须可调用")
+        if self._channel_outbound_dispatcher is not None:
+            raise RuntimeError("v3 Channel outbound dispatcher 已绑定")
+        self._channel_outbound_dispatcher = callback
+
     async def publish_inbound(self, msg: InboundItem) -> None:
         """将渠道输入交给 Agent 消费。"""
         self._raise_inbound_cleanup_error()
         await self._publish_inbound(msg, allow_existing_handoff=False)
+
+    async def publish_channel_inbound(self, envelope: InboundEnvelope) -> None:
+        """Accept one exact Channel envelope into the Bus-owned queue."""
+
+        self._raise_inbound_cleanup_error()
+        if self._outbound_closed:
+            await envelope.close(InboundOwner.INGRESS)
+            raise RuntimeError("message bus 已关闭")
+        if (
+            envelope.owner is not InboundOwner.INGRESS
+            or envelope.state is not InboundState.ADMITTED
+        ):
+            raise RuntimeError("v3 Channel inbound 必须由 INGRESS/ADMITTED 交给 Bus")
+        await self._chat_lane.mark_passive_pending(
+            envelope.channel,
+            envelope.chat_id,
+        )
+        if self._outbound_closed:
+            await self._chat_lane.mark_passive_done(
+                envelope.channel,
+                envelope.chat_id,
+            )
+            await envelope.close(InboundOwner.INGRESS)
+            raise RuntimeError("message bus 已关闭")
+        envelope.handoff(InboundOwner.INGRESS, InboundOwner.BUS)
+        try:
+            self._inbound.put_nowait(envelope)
+        except BaseException:
+            await envelope.close(InboundOwner.BUS)
+            await self._chat_lane.mark_passive_done(
+                envelope.channel,
+                envelope.chat_id,
+            )
+            raise
 
     async def _publish_inbound(
         self,
@@ -496,12 +591,19 @@ class MessageBus:
             raise
         self._inbound_accepted[id(msg)] = _InboundOwner(item=msg)
 
-    async def consume_inbound(self) -> InboundItem:
-        """阻塞直到有消息可消费"""
-        return await self._inbound.get()
+    async def consume_inbound(self) -> InboundItem | InboundEnvelope:
+        """Transfer one queued Channel envelope to the lane owner."""
 
-    async def complete_inbound(self, msg: InboundItem) -> None:
+        item = await self._inbound.get()
+        if isinstance(item, InboundEnvelope):
+            item.handoff(InboundOwner.BUS, InboundOwner.LANE)
+        return item
+
+    async def complete_inbound(self, msg: InboundItem | InboundEnvelope) -> None:
         self._raise_inbound_cleanup_error()
+        if isinstance(msg, InboundEnvelope):
+            await self.release_channel_inbound(msg, InboundOwner.LOOP)
+            return
         owner = self._inbound_accepted.get(id(msg))
         if owner is None:
             await self._chat_lane.mark_passive_done(msg.channel, msg.chat_id)
@@ -530,6 +632,30 @@ class MessageBus:
                 self._record_inbound_cleanup_fatal(error, id(msg))
                 raise
         await self._finalize_inbound_owner(id(msg), owner)
+
+    async def release_channel_inbound(
+        self,
+        envelope: InboundEnvelope,
+        expected_owner: InboundOwner,
+    ) -> None:
+        """Close one exact inbound lease and release its lane admission."""
+
+        task = asyncio.create_task(
+            self._release_channel_inbound(envelope, expected_owner),
+            name=f"channel-inbound-release:{envelope.message_id}",
+        )
+        await _await_cleanup_after_cancellation(task)
+
+    async def _release_channel_inbound(
+        self,
+        envelope: InboundEnvelope,
+        expected_owner: InboundOwner,
+    ) -> None:
+        await envelope.close(expected_owner)
+        await self._chat_lane.mark_passive_done(
+            envelope.channel,
+            envelope.chat_id,
+        )
 
     def _raise_inbound_cleanup_error(self) -> None:
         error = self._inbound_cleanup_error
@@ -638,7 +764,19 @@ class MessageBus:
         阶段3：取消 cleanup-only retry task，并暴露已发生的 cleanup fatal。
         """
 
+        self._outbound_closed = True
         self.stop()
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(
+                self._close_all(),
+                name="message-bus-close",
+            )
+        await _await_cleanup_after_cancellation(self._close_task)
+
+    async def _close_all(self) -> None:
+        """Complete all terminal Bus cleanup after admission is closed."""
+
+        await self._drain_channel_inbound_queue()
         await self._drain_outbound_queue()
         tasks = tuple(self._inbound_cleanup_tasks.values())
         for task in tasks:
@@ -648,6 +786,22 @@ class MessageBus:
         self._inbound_cleanup_tasks.clear()
         self._raise_inbound_cleanup_error()
 
+    async def _drain_channel_inbound_queue(self) -> None:
+        """Close only Bus-owned v3 envelopes without rewriting legacy recovery."""
+
+        retained: list[InboundItem] = []
+        while True:
+            try:
+                item = self._inbound.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if isinstance(item, InboundEnvelope):
+                await self.release_channel_inbound(item, InboundOwner.BUS)
+            else:
+                retained.append(item)
+        for item in retained:
+            self._inbound.put_nowait(item)
+
     async def _drain_outbound_queue(self) -> None:
         """排空尚未 dispatch 的出站项：收束其 receipt 并回滚 lane pending 计数。"""
 
@@ -656,6 +810,20 @@ class MessageBus:
                 item = self._outbound.get_nowait()
             except asyncio.QueueEmpty:
                 return
+            if isinstance(item, _AwaitedChannelOutbound):
+                if not item.receipt.done():
+                    item.receipt.set_result(
+                        _channel_delivery_receipt(
+                            item.envelope,
+                            ChannelDeliveryStatus.REJECTED,
+                            "message bus 已关闭，delivery 尚未执行",
+                        )
+                    )
+                self._pending_channel_receipts.discard(item.receipt)
+                channel = item.envelope.channel
+                recipient = item.envelope.recipient
+                await self._chat_lane.mark_passive_send_done(channel, recipient)
+                continue
             if isinstance(item, _AwaitedOutbound):
                 if not item.receipt.done():
                     item.receipt.set_result(False)
@@ -700,6 +868,51 @@ class MessageBus:
         future.add_done_callback(self._pending_outbound_receipts.discard)
         return await future
 
+    async def publish_channel_outbound_awaited(
+        self,
+        envelope: OutboundEnvelope,
+        binding: _ChannelBindingOwner,
+    ) -> ChannelDeliveryReceipt:
+        """Queue one exact v3 delivery and wait for its non-retryable receipt."""
+
+        _validate_channel_binding_owner(envelope, binding)
+        if self._outbound_closed or self._outbound_dispatch_stopped:
+            return _channel_delivery_receipt(
+                envelope,
+                ChannelDeliveryStatus.REJECTED,
+                "message bus outbound admission 已关闭",
+            )
+        future: asyncio.Future[ChannelDeliveryReceipt] = (
+            asyncio.get_running_loop().create_future()
+        )
+        await self._chat_lane.mark_passive_send_pending(
+            envelope.channel,
+            envelope.recipient,
+        )
+        if self._outbound_closed or self._outbound_dispatch_stopped:
+            await self._chat_lane.mark_passive_send_done(
+                envelope.channel,
+                envelope.recipient,
+            )
+            return _channel_delivery_receipt(
+                envelope,
+                ChannelDeliveryStatus.REJECTED,
+                "message bus outbound admission 已关闭",
+            )
+        try:
+            self._outbound.put_nowait(
+                _AwaitedChannelOutbound(envelope, binding, future)
+            )
+        except BaseException:
+            await self._chat_lane.mark_passive_send_done(
+                envelope.channel,
+                envelope.recipient,
+            )
+            raise
+        self._pending_channel_receipts.add(future)
+        future.add_done_callback(self._pending_channel_receipts.discard)
+        return await _await_channel_receipt_after_cancellation(future)
+
     def subscribe_outbound(
         self,
         channel: str,
@@ -732,14 +945,33 @@ class MessageBus:
         finally 只收束当前 in-flight 收据：队列中尚未 dispatch 的项由 aclose
         排空时收束；observer 异常绝不回滚已解析的 receipt。
         """
+        if self._outbound_closed:
+            return
         self._running = True
         self._outbound_dispatch_stopped = False
         in_flight_receipt: asyncio.Future[bool] | None = None
+        in_flight_channel: _AwaitedChannelOutbound | None = None
         try:
             while self._running:
                 try:
                     item = await asyncio.wait_for(self._outbound.get(), timeout=1.0)
                 except asyncio.TimeoutError:
+                    continue
+                if self._outbound_closed:
+                    await self._reject_outbound_after_close(item)
+                    break
+                if isinstance(item, _AwaitedChannelOutbound):
+                    channel_item = item
+                    in_flight_channel = channel_item
+                    channel_receipt = await self._chat_lane.run_passive(
+                        channel_item.envelope.channel,
+                        channel_item.envelope.recipient,
+                        lambda: self._send_channel_outbound(channel_item),
+                        pending_registered=True,
+                    )
+                    if not channel_item.receipt.done():
+                        channel_item.receipt.set_result(channel_receipt)
+                    in_flight_channel = None
                     continue
                 receipt: asyncio.Future[bool] | None = None
                 if isinstance(item, _AwaitedOutbound):
@@ -763,6 +995,86 @@ class MessageBus:
             self._outbound_dispatch_stopped = True
             if in_flight_receipt is not None and not in_flight_receipt.done():
                 in_flight_receipt.set_result(False)
+            if in_flight_channel is not None and not in_flight_channel.receipt.done():
+                in_flight_channel.receipt.set_result(
+                    _channel_delivery_receipt(
+                        in_flight_channel.envelope,
+                        ChannelDeliveryStatus.UNKNOWN,
+                        "message bus dispatch 在 provider receipt 前停止",
+                    )
+                )
+
+    async def _send_channel_outbound(
+        self,
+        item: _AwaitedChannelOutbound,
+    ) -> ChannelDeliveryReceipt:
+        """Invoke a v3 provider exactly once and preserve after-effect uncertainty."""
+
+        dispatcher = self._channel_outbound_dispatcher
+        if self._outbound_closed:
+            return _channel_delivery_receipt(
+                item.envelope,
+                ChannelDeliveryStatus.REJECTED,
+                "message bus outbound admission 已关闭",
+            )
+        if dispatcher is None:
+            return _channel_delivery_receipt(
+                item.envelope,
+                ChannelDeliveryStatus.REJECTED,
+                "v3 Channel outbound dispatcher 未绑定",
+            )
+        try:
+            receipt = await dispatcher(item.envelope, item.binding)
+        except asyncio.CancelledError:
+            raise
+        except BaseException as error:
+            logger.error(
+                "v3 channel delivery unknown channel=%s delivery_id=%s error=%s",
+                item.envelope.channel,
+                item.envelope.delivery_id,
+                error,
+            )
+            return _channel_delivery_receipt(
+                item.envelope,
+                ChannelDeliveryStatus.UNKNOWN,
+                str(error) or type(error).__name__,
+            )
+        if not isinstance(receipt, ChannelDeliveryReceipt):
+            raise TypeError("v3 Channel dispatcher 必须返回 ChannelDeliveryReceipt")
+        if receipt.delivery_id != item.envelope.delivery_id:
+            raise RuntimeError("v3 Channel receipt delivery_id 不匹配")
+        return receipt
+
+    async def _reject_outbound_after_close(
+        self,
+        item: OutboundMessage | _AwaitedOutbound | _AwaitedChannelOutbound,
+    ) -> None:
+        """Settle one item dequeued concurrently with terminal Bus close."""
+
+        if isinstance(item, _AwaitedChannelOutbound):
+            if not item.receipt.done():
+                item.receipt.set_result(
+                    _channel_delivery_receipt(
+                        item.envelope,
+                        ChannelDeliveryStatus.REJECTED,
+                        "message bus outbound admission 已关闭",
+                    )
+                )
+            await self._chat_lane.mark_passive_send_done(
+                item.envelope.channel,
+                item.envelope.recipient,
+            )
+            return
+        if isinstance(item, _AwaitedOutbound):
+            if not item.receipt.done():
+                item.receipt.set_result(False)
+            message = item.message
+        else:
+            message = item
+        await self._chat_lane.mark_passive_send_done(
+            message.channel,
+            message.chat_id,
+        )
 
     async def _send_outbound(
         self,
@@ -828,3 +1140,63 @@ class MessageBus:
     @property
     def outbound_size(self) -> int:
         return self._outbound.qsize()
+
+
+def _validate_channel_binding_owner(
+    envelope: OutboundEnvelope,
+    binding: _ChannelBindingOwner,
+) -> None:
+    """Fence one outbound attempt to its exact live snapshot binding."""
+
+    if not binding.active:
+        raise RuntimeError("v3 Channel binding lease 已关闭")
+    if (
+        binding.snapshot_id != envelope.snapshot_id
+        or binding.generation_id != envelope.generation_id
+        or binding.channel_name != envelope.channel
+        or binding.binding_token != envelope.binding_token
+    ):
+        raise RuntimeError("OutboundEnvelope 与 exact Channel binding 不一致")
+
+
+def _channel_delivery_receipt(
+    envelope: OutboundEnvelope,
+    status: ChannelDeliveryStatus,
+    error: str,
+) -> ChannelDeliveryReceipt:
+    return ChannelDeliveryReceipt(
+        delivery_id=envelope.delivery_id,
+        status=status,
+        error=error,
+    )
+
+
+async def _await_channel_receipt_after_cancellation(
+    future: asyncio.Future[ChannelDeliveryReceipt],
+) -> ChannelDeliveryReceipt:
+    """Wait for provider settlement before restoring caller cancellation."""
+
+    cancelled = False
+    while not future.done():
+        try:
+            await asyncio.shield(future)
+        except asyncio.CancelledError:
+            cancelled = True
+    receipt = future.result()
+    if cancelled:
+        raise asyncio.CancelledError
+    return receipt
+
+
+async def _await_cleanup_after_cancellation(task: asyncio.Task[None]) -> None:
+    """Finish terminal cleanup before restoring caller cancellation."""
+
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+    task.result()
+    if cancelled:
+        raise asyncio.CancelledError
