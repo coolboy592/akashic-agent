@@ -18,12 +18,17 @@ from agent.tool_hooks import ToolHook
 from agent.skills import SkillIndex
 from agent.plugin_composition import (
     COMMANDS,
+    MCP_SERVERS,
     CommandRegistry,
     CompositionError,
     CompositionRoot,
     MobileUiRegistry,
     UI_SLOTS,
     TopologyView,
+)
+from agent.plugin_composition.mcp_slots import (
+    McpServerRegistry,
+    _freeze_plugin_mcp_servers,
 )
 from bus.event_bus import Handler
 from infra.channels.contract import Channel
@@ -69,6 +74,8 @@ class RuntimeSnapshot:
     dashboard_bindings: tuple[object, ...] = ()
     mobile_ui_registry: MobileUiRegistry | None = None
     mobile_ui_registry_identity: str | None = None
+    mcp_server_registry: McpServerRegistry | None = None
+    mcp_server_registry_identity: str | None = None
     tool_registry: ToolRegistry | None = None
     plugin_skill_index: SkillIndex | None = None
     command_registry: CommandRegistry | None = None
@@ -242,6 +249,7 @@ class RuntimeSnapshotCompiler:
         composition_active_plugin_ids: frozenset[str] | None = None
         command_registry: CommandRegistry | None = None
         mobile_ui_registry: MobileUiRegistry | None = None
+        mcp_server_registry: McpServerRegistry | None = None
         if composition_root is not None:
             receipt = composition_root.receipt()
             if require_composition_ready and not receipt.ready:
@@ -289,6 +297,32 @@ class RuntimeSnapshotCompiler:
             if commands is not None:
                 command_registry = commands.freeze()
                 identity += f"|commands:{command_registry.catalog_digest}"
+            mcp_servers = composition_root.context.get(MCP_SERVERS)
+            if mcp_servers is not None:
+                frozen_mcp = _freeze_plugin_mcp_servers(
+                    mcp_servers,
+                    composition_root.instance_token,
+                )
+                legacy_names = {
+                    name
+                    for generation in ordered
+                    for name in generation.contributions.mcp_servers
+                }
+                collisions = legacy_names.intersection(frozen_mcp)
+                if collisions:
+                    raise RuntimeError(
+                        "RuntimeSnapshot v2/v3 MCP server 名称冲突: "
+                        + ", ".join(sorted(collisions))
+                    )
+                for descriptor in frozen_mcp.descriptors:
+                    generation = generations.get(descriptor.owner)
+                    if generation is None:
+                        raise RuntimeError(
+                            "RuntimeSnapshot MCP owner 不属于 generations: "
+                            f"{descriptor.owner}"
+                        )
+                mcp_server_registry = frozen_mcp
+                identity += f"|mcp-v3:{frozen_mcp.identity}"
         snapshot_id = hashlib.sha256(identity.encode()).hexdigest()[:16]
         return RuntimeSnapshot(
             snapshot_id=snapshot_id,
@@ -312,6 +346,12 @@ class RuntimeSnapshotCompiler:
             mobile_ui_registry=mobile_ui_registry,
             mobile_ui_registry_identity=(
                 None if mobile_ui_registry is None else mobile_ui_registry.identity
+            ),
+            mcp_server_registry=mcp_server_registry,
+            mcp_server_registry_identity=(
+                None
+                if mcp_server_registry is None
+                else mcp_server_registry.identity
             ),
             plugin_skill_index=(
                 catalog_owner.skill_catalog.normal_plugins
@@ -1153,6 +1193,8 @@ class RuntimeSnapshotStore:
                 snapshot.composition_topology is not None
                 or snapshot.mobile_ui_registry is not None
                 or snapshot.mobile_ui_registry_identity is not None
+                or snapshot.mcp_server_registry is not None
+                or snapshot.mcp_server_registry_identity is not None
             ):
                 raise RuntimeError(
                     "RuntimeSnapshot composition identity 缺少 Root Context"
@@ -1167,6 +1209,21 @@ class RuntimeSnapshotStore:
             )
         ):
             raise RuntimeError("RuntimeSnapshot Mobile UI descriptor 在编译后发生变化")
+        if (
+            snapshot.mcp_server_registry_identity
+            != (
+                None
+                if snapshot.mcp_server_registry is None
+                else snapshot.mcp_server_registry.identity
+            )
+        ):
+            raise RuntimeError("RuntimeSnapshot MCP descriptor 在编译后发生变化")
+        if (
+            snapshot.mcp_server_registry is not None
+            and snapshot.mcp_server_registry.root_instance_token
+            is not root.instance_token
+        ):
+            raise RuntimeError("RuntimeSnapshot MCP registry 不属于 exact Root")
         topology = snapshot.composition_topology
         if topology is None:
             raise RuntimeError("RuntimeSnapshot composition Root 缺少 TopologyView")

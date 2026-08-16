@@ -53,6 +53,11 @@ from agent.plugin_composition.runtime_services import (
     MEMORY_RUNTIME,
     MemoryRuntimeInfo,
 )
+from agent.plugin_composition.mcp_slots import (
+    MCP_SERVERS,
+    EndpointEnv,
+    McpServerDefinition,
+)
 from agent.plugin_composition.ui_slots import (
     UI_SLOTS,
     MobileUiBinding,
@@ -94,7 +99,10 @@ __all__ = [
     "HealthHandle",
     "IncidentView",
     "MEMORY_RUNTIME",
+    "MCP_SERVERS",
     "MemoryRuntimeInfo",
+    "EndpointEnv",
+    "McpServerDefinition",
     "MobileUiBinding",
     "MobileUiDefinition",
     "MobileUiDescriptor",

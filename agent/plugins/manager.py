@@ -24,6 +24,7 @@ from pydantic import BaseModel, ValidationError
 
 from agent.plugin_composition import (
     COMMANDS,
+    MCP_SERVERS,
     MEMORY_RUNTIME,
     UI_SLOTS,
     CommandRegistry,
@@ -36,6 +37,7 @@ from agent.plugin_composition import (
     resolve_mobile_ui_asset,
     ServiceView,
 )
+from agent.plugin_composition.mcp_slots import PluginMcpServers
 from agent.plugin_composition.model import resolve_declared_workspace_root
 from agent.plugins.composable import ComposablePlugin
 
@@ -4380,6 +4382,11 @@ class PluginManager:
         try:
             _ = await root.context.provide(COMMANDS, PluginCommands())
             if any(
+                MCP_SERVERS in cast(ComposablePlugin, item.instance).inject
+                for item in ordered
+            ):
+                _ = await root.context.provide(MCP_SERVERS, PluginMcpServers())
+            if any(
                 UI_SLOTS in cast(ComposablePlugin, item.instance).inject
                 for item in ordered
             ):
@@ -6079,6 +6086,8 @@ def _replace_snapshot_payload(
         "dashboard_bindings",
         "mobile_ui_registry",
         "mobile_ui_registry_identity",
+        "mcp_server_registry",
+        "mcp_server_registry_identity",
         "tool_registry",
         "plugin_skill_index",
         "command_registry",
