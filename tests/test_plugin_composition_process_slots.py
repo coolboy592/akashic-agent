@@ -88,6 +88,12 @@ async def test_process_registry_freezes_health_identity_and_cleanup(
     assert binding.is_live()
     assert registry.identity == registry.catalog_digest
     assert not hasattr(processes, "freeze")
+    incident = binding.incident_reporter(
+        "process_readiness_failed",
+        "calendar_api did not become ready",
+    )
+    assert incident.owner == "calendar"
+    assert root.recent_incidents() == (incident,)
 
     await fiber.dispose()
     assert not binding.is_live()

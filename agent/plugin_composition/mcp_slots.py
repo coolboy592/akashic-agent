@@ -12,6 +12,7 @@ from agent.plugin_composition.context import Context, FiberHandle, HealthHandle
 from agent.plugin_composition.model import (
     CompositionError,
     FiberState,
+    IncidentView,
     ServiceKey,
 )
 
@@ -64,6 +65,10 @@ class McpServerBinding:
     health: HealthHandle
     owner_fiber: FiberHandle
     activation_token: object
+    incident_reporter: Callable[[str, str], IncidentView] = field(
+        repr=False,
+        compare=False,
+    )
 
     def is_live(self) -> bool:
         """Return whether the declaration still belongs to its Fiber activation."""
@@ -156,6 +161,7 @@ class _McpRegistration:
     descriptor: McpServerDescriptor
     owner_fiber: FiberHandle
     activation_token: object
+    incident_reporter: Callable[[str, str], IncidentView]
     health: HealthHandle | None = None
 
 
@@ -193,6 +199,7 @@ class _McpServerDeclarations:
                 normalized,
                 owner_fiber,
                 activation_token,
+                ctx.report_incident,
             )
             return cleanup
 
@@ -228,6 +235,7 @@ class _McpServerDeclarations:
                 health=registration.health,
                 owner_fiber=registration.owner_fiber,
                 activation_token=registration.activation_token,
+                incident_reporter=registration.incident_reporter,
             )
         self._frozen = McpServerRegistry(
             bindings,
@@ -241,6 +249,7 @@ class _McpServerDeclarations:
         definition: McpServerDefinition,
         owner_fiber: FiberHandle,
         activation_token: object,
+        incident_reporter: Callable[[str, str], IncidentView],
     ) -> tuple[_McpRegistration, Callable[[], None]]:
         """Add one normalized declaration and return its exact inverse."""
 
@@ -263,6 +272,7 @@ class _McpServerDeclarations:
             descriptor=_descriptor(owner, definition),
             owner_fiber=owner_fiber,
             activation_token=activation_token,
+            incident_reporter=incident_reporter,
         )
         self._registrations[token] = registration
         self._names[definition.name] = token

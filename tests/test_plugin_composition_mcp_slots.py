@@ -90,6 +90,12 @@ async def test_mcp_registry_freezes_descriptor_health_and_cleanup(
     assert binding.health.healthy
     assert binding.is_live()
     assert registry.identity == registry.catalog_digest
+    incident = binding.incident_reporter(
+        "mcp_handshake_failed",
+        "calendar initialize failed",
+    )
+    assert incident.owner == "calendar"
+    assert root.recent_incidents() == (incident,)
 
     await fiber.dispose()
     assert _freeze_plugin_mcp_servers(servers, root.instance_token) is registry

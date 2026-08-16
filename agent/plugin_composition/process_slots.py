@@ -11,7 +11,12 @@ from types import MappingProxyType
 from urllib.parse import urlsplit
 
 from agent.plugin_composition.context import Context, FiberHandle, HealthHandle
-from agent.plugin_composition.model import CompositionError, FiberState, ServiceKey
+from agent.plugin_composition.model import (
+    CompositionError,
+    FiberState,
+    IncidentView,
+    ServiceKey,
+)
 
 _NAME = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 _ENV_NAME = re.compile(r"^[A-Z_][A-Z0-9_]{0,127}$")
@@ -56,6 +61,10 @@ class ManagedProcessBinding:
     health: HealthHandle
     owner_fiber: FiberHandle
     activation_token: object
+    incident_reporter: Callable[[str, str], IncidentView] = field(
+        repr=False,
+        compare=False,
+    )
 
     def is_live(self) -> bool:
         """Return whether the declaration still belongs to its Fiber activation."""
@@ -145,6 +154,7 @@ class _ProcessRegistration:
     descriptor: ManagedProcessDescriptor
     owner_fiber: FiberHandle
     activation_token: object
+    incident_reporter: Callable[[str, str], IncidentView]
     health: HealthHandle | None = None
 
 
@@ -182,6 +192,7 @@ class _ManagedProcessDeclarations:
                 normalized,
                 owner_fiber,
                 activation_token,
+                ctx.report_incident,
             )
             return cleanup
 
@@ -220,6 +231,7 @@ class _ManagedProcessDeclarations:
                 health=registration.health,
                 owner_fiber=registration.owner_fiber,
                 activation_token=registration.activation_token,
+                incident_reporter=registration.incident_reporter,
             )
         self._frozen = ManagedProcessRegistry(
             bindings,
@@ -233,6 +245,7 @@ class _ManagedProcessDeclarations:
         definition: ManagedProcessDefinition,
         owner_fiber: FiberHandle,
         activation_token: object,
+        incident_reporter: Callable[[str, str], IncidentView],
     ) -> tuple[_ProcessRegistration, Callable[[], None]]:
         """Add one normalized declaration and return its exact inverse."""
 
@@ -255,6 +268,7 @@ class _ManagedProcessDeclarations:
             descriptor=_descriptor(owner, definition),
             owner_fiber=owner_fiber,
             activation_token=activation_token,
+            incident_reporter=incident_reporter,
         )
         self._registrations[token] = registration
         self._names[definition.name] = token
