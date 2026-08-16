@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import socket
 import sys
 from pathlib import Path
@@ -19,7 +20,12 @@ def _free_port() -> int:
         return int(listener.getsockname()[1])
 
 
-def _http_definition(script: Path, *, formal_port: int) -> ManagedProcessDefinition:
+def _http_definition(
+    script: Path,
+    *,
+    formal_port: int,
+    startup_timeout_seconds: float = 3.0,
+) -> ManagedProcessDefinition:
     return ManagedProcessDefinition(
         name="calendar_api",
         command=(sys.executable, str(script)),
@@ -28,11 +34,17 @@ def _http_definition(script: Path, *, formal_port: int) -> ManagedProcessDefinit
         port_env="PORT",
         formal_port=formal_port,
         readiness_path="/health",
-        startup_timeout_seconds=3.0,
+        startup_timeout_seconds=startup_timeout_seconds,
     )
 
 
-def _write_http_server(script: Path, *, exit_first: bool = False) -> None:
+def _write_http_server(
+    script: Path,
+    *,
+    exit_first: bool = False,
+    ready_status: int = 200,
+    redirect_location: str | None = None,
+) -> None:
     first_exit = (
         "from pathlib import Path\n"
         "counter = Path('attempts')\n"
@@ -46,12 +58,19 @@ def _write_http_server(script: Path, *, exit_first: bool = False) -> None:
         if exit_first
         else ""
     )
+    redirect_header = (
+        f"        self.send_header('Location', {redirect_location!r})\n"
+        if redirect_location is not None
+        else ""
+    )
     script.write_text(
         "import os, sys, time\n"
         "from http.server import BaseHTTPRequestHandler, HTTPServer\n"
         "class Handler(BaseHTTPRequestHandler):\n"
         "    def do_GET(self):\n"
-        "        self.send_response(200); self.end_headers(); self.wfile.write(b'ready')\n"
+        f"        self.send_response({ready_status})\n"
+        + redirect_header
+        + "        self.end_headers(); self.wfile.write(b'ready')\n"
         "    def log_message(self, *args): pass\n"
         "server = HTTPServer(('127.0.0.1', int(os.environ['PORT'])), Handler)\n"
         "print('managed stdout', flush=True)\n"
@@ -60,6 +79,94 @@ def _write_http_server(script: Path, *, exit_first: bool = False) -> None:
         + "server.serve_forever()\n",
         encoding="utf-8",
     )
+
+
+def _write_slow_process(script: Path) -> None:
+    script.write_text(
+        "import os, signal, socket, subprocess, sys, time\n"
+        "from pathlib import Path\n"
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
+        "Path(os.environ['PID_FILE']).write_text(str(os.getpid()))\n"
+        "Path(os.environ['CHILD_PID_FILE']).write_text(str(child.pid))\n"
+        "Path(os.environ['PORT_FILE']).write_text(os.environ['PORT'])\n"
+        "listener = socket.socket()\n"
+        "listener.bind(('127.0.0.1', int(os.environ['PORT'])))\n"
+        "listener.listen()\n"
+        "def ignore_term(signum, frame):\n"
+        "    time.sleep(30)\n"
+        "signal.signal(signal.SIGTERM, ignore_term)\n"
+        "while True:\n"
+        "    time.sleep(1)\n",
+        encoding="utf-8",
+    )
+
+
+def _write_exhausting_recovery_server(script: Path) -> None:
+    script.write_text(
+        "import os, threading, time\n"
+        "from http.server import BaseHTTPRequestHandler, HTTPServer\n"
+        "from pathlib import Path\n"
+        "counter = Path('recovery-attempts')\n"
+        "attempt = int(counter.read_text()) + 1 if counter.exists() else 1\n"
+        "counter.write_text(str(attempt))\n"
+        "if attempt == 1:\n"
+        "    class Handler(BaseHTTPRequestHandler):\n"
+        "        def do_GET(self):\n"
+        "            self.send_response(200); self.end_headers(); self.wfile.write(b'ready')\n"
+        "        def log_message(self, *args): pass\n"
+        "    server = HTTPServer(('127.0.0.1', int(os.environ['PORT'])), Handler)\n"
+        "    threading.Thread(target=server.serve_forever, daemon=True).start()\n"
+        "    time.sleep(0.1)\n"
+        "raise SystemExit(19)\n",
+        encoding="utf-8",
+    )
+
+
+def _slow_definition(
+    script: Path,
+    *,
+    pid_file: Path,
+    child_pid_file: Path,
+    port_file: Path,
+) -> ManagedProcessDefinition:
+    return ManagedProcessDefinition(
+        name="slow_process",
+        command=(sys.executable, str(script)),
+        cwd=str(script.parent),
+        env={
+            "PID_FILE": str(pid_file),
+            "CHILD_PID_FILE": str(child_pid_file),
+            "PORT_FILE": str(port_file),
+        },
+        port_env="PORT",
+        formal_port=_free_port(),
+        readiness_path="/never-ready",
+        startup_timeout_seconds=5.0,
+    )
+
+
+def _pid_live(pid: int) -> bool:
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except OSError:
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return False
+        return True
+    command_end = stat.rfind(")")
+    fields = stat[command_end + 2 :].split()
+    return bool(fields) and fields[0] != "Z"
+
+
+def _port_live(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.settimeout(0.1)
+        try:
+            probe.connect(("127.0.0.1", port))
+        except OSError:
+            return False
+        return True
 
 
 async def _wait_until(predicate, *, timeout: float = 5.0) -> None:
@@ -162,6 +269,182 @@ async def test_process_exit_recovers_with_new_epoch_without_stale_resurrection(
     await host.stop_generation("candidate-recover")
     await asyncio.sleep(0.05)
     assert host.get("candidate-recover") is None
+
+
+@pytest.mark.asyncio
+async def test_cancel_start_drains_real_process_group_after_repeated_cancellation(
+    tmp_path: Path,
+) -> None:
+    script = tmp_path / "slow.py"
+    pid_file = tmp_path / "leader.pid"
+    child_pid_file = tmp_path / "child.pid"
+    port_file = tmp_path / "port"
+    _write_slow_process(script)
+    host = ManagedProcessGenerationHost(stop_timeout_seconds=0.15)
+    definition = _slow_definition(
+        script,
+        pid_file=pid_file,
+        child_pid_file=child_pid_file,
+        port_file=port_file,
+    )
+    start_task = asyncio.create_task(
+        host.start_candidate("cancel-start", {definition.name: definition})
+    )
+    try:
+        await _wait_until(
+            lambda: pid_file.exists() and child_pid_file.exists() and port_file.exists()
+        )
+        leader_pid = int(pid_file.read_text(encoding="utf-8"))
+        child_pid = int(child_pid_file.read_text(encoding="utf-8"))
+        port = int(port_file.read_text(encoding="utf-8"))
+        await _wait_until(lambda: _port_live(port))
+
+        start_task.cancel()
+        await asyncio.sleep(0.02)
+        start_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await start_task
+
+        await _wait_until(
+            lambda: not _pid_live(leader_pid) and not _pid_live(child_pid),
+            timeout=3.0,
+        )
+        assert host.get("cancel-start") is None
+        assert host.tombstone("cancel-start") is None
+        assert not _port_live(port)
+    finally:
+        if not start_task.done():
+            start_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await start_task
+        await host.close()
+
+
+@pytest.mark.asyncio
+async def test_health_ready_callback_cancellation_cleans_started_process(
+    tmp_path: Path,
+) -> None:
+    script = tmp_path / "server.py"
+    _write_http_server(script)
+
+    async def cancel_ready(_generation: str, _name: str, healthy: bool, _reason: str) -> None:
+        if healthy:
+            raise asyncio.CancelledError
+
+    host = ManagedProcessGenerationHost(on_health=cancel_ready)
+    with pytest.raises(asyncio.CancelledError):
+        await host.start_candidate(
+            "health-cancel",
+            {"calendar_api": _http_definition(script, formal_port=_free_port())},
+        )
+    assert host.get("health-cancel") is None
+    assert host.tombstone("health-cancel") is None
+
+
+@pytest.mark.asyncio
+async def test_incident_callback_cancellation_cleans_readiness_process(
+    tmp_path: Path,
+) -> None:
+    script = tmp_path / "unready.py"
+    _write_http_server(script, ready_status=503)
+
+    async def cancel_incident(
+        _generation: str,
+        _name: str,
+        _kind: str,
+        _message: str,
+    ) -> None:
+        raise asyncio.CancelledError
+
+    host = ManagedProcessGenerationHost(on_incident=cancel_incident)
+    with pytest.raises(asyncio.CancelledError):
+        await host.start_candidate(
+            "incident-cancel",
+            {
+                "calendar_api": _http_definition(
+                    script,
+                    formal_port=_free_port(),
+                    startup_timeout_seconds=0.15,
+                )
+            },
+        )
+    assert host.get("incident-cancel") is None
+    assert host.tombstone("incident-cancel") is None
+
+
+@pytest.mark.asyncio
+async def test_health_callback_failure_is_fail_loud_and_cleans_process(
+    tmp_path: Path,
+) -> None:
+    script = tmp_path / "server.py"
+    _write_http_server(script)
+
+    def fail_ready(_generation: str, _name: str, healthy: bool, _reason: str) -> None:
+        if healthy:
+            raise RuntimeError("health bridge unavailable")
+
+    host = ManagedProcessGenerationHost(on_health=fail_ready)
+    with pytest.raises(RuntimeError, match="health bridge unavailable"):
+        await host.start_candidate(
+            "health-failure",
+            {"calendar_api": _http_definition(script, formal_port=_free_port())},
+        )
+    assert host.get("health-failure") is None
+    assert host.tombstone("health-failure") is None
+
+
+@pytest.mark.asyncio
+async def test_readiness_rejects_redirect_and_strict_timeout(
+    tmp_path: Path,
+) -> None:
+    script = tmp_path / "redirect.py"
+    _write_http_server(
+        script,
+        ready_status=302,
+        redirect_location="http://127.0.0.1:9/unrelated",
+    )
+    host = ManagedProcessGenerationHost()
+    with pytest.raises(TimeoutError):
+        await host.start_candidate(
+            "redirected",
+            {
+                "calendar_api": _http_definition(
+                    script,
+                    formal_port=_free_port(),
+                    startup_timeout_seconds=0.15,
+                )
+            },
+        )
+    assert host.get("redirected") is None
+    assert host.tombstone("redirected") is None
+
+
+@pytest.mark.asyncio
+async def test_recovery_exhaustion_retains_tombstone_until_explicit_retry(
+    tmp_path: Path,
+) -> None:
+    script = tmp_path / "exhaust.py"
+    _write_exhausting_recovery_server(script)
+    host = ManagedProcessGenerationHost(
+        recovery_backoff_seconds=(0.01, 0.01),
+        recovery_stable_seconds=60.0,
+    )
+    generation_id = "recovery-exhausted"
+    await host.start_candidate(
+        generation_id,
+        {"calendar_api": _http_definition(script, formal_port=_free_port())},
+    )
+
+    await _wait_until(lambda: host.tombstone(generation_id) is not None, timeout=3.0)
+    tombstone = host.tombstone(generation_id)
+    assert tombstone is not None
+    assert tombstone.state == "degraded"
+    assert tombstone.action == "retry_runtime_recovery"
+    assert host.generation_state(generation_id) == "degraded"
+
+    await host.retry_runtime_recovery(generation_id)
+    assert host.get(generation_id) is None
+    assert host.tombstone(generation_id) is None
 
 
 @pytest.mark.asyncio

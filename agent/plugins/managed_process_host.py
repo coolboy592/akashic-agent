@@ -17,8 +17,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Literal, Protocol, cast
-from urllib.error import URLError
-from urllib.request import urlopen
+from urllib.error import HTTPError, URLError
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 from agent.plugin_composition.process_slots import ManagedProcessDefinition
 from utils.process_group import (
@@ -273,16 +273,14 @@ class ManagedProcessGenerationHost:
                 await self._start_entry(generation, entry)
             generation.state = "ready"
             return ManagedProcessGeneration(self, generation_id)
-        except asyncio.CancelledError:
-            raise
-        except Exception as error:
+        except BaseException as error:
             cleanup_task = asyncio.create_task(
                 self._cleanup_generation(generation, cause=error),
                 name=f"managed_process_cleanup:{generation_id}",
             )
             try:
                 await _await_task_after_cancellation(cleanup_task)
-            except asyncio.CancelledError:
+            except asyncio.CancelledError as cleanup_cancelled:
                 if cleanup_task.done() and cleanup_task.exception() is None:
                     _ = self._generations.pop(generation_id, None)
                 else:
@@ -290,9 +288,13 @@ class ManagedProcessGenerationHost:
                         generation,
                         _task_error(cleanup_task, error),
                     )
-                raise
+                if isinstance(error, asyncio.CancelledError):
+                    raise error
+                raise cleanup_cancelled from error
             except BaseException as cleanup_failure:
                 self._retain_cleanup_tombstone(generation, cleanup_failure)
+                if isinstance(error, asyncio.CancelledError):
+                    raise error from cleanup_failure
             else:
                 _ = self._generations.pop(generation_id, None)
             raise
@@ -632,7 +634,8 @@ class ManagedProcessGenerationHost:
         while asyncio.get_running_loop().time() < deadline:
             if process.returncode is not None:
                 raise RuntimeError(f"managed process 启动失败: exit={process.returncode}")
-            if await asyncio.to_thread(_url_ready, url):
+            remaining = deadline - asyncio.get_running_loop().time()
+            if await asyncio.to_thread(_url_ready, url, min(0.5, remaining)):
                 await asyncio.sleep(0)
                 if process.returncode is not None:
                     raise RuntimeError(f"managed process 启动失败: exit={process.returncode}")
@@ -652,18 +655,27 @@ class ManagedProcessGenerationHost:
         exit_code = await process.wait()
         if entry.stopping or entry.epoch != observed_epoch or generation.state == "stopping":
             return
-        await self._emit_health(
-            generation.generation_id,
-            entry.definition.name,
-            False,
-            f"process exited: {exit_code}",
-        )
-        await self._emit_incident(
-            generation.generation_id,
-            entry.definition.name,
-            "process_exit",
-            f"managed process exited unexpectedly: exit={exit_code}, epoch={observed_epoch}",
-        )
+        try:
+            await self._emit_health(
+                generation.generation_id,
+                entry.definition.name,
+                False,
+                f"process exited: {exit_code}",
+            )
+            await self._emit_incident(
+                generation.generation_id,
+                entry.definition.name,
+                "process_exit",
+                f"managed process exited unexpectedly: exit={exit_code}, epoch={observed_epoch}",
+            )
+        except asyncio.CancelledError as error:
+            if entry.stopping or generation.state == "stopping":
+                raise
+            await self._retain_runtime_callback_failure(generation, entry, error)
+            return
+        except BaseException as error:
+            await self._retain_runtime_callback_failure(generation, entry, error)
+            return
         try:
             await self._terminate_runtime(entry)
         except BaseException as error:
@@ -691,13 +703,28 @@ class ManagedProcessGenerationHost:
                 if entry.ready_at is not None and now - entry.ready_at >= self._recovery_stable_seconds:
                     entry.recovery_attempts = 0
                 if entry.recovery_attempts >= len(self._recovery_backoff_seconds):
-                    generation.state = "degraded"
-                    await self._emit_incident(
-                        generation.generation_id,
-                        entry.definition.name,
-                        "recovery_exhausted",
-                        f"managed process recovery exhausted at epoch={observed_epoch}",
+                    exhaustion = RuntimeError(
+                        "managed process recovery exhausted at "
+                        f"epoch={observed_epoch}"
                     )
+                    generation.state = "degraded"
+                    self._retain_runtime_tombstone(generation, entry, exhaustion)
+                    try:
+                        await self._emit_incident(
+                            generation.generation_id,
+                            entry.definition.name,
+                            "recovery_exhausted",
+                            str(exhaustion),
+                        )
+                    except asyncio.CancelledError:
+                        if entry.stopping or generation.state == "stopping":
+                            raise
+                    except BaseException as callback_error:
+                        self._retain_runtime_tombstone(
+                            generation,
+                            entry,
+                            callback_error,
+                        )
                     return
                 delay = self._recovery_backoff_seconds[entry.recovery_attempts]
                 entry.recovery_attempts += 1
@@ -706,15 +733,39 @@ class ManagedProcessGenerationHost:
                     return
                 try:
                     await self._start_entry(generation, entry)
-                except asyncio.CancelledError:
-                    raise
-                except BaseException as error:
-                    await self._emit_incident(
-                        generation.generation_id,
-                        entry.definition.name,
-                        "recovery_failed",
-                        _error_text(error),
+                except asyncio.CancelledError as error:
+                    if entry.stopping or generation.state == "stopping":
+                        raise
+                    await self._retain_runtime_callback_failure(
+                        generation,
+                        entry,
+                        error,
                     )
+                    return
+                except BaseException as error:
+                    try:
+                        await self._emit_incident(
+                            generation.generation_id,
+                            entry.definition.name,
+                            "recovery_failed",
+                            _error_text(error),
+                        )
+                    except asyncio.CancelledError as callback_error:
+                        if entry.stopping or generation.state == "stopping":
+                            raise
+                        await self._retain_runtime_callback_failure(
+                            generation,
+                            entry,
+                            callback_error,
+                        )
+                        return
+                    except BaseException as callback_error:
+                        await self._retain_runtime_callback_failure(
+                            generation,
+                            entry,
+                            callback_error,
+                        )
+                        return
                     try:
                         await self._terminate_runtime(entry)
                     except BaseException as cleanup_error:
@@ -799,6 +850,12 @@ class ManagedProcessGenerationHost:
     async def _terminate_runtime(self, entry: _ProcessEpoch) -> None:
         """Kill an exited leader's complete process group before recovery."""
 
+        watch_task = entry.watch_task
+        if watch_task is not None and watch_task is not asyncio.current_task():
+            if not watch_task.done():
+                _ = watch_task.cancel()
+            await _await_task_after_cancellation(watch_task)
+            entry.watch_task = None
         if entry.process_group is not None:
             await entry.process_group.terminate(timeout_s=self._stop_timeout_seconds)
         if entry.process is not None:
@@ -813,6 +870,22 @@ class ManagedProcessGenerationHost:
         entry.stdout_task = None
         entry.stderr_task = None
         entry.watch_task = None
+
+    async def _retain_runtime_callback_failure(
+        self,
+        generation: _Generation,
+        entry: _ProcessEpoch,
+        error: BaseException,
+    ) -> None:
+        """Stop a runtime after a health/incident bridge failure and retain ownership."""
+
+        generation.state = "degraded"
+        try:
+            await self._terminate_runtime(entry)
+        except BaseException as cleanup_error:
+            self._retain_runtime_tombstone(generation, entry, cleanup_error)
+            return
+        self._retain_runtime_tombstone(generation, entry, error)
 
     async def _drain_stream(
         self,
@@ -881,6 +954,7 @@ class ManagedProcessGenerationHost:
                 process_name,
                 _error_text(error),
             )
+            raise
 
     async def _emit_incident(
         self,
@@ -904,6 +978,7 @@ class ManagedProcessGenerationHost:
                 process_name,
                 _error_text(error),
             )
+            raise
 
     @staticmethod
     def _normalize_definitions(
@@ -1035,10 +1110,30 @@ def _assert_port_free(port: int) -> None:
             raise RuntimeError(f"managed process formal port already occupied: {port}") from error
 
 
-def _url_ready(url: str) -> bool:
+class _RejectReadinessRedirect(HTTPRedirectHandler):
+    """Reject every readiness redirect instead of following an untrusted URL."""
+
+    def redirect_request(
+        self,
+        request: Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> Request:
+        raise URLError(f"managed process readiness redirect rejected: {newurl}")
+
+
+def _url_ready(url: str, timeout: float) -> bool:
     try:
-        with urlopen(url, timeout=0.5) as response:
-            return 200 <= response.status < 400
+        opener = build_opener(ProxyHandler({}), _RejectReadinessRedirect())
+        request = Request(url, method="GET")
+        with opener.open(request, timeout=timeout) as response:
+            return 200 <= response.status < 300 and response.geturl() == url
+    except HTTPError as error:
+        error.close()
+        return False
     except (OSError, URLError):
         return False
 
