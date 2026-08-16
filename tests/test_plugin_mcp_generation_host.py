@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import socket
 import sys
 from pathlib import Path
@@ -200,6 +201,38 @@ async def test_formal_exposes_all_tools_and_does_not_apply_candidate_env(tmp_pat
         assert result.status == "tool_error"
         read_result = await generation.route("calendar").call("read_tool", {})
         assert read_result.output.startswith("none|formal-a|")
+    finally:
+        await host.close()
+        await root.dispose()
+
+
+@pytest.mark.asyncio
+async def test_child_env_scrubs_ambient_candidate_value(monkeypatch, tmp_path: Path) -> None:
+    script = tmp_path / "server.py"
+    _write_server(script)
+    root, registry = await _registry(tmp_path, script)
+    monkeypatch.setenv("ROLE", "candidate")
+    host = McpGenerationHost()
+    try:
+        formal = await host.start_formal(
+            "formal-ambient-env",
+            registry,
+            _command(script),
+            endpoint_ports={"calendar_api": _free_port()},
+        )
+        formal_result = await formal.route("calendar").call("read_tool", {})
+        assert formal_result.output.split("|", 1)[0] == "none"
+        await host.stop_generation("formal-ambient-env")
+
+        candidate = await host.start_candidate(
+            "candidate-ambient-env",
+            registry,
+            _command(script),
+            endpoint_ports={"calendar_api": _free_port()},
+        )
+        candidate_result = await candidate.route("calendar").call("read_tool", {})
+        assert candidate_result.output.split("|", 1)[0] == "candidate"
+        await host.stop_generation("candidate-ambient-env")
     finally:
         await host.close()
         await root.dispose()
