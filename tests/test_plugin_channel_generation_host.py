@@ -286,14 +286,23 @@ async def test_wrong_binding_and_receipt_identity_fail_loud() -> None:
 @pytest.mark.asyncio
 async def test_journal_callback_happens_before_start_and_failure_keeps_count_zero() -> None:
     events: list[str] = []
+    records: list[ChannelStartRecord] = []
     snapshot, factories, _ = await _make_snapshot(factory_events=events)
 
     async def before(record: ChannelStartRecord) -> None:
+        records.append(record)
         events.append("journal")
 
     host = ChannelGenerationHost(on_before_start=before)
     generation = await host.start(snapshot, factories)
     assert events == ["journal", "factory"]
+    assert records[0].source_revision == "source-1"
+    assert records[0].config_revision == "config-1"
+    assert len(records[0].descriptor_digest) == 64
+    assert records[0].factory_export == "make_adapter"
+    assert records[0].artifact_pointer == "plugins/feishu/plugin.py"
+    assert records[0].target == "formal"
+    assert records[0].boot_owner == "plugin-manager"
     assert host.start_count(snapshot.snapshot_id, "feishu") == 1
     await generation.stop()
 
@@ -336,6 +345,15 @@ async def test_stop_failure_retains_tombstone_and_retry_cleans_exact_owner() -> 
     tombstone = host.failure(snapshot.snapshot_id, "feishu")
     assert tombstone is not None
     assert tombstone.binding_token == generation.channel("feishu").binding_token
+    assert tombstone.artifact_pointer == "plugins/feishu/plugin.py"
+    assert tombstone.factory_export == "make_adapter"
+    assert tombstone.source_revision == "source-1"
+    assert tombstone.config_revision == "config-1"
+    assert len(tombstone.descriptor_digest) == 64
+    assert tombstone.target == "formal"
+    assert tombstone.boot_owner == "plugin-manager"
+    with pytest.raises(RuntimeError, match="未知"):
+        await host.retry_binding_cleanup("wrong-binding-token")
     adapter = next(iter(adapters.values()))
     adapter.fail_stop = False
     await host.retry_generation_cleanup(snapshot.snapshot_id)

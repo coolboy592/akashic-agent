@@ -7,7 +7,9 @@ leases and the current runtime remain Core/Manager responsibilities.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
+import json
 import logging
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
@@ -48,6 +50,9 @@ class ChannelStartRecord:
     module_name: str
     artifact_pointer: str
     factory_export: str
+    source_revision: str
+    config_revision: str
+    descriptor_digest: str
     target: str
     boot_owner: str
     attempt: int = 1
@@ -68,6 +73,13 @@ class ChannelCleanupTombstone:
     factory_context: ChannelFactoryContext | None
     provider_client_factory: ProviderClientFactory
     binding_token: str
+    artifact_pointer: str
+    factory_export: str
+    source_revision: str
+    config_revision: str
+    descriptor_digest: str
+    target: str
+    boot_owner: str
     resource: str
     error_type: str
     message: str
@@ -98,6 +110,9 @@ class _ChannelBindingState:
     credential_paths: tuple[str, ...]
     factory_context: ChannelFactoryContext | None
     factory_export: str
+    source_revision: str
+    config_revision: str
+    descriptor_digest: str
     target: str
     boot_owner: str
     start_attempt: int
@@ -547,6 +562,7 @@ class ChannelGenerationHost:
         if not isinstance(config, Mapping):
             raise RuntimeError(f"channel generation config projection 无效: {descriptor.owner}")
         binding_token = uuid.uuid4().hex
+        descriptor_digest = _descriptor_digest(descriptor)
         _validate_provider_factory(provider_client_factory, descriptor.name)
         return _ChannelBindingState(
             snapshot_id=snapshot.snapshot_id,
@@ -564,6 +580,9 @@ class ChannelGenerationHost:
             credential_paths=descriptor.credential_paths,
             factory_context=None,
             factory_export=descriptor.factory_export,
+            source_revision=generation.source_revision,
+            config_revision=generation.config_revision,
+            descriptor_digest=descriptor_digest,
             target=target,
             boot_owner=boot_owner,
             start_attempt=1,
@@ -581,6 +600,9 @@ class ChannelGenerationHost:
             module_name=state.module.__name__,
             artifact_pointer=state.artifact_pointer,
             factory_export=state.factory_export,
+            source_revision=state.source_revision,
+            config_revision=state.config_revision,
+            descriptor_digest=state.descriptor_digest,
             target=state.target,
             boot_owner=state.boot_owner,
             attempt=state.start_attempt,
@@ -805,6 +827,13 @@ class ChannelGenerationHost:
             factory_context=state.factory_context,
             provider_client_factory=state.provider_client_factory,
             binding_token=state.binding_token,
+            artifact_pointer=state.artifact_pointer,
+            factory_export=state.factory_export,
+            source_revision=state.source_revision,
+            config_revision=state.config_revision,
+            descriptor_digest=state.descriptor_digest,
+            target=state.target,
+            boot_owner=state.boot_owner,
             resource=failure.resource,
             error_type=type(error).__name__,
             message=str(error),
@@ -883,6 +912,26 @@ def _find_provenance(
     if len(matches) != 1:
         raise RuntimeError(f"channel factory provenance 缺失或重复: {channel_name}")
     return matches[0]
+
+
+def _descriptor_digest(descriptor: Any) -> str:
+    """Hash the complete immutable descriptor identity for durable ownership."""
+
+    payload = {
+        "owner": descriptor.owner,
+        "name": descriptor.name,
+        "capabilities": [item.value for item in descriptor.capabilities],
+        "factory_export": descriptor.factory_export,
+        "inbound_identity": (
+            None if descriptor.inbound_identity is None else descriptor.inbound_identity.value
+        ),
+        "credential_paths": list(descriptor.credential_paths),
+    }
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode(
+            "utf-8"
+        )
+    ).hexdigest()
 
 
 def _resolve_sync_factory(module: ModuleType, export: str) -> Callable[[ChannelFactoryContext], ChannelAdapter]:
