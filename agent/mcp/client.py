@@ -80,10 +80,12 @@ class McpClient:
         command: list[str],
         env: dict[str, str] | None = None,
         cwd: str | None = None,
+        env_scrub_keys: frozenset[str] | None = None,
     ) -> None:
         self.name = name
         self.command = command
         self.env = env or {}
+        self.env_scrub_keys = env_scrub_keys or frozenset()
         # cwd 未指定时从 command 中推断，避免子进程继承 agent 工作目录
         self.cwd = cwd or _infer_cwd(command)
         self._process: asyncio.subprocess.Process | None = None
@@ -142,6 +144,10 @@ class McpClient:
     async def _connect_impl(self) -> list[McpToolInfo]:
         """启动子进程，完成握手，获取工具列表。"""
         proc_env = owned_process_env(self.env)
+        for key in self.env_scrub_keys:
+            proc_env.pop(key, None)
+            if key in self.env:
+                proc_env[key] = self.env[key]
         logger.debug("[mcp] 启动 %r: %s  cwd=%s", self.name, self.command, self.cwd)
         self._process = await asyncio.create_subprocess_exec(
             *self.command,

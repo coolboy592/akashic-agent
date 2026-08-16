@@ -8,7 +8,6 @@ plugins never receive a client, process, or mutable tool wrapper.
 from __future__ import annotations
 
 import asyncio
-import contextvars
 import hashlib
 import inspect
 import json
@@ -20,7 +19,6 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Literal, Protocol, cast
 
-import agent.mcp.client as _mcp_client_module
 from agent.mcp.client import McpClient, McpToolExecutionError
 from agent.plugin_composition.mcp_slots import (
     McpServerBinding,
@@ -47,24 +45,6 @@ _POLL_SECONDS = 0.02
 _STOP_TIMEOUT_SECONDS = 5.0
 _READINESS_TIMEOUT_SECONDS = 8.0
 _MAX_LOG_LINES = 8
-
-_MCP_ENV_SCRUB_KEYS: contextvars.ContextVar[frozenset[str]] = (
-    contextvars.ContextVar("mcp_generation_host_env_scrub_keys", default=frozenset())
-)
-_ORIGINAL_OWNED_PROCESS_ENV = _mcp_client_module.owned_process_env
-
-
-def _owned_process_env_with_scrub(overrides: dict[str, str]) -> dict[str, str]:
-    environment = _ORIGINAL_OWNED_PROCESS_ENV(overrides)
-    for key in _MCP_ENV_SCRUB_KEYS.get():
-        environment.pop(key, None)
-        if key in overrides:
-            environment[key] = overrides[key]
-    return environment
-
-
-_mcp_client_module.owned_process_env = _owned_process_env_with_scrub
-
 
 class HealthReporter(Protocol):
     def __call__(
@@ -810,6 +790,9 @@ class McpGenerationHost:
             command=list(materialized.command),
             env=environment,
             cwd=materialized.cwd,
+            env_scrub_keys=frozenset(
+                key for key, _ in binding.descriptor.candidate_env
+            ),
         )
         self._next_epoch += 1
         entry = _McpEntry(
@@ -837,10 +820,7 @@ class McpGenerationHost:
         )
         try:
             infos = await asyncio.wait_for(
-                _connect_with_env_projection(
-                    client,
-                    frozenset(key for key, _ in binding.descriptor.candidate_env),
-                ),
+                client.connect(),
                 timeout=self._readiness_timeout_seconds,
             )
         except asyncio.CancelledError:
@@ -1358,17 +1338,6 @@ def _freeze_schema(value: Mapping[str, Any]) -> Mapping[str, Any]:
         return item
 
     return cast(Mapping[str, Any], freeze(value))
-
-
-async def _connect_with_env_projection(
-    client: McpClient,
-    scrub_keys: frozenset[str],
-) -> list[Any]:
-    token = _MCP_ENV_SCRUB_KEYS.set(scrub_keys)
-    try:
-        return await client.connect()
-    finally:
-        _MCP_ENV_SCRUB_KEYS.reset(token)
 
 
 async def _disconnect_after_readiness_failure(client: McpClient) -> None:

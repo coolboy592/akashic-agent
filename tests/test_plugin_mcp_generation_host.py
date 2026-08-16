@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import socket
+import subprocess
 import sys
 from pathlib import Path
 
@@ -236,6 +237,30 @@ async def test_child_env_scrubs_ambient_candidate_value(monkeypatch, tmp_path: P
     finally:
         await host.close()
         await root.dispose()
+
+
+def test_host_reload_does_not_mutate_shared_process_environment_builder() -> None:
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import importlib\n"
+                "import agent.mcp.client as client\n"
+                "import agent.plugins.mcp_generation_host as host\n"
+                "original = client.owned_process_env\n"
+                "importlib.reload(host)\n"
+                "assert client.owned_process_env is original\n"
+                "assert isinstance(client.owned_process_env({}), dict)\n"
+            ),
+        ],
+        cwd=Path(__file__).parents[1],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert probe.returncode == 0, probe.stderr
 
 
 @pytest.mark.asyncio
