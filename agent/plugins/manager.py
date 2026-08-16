@@ -24,6 +24,7 @@ from pydantic import BaseModel, ValidationError
 
 from agent.plugin_composition import (
     COMMANDS,
+    MANAGED_PROCESSES,
     MCP_SERVERS,
     MEMORY_RUNTIME,
     UI_SLOTS,
@@ -38,6 +39,7 @@ from agent.plugin_composition import (
     ServiceView,
 )
 from agent.plugin_composition.mcp_slots import PluginMcpServers
+from agent.plugin_composition.process_slots import PluginManagedProcesses
 from agent.plugin_composition.model import resolve_declared_workspace_root
 from agent.plugins.composable import ComposablePlugin
 
@@ -4385,7 +4387,18 @@ class PluginManager:
                 MCP_SERVERS in cast(ComposablePlugin, item.instance).inject
                 for item in ordered
             ):
-                _ = await root.context.provide(MCP_SERVERS, PluginMcpServers())
+                _ = await root.context.provide(
+                    MCP_SERVERS,
+                    PluginMcpServers(root.instance_token),
+                )
+            if any(
+                MANAGED_PROCESSES in cast(ComposablePlugin, item.instance).inject
+                for item in ordered
+            ):
+                _ = await root.context.provide(
+                    MANAGED_PROCESSES,
+                    PluginManagedProcesses(root.instance_token),
+                )
             if any(
                 UI_SLOTS in cast(ComposablePlugin, item.instance).inject
                 for item in ordered
@@ -6088,6 +6101,8 @@ def _replace_snapshot_payload(
         "mobile_ui_registry_identity",
         "mcp_server_registry",
         "mcp_server_registry_identity",
+        "managed_process_registry",
+        "managed_process_registry_identity",
         "tool_registry",
         "plugin_skill_index",
         "command_registry",

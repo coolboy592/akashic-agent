@@ -18,6 +18,7 @@ from agent.tool_hooks import ToolHook
 from agent.skills import SkillIndex
 from agent.plugin_composition import (
     COMMANDS,
+    MANAGED_PROCESSES,
     MCP_SERVERS,
     CommandRegistry,
     CompositionError,
@@ -29,6 +30,10 @@ from agent.plugin_composition import (
 from agent.plugin_composition.mcp_slots import (
     McpServerRegistry,
     _freeze_plugin_mcp_servers,
+)
+from agent.plugin_composition.process_slots import (
+    ManagedProcessRegistry,
+    _freeze_plugin_managed_processes,
 )
 from bus.event_bus import Handler
 from infra.channels.contract import Channel
@@ -76,6 +81,8 @@ class RuntimeSnapshot:
     mobile_ui_registry_identity: str | None = None
     mcp_server_registry: McpServerRegistry | None = None
     mcp_server_registry_identity: str | None = None
+    managed_process_registry: ManagedProcessRegistry | None = None
+    managed_process_registry_identity: str | None = None
     tool_registry: ToolRegistry | None = None
     plugin_skill_index: SkillIndex | None = None
     command_registry: CommandRegistry | None = None
@@ -250,6 +257,7 @@ class RuntimeSnapshotCompiler:
         command_registry: CommandRegistry | None = None
         mobile_ui_registry: MobileUiRegistry | None = None
         mcp_server_registry: McpServerRegistry | None = None
+        managed_process_registry: ManagedProcessRegistry | None = None
         if composition_root is not None:
             receipt = composition_root.receipt()
             if require_composition_ready and not receipt.ready:
@@ -297,6 +305,33 @@ class RuntimeSnapshotCompiler:
             if commands is not None:
                 command_registry = commands.freeze()
                 identity += f"|commands:{command_registry.catalog_digest}"
+            process_declarations = composition_root.context.get(MANAGED_PROCESSES)
+            if process_declarations is not None:
+                frozen_processes = _freeze_plugin_managed_processes(
+                    process_declarations,
+                    composition_root.instance_token,
+                )
+                legacy_process_names = {
+                    name
+                    for generation in ordered
+                    for name in generation.contributions.managed_services
+                }
+                process_collisions = legacy_process_names.intersection(
+                    frozen_processes
+                )
+                if process_collisions:
+                    raise RuntimeError(
+                        "RuntimeSnapshot v2/v3 managed process 名称冲突: "
+                        + ", ".join(sorted(process_collisions))
+                    )
+                for descriptor in frozen_processes.descriptors:
+                    if descriptor.owner not in generations:
+                        raise RuntimeError(
+                            "RuntimeSnapshot managed process owner 不属于 generations: "
+                            f"{descriptor.owner}"
+                        )
+                managed_process_registry = frozen_processes
+                identity += f"|managed-process-v3:{frozen_processes.identity}"
             mcp_servers = composition_root.context.get(MCP_SERVERS)
             if mcp_servers is not None:
                 frozen_mcp = _freeze_plugin_mcp_servers(
@@ -321,6 +356,21 @@ class RuntimeSnapshotCompiler:
                             "RuntimeSnapshot MCP owner 不属于 generations: "
                             f"{descriptor.owner}"
                         )
+                    for endpoint in descriptor.endpoint_env:
+                        process = (
+                            None
+                            if managed_process_registry is None
+                            else managed_process_registry.get(endpoint.process)
+                        )
+                        if (
+                            process is None
+                            or process.descriptor.owner != descriptor.owner
+                        ):
+                            raise RuntimeError(
+                                "RuntimeSnapshot MCP endpoint 缺少同 owner managed process: "
+                                f"{descriptor.owner}:{descriptor.name} -> "
+                                f"{endpoint.process}"
+                            )
                 mcp_server_registry = frozen_mcp
                 identity += f"|mcp-v3:{frozen_mcp.identity}"
         snapshot_id = hashlib.sha256(identity.encode()).hexdigest()[:16]
@@ -352,6 +402,12 @@ class RuntimeSnapshotCompiler:
                 None
                 if mcp_server_registry is None
                 else mcp_server_registry.identity
+            ),
+            managed_process_registry=managed_process_registry,
+            managed_process_registry_identity=(
+                None
+                if managed_process_registry is None
+                else managed_process_registry.identity
             ),
             plugin_skill_index=(
                 catalog_owner.skill_catalog.normal_plugins
@@ -1195,6 +1251,8 @@ class RuntimeSnapshotStore:
                 or snapshot.mobile_ui_registry_identity is not None
                 or snapshot.mcp_server_registry is not None
                 or snapshot.mcp_server_registry_identity is not None
+                or snapshot.managed_process_registry is not None
+                or snapshot.managed_process_registry_identity is not None
             ):
                 raise RuntimeError(
                     "RuntimeSnapshot composition identity 缺少 Root Context"
@@ -1224,6 +1282,25 @@ class RuntimeSnapshotStore:
             is not root.instance_token
         ):
             raise RuntimeError("RuntimeSnapshot MCP registry 不属于 exact Root")
+        if (
+            snapshot.managed_process_registry_identity
+            != (
+                None
+                if snapshot.managed_process_registry is None
+                else snapshot.managed_process_registry.identity
+            )
+        ):
+            raise RuntimeError(
+                "RuntimeSnapshot managed process descriptor 在编译后发生变化"
+            )
+        if (
+            snapshot.managed_process_registry is not None
+            and snapshot.managed_process_registry.root_instance_token
+            is not root.instance_token
+        ):
+            raise RuntimeError(
+                "RuntimeSnapshot managed process registry 不属于 exact Root"
+            )
         topology = snapshot.composition_topology
         if topology is None:
             raise RuntimeError("RuntimeSnapshot composition Root 缺少 TopologyView")

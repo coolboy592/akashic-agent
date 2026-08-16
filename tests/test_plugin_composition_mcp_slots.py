@@ -69,7 +69,7 @@ async def test_mcp_registry_freezes_descriptor_health_and_cleanup(
 ) -> None:
     plugin_dir = _plugin_dir(tmp_path)
     root = CompositionRoot("mcp-registry")
-    servers = PluginMcpServers()
+    servers = PluginMcpServers(root.instance_token)
     _ = await root.context.provide(MCP_SERVERS, servers)
 
     async def apply(ctx) -> None:
@@ -104,7 +104,7 @@ async def test_mcp_registry_rejects_duplicate_frozen_and_reserved_env(
 ) -> None:
     plugin_dir = _plugin_dir(tmp_path)
     root = CompositionRoot("mcp-invalid")
-    servers = PluginMcpServers()
+    servers = PluginMcpServers(root.instance_token)
     _ = await root.context.provide(MCP_SERVERS, servers)
     captured = None
 
@@ -126,7 +126,7 @@ async def test_mcp_registry_rejects_duplicate_frozen_and_reserved_env(
     await root.dispose()
 
     root = CompositionRoot("mcp-reserved")
-    servers = PluginMcpServers()
+    servers = PluginMcpServers(root.instance_token)
     _ = await root.context.provide(MCP_SERVERS, servers)
 
     async def reserved(ctx) -> None:
@@ -157,7 +157,7 @@ async def test_mcp_registry_identity_ignores_runtime_root(tmp_path: Path) -> Non
     for suffix in ("candidate", "formal"):
         plugin_dir = _plugin_dir(tmp_path / suffix)
         root = CompositionRoot(f"mcp-{suffix}")
-        servers = PluginMcpServers()
+        servers = PluginMcpServers(root.instance_token)
         _ = await root.context.provide(MCP_SERVERS, servers)
 
         async def apply(ctx) -> None:
@@ -190,7 +190,7 @@ async def test_mcp_registry_rejects_missing_command_and_escaped_cwd(
     )
     for index, definition in enumerate(definitions):
         root = CompositionRoot(f"mcp-path-{index}")
-        servers = PluginMcpServers()
+        servers = PluginMcpServers(root.instance_token)
         _ = await root.context.provide(MCP_SERVERS, servers)
 
         async def apply(ctx, definition=definition) -> None:
@@ -214,7 +214,7 @@ async def test_plugins_cannot_freeze_shared_mcp_declarations_early(
     tmp_path: Path,
 ) -> None:
     root = CompositionRoot("mcp-core-freeze-owner")
-    servers = PluginMcpServers()
+    servers = PluginMcpServers(root.instance_token)
     _ = await root.context.provide(MCP_SERVERS, servers)
 
     definitions = (
@@ -244,6 +244,43 @@ async def test_plugins_cannot_freeze_shared_mcp_declarations_early(
     await root.dispose()
 
 
+@pytest.mark.asyncio
+async def test_mcp_registry_rejects_context_from_another_root(
+    tmp_path: Path,
+) -> None:
+    root_a = CompositionRoot("mcp-root-a")
+    root_b = CompositionRoot("mcp-root-b")
+    servers_a = PluginMcpServers(root_a.instance_token)
+    servers_b = PluginMcpServers(root_b.instance_token)
+    _ = await root_a.context.provide(MCP_SERVERS, servers_a)
+    _ = await root_b.context.provide(MCP_SERVERS, servers_b)
+    plugin_dir = _plugin_dir(tmp_path)
+
+    async def apply(ctx) -> None:
+        await servers_a.register(ctx, _definition())
+
+    _ = await root_b.mount(
+        apply,
+        name="calendar",
+        inject=(MCP_SERVERS,),
+        runtime=_runtime(plugin_dir),
+    )
+
+    assert any(
+        "插件 MCP 声明 Service 不属于当前 Root" in (fiber.error or "")
+        for fiber in root_b.receipt().fibers
+    )
+    assert root_a.receipt().health == ()
+    assert root_b.receipt().health == ()
+    assert root_a.receipt().effects == ("root:service:core.mcp_servers",)
+    assert root_b.receipt().effects == ("root:service:core.mcp_servers",)
+    assert len(_freeze_plugin_mcp_servers(servers_a, root_a.instance_token)) == 0
+    assert len(_freeze_plugin_mcp_servers(servers_b, root_b.instance_token)) == 0
+
+    await root_b.dispose()
+    await root_a.dispose()
+
+
 def _manager(tmp_path: Path) -> PluginManager:
     return PluginManager(
         plugin_dirs=[tmp_path / "plugins"],
@@ -257,13 +294,20 @@ def _manager(tmp_path: Path) -> PluginManager:
 def _plugin_source(version: str) -> str:
     return (
         "from agent.plugin_composition import (\n"
-        "    MCP_SERVERS, EndpointEnv, McpServerDefinition,\n"
+        "    MANAGED_PROCESSES, MCP_SERVERS, EndpointEnv,\n"
+        "    ManagedProcessDefinition, McpServerDefinition,\n"
         ")\n"
         "api_version = 3\n"
         "name = 'calendar'\n"
         f"version = '{version}'\n"
-        "inject = (MCP_SERVERS,)\n"
+        "inject = (MCP_SERVERS, MANAGED_PROCESSES)\n"
         "async def apply(ctx, config):\n"
+        "    await ctx.require(MANAGED_PROCESSES).register(\n"
+        "        ctx, ManagedProcessDefinition(\n"
+        "            name='calendar_api', command=('python', 'api.py'),\n"
+        "            formal_port=18000, readiness_path='/health',\n"
+        "        ),\n"
+        "    )\n"
         "    await ctx.require(MCP_SERVERS).register(\n"
         "        ctx, McpServerDefinition(\n"
         "            name='calendar', command=('python', 'mcp.py'),\n"
@@ -282,6 +326,7 @@ def _write_manager_plugin(tmp_path: Path, version: str) -> Path:
         _plugin_source(version),
         encoding="utf-8",
     )
+    (plugin_dir / "api.py").write_text("print('api')\n", encoding="utf-8")
     return plugin_dir
 
 
@@ -347,4 +392,37 @@ async def test_manager_rejects_mcp_registry_drift_before_publish(
     assert manager.current_snapshot.mcp_server_registry is stable_registry
 
     await manager.discard_prepared("calendar")
+    await manager.terminate_all()
+
+
+@pytest.mark.asyncio
+async def test_manager_rejects_mcp_endpoint_without_same_owner_process(
+    tmp_path: Path,
+) -> None:
+    plugin_dir = _plugin_dir(tmp_path / "plugins")
+    (plugin_dir / "plugin.py").write_text(
+        "from agent.plugin_composition import (\n"
+        "    MCP_SERVERS, EndpointEnv, McpServerDefinition,\n"
+        ")\n"
+        "api_version = 3\n"
+        "name = 'calendar'\n"
+        "version = '1'\n"
+        "inject = (MCP_SERVERS,)\n"
+        "async def apply(ctx, config):\n"
+        "    await ctx.require(MCP_SERVERS).register(\n"
+        "        ctx, McpServerDefinition(\n"
+        "            name='calendar', command=('python', 'mcp.py'),\n"
+        "            endpoint_env=(EndpointEnv('PORT', 'calendar_api'),),\n"
+        "        ),\n"
+        "    )\n",
+        encoding="utf-8",
+    )
+    manager = _manager(tmp_path)
+
+    await manager.load_all()
+
+    assert manager.generation("calendar") is None
+    gate = manager.latest_gate("calendar")
+    assert gate is not None and gate.status == "failed"
+    assert "缺少同 owner managed process" in gate.failure_reason
     await manager.terminate_all()

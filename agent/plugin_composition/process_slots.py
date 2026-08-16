@@ -2,18 +2,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
+from urllib.parse import urlsplit
 
 from agent.plugin_composition.context import Context, FiberHandle, HealthHandle
-from agent.plugin_composition.model import (
-    CompositionError,
-    FiberState,
-    ServiceKey,
-)
+from agent.plugin_composition.model import CompositionError, FiberState, ServiceKey
 
 _NAME = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 _ENV_NAME = re.compile(r"^[A-Z_][A-Z0-9_]{0,127}$")
@@ -27,40 +25,34 @@ _RESERVED_ENV = frozenset(
 
 
 @dataclass(frozen=True, slots=True)
-class EndpointEnv:
-    env: str
-    process: str
-
-
-@dataclass(frozen=True, slots=True)
-class McpServerDefinition:
+class ManagedProcessDefinition:
     name: str
     command: tuple[str, ...]
     cwd: str = "."
     env: Mapping[str, str] = field(default_factory=dict)
-    required_tools: tuple[str, ...] = ()
-    candidate_read_only_tools: tuple[str, ...] = ()
-    endpoint_env: tuple[EndpointEnv, ...] = ()
-    candidate_env: Mapping[str, str] = field(default_factory=dict)
+    port_env: str = "PORT"
+    formal_port: int = 0
+    readiness_path: str = "/health"
+    startup_timeout_seconds: float = 15.0
 
 
 @dataclass(frozen=True, slots=True)
-class McpServerDescriptor:
+class ManagedProcessDescriptor:
     owner: str
     name: str
     command: tuple[str, ...]
     cwd: str
     env: tuple[tuple[str, str], ...]
-    required_tools: tuple[str, ...]
-    candidate_read_only_tools: tuple[str, ...]
-    endpoint_env: tuple[EndpointEnv, ...]
-    candidate_env: tuple[tuple[str, str], ...]
+    port_env: str
+    formal_port: int
+    readiness_path: str
+    startup_timeout_seconds: float
 
 
 @dataclass(frozen=True, slots=True)
-class McpServerBinding:
-    descriptor: McpServerDescriptor
-    definition: McpServerDefinition
+class ManagedProcessBinding:
+    descriptor: ManagedProcessDescriptor
+    definition: ManagedProcessDefinition
     health: HealthHandle
     owner_fiber: FiberHandle
     activation_token: object
@@ -75,12 +67,12 @@ class McpServerBinding:
         )
 
 
-class McpServerRegistry(Mapping[str, McpServerBinding]):
-    """Expose one immutable Root-local MCP declaration catalog."""
+class ManagedProcessRegistry(Mapping[str, ManagedProcessBinding]):
+    """Expose one immutable Root-local managed-process catalog."""
 
     def __init__(
         self,
-        bindings: Mapping[str, McpServerBinding],
+        bindings: Mapping[str, ManagedProcessBinding],
         *,
         root_instance_token: object,
     ) -> None:
@@ -98,15 +90,10 @@ class McpServerRegistry(Mapping[str, McpServerBinding]):
                 "command": list(item.command),
                 "cwd": item.cwd,
                 "env": list(item.env),
-                "required_tools": list(item.required_tools),
-                "candidate_read_only_tools": list(
-                    item.candidate_read_only_tools
-                ),
-                "endpoint_env": [
-                    {"env": endpoint.env, "process": endpoint.process}
-                    for endpoint in item.endpoint_env
-                ],
-                "candidate_env": list(item.candidate_env),
+                "port_env": item.port_env,
+                "formal_port": item.formal_port,
+                "readiness_path": item.readiness_path,
+                "startup_timeout_seconds": item.startup_timeout_seconds,
             }
             for item in self._descriptors
         ]
@@ -120,7 +107,7 @@ class McpServerRegistry(Mapping[str, McpServerBinding]):
         ).hexdigest()
 
     @property
-    def descriptors(self) -> tuple[McpServerDescriptor, ...]:
+    def descriptors(self) -> tuple[ManagedProcessDescriptor, ...]:
         return self._descriptors
 
     @property
@@ -135,7 +122,7 @@ class McpServerRegistry(Mapping[str, McpServerBinding]):
     def root_instance_token(self) -> object:
         return self._root_instance_token
 
-    def __getitem__(self, name: str) -> McpServerBinding:
+    def __getitem__(self, name: str) -> ManagedProcessBinding:
         return self._bindings[name]
 
     def __iter__(self) -> Iterator[str]:
@@ -145,35 +132,37 @@ class McpServerRegistry(Mapping[str, McpServerBinding]):
         return len(self._bindings)
 
 
-MCP_SERVERS = ServiceKey["PluginMcpServers"]("core.mcp_servers")
+MANAGED_PROCESSES = ServiceKey["PluginManagedProcesses"](
+    "core.managed_processes"
+)
 
 
 @dataclass(slots=True)
-class _McpRegistration:
+class _ProcessRegistration:
     token: int
     owner: str
-    definition: McpServerDefinition
-    descriptor: McpServerDescriptor
+    definition: ManagedProcessDefinition
+    descriptor: ManagedProcessDescriptor
     owner_fiber: FiberHandle
     activation_token: object
     health: HealthHandle | None = None
 
 
-class _McpServerDeclarations:
+class _ManagedProcessDeclarations:
     """Own one Root-local mutable declaration set for Core."""
 
     def __init__(self) -> None:
         self._next_token = 1
-        self._registrations: dict[int, _McpRegistration] = {}
+        self._registrations: dict[int, _ProcessRegistration] = {}
         self._names: dict[str, int] = {}
-        self._frozen: McpServerRegistry | None = None
+        self._frozen: ManagedProcessRegistry | None = None
 
     async def register(
         self,
         ctx: Context,
-        definition: McpServerDefinition,
+        definition: ManagedProcessDefinition,
     ) -> None:
-        """Validate and register one declaration as Fiber-owned effects."""
+        """Validate and register one process declaration as Fiber-owned effects."""
 
         # 1. Freeze source-relative inputs before any Root state changes.
         normalized = _normalize_definition(ctx.runtime.plugin_dir, definition)
@@ -184,7 +173,7 @@ class _McpServerDeclarations:
                 "INACTIVE_FIBER",
                 f"{ctx.runtime.plugin_id} 当前 Fiber 没有 active activation",
             )
-        registration: _McpRegistration | None = None
+        registration: _ProcessRegistration | None = None
 
         def setup() -> Callable[[], None]:
             nonlocal registration
@@ -196,40 +185,43 @@ class _McpServerDeclarations:
             )
             return cleanup
 
-        # 2. Registration and required health either both settle or both roll back.
+        # 2. Registration and required health either both settle or roll back.
         registration_effect = await ctx.effect(
             setup,
-            label=f"mcp-server:{normalized.name}",
+            label=f"managed-process:{normalized.name}",
         )
         try:
-            health = await ctx.health(f"mcp:{normalized.name}", required=True)
+            health = await ctx.health(
+                f"managed-process:{normalized.name}",
+                required=True,
+            )
         except BaseException:
             await registration_effect.aclose()
             raise
         assert registration is not None
         registration.health = health
 
-    def freeze(self, root_instance_token: object) -> McpServerRegistry:
+    def freeze(self, root_instance_token: object) -> ManagedProcessRegistry:
         """Freeze declarations into an immutable snapshot registry."""
 
         if self._frozen is not None:
             if self._frozen.root_instance_token is not root_instance_token:
-                raise RuntimeError("MCP declaration registry 属于另一棵 Root")
+                raise RuntimeError("managed process registry 属于另一棵 Root")
             return self._frozen
-        bindings: dict[str, McpServerBinding] = {}
+        bindings: dict[str, ManagedProcessBinding] = {}
         for registration in sorted(
             self._registrations.values(), key=lambda item: item.token
         ):
             if registration.health is None:
-                raise RuntimeError("MCP declaration 缺少 required Health")
-            bindings[registration.definition.name] = McpServerBinding(
+                raise RuntimeError("managed process 声明缺少 required Health")
+            bindings[registration.definition.name] = ManagedProcessBinding(
                 descriptor=registration.descriptor,
                 definition=registration.definition,
                 health=registration.health,
                 owner_fiber=registration.owner_fiber,
                 activation_token=registration.activation_token,
             )
-        self._frozen = McpServerRegistry(
+        self._frozen = ManagedProcessRegistry(
             bindings,
             root_instance_token=root_instance_token,
         )
@@ -238,25 +230,25 @@ class _McpServerDeclarations:
     def _register(
         self,
         owner: str,
-        definition: McpServerDefinition,
+        definition: ManagedProcessDefinition,
         owner_fiber: FiberHandle,
         activation_token: object,
-    ) -> tuple[_McpRegistration, Callable[[], None]]:
+    ) -> tuple[_ProcessRegistration, Callable[[], None]]:
         """Add one normalized declaration and return its exact inverse."""
 
         if self._frozen is not None:
             raise CompositionError(
-                "PLUGIN_MCP_SERVERS_FROZEN",
-                "插件 MCP 声明已冻结，不能在 snapshot 发布后新增",
+                "PLUGIN_MANAGED_PROCESSES_FROZEN",
+                "插件 managed process 声明已冻结",
             )
         if definition.name in self._names:
             raise CompositionError(
-                "DUPLICATE_PLUGIN_MCP_SERVER",
-                f"插件 MCP server 名称重复: {definition.name}",
+                "DUPLICATE_PLUGIN_MANAGED_PROCESS",
+                f"插件 managed process 名称重复: {definition.name}",
             )
         token = self._next_token
         self._next_token += 1
-        registration = _McpRegistration(
+        registration = _ProcessRegistration(
             token=token,
             owner=owner,
             definition=definition,
@@ -275,106 +267,120 @@ class _McpServerDeclarations:
         return registration, cleanup
 
 
-class PluginMcpServers:
-    """Expose only Fiber-owned MCP registration to plugins."""
+class PluginManagedProcesses:
+    """Expose only Fiber-owned process registration to plugins."""
 
     def __init__(self, root_instance_token: object) -> None:
         self._root_instance_token = root_instance_token
-        self._declarations = _McpServerDeclarations()
+        self._declarations = _ManagedProcessDeclarations()
 
     async def register(
         self,
         ctx: Context,
-        definition: McpServerDefinition,
+        definition: ManagedProcessDefinition,
     ) -> None:
-        """Register one declaration through the Core-owned collector."""
+        """Register one process declaration through the Core-owned collector."""
 
         if (
             ctx._root_instance_token() is not self._root_instance_token
-            or ctx.require(MCP_SERVERS) is not self
+            or ctx.require(MANAGED_PROCESSES) is not self
         ):
             raise CompositionError(
-                "MCP_SERVICE_ROOT_MISMATCH",
-                "插件 MCP 声明 Service 不属于当前 Root",
+                "MANAGED_PROCESS_SERVICE_ROOT_MISMATCH",
+                "插件 managed process Service 不属于当前 Root",
             )
         await self._declarations.register(ctx, definition)
 
 
-def _freeze_plugin_mcp_servers(
+def _freeze_plugin_managed_processes(
     value: object,
     root_instance_token: object,
-) -> McpServerRegistry:
-    """Freeze the exact Core-created MCP registration facade."""
+) -> ManagedProcessRegistry:
+    """Freeze the exact Core-created process registration facade."""
 
-    if not isinstance(value, PluginMcpServers):
-        raise RuntimeError("RuntimeSnapshot MCP Service 类型无效")
+    if not isinstance(value, PluginManagedProcesses):
+        raise RuntimeError("RuntimeSnapshot managed process Service 类型无效")
     if value._root_instance_token is not root_instance_token:
-        raise RuntimeError("RuntimeSnapshot MCP Service 不属于 exact Root")
+        raise RuntimeError("RuntimeSnapshot managed process Service 不属于 exact Root")
     return value._declarations.freeze(root_instance_token)
 
 
 def _normalize_definition(
     plugin_dir: Path,
-    definition: McpServerDefinition,
-) -> McpServerDefinition:
-    """Validate and detach one plugin-owned MCP declaration."""
+    definition: ManagedProcessDefinition,
+) -> ManagedProcessDefinition:
+    """Validate and detach one plugin-owned process declaration."""
 
-    if not isinstance(definition, McpServerDefinition):
-        raise TypeError("PluginMcpServers.register 只接受 McpServerDefinition")
+    if not isinstance(definition, ManagedProcessDefinition):
+        raise TypeError("PluginManagedProcesses.register 只接受 ManagedProcessDefinition")
     if not isinstance(definition.name, str) or not _NAME.fullmatch(definition.name):
-        raise ValueError(f"MCP server name 无效: {definition.name}")
+        raise ValueError(f"managed process name 无效: {definition.name}")
     command = _string_tuple(definition.command, "command", allow_empty=False)
     cwd = _relative_path(plugin_dir, definition.cwd, kind="cwd", directory=True)
     for item in command:
         if Path(item).is_absolute():
-            raise ValueError("MCP command 不得声明绝对 artifact 路径")
+            raise ValueError("managed process command 不得声明绝对 artifact 路径")
         if item.startswith("-"):
             continue
         if "/" in item or "\\" in item or item.startswith(".") or item.endswith(".py"):
             _ = _relative_path(plugin_dir, item, kind="command", directory=False)
-    env = _environment(definition.env, field_name="env")
-    candidate_env = _environment(
-        definition.candidate_env,
-        field_name="candidate_env",
-    )
-    required_tools = _string_tuple(definition.required_tools, "required_tools")
-    candidate_tools = _string_tuple(
-        definition.candidate_read_only_tools,
-        "candidate_read_only_tools",
-    )
-    endpoints = _endpoint_tuple(definition.endpoint_env)
-    occupied = set(env) | set(candidate_env)
-    if occupied.intersection(endpoint.env for endpoint in endpoints):
-        raise ValueError(f"MCP endpoint env 与声明 env 冲突: {definition.name}")
-    return McpServerDefinition(
+    env = _environment(definition.env)
+    port_env = definition.port_env
+    if (
+        not isinstance(port_env, str)
+        or not _ENV_NAME.fullmatch(port_env)
+        or port_env in _RESERVED_ENV
+        or port_env in env
+    ):
+        raise ValueError(f"managed process port_env 无效: {port_env}")
+    formal_port = definition.formal_port
+    if (
+        not isinstance(formal_port, int)
+        or isinstance(formal_port, bool)
+        or not 1 <= formal_port <= 65535
+    ):
+        raise ValueError(f"managed process formal_port 无效: {formal_port}")
+    readiness_path = _readiness_path(definition.readiness_path)
+    timeout = definition.startup_timeout_seconds
+    if (
+        not isinstance(timeout, (int, float))
+        or isinstance(timeout, bool)
+        or not math.isfinite(float(timeout))
+        or not 0 < float(timeout) <= 300
+    ):
+        raise ValueError(f"managed process startup timeout 无效: {timeout}")
+    return ManagedProcessDefinition(
         name=definition.name,
         command=command,
         cwd=cwd,
         env=MappingProxyType(env),
-        required_tools=required_tools,
-        candidate_read_only_tools=candidate_tools,
-        endpoint_env=endpoints,
-        candidate_env=MappingProxyType(candidate_env),
+        port_env=port_env,
+        formal_port=formal_port,
+        readiness_path=readiness_path,
+        startup_timeout_seconds=float(timeout),
     )
 
 
-def _descriptor(owner: str, definition: McpServerDefinition) -> McpServerDescriptor:
-    return McpServerDescriptor(
+def _descriptor(
+    owner: str,
+    definition: ManagedProcessDefinition,
+) -> ManagedProcessDescriptor:
+    return ManagedProcessDescriptor(
         owner=owner,
         name=definition.name,
         command=definition.command,
         cwd=definition.cwd,
         env=tuple(sorted(definition.env.items())),
-        required_tools=definition.required_tools,
-        candidate_read_only_tools=definition.candidate_read_only_tools,
-        endpoint_env=definition.endpoint_env,
-        candidate_env=tuple(sorted(definition.candidate_env.items())),
+        port_env=definition.port_env,
+        formal_port=definition.formal_port,
+        readiness_path=definition.readiness_path,
+        startup_timeout_seconds=definition.startup_timeout_seconds,
     )
 
 
-def _environment(value: Mapping[str, str], *, field_name: str) -> dict[str, str]:
+def _environment(value: Mapping[str, str]) -> dict[str, str]:
     if not isinstance(value, Mapping):
-        raise TypeError(f"MCP {field_name} 必须是字符串 mapping")
+        raise TypeError("managed process env 必须是字符串 mapping")
     result: dict[str, str] = {}
     for key, item in value.items():
         if (
@@ -383,28 +389,25 @@ def _environment(value: Mapping[str, str], *, field_name: str) -> dict[str, str]
             or key in _RESERVED_ENV
             or not isinstance(item, str)
         ):
-            raise ValueError(f"MCP {field_name} 无效: {key}")
+            raise ValueError(f"managed process env 无效: {key}")
         result[key] = item
     return result
 
 
-def _endpoint_tuple(value: tuple[EndpointEnv, ...]) -> tuple[EndpointEnv, ...]:
-    if not isinstance(value, tuple):
-        raise TypeError("MCP endpoint_env 必须是 tuple")
-    result: list[EndpointEnv] = []
-    seen: set[str] = set()
-    for endpoint in value:
-        if (
-            not isinstance(endpoint, EndpointEnv)
-            or not _ENV_NAME.fullmatch(endpoint.env)
-            or endpoint.env in _RESERVED_ENV
-            or not _NAME.fullmatch(endpoint.process)
-            or endpoint.env in seen
-        ):
-            raise ValueError(f"MCP endpoint env 无效: {endpoint!r}")
-        seen.add(endpoint.env)
-        result.append(EndpointEnv(endpoint.env, endpoint.process))
-    return tuple(result)
+def _readiness_path(raw: str) -> str:
+    if (
+        not isinstance(raw, str)
+        or not raw.startswith("/")
+        or raw.startswith("//")
+        or raw != raw.strip()
+        or "\\" in raw
+        or any(part in {".", ".."} for part in raw.split("/"))
+    ):
+        raise ValueError(f"managed process readiness_path 无效: {raw}")
+    parsed = urlsplit(raw)
+    if parsed.scheme or parsed.netloc or parsed.query or parsed.fragment:
+        raise ValueError(f"managed process readiness_path 无效: {raw}")
+    return raw
 
 
 def _string_tuple(
@@ -414,11 +417,13 @@ def _string_tuple(
     allow_empty: bool = True,
 ) -> tuple[str, ...]:
     if not isinstance(value, tuple) or (not value and not allow_empty):
-        raise ValueError(f"MCP {field_name} 必须是非空 tuple" if not allow_empty else f"MCP {field_name} 必须是 tuple")
-    if any(not isinstance(item, str) or not item or item != item.strip() for item in value):
-        raise ValueError(f"MCP {field_name} 包含无效字符串")
-    if len(set(value)) != len(value):
-        raise ValueError(f"MCP {field_name} 包含重复项")
+        requirement = "非空 tuple" if not allow_empty else "tuple"
+        raise ValueError(f"managed process {field_name} 必须是{requirement}")
+    if any(
+        not isinstance(item, str) or not item or item != item.strip()
+        for item in value
+    ):
+        raise ValueError(f"managed process {field_name} 包含无效字符串")
     return tuple(value)
 
 
@@ -429,14 +434,19 @@ def _relative_path(
     kind: str,
     directory: bool,
 ) -> str:
-    if not isinstance(raw, str) or not raw or raw != raw.strip() or Path(raw).is_absolute():
-        raise ValueError(f"MCP {kind} 必须是 artifact 内相对路径")
+    if (
+        not isinstance(raw, str)
+        or not raw
+        or raw != raw.strip()
+        or Path(raw).is_absolute()
+    ):
+        raise ValueError(f"managed process {kind} 必须是 artifact 内相对路径")
     root = plugin_dir.resolve(strict=True)
     try:
         resolved = (root / raw).resolve(strict=True)
     except FileNotFoundError as error:
-        raise ValueError(f"MCP {kind} 不存在: {raw}") from error
+        raise ValueError(f"managed process {kind} 不存在: {raw}") from error
     valid_type = resolved.is_dir() if directory else resolved.is_file()
     if not resolved.is_relative_to(root) or not valid_type:
-        raise ValueError(f"MCP {kind} 越过 immutable artifact: {raw}")
+        raise ValueError(f"managed process {kind} 越过 immutable artifact: {raw}")
     return raw
