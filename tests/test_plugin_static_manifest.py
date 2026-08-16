@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 import subprocess
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 import agent.plugins.install as install_module
+import agent.plugins.manager as manager_module
 from agent.plugins.install import install_git_plugin
-from agent.plugins.static_manifest import load_static_plugin_manifest
+from agent.plugins.static_manifest import (
+    load_static_plugin_manifest,
+    staged_python_interpreter,
+)
 
 
 def _git(root: Path, *args: str) -> str:
@@ -112,6 +118,130 @@ candidate_env = {CALENDAR_BACKEND = "recording"}
     assert manifest.mcp_servers[0].candidate_env == (("CALENDAR_BACKEND", "recording"),)
 
 
+def test_static_manifest_allows_external_executable_only_at_command_head(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "calendar"
+    (root / "mcp").mkdir(parents=True)
+    (root / "plugin.py").write_text("", encoding="utf-8")
+    (root / "mcp" / "run_mcp.py").write_text("", encoding="utf-8")
+    (root / "mcp" / "requirements.txt").write_text("", encoding="utf-8")
+    (root / "akashic.plugin.toml").write_text(
+        _manifest()
+        + f'\n[[mcp]]\nname = "calendar"\ncommand = ["{sys.executable}", "mcp/run_mcp.py"]\n',
+        encoding="utf-8",
+    )
+
+    manifest = load_static_plugin_manifest(root)
+
+    assert manifest.mcp_servers[0].command == (sys.executable, "mcp/run_mcp.py")
+
+    (root / "mcp" / ".venv" / "bin").mkdir(parents=True)
+    interpreter = root / "mcp" / ".venv" / "bin" / "python"
+    interpreter.write_text("", encoding="utf-8")
+    interpreter.chmod(interpreter.stat().st_mode | 0o111)
+    assert staged_python_interpreter(root, manifest.python[0]) == interpreter
+
+
+def test_static_manifest_rejects_external_command_argument(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "calendar"
+    (root / "mcp").mkdir(parents=True)
+    (root / "plugin.py").write_text("", encoding="utf-8")
+    (root / "mcp" / "run_mcp.py").write_text("", encoding="utf-8")
+    (root / "mcp" / "requirements.txt").write_text("", encoding="utf-8")
+    (root / "akashic.plugin.toml").write_text(
+        _manifest()
+        + f'\n[[mcp]]\nname = "calendar"\ncommand = ["{sys.executable}", "/tmp/other.py"]\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="artifact 外绝对路径"):
+        load_static_plugin_manifest(root)
+
+
+def test_manager_command_containment_preserves_staged_interpreter(
+    tmp_path: Path,
+) -> None:
+    plugin_root = tmp_path / "calendar"
+    plugin_root.mkdir()
+    script = plugin_root / "run.py"
+    script.write_text("", encoding="utf-8")
+
+    assert manager_module._resolve_command_item(  # pyright: ignore[reportPrivateUsage]
+        plugin_root,
+        sys.executable,
+        executable=True,
+    ) == sys.executable
+    assert manager_module._resolve_command_item(  # pyright: ignore[reportPrivateUsage]
+        plugin_root,
+        "./run.py",
+        executable=False,
+    ) == str(script.resolve())
+
+    outside = tmp_path / "not-executable"
+    outside.write_text("", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="绝对路径不允许越过 artifact"):
+        manager_module._resolve_command_item(  # pyright: ignore[reportPrivateUsage]
+            plugin_root,
+            str(outside),
+            executable=True,
+        )
+
+
+def test_candidate_data_inventory_excludes_manifest_paths(tmp_path: Path) -> None:
+    source = tmp_path / "production-data"
+    target = tmp_path / "candidate-data"
+    source.mkdir()
+    (source / "state.json").write_text("keep", encoding="utf-8")
+    (source / ".env").write_text("SECRET=bad", encoding="utf-8")
+    (source / "oauth").mkdir()
+    (source / "oauth" / "token.json").write_text("secret", encoding="utf-8")
+
+    inventory = manager_module._copy_validation_data(  # pyright: ignore[reportPrivateUsage]
+        source,
+        target,
+        (".env", "oauth"),
+    )
+
+    assert inventory == ("state.json",)
+    assert (target / "state.json").is_file()
+    assert not (target / ".env").exists()
+    assert not (target / "oauth").exists()
+
+
+def test_static_process_declaration_fails_without_c13_root_registry(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "calendar"
+    root.mkdir()
+    (root / "plugin.py").write_text("", encoding="utf-8")
+    (root / "run_server.py").write_text("", encoding="utf-8")
+    (root / "akashic.plugin.toml").write_text(
+        "schema_version = 1\n"
+        "name = 'calendar'\n"
+        "version = '3.0.0'\n"
+        "api_version = 3\n"
+        "entrypoint = 'plugin.py'\n\n"
+        "[[process]]\n"
+        "name = 'calendar_api'\n"
+        "command = ['python', 'run_server.py']\n"
+        "port_env = 'PORT'\n"
+        "formal_port = 18000\n",
+        encoding="utf-8",
+    )
+    manifest = load_static_plugin_manifest(root)
+    generation = SimpleNamespace(static_manifest=manifest, plugin_dir=root)
+    snapshot = SimpleNamespace(mcp_server_registry=None)
+
+    with pytest.raises(RuntimeError, match="process registry"):
+        manager_module._validate_static_manifest_runtime(  # pyright: ignore[reportPrivateUsage]
+            snapshot,
+            {"calendar": generation},
+        )
+
+
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
@@ -193,4 +323,3 @@ def test_v3_static_install_stages_before_importing_plugin(
     assert not (result.installed_path / "imported").exists()
     assert (result.installed_path / "akashic.plugin.toml").is_file()
     assert (result.installed_path / "mcp" / ".venv").is_dir()
-

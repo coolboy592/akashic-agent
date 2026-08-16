@@ -103,6 +103,43 @@ def test_plugin_doctor_reads_v3_namespace_declaration(tmp_path: Path) -> None:
     assert _check(report, "mcp")["detail"] == "servers=0"
 
 
+def test_plugin_doctor_uses_static_custom_entrypoint(tmp_path: Path) -> None:
+    plugins_home = tmp_path / ".akashic-plugin"
+    workspace = tmp_path / "workspace"
+    plugin_root = plugins_home / "cache" / "github" / "static_demo" / "1.0.0"
+    plugin_root.mkdir(parents=True)
+    (plugin_root / "entry.py").write_text(
+        "api_version = 3\n"
+        "name = 'static_demo'\n"
+        "version = '1.0.0'\n"
+        "def apply(ctx, config): pass\n",
+        encoding="utf-8",
+    )
+    (plugin_root / "akashic.plugin.toml").write_text(
+        "schema_version = 1\n"
+        "name = 'static_demo'\n"
+        "version = '1.0.0'\n"
+        "api_version = 3\n"
+        "entrypoint = 'entry.py'\n",
+        encoding="utf-8",
+    )
+    upsert_plugin_manifest(
+        "static_demo@github",
+        enabled=True,
+        plugins_home=plugins_home,
+    )
+
+    report = run_plugin_doctor(
+        plugin_id="static_demo@github",
+        config_path=str(_init_config(tmp_path)),
+        plugins_home=plugins_home,
+        workspace=workspace,
+    )
+
+    assert report["status"] == "healthy"
+    assert "entry.py" in format_plugin_doctor_report(report)
+
+
 def test_plugin_doctor_reads_latest_artifact_candidate(tmp_path: Path) -> None:
     plugins_home = tmp_path / ".akashic-plugin"
     workspace = tmp_path / "workspace"

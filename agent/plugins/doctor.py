@@ -83,7 +83,13 @@ def _inspect_plugin(
         plugin_id == "default_memory" and memory_engine != "default"
     )
     if stable_root is not None:
-        checks.append(_check("install", "ok", f"stable plugin.py: {stable_root}"))
+        checks.append(
+            _check(
+                "install",
+                "ok",
+                f"stable {_entrypoint_label(stable_root)}: {stable_root}",
+            )
+        )
         try:
             declaration = _load_plugin_declaration(stable_root)
             checks.extend(
@@ -101,7 +107,11 @@ def _inspect_plugin(
         checks.append(_check("install", "error", "未找到插件目录"))
     else:
         checks.append(
-            _check("install", "ok", f"latest candidate plugin.py: {latest_root}")
+            _check(
+                "install",
+                "ok",
+                f"latest candidate {_entrypoint_label(latest_root)}: {latest_root}",
+            )
         )
         try:
             declaration = _load_plugin_declaration(latest_root)
@@ -141,7 +151,7 @@ def _find_plugin_roots(
     name, separator, marketplace = plugin_id.partition("@")
     if not separator:
         root = Path(__file__).resolve().parents[2] / "plugins" / name
-        resolved = root if (root / "plugin.py").exists() else None
+        resolved = root if _plugin_root_has_entrypoint(root) else None
         return resolved, resolved, resolved
 
     # 2. 新安装布局以原子 pointer 为准；投影只能跟随 stable。
@@ -160,8 +170,25 @@ def _find_plugin_roots(
         if base.is_dir()
         else []
     )
-    root = versions[-1] if versions and (versions[-1] / "plugin.py").exists() else None
+    root = versions[-1] if versions and _plugin_root_has_entrypoint(versions[-1]) else None
     return root, root, base
+
+
+def _plugin_root_has_entrypoint(root: Path) -> bool:
+    """Recognize legacy plugin.py and static-manifest custom entrypoints."""
+
+    manifest_path = root / "akashic.plugin.toml"
+    if manifest_path.exists() or manifest_path.is_symlink():
+        manifest = load_static_plugin_manifest(root)
+        return (root / manifest.entrypoint).is_file()
+    return (root / "plugin.py").is_file()
+
+
+def _entrypoint_label(root: Path) -> str:
+    manifest_path = root / "akashic.plugin.toml"
+    if manifest_path.exists() or manifest_path.is_symlink():
+        return load_static_plugin_manifest(root).entrypoint
+    return "plugin.py"
 
 
 PluginDeclaration = type[Plugin] | ComposablePlugin

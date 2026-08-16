@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from agent.plugins.skill_host import PreparedSkillCatalog
     from agent.mcp.host import PreparedMcpCatalog
     from agent.plugins.activity_host import PreparedJobCatalog, PreparedProactiveCatalog
+    from agent.plugins.static_manifest import StaticPluginManifest
     from agent.plugins.snapshot import RuntimeSnapshot
 
 
@@ -113,6 +114,8 @@ class PluginGeneration:
     contributions: PluginContributions
     gate_result: GateResult
     source_type: Literal["builtin", "installed"] = "builtin"
+    static_manifest: StaticPluginManifest | None = None
+    entrypoint: str = "plugin.py"
     skill_catalog: PreparedSkillCatalog | None = None
     mcp_catalog: PreparedMcpCatalog | None = None
     job_catalog: PreparedJobCatalog | None = None
@@ -130,3 +133,4 @@ class PluginGeneration:
     production_data_dir: Path | None = None
     boot_created_data_dir: bool = False
     validation_workspace: Path | None = None
+    validation_data_inventory: tuple[str, ...] = ()

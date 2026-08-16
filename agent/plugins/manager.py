@@ -14,7 +14,7 @@ import socket
 import sys
 import tomllib
 from dataclasses import dataclass, field, replace
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from types import MappingProxyType, ModuleType
 from collections.abc import Awaitable, Callable, Mapping
 from typing import Any, Literal, TypeVar, cast
@@ -107,6 +107,12 @@ from agent.plugins.generation import (
 )
 from agent.plugins.importer import FreshPluginImporter
 from agent.plugins.install import PluginInstallResult, install_git_plugin
+from agent.plugins.static_manifest import (
+    StaticPluginManifest,
+    load_static_plugin_manifest,
+    staged_python_interpreter,
+    validate_module_exports,
+)
 from agent.plugins.reload_journal import (
     ReloadJournal,
     ReloadPhase,
@@ -920,11 +926,7 @@ class PluginManager:
             installed_cache_root=self._installed_cache_root,
             installed_selector=installed_selector,
         ):
-            name = (
-                source.plugin_name
-                if source.source_type == "installed"
-                else source.plugin_root.name
-            )
+            name = source.plugin_name or source.plugin_root.name
             package_id = member_packages.get(name, "")
             if package_id and name not in enabled_members:
                 continue
@@ -934,12 +936,18 @@ class PluginManager:
             seen_names.add(name)
             import_suffix = name.replace("-", "_").replace("@", "_")
             import_source = source.marketplace or source.plugin_root.parent.name
-            module_path = source.plugin_root / "plugin.py"
+            module_path = source.plugin_root / source.entrypoint
             mods.append(
                 {
                     "name": name,
                     "plugin_root": str(source.plugin_root),
                     "module_path": str(module_path) if module_path is not None else "",
+                    "entrypoint": source.entrypoint,
+                    "manifest_digest": (
+                        source.static_manifest.identity_digest
+                        if source.static_manifest is not None
+                        else ""
+                    ),
                     "import_path": f"akasic_plugin_{import_source}_{import_suffix}",
                     "marketplace": source.marketplace,
                     "source_type": source.source_type,
@@ -2125,6 +2133,7 @@ class PluginManager:
                 workspace_mcp_generation=self._active_workspace_mcp,
                 composition_root=composition_root,
             )
+            _validate_static_manifest_runtime(snapshot, generations)
             snapshot.skill_catalog_generation_id = catalog_id
             snapshot.plugin_skill_index = catalog.normal_plugins
             snapshot.tool_registry = self._compile_snapshot_tools(
@@ -2489,6 +2498,7 @@ class PluginManager:
         generation.validation_workspace = None
         if validation_workspace is not None:
             _remove_validation_data_dir(validation_workspace.parent)
+        generation.validation_data_inventory = ()
         self._compile_snapshot_event_handlers(ready.snapshot)
         if self._dashboard_preparer is not None:
             self._dashboard_preparer(ready.snapshot)
@@ -3191,6 +3201,7 @@ class PluginManager:
         generation.runtime_snapshot = validation_snapshot
         if validation_workspace is not None:
             _remove_validation_data_dir(validation_workspace.parent)
+        generation.validation_data_inventory = ()
         if not isinstance(generation.instance, ComposablePlugin):
             cast(Any, generation.instance).context.tool_registry = (
                 validation_snapshot.tool_registry
@@ -3686,6 +3697,34 @@ class PluginManager:
         self._generation_sequence += 1
         generation_sequence = self._generation_sequence
         module_path = mod["module_path"].strip()
+        static_manifest: StaticPluginManifest | None = None
+        manifest_path = plugin_dir / "akashic.plugin.toml"
+        if manifest_path.exists() or manifest_path.is_symlink():
+            try:
+                # Static identity is the admission source.  No plugin module is
+                # imported until this parse and the discovered entrypoint agree.
+                static_manifest = load_static_plugin_manifest(plugin_dir)
+                expected_module_path = plugin_dir / static_manifest.entrypoint
+                discovered_entrypoint = mod.get("entrypoint", "plugin.py")
+                if discovered_entrypoint != static_manifest.entrypoint:
+                    raise RuntimeError(
+                        "source discovery entrypoint 与静态 manifest 不一致: "
+                        f"discovered={discovered_entrypoint} "
+                        f"manifest={static_manifest.entrypoint}"
+                    )
+                if mod.get("manifest_digest", "") != static_manifest.identity_digest:
+                    raise RuntimeError("source discovery manifest identity 已漂移")
+                if Path(module_path).resolve(strict=False) != expected_module_path.resolve(
+                    strict=False
+                ):
+                    raise RuntimeError(
+                        "source discovery module path 与静态 manifest 不一致: "
+                        f"discovered={module_path} expected={expected_module_path}"
+                    )
+            except Exception as error:
+                raise RuntimeError(
+                    f"插件 {initial_plugin_id} 静态 manifest admission 失败: {error}"
+                ) from error
         try:
             source_revision = _source_revision(plugin_dir)
         except Exception as error:
@@ -3767,6 +3806,29 @@ class PluginManager:
             )
             return None
         loaded_module = sys.modules.get(mp)
+        if static_manifest is not None:
+            try:
+                if not isinstance(loaded_module, ModuleType):
+                    raise RuntimeError("v3 插件模块未保留在 import registry")
+                validate_module_exports(
+                    static_manifest,
+                    loaded_module,
+                    plugin_root=plugin_dir,
+                )
+            except Exception as error:
+                self._remove_module_tree(mp)
+                error_text = str(error) or type(error).__name__
+                self._record_failed_gate(
+                    plugin_id=initial_plugin_id,
+                    revision=source_revision,
+                    check_id="static_manifest_exports",
+                    reason=error_text,
+                )
+                self._abort_reload_attempt(
+                    reload_tx_id,
+                    error=f"static_manifest_exports: {error_text}",
+                )
+                return None
         is_v3 = (
             loaded_module is not None
             and getattr(loaded_module, "api_version", None) == 3
@@ -3945,6 +4007,12 @@ class PluginManager:
                     Literal["builtin", "installed"],
                     mod["source_type"],
                 ),
+                static_manifest=static_manifest,
+                entrypoint=(
+                    static_manifest.entrypoint
+                    if static_manifest is not None
+                    else "plugin.py"
+                ),
                 state="prepared",
                 reload_tx_id=reload_tx_id,
             )
@@ -4081,7 +4149,15 @@ class PluginManager:
                     / generation.data_dir.name
                 )
                 validation_data_dir.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copytree(generation.data_dir, validation_data_dir)
+                generation.validation_data_inventory = _copy_validation_data(
+                    generation.data_dir,
+                    validation_data_dir,
+                    (
+                        generation.static_manifest.exclude_data_paths
+                        if generation.static_manifest is not None
+                        else ()
+                    ),
+                )
                 generation.data_dir = validation_data_dir
                 generation.contributions = _validation_contributions(
                     generation,
@@ -4307,6 +4383,7 @@ class PluginManager:
                 composition_root=composition_root,
                 require_composition_ready=not reuses_stable_root,
             )
+            _validate_static_manifest_runtime(snapshot, generations)
             if reuses_stable_root and composition_root is not None:
                 snapshot.composition_health_exempt_root_token = (
                     composition_root.instance_token
@@ -4635,15 +4712,30 @@ class PluginManager:
         plugin_dir = generation.plugin_dir
         data_dir = attempt_workspace / "plugin-data" / generation.data_dir.name
         _ = data_dir.parent.mkdir(parents=True, exist_ok=True)
-        _ = shutil.copytree(generation.data_dir, data_dir)
+        _ = _copy_validation_data(
+            generation.data_dir,
+            data_dir,
+            (
+                generation.static_manifest.exclude_data_paths
+                if generation.static_manifest is not None
+                else ()
+            ),
+        )
         module_path = (
             f"{generation.module_path}__candidate_"
             f"{candidate_owner.generation_id.replace(':', '_')}_"
             f"{secrets.token_hex(4)}"
         )
-        self._import_plugin(module_path, plugin_dir / "plugin.py")
+        entrypoint = generation.entrypoint
+        self._import_plugin(module_path, plugin_dir / entrypoint)
         try:
             module = sys.modules[module_path]
+            if generation.static_manifest is not None:
+                validate_module_exports(
+                    generation.static_manifest,
+                    module,
+                    plugin_root=plugin_dir,
+                )
             clone = ComposablePlugin.from_module(module)
             config = _load_plugin_config(
                 data_dir,
@@ -6055,6 +6147,38 @@ def _remove_validation_data_dir(path: Path) -> None:
         shutil.rmtree(path)
 
 
+def _copy_validation_data(
+    source: Path,
+    target: Path,
+    exclude_paths: tuple[str, ...],
+) -> tuple[str, ...]:
+    """Copy plugin data to a candidate tree while returning copied file paths."""
+
+    source_root = source.resolve(strict=True)
+    excluded = tuple(PurePosixPath(item).as_posix() for item in exclude_paths)
+
+    def ignore(directory: str, names: list[str]) -> list[str]:
+        current = Path(directory).resolve(strict=True)
+        relative_dir = current.relative_to(source_root)
+        ignored: list[str] = []
+        for name in names:
+            relative = (relative_dir / name).as_posix()
+            if any(
+                relative == item or relative.startswith(item + "/")
+                for item in excluded
+            ):
+                ignored.append(name)
+        return ignored
+
+    shutil.copytree(source_root, target, ignore=ignore)
+    inventory: list[str] = []
+    for directory, _dirnames, filenames in os.walk(target):
+        root = Path(directory)
+        for filename in filenames:
+            inventory.append(root.joinpath(filename).relative_to(target).as_posix())
+    return tuple(sorted(inventory))
+
+
 def _replace_url_port(url: str, port: int) -> str:
     parsed = urlsplit(url)
     if parsed.scheme not in {"http", "https"} or parsed.hostname is None:
@@ -6115,6 +6239,90 @@ def _replace_snapshot_payload(
         setattr(target, name, getattr(source, name))
 
 
+def _validate_static_manifest_runtime(
+    snapshot: RuntimeSnapshot,
+    generations: Mapping[str, PluginGeneration],
+) -> None:
+    """Reconcile static MCP/process policy with the frozen Root projection."""
+
+    manifests = {
+        plugin_id: generation.static_manifest
+        for plugin_id, generation in generations.items()
+        if generation.static_manifest is not None
+    }
+    if not manifests:
+        return
+
+    # 1. Install staging owns the interpreter used by every declared Python runtime.
+    for plugin_id, generation in generations.items():
+        manifest = generation.static_manifest
+        if manifest is None:
+            continue
+        for runtime in manifest.python:
+            _ = staged_python_interpreter(generation.plugin_dir, runtime)
+
+    # 2. C13 has no Root-frozen process registry in this integration base.
+    process_owners = tuple(
+        plugin_id
+        for plugin_id, manifest in manifests.items()
+        if manifest is not None and manifest.managed_processes
+    )
+    if process_owners:
+        raise RuntimeError(
+            "静态 manifest 声明 managed process，但 Core process registry 尚未接入: "
+            + ", ".join(sorted(process_owners))
+        )
+
+    # 3. Compare every static owner's import-free MCP declaration with the exact
+    # Root-frozen descriptor.  Missing, extra, and field drift all fail closed.
+    expected: set[tuple[object, ...]] = set()
+    for plugin_id, manifest in manifests.items():
+        assert manifest is not None
+        expected.update(
+            (
+                plugin_id,
+                declaration.name,
+                declaration.command,
+                declaration.cwd,
+                declaration.env,
+                declaration.required_tools,
+                declaration.candidate_read_only_tools,
+                declaration.endpoint_env,
+                declaration.candidate_env,
+            )
+            for declaration in manifest.mcp_servers
+        )
+    registry = snapshot.mcp_server_registry
+    actual: set[tuple[object, ...]] = set()
+    if registry is not None:
+        static_owners = set(manifests)
+        actual.update(
+            (
+                descriptor.owner,
+                descriptor.name,
+                descriptor.command,
+                descriptor.cwd,
+                descriptor.env,
+                descriptor.required_tools,
+                descriptor.candidate_read_only_tools,
+                tuple(
+                    (endpoint.env, endpoint.process)
+                    for endpoint in descriptor.endpoint_env
+                ),
+                descriptor.candidate_env,
+            )
+            for descriptor in registry.descriptors
+            if descriptor.owner in static_owners
+        )
+    if actual != expected:
+        missing = sorted(expected - actual, key=repr)
+        extra = sorted(actual - expected, key=repr)
+        raise RuntimeError(
+            "静态 manifest MCP 声明与 Root frozen registry 不一致: "
+            f"missing={missing!r} extra={extra!r}"
+        )
+
+
 def _resolve_command_item(
     plugin_dir: Path,
     item: str,
@@ -6122,8 +6330,10 @@ def _resolve_command_item(
     executable: bool,
 ) -> str:
     path = Path(item)
-    if executable and path.is_absolute():
-        return item
+    if path.is_absolute() or PureWindowsPath(item).is_absolute():
+        if executable and path.is_file() and os.access(path, os.X_OK):
+            return item
+        raise RuntimeError(f"插件 MCP command 绝对路径不允许越过 artifact: {item}")
     if "/" not in item and "\\" not in item and not item.startswith("."):
         return item
     resolved = (
@@ -6132,6 +6342,8 @@ def _resolve_command_item(
         else (plugin_dir / path).resolve(strict=False)
     )
     _require_plugin_path(plugin_dir, resolved, "MCP command")
+    if not resolved.is_file():
+        raise RuntimeError(f"插件 MCP command 文件不存在: {item}")
     return str(resolved)
 
 

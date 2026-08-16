@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import tomllib
 from collections.abc import Mapping
@@ -157,6 +158,25 @@ def validate_module_exports(
             )
     elif imported_path.name != Path(manifest.entrypoint).name:
         raise ValueError("v3 插件 module entrypoint 无法核对")
+
+
+def staged_python_interpreter(
+    plugin_root: Path,
+    runtime: StaticPythonRuntime,
+) -> Path:
+    """Return the executable staged for one manifest Python runtime."""
+
+    root = plugin_root.resolve(strict=True)
+    runtime_root = (root / runtime.runtime_root).resolve(strict=True)
+    if not runtime_root.is_relative_to(root):
+        raise ValueError("插件 Python runtime 越过 artifact")
+    interpreter = _venv_python(runtime_root / ".venv")
+    if not interpreter.is_file() or not os.access(interpreter, os.X_OK):
+        raise RuntimeError(
+            "插件 Python runtime 尚未完成 staging: "
+            f"requirements={runtime.requirements} interpreter={interpreter}"
+        )
+    return interpreter
 
 
 def _validate_manifest(root: Path, raw: Mapping[str, object]) -> StaticPluginManifest:
@@ -468,7 +488,9 @@ def _command(root: Path, raw: object, label: str) -> tuple[str, ...]:
     values = _string_list(raw, label)
     for index, value in enumerate(values):
         if _is_absolute_path(value):
-            raise ValueError(f"{label}[{index}] 不得是绝对路径")
+            if index == 0 and _is_legal_external_executable(value):
+                continue
+            raise ValueError(f"{label}[{index}] 不得是 artifact 外绝对路径")
     for value in values[1:]:
         if _looks_like_artifact_path(value):
             _ = _relative_artifact_path(
@@ -479,6 +501,19 @@ def _command(root: Path, raw: object, label: str) -> tuple[str, ...]:
                 require_file=True,
             )
     return values
+
+
+def _is_legal_external_executable(value: str) -> bool:
+    """Allow only an existing executable as command[0] outside the artifact."""
+
+    path = Path(value)
+    return path.is_absolute() and path.is_file() and os.access(path, os.X_OK)
+
+
+def _venv_python(venv_dir: Path) -> Path:
+    if os.name == "nt":
+        return venv_dir / "Scripts" / "python.exe"
+    return venv_dir / "bin" / "python"
 
 
 def _endpoint_env(raw: object, label: str) -> tuple[tuple[str, str], ...]:

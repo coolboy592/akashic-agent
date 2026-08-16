@@ -330,6 +330,69 @@ def _write_manager_plugin(tmp_path: Path, version: str) -> Path:
     return plugin_dir
 
 
+def _write_static_manager_plugin(tmp_path: Path, version: str) -> Path:
+    plugin_dir = _plugin_dir(tmp_path / "plugins")
+    (plugin_dir / "entry.py").write_text(
+        _plugin_source(version).replace(
+            "            endpoint_env=(EndpointEnv('PORT', 'calendar_api'),),\n",
+            "",
+        ),
+        encoding="utf-8",
+    )
+    (plugin_dir / "akashic.plugin.toml").write_text(
+        "schema_version = 1\n"
+        "name = \"calendar\"\n"
+        f"version = \"{version}\"\n"
+        "api_version = 3\n"
+        "entrypoint = \"entry.py\"\n\n"
+        "[[mcp]]\n"
+        "name = \"calendar\"\n"
+        "command = [\"python\", \"mcp.py\"]\n"
+        "required_tools = [\"get_events\"]\n"
+        "candidate_read_only_tools = [\"get_events\"]\n"
+        f"candidate_env = {{VERSION = \"{version}\"}}\n",
+        encoding="utf-8",
+    )
+    return plugin_dir
+
+
+@pytest.mark.asyncio
+async def test_static_manifest_is_admission_source_and_reconciles_mcp_root(
+    tmp_path: Path,
+) -> None:
+    plugin_dir = _write_static_manager_plugin(tmp_path, "1")
+    manager = _manager(tmp_path)
+
+    await manager.load_all()
+    generation = manager._active_generations["calendar"]  # pyright: ignore[reportPrivateUsage]
+    assert generation.entrypoint == "entry.py"
+    assert generation.static_manifest is not None
+    assert generation.static_manifest.mcp_servers[0].name == "calendar"
+    assert manager.current_snapshot is not None
+    assert manager.current_snapshot.mcp_server_registry is not None
+
+    (plugin_dir / "entry.py").write_text(
+        _plugin_source("2").replace(
+            "            endpoint_env=(EndpointEnv('PORT', 'calendar_api'),),\n",
+            "",
+        ),
+        encoding="utf-8",
+    )
+    (plugin_dir / "akashic.plugin.toml").write_text(
+        (plugin_dir / "akashic.plugin.toml")
+        .read_text(encoding="utf-8")
+        .replace('version = "1"', 'version = "2"')
+        .replace('VERSION = "1"', 'VERSION = "2"'),
+        encoding="utf-8",
+    )
+    candidate = await manager.prepare_candidate("calendar")
+    assert candidate is not None
+    assert candidate.entrypoint == "entry.py"
+    assert candidate.static_manifest is not None
+    await manager.discard_prepared("calendar")
+    await manager.terminate_all()
+
+
 @pytest.mark.asyncio
 async def test_manager_keeps_candidate_mcp_registry_private_until_publish(
     tmp_path: Path,
