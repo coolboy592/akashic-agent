@@ -5,12 +5,20 @@ import os
 import socket
 import sys
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, cast
 from urllib.request import urlopen
 
 import pytest
 
 from agent.plugin_composition import ManagedProcessDefinition
-from agent.plugins.managed_process_host import ManagedProcessGenerationHost
+import agent.plugins.managed_process_host as managed_process_host
+from agent.plugins.managed_process_host import (
+    ManagedProcessGenerationHost,
+    _Generation,
+    _LogRing,
+    _ProcessEpoch,
+)
 from utils.process_group import OwnedProcessGroup
 
 
@@ -175,6 +183,54 @@ async def _wait_until(predicate, *, timeout: float = 5.0) -> None:
         if asyncio.get_running_loop().time() >= deadline:
             raise AssertionError("condition did not become true before timeout")
         await asyncio.sleep(0.02)
+
+
+def test_log_ring_enforces_utf8_byte_cap() -> None:
+    ring = _LogRing(max_bytes=4, max_lines=4)
+    ring.append("😀😀".encode("utf-8"))
+
+    lines, retained_bytes, _dropped = ring.snapshot()
+    assert retained_bytes <= 4
+    assert sum(len(line.encode("utf-8")) for line in lines) == retained_bytes
+    assert all(line.encode("utf-8").decode("utf-8") == line for line in lines)
+    assert lines == ("😀",)
+
+
+@pytest.mark.asyncio
+async def test_readiness_poll_sleep_respects_remaining_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    definition = ManagedProcessDefinition(
+        name="deadline",
+        command=(sys.executable, "-c"),
+        formal_port=_free_port(),
+        startup_timeout_seconds=0.01,
+    )
+    entry = _ProcessEpoch(
+        generation_id="deadline-generation",
+        definition=definition,
+        mode="candidate",
+        artifact_root=None,
+    )
+    entry.process = cast(Any, SimpleNamespace(returncode=None))
+    generation = _Generation(
+        generation_id="deadline-generation",
+        mode="candidate",
+        artifact_root=None,
+        entries={definition.name: entry},
+    )
+
+    async def direct_to_thread(function: Any, *args: Any) -> Any:
+        return function(*args)
+
+    monkeypatch.setattr(asyncio, "to_thread", direct_to_thread)
+    monkeypatch.setattr(managed_process_host, "_url_ready", lambda *_args: False)
+    host = ManagedProcessGenerationHost()
+    started = asyncio.get_running_loop().time()
+    with pytest.raises(TimeoutError):
+        await host._wait_ready(generation, entry, _free_port())
+    elapsed = asyncio.get_running_loop().time() - started
+    assert elapsed < 0.04
 
 
 @pytest.mark.asyncio

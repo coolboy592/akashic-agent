@@ -121,7 +121,7 @@ class _LogRing:
     def _append_line(self, line: str) -> None:
         encoded_size = len(line.encode("utf-8", errors="replace"))
         if encoded_size > self._max_bytes:
-            line = line[-self._max_bytes :]
+            line = _truncate_utf8_tail(line, self._max_bytes)
             encoded_size = len(line.encode("utf-8", errors="replace"))
         while self._lines and (
             self._bytes + encoded_size > self._max_bytes
@@ -640,7 +640,10 @@ class ManagedProcessGenerationHost:
                 if process.returncode is not None:
                     raise RuntimeError(f"managed process 启动失败: exit={process.returncode}")
                 return
-            await asyncio.sleep(0.05)
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(0.05, remaining))
         raise TimeoutError(f"managed process readiness timeout: {generation.generation_id}:{entry.definition.name}")
 
     async def _watch_process(
@@ -1141,3 +1144,12 @@ def _url_ready(url: str, timeout: float) -> bool:
 def _error_text(error: BaseException) -> str:
     message = str(error).strip()
     return message or type(error).__name__
+
+
+def _truncate_utf8_tail(value: str, max_bytes: int) -> str:
+    """Keep the newest complete UTF-8 code points within a hard byte budget."""
+
+    encoded = value.encode("utf-8", errors="replace")
+    if len(encoded) <= max_bytes:
+        return value
+    return encoded[-max_bytes:].decode("utf-8", errors="ignore")
