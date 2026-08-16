@@ -1,6 +1,6 @@
 # 插件 v3 Runtime Inspection 任务合同
 
-- 状态：approved / implementing
+- 状态：implemented / verified
 - 日期：2026-08-16
 - 实现基线：`2d9fb408`
 - 关联条款：PLG-008～PLG-010、PLG-014、CTRL-003、MOB-006、TST-001～TST-008
