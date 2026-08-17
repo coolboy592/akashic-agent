@@ -4,7 +4,7 @@ import hashlib
 import inspect
 import json
 import re
-from collections.abc import Awaitable, Callable, Iterable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Literal, cast
@@ -19,7 +19,6 @@ CommandHandler = Callable[
 CommandResultKind = Literal["success", "error"]
 
 _COMMAND_NAME = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
-_LEGACY_COMMAND_NAME = re.compile(r"^[a-z][a-z0-9_-]*$")
 _RESERVED_COMMAND_NAMES = frozenset({"stop"})
 _MAX_COMMAND_DESCRIPTION_LENGTH = 256
 
@@ -111,12 +110,6 @@ class CommandRegistry:
             ).encode("utf-8")
         ).hexdigest()
 
-    @classmethod
-    def empty(cls) -> CommandRegistry:
-        """Build an empty registry for legacy namespace validation."""
-
-        return cls({}, {}, ())
-
     @property
     def descriptors(self) -> tuple[CommandDescriptor, ...]:
         return self._descriptors
@@ -128,31 +121,6 @@ class CommandRegistry:
     @property
     def catalog_digest(self) -> str:
         return self._catalog_digest
-
-    def validate_legacy_claims(
-        self,
-        claims: Iterable[tuple[str, str]],
-    ) -> None:
-        """Reject legacy command claims that collide with this catalog."""
-
-        owners = dict(self._owners)
-        for raw_name, owner in claims:
-            if not isinstance(raw_name, str) or not _LEGACY_COMMAND_NAME.fullmatch(
-                raw_name
-            ):
-                raise ValueError(f"Legacy Command name 无效: {raw_name}")
-            if raw_name in _RESERVED_COMMAND_NAMES:
-                raise CompositionError(
-                    "RESERVED_PLUGIN_COMMAND",
-                    f"Plugin Command 名称由 Core 保留: {raw_name}",
-                )
-            previous = owners.get(raw_name)
-            if previous is not None:
-                raise CompositionError(
-                    "DUPLICATE_PLUGIN_COMMAND",
-                    f"插件 Command 名称重复: {raw_name} ({previous}, {owner})",
-                )
-            owners[raw_name] = owner
 
     async def execute(
         self,
