@@ -1,32 +1,34 @@
 ---
 name: plugin-system
-description: 说明并执行 Akashic 插件安装、加载、配置、插件内 MCP、Skill、生命周期、卸载与 turn 边界更新。
+description: 说明并执行 Akashic v3 插件安装、加载、配置、插件内 MCP、Skill、生命周期、卸载与 turn 边界更新。
 when_to_use: 用户询问或要求处理 Akashic 插件、marketplace、插件自带 MCP、Skill、插件配置、安装、更新、卸载或排障时。独立本地 MCP server 使用 manage-workspace-mcp。
 metadata: {"akashic": {"always": false}}
 ---
 
 # Akashic 插件系统
 
-优先直接完成明确的插件请求。创建或改写源码、加入 Skill/MCP、递归验证候选时，先加载 `develop-akashic-plugin`。用户要管理不属于插件的独立本地 MCP server 时，加载 `manage-workspace-mcp`。
+优先完成明确的插件请求。创建或改写 source、加入 Skill/MCP、安装候选或递归验证时，先加载 `develop-akashic-plugin`；这里只负责安装链、状态边界和 turn 结果。
 
-## 事实来源
+## 事实来源与边界
 
 ```text
 ┌─ ~/.akashic-plugin/manifest.toml
-│  └─ 全局安装清单
+│  └─ 全局安装清单与启用状态
 ├─ ~/.akashic-plugin/cache/<marketplace>/<plugin>/.artifacts/
-│  └─ 不可变 installed code 与 stable/latest 内部 pointer
+│  └─ 不可变 installed artifact 与 generation pointer
 ├─ <workspace>/plugin-data/<plugin>-<marketplace>/
-│  └─ 插件配置和持久状态
+│  └─ 插件配置与持久状态
 └─ <workspace>/runtime/plugin-reloads.sqlite3
-   └─ Core reload 与恢复证据
+   └─ reload、candidate、恢复与 turn rollout 证据
 ```
 
-不要查找或创建 `registry.json`、`.aka-plugin/plugin.json`、`manifest.yaml` 或插件级 `mcp/servers.json`。不要直接编辑 cache、pointer、manifest 或正式 plugin-data。
+外部 source 的 canonical 根必须包含 `akashic.plugin.toml` 和其 `entrypoint` 指向的 v3 module。manifest 的 `schema_version=1`、`api_version=3`、`name`、`version`、`entrypoint` 在 import 前校验；module 还必须导出同值的 `api_version/name/version` 与精确 `apply(ctx, config)`。Skill/MCP 通过 source 的静态 root 和 typed service 进入 generation catalog。
+
+不要查找或创建 `registry.json`、`.aka-plugin/plugin.json`、`manifest.yaml`、插件级 `mcp/servers.json` 或 workspace 手工 Skill owner。不要直接编辑 cache、pointer、全局 manifest、workspace Skill 软链接或正式 plugin-data。
+
+Default/Wake proactive island 的 exact source root、member 顺序和 factory export 属于 Core-private allowlist；外部插件不能导入、同名替代、re-export 或取得该 bridge。外部主动信息源使用 `MCP_SERVERS` + `PROACTIVE_COMPONENTS`，见 `create-proactive-source`。
 
 ## Agent 可用动作
-
-Agent 只使用：
 
 ```text
 plugin-install    安装或更新本 turn 的候选
@@ -34,26 +36,54 @@ plugin-uninstall  登记本 turn 结束后的卸载
 plugin-revert     撤销本 turn 最近一次尚未提交的操作
 ```
 
-不要调用 status、promote、discard、enable、disable 或手工 restart。它们不是 Agent 更新流程的一部分；stable/latest、排空、提交和恢复由 Core 管理。
+不要手工编辑 manifest/cache/pointer，不要手工切换 generation、重启 Gateway 或用第二个进程绕过 turn 边界。stable、candidate、lease、排空、提交、恢复、能力投影和服务切换由 Core 拥有。
 
 ## 安装与更新
 
-仓库根必须有 `plugin.py`，Plugin 子类声明 `name` 和 `version`。只安装已提交 Git HEAD；远程 source 必须先 push 对应 commit。
+只从已提交 Git HEAD 安装；远程 source 必须先 push 对应 commit：
 
 ```bash
-python main.py plugin-install --source <repo_or_url> --marketplace github
+python main.py plugin-install \
+  --source <repo_or_url> \
+  --marketplace <marketplace>
 ```
 
-命令必须从 active Agent turn 的 Shell 发起。成功返回表示：候选已准备；当前父 turn 仍使用原版本；本 turn 的 attached programmatic child 自动使用候选；通过后正常结束父 turn，Core 自动切换，下一 turn 生效。
+正常链路：
 
 ```text
-修改 canonical source → source tests → commit/push → plugin-install
-       → attached child 真实行为验证
-       ├─ pass → 正常结束父 turn → Core 自动切换
-       └─ fail → plugin-revert → 修复后递归
+source test → commit/push → plugin-install
+       → attached child 的真实行为 oracle
+       ├─ pass → 正常结束父 turn → Core 自动提交 → 下一 turn 生效
+       └─ fail → plugin-revert → 修复 source 后递归
 ```
 
-`plugin-doctor` 只是人工诊断，不能证明新行为正确，也不能代替 child trace。
+安装成功只表示候选准备并绑定当前父 turn；父 turn 仍使用旧 stable，attached child 自动使用候选。子 turn 不指定 runtime、不 detach、不直接选择 candidate。结果必须保存 candidate identity、reload transaction、child identity、tool trace 和 terminal；只看命令返回或 catalog 不足以证明功能。
+
+## Skill、MCP 与服务检查
+
+```text
+┌─ Skill
+│  └─ source root、SKILL.md、references、catalog source、真实触发轨迹
+├─ MCP
+│  └─ manifest command、requirements、required tools、candidate read-only tools、endpoint env
+├─ managed service
+│  └─ process identity、port_env、readiness、退出与隔离 plugin-data
+├─ Channel
+│  └─ descriptor、credential paths、stop/start ownership 与恢复
+└─ rollout
+   └─ child terminal、tool items、reload journal、turn 后 generation
+```
+
+固定 listener 必须在 manifest 的 `[[processes]]` 中声明 `port_env`、`formal_port`、`readiness_path` 和超时；module 的 typed `ManagedProcessDefinition` 必须与其一致，服务进程和同插件 MCP 必须真正读取注入端口。候选验证使用隔离端点和数据副本，写型 Tool/MCP 仅在事务、dry-run、隔离目标或明确授权下执行。
+
+Channel candidate 不复制正式 token、webhook 或 long-poll ownership。父 turn 结束后的顺序是：
+
+```text
+old Channel.stop → managed service switch → new Channel.start
+       └─ 任一步失败：恢复并验证 old generation
+```
+
+`stop()` 返回必须证明 ingress、在途工作和 ownership 已收束；`start()` 返回必须证明新 generation ready。验证结果不能把 endpoint 试运行写成正式外部切换。
 
 ## 卸载与撤销
 
@@ -62,35 +92,14 @@ python main.py plugin-uninstall demo@github
 python main.py plugin-revert
 ```
 
-卸载成功返回表示意图已绑定当前 turn，不表示代码已经删除。告诉用户：当前 turn 可以完成；本轮结束后 Core 自动停止 endpoint、移除能力和 installed code；plugin-data 保留；下一 turn 不再加载。
+卸载成功只表示意图已登记当前 turn；当前 turn 可完成，结束后 Core 停止 endpoint、移除能力投影和 installed code，并保留 `<workspace>/plugin-data/<plugin>-<marketplace>/`。下一 turn 核对 manifest entry、artifact/cache、process/socket 清理和 plugin-data 仍在；清理失败必须报告实际残留和错误。
 
-`plugin-revert` 只撤销同一 turn 最近一次未提交 install/uninstall，不能跨 turn 回滚历史版本。不要反复卸载、轮询、手改 manifest/cache 或删除 plugin-data。
-
-下一用户 turn 会收到 Core 的自然语言运行事实。卸载完成必须满足 manifest entry 和 cache 已移除、原 plugin-data 仍存在；清理失败时说明残留路径和错误，不能假报完整成功。
-
-## 独占 endpoint
-
-固定 listener 的 managed service 必须声明 `ManagedServiceSpec.validation_port_env`，服务进程和同插件 MCP 必须读取同名环境变量。Core 会复制 plugin-data 到隔离验证目录、分配临时 loopback 端口并验证 readiness。忽略变量、缺少声明、端口冲突或 readiness 失败都必须暴露。
-
-Channel 的 candidate 不接管正式 bot token/webhook/long-poll ownership。父 turn 结束后由 Core 统一执行：
-
-```text
-old Channel.stop → managed service switch → new Channel.start
-        └──────── 任一步失败：恢复并验证 old generation
-```
-
-`stop()` 返回即承诺新 ingress 已停止、在途工作已收束且 ownership 已释放；`start()` 返回即承诺 ownership 已取得并 ready。
+`plugin-revert` 只撤销同一 turn 最近一次尚未提交的 install/uninstall，不能跨 turn 回滚已发布版本。不要反复安装、轮询、删除 plugin-data 或借手工文件修改伪造恢复。
 
 ## 配置与排障
 
-读取插件 `ConfigModel`，配置只写对应 plugin-data，不写主 `config.toml`。缺失依赖、导入失败、配置错误、command 失败和数据损坏必须 fail-loud。
+插件 `Config` 是 module namespace 中可选的 typed 配置模型；配置只写对应 plugin-data，不改主 `config.toml`。缺少依赖、导入失败、manifest/module 不一致、配置错误、命令失败、readiness 失败和数据损坏必须 fail-loud。
 
-```text
-┌─ Skill      检查 skill_roots()/drift_skill_roots() 与真实触发轨迹
-├─ MCP        检查 mcp_servers()、入口、依赖、候选 endpoint env
-├─ service    检查 process identity、listener、readiness 和恢复
-├─ Channel    检查 ingress/ownership 的 stop/start 证据
-└─ rollout    检查 child terminal/tool trace 与 reload journal
-```
+只有以下情况才进入 runtime diagnostics：子 turn 长时间 queued、超时、terminal 错误、candidate identity 不一致、cleanup 残留或行为 oracle 缺层。按 reload journal、SessionDB、tool items、process/readiness 和 write set 逐层定位，不重复安装同一 source revision。
 
-插件能力全部由通用代码声明，Core 不应出现具体插件名或业务路径特判。
+完成时至少能独立证明：source commit 可回源；manifest/module、source tests 和 readiness 通过；attached child 使用目标 generation 并实际执行 Skill/Tool/MCP；父 turn 正常结束；下一 turn 的 Core 事实已提交或明确报告恢复失败；正式 SessionDB、memory、plugin-data 和未授权外部效果没有被候选验证改写。
