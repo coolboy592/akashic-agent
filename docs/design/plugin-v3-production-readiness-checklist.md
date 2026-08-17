@@ -12,8 +12,9 @@
 目标是让 Akashic 的通用插件平台只接受 v3 namespace，以
 `Context / Service / Fiber / Effect / typed event` 组合能力，同时保留 Akashic 的 candidate
 验证、promotion、snapshot lease 和旧 generation drain。除 Default/Wake Proactive 两族的内部
-领域实现外，所有已跟踪插件都迁入 v3；两族只保留私有 proactive 运行实现，不再取得通用 v2
-插件 ABI。
+领域实现外，生产目标 fleet 中的插件都迁入 v3；两族只保留私有 proactive 运行实现，不再取得
+通用 v2 插件 ABI。Context Pressure 与 Computer Use Linux 已由维护者移出目标 fleet，不再迁移；
+最终 consumer scan 和 E4 必须证明正式替代清单不加载这两个插件，不能为它们保留 v2 兼容面。
 
 只有下列条件全部成立，才能向维护者报告“可替代线上 Akashic”：
 
@@ -33,7 +34,7 @@ semantic_delta: breaking
 capability_owner: mixed
 consumer_scope:
   - akashic core plugin runtime
-  - 21 locked external plugins
+  - 19 locked external plugins
   - 8 in-tree plugin implementations
   - later admitted GitHub Watcher canonical source
 runtime_patch: required
@@ -164,21 +165,19 @@ Gate 报告。分支名、PR 号和浮动 ref 不能代替 commit。
 
 | 插件 | 当前 v2 能力 | 依赖 Core seam | 状态 | 最终组合批次 |
 |---|---|---|---|---|
-| Context Pressure | lifecycle / prompt context | C02/C08 | `OPEN` | E1 |
-| Daynight Gate | proactive module / prompt gate | C15 | `OPEN` | E3 |
+| Daynight Gate | proactive module / prompt gate | C15 | `CANDIDATE` | plugin `e5adbd2`；真实 Manager/ActivityHost exact lease、配置行为、dispose、contract 与 Pyright 已通过，待 E3 |
 | Emotion | Dashboard、mobile、Drift Skill、proactive module、job/LLM | C09/C15/C17/C21 | `OPEN` | E1/E3 |
 | Plugin Undo | command、before-turn、显式 interaction 撤销 | C02/C11 | `OPEN` | E1/E3 |
 | Observe | Dashboard、mobile、committed event observers | C02/C17 | `OPEN` | E1 |
 | Setup Helper | lifecycle、command | C02/C11 | `OPEN` | E3 |
 | Status Commands | mobile、command、只读 Session projection | C11/C17/C24 | `CANDIDATE` | Core `cb2011b4` + plugin `eb245ad`；真实 Manager command/Mobile/ledger oracle 通过，待 E3 复制 workspace |
-| Computer Use Linux | Skill、MCP | C09/C12 | `OPEN` | E2 |
-| Feed MCP | Skill、MCP、proactive source | C09/C12/C15 | `OPEN` | E2/E3 |
+| Feed MCP | Skill、MCP、proactive source | C09/C12/C15 | `CANDIDATE` | Core `78e50d4d` + plugin `b4a8626`；真实 Manager/stdio、exact source lease、typed empty fetch、candidate data 排除、进程内回滚与进程崩溃后重启迁移均通过，待 E2/E3 |
 | Feishu | channel | C14 | `OPEN` | E3 |
 | Fitbit MCP | MCP、managed process、proactive source、mobile | C12/C13/C15/C17 | `OPEN` | E2/E3 |
 | Steam MCP | Skill、MCP、proactive source | C09/C12/C15 | `OPEN` | E2/E3 |
 | QQBot | channel | C14 | `OPEN` | E3 |
 | Proactive Feedback | Dashboard、mobile、committed event observers | C02/C17 | `OPEN` | E1 |
-| Huayue Skills | Skill roots | C09 | `OPEN` | E3 |
+| Huayue Skills | Skill roots | C09 | `CANDIDATE` | plugin `1171904`；pure-v3 module-level skill roots、contract 与 Pyright 已通过，待 E3 |
 
 ### 4.3 In-tree plugins 与保留族群
 
@@ -242,8 +241,8 @@ GitHub Watcher 在 canonical source 未确认前不计入“已完成”，也�
 
 | 批次 | 一次覆盖的组合 | 主要 oracle | 运行时机 |
 |---|---|---|---|
-| E1 Passive/Data/Mobile | Akasha、Default Memory、Citation、Meme、Context Pressure、Emotion、Observe、Proactive Feedback、Plugin Undo | prompt/recall/metadata/media、bounded mobile query/lease、SessionDB 普通 append-only；显式 `/undo` 按 `control_turn_id` 原子删除完整 interaction、embedding/reference 协调与恢复；Akasha/plugin-data write-set | 被动与数据族全部 `CANDIDATE` 后一次 |
-| E2 Tool/MCP/Process | Restore、Safety、Loop Guard、Calendar/Computer Use/Feed/Fitbit/Steam | transform→authorize→invoke、readiness、端口、取消、process cleanup、受控外部只读调用 | MCP/process 族全部 `CANDIDATE` 后一次 |
+| E1 Passive/Data/Mobile | Akasha、Default Memory、Citation、Meme、Emotion、Observe、Proactive Feedback、Plugin Undo | prompt/recall/metadata/media、bounded mobile query/lease、SessionDB 普通 append-only；显式 `/undo` 按 `control_turn_id` 原子删除完整 interaction、embedding/reference 协调与恢复；Akasha/plugin-data write-set | 被动与数据族全部 `CANDIDATE` 后一次 |
+| E2 Tool/MCP/Process | Restore、Safety、Loop Guard、Calendar/Feed/Fitbit/Steam | transform→authorize→invoke、readiness、端口、取消、process cleanup、受控外部只读调用 | MCP/process 族全部 `CANDIDATE` 后一次 |
 | E3 Fleet/Channel/Proactive | Commands、Feishu/QQBot recording adapters、Daynight、Emotion、Calendar/Feed/Fitbit/Steam sources、Huayue Skills、Default/Wake 薄入口 | full boot、catalog、candidate discard/promote、reload；loopback channel 正向收发；固定时钟/模型/sink 的 enabled proactive empty/skip/source/model/delivery/restart | 全插件接线完成后一次 |
 | E4 Production Rehearsal | E1～E3 的 exact heads + 复制的真实 workspace，WebUI-only | DB integrity、完整 write-set、artifact/pointer、restart、stop cleanup、恢复证据 | 删除 v2 后最终一次 |
 
