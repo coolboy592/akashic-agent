@@ -1089,7 +1089,7 @@ class MobileRealtimeChannel:
         catalog = (
             context.command_catalog_provider()
             if context.command_catalog_provider is not None
-            else tuple(context.mobile_bot_commands)
+            else ()
         )
         for raw_command, raw_description in catalog:
             command = raw_command.strip().removeprefix("/")

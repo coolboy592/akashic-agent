@@ -1806,8 +1806,12 @@ async def test_installed_command_catalog_publishes_only_after_provisional_pointe
         assert manager.current_snapshot is old_snapshot
         assert not provisional.accepting_leases
         assert old_snapshot.state == "committed"
-        assert manager.telegram_bot_commands == [("hello", "old description")]
-        assert manager.mobile_bot_commands == [("hello", "old description")]
+        assert manager.stable_telegram_command_catalog() == (
+            ("hello", "old description"),
+        )
+        assert manager.stable_mobile_command_catalog() == (
+            ("hello", "old description"),
+        )
         assert read_pointer(plugin_base, "stable") == stable_pointer
         calls.append(new_commands)
 
@@ -3845,53 +3849,23 @@ async def test_repeated_disable_with_retained_snapshot_keeps_unique_id_and_alias
 
 
 @pytest.mark.asyncio
-async def test_current_plugin_views_ignore_retained_old_generation(
-    tmp_path: Path,
-) -> None:
-    plugin_dir = _write_plugin(
+async def test_v2_command_declaration_fails_before_publication(tmp_path: Path) -> None:
+    _write_plugin(
         tmp_path / "plugins",
-        "current_view",
+        "legacy_command",
         "from agent.plugins import Plugin\n"
-        "class CurrentViewPlugin(Plugin):\n"
-        "    name = 'current_view'\n"
-        "    version = 'v1'\n"
+        "class LegacyCommandPlugin(Plugin):\n"
+        "    name = 'legacy_command'\n"
         "    def telegram_bot_commands(self):\n"
-        "        return [(f'view-{self.version}', self.version)]\n",
+        "        return [('legacy', 'legacy')]\n",
     )
     manager = _manager(tmp_path)
+
     await manager.load_all()
-    retained = manager.snapshot_store.lease()
 
-    _ = (plugin_dir / "plugin.py").write_text(
-        "from agent.plugins import Plugin\n"
-        "class CurrentViewPlugin(Plugin):\n"
-        "    name = 'current_view'\n"
-        "    version = 'v2'\n"
-        "    def telegram_bot_commands(self):\n"
-        "        return [(f'view-{self.version}', self.version)]\n",
-        encoding="utf-8",
-    )
-    candidate = await manager.prepare_candidate("current_view")
-    assert candidate is not None
-    await manager.publish_prepared("current_view")
-
-    active = manager.active_plugins()
-    assert len(active) == 1
-    assert active[0].manifest["version"] == "v2"
-    assert manager.telegram_bot_commands == [("view-v2", "v2")]
-    assert manager.mobile_bot_commands == []
-
-    write_plugin_manifest(
-        {"current_view": False},
-        plugins_home=tmp_path / "home",
-    )
-    await manager.reconcile_changed()
-    assert manager.active_plugins() == []
-    assert manager.telegram_bot_commands == []
-    assert manager.mobile_bot_commands == []
-
-    await retained.release()
-    await manager.terminate_all()
+    assert manager.current_snapshot is None
+    assert manager.loaded_count == 0
+    assert manager.stable_telegram_command_catalog() == ()
 
 
 @pytest.mark.asyncio
@@ -4077,7 +4051,7 @@ async def test_hot_reload_forgets_closed_retired_generation(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
-async def test_bot_command_catalogs_require_explicit_channel_declarations(
+async def test_v2_channel_command_methods_are_not_a_catalog_source(
     tmp_path: Path,
 ) -> None:
     _write_plugin(
@@ -4102,14 +4076,11 @@ async def test_bot_command_catalogs_require_explicit_channel_declarations(
     )
     manager = _manager(tmp_path)
 
-    await manager.load_all()
+    with pytest.raises(RuntimeError, match="v2 channel command ABI 已删除"):
+        await manager.load_all()
 
-    assert manager.telegram_bot_commands == [
-        ("telegram_only", "仅 Telegram"),
-        ("shared", "共享命令"),
-    ]
-    assert manager.mobile_bot_commands == [("shared", "共享命令")]
-    await manager.terminate_all()
+    assert manager.current_snapshot is None
+    assert manager.loaded_count == 0
 
 
 @pytest.mark.asyncio

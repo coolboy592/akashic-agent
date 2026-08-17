@@ -90,7 +90,6 @@ class TelegramChannel:
         bus: MessageBus,
         session_manager: SessionManager,
         allow_from: list[str] | None = None,
-        bot_commands: list[tuple[str, str]] | None = None,
         command_catalog_provider: Callable[
             [], tuple[tuple[str, str], ...]
         ] | None = None,
@@ -113,7 +112,6 @@ class TelegramChannel:
             normalizer=lambda value: value.lower(),
         )
         self._app = Application.builder().token(token).build()
-        self._bot_commands = bot_commands or []
         self._command_catalog_provider = command_catalog_provider
         self._app.add_handler(CommandHandler("stop", self._on_stop_command))
         self._app.add_handler(
@@ -249,7 +247,7 @@ class TelegramChannel:
         catalog = (
             self._command_catalog_provider()
             if self._command_catalog_provider is not None
-            else tuple(self._bot_commands)
+            else ()
         )
         commands = [
             BotCommand(command, description)
@@ -271,7 +269,6 @@ class TelegramChannel:
             for command, description in (*commands, ("stop", "中断当前回复"))
         ]
         await self._app.bot.set_my_commands(published)
-        self._bot_commands = list(commands)
 
     async def _remember_username(self, chat_id: str, username: str | None) -> None:
         if username:

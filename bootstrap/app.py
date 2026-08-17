@@ -510,8 +510,6 @@ class AppRuntime:
                     channel_name=self.config.channels.chat.channel_name,
                 )
                 plugin_channels.append(self.web_chat_channel)
-            # V2_REMOVAL(channel-command-catalog)：channel host 改读 committed stable command
-            # catalog 后，删除两个 Manager command 列表和对应 start_channels 参数。
             self.channel_host = await start_channels(
                 self.config,
                 bus=self.bus,
@@ -519,12 +517,6 @@ class AppRuntime:
                 push_tool=self.push_tool,
                 http_resources=self.http_resources,
                 event_bus=event_bus,
-                telegram_bot_commands=(
-                    plugin_manager.telegram_bot_commands if plugin_manager else None
-                ),
-                mobile_bot_commands=(
-                    plugin_manager.mobile_bot_commands if plugin_manager else None
-                ),
                 telegram_command_catalog_provider=(
                     plugin_manager.stable_telegram_command_catalog
                     if plugin_manager is not None

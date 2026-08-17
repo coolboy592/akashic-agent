@@ -1407,31 +1407,15 @@ class PluginManager:
             )
         return plugin_is_active(instance, plugin_id=module_path)
 
-    @property
-    def telegram_bot_commands(self) -> list[tuple[str, str]]:
-        # V2_REMOVAL(channel-command-catalog)：Observe/Setup Helper/Status Commands 迁到只发布
-        # stable generation 的 channel command catalog 后，连同 mobile 聚合和 bootstrap 传参删除。
-        return list(self.stable_telegram_command_catalog())
-
-    @property
-    def mobile_bot_commands(self) -> list[tuple[str, str]]:
-        return list(self.stable_mobile_command_catalog())
-
     def stable_telegram_command_catalog(self) -> tuple[tuple[str, str], ...]:
         """Return discovery commands from the exact committed stable snapshot."""
 
-        return self._snapshot_bot_commands(
-            self.current_snapshot,
-            "telegram_bot_commands",
-        )
+        return self._snapshot_bot_commands(self.current_snapshot)
 
     def stable_mobile_command_catalog(self) -> tuple[tuple[str, str], ...]:
         """Return mobile commands from the exact committed stable snapshot."""
 
-        return self._snapshot_bot_commands(
-            self.current_snapshot,
-            "mobile_bot_commands",
-        )
+        return self._snapshot_bot_commands(self.current_snapshot)
 
     def stable_channel_catalog(self) -> ChannelRegistrySnapshot | None:
         """Return the exact committed stable channel declaration catalog."""
@@ -1439,37 +1423,21 @@ class PluginManager:
         snapshot = self.current_snapshot
         return None if snapshot is None else snapshot.channel_registry
 
-    def _declared_bot_commands(self, getter_name: str) -> list[tuple[str, str]]:
-        """聚合当前插件代际为指定渠道显式声明的命令。"""
-
-        return list(self._snapshot_bot_commands(self.current_snapshot, getter_name))
-
     @staticmethod
     def _snapshot_bot_commands(
         snapshot: RuntimeSnapshot | None,
-        getter_name: str,
     ) -> tuple[tuple[str, str], ...]:
         """Project one immutable channel catalog from a snapshot."""
 
         if snapshot is None:
             return ()
-        commands: list[tuple[str, str]] = []
-        for generation in snapshot.active_generations():
-            if isinstance(generation.instance, ComposablePlugin):
-                continue
-            instance = generation.instance
-            getter = getattr(instance, getter_name, None)
-            if getter is None:
-                continue
-            typed_getter = cast(Callable[[], list[tuple[str, str]]], getter)
-            for command, description in typed_getter():
-                commands.append((str(command), str(description)))
-        if snapshot.command_registry is not None:
-            commands.extend(
-                (descriptor.name, descriptor.description)
-                for descriptor in snapshot.command_registry.descriptors
-            )
-        return tuple(commands)
+        registry = snapshot.command_registry
+        if registry is None:
+            return ()
+        return tuple(
+            (descriptor.name, descriptor.description)
+            for descriptor in registry.descriptors
+        )
 
     # 扫描所有 plugin_dirs，返回可加载的插件描述列表
     def discover(
@@ -2752,10 +2720,7 @@ class PluginManager:
         old_services = active.contributions.managed_services
         old_channels = active.contributions.channels
         old_commands = self.stable_telegram_command_catalog()
-        new_commands = self._snapshot_bot_commands(
-            snapshot,
-            "telegram_bot_commands",
-        )
+        new_commands = self._snapshot_bot_commands(snapshot)
         exclusive_endpoint_changed = bool(old_services or old_channels)
         command_catalog_changed = old_commands != new_commands
         v3_channel_catalog_changed = (
@@ -3231,10 +3196,7 @@ class PluginManager:
             )
             new_channels = target_contributions.channels
             old_commands = self.stable_telegram_command_catalog()
-            new_commands = self._snapshot_bot_commands(
-                ready.snapshot,
-                "telegram_bot_commands",
-            )
+            new_commands = self._snapshot_bot_commands(ready.snapshot)
             stable_snapshot = self.current_snapshot
             v3_runtime_handoff = self._composition_runtime_declared(
                 ready.snapshot,
@@ -3310,10 +3272,7 @@ class PluginManager:
                     )
                     new_services = generation.contributions.managed_services
                     new_channels = generation.contributions.channels
-                    new_commands = self._snapshot_bot_commands(
-                        ready.snapshot,
-                        "telegram_bot_commands",
-                    )
+                    new_commands = self._snapshot_bot_commands(ready.snapshot)
                 except BaseException:
                     gated_runtime_error: BaseException | None = None
                     if runtime_restore_started:
@@ -4289,10 +4248,7 @@ class PluginManager:
         old_channels = active.contributions.channels if active is not None else ()
         new_channels = generation.contributions.channels
         old_commands = self.stable_telegram_command_catalog()
-        new_commands = self._snapshot_bot_commands(
-            snapshot,
-            "telegram_bot_commands",
-        )
+        new_commands = self._snapshot_bot_commands(snapshot)
         current = self.current_snapshot
         v3_runtime_handoff = self._composition_runtime_declared(
             snapshot,
@@ -6297,7 +6253,6 @@ class PluginManager:
     ) -> None:
         """Validate v2 claims against the frozen v3 command namespace."""
 
-        registry = snapshot.command_registry or CommandRegistry.empty()
         claims: set[tuple[str, str]] = set()
         for generation in snapshot.generations.values():
             if isinstance(generation.instance, ComposablePlugin):
@@ -6312,7 +6267,11 @@ class PluginManager:
                 typed_getter = cast(Callable[[], list[tuple[str, str]]], getter)
                 for command, _description in typed_getter():
                     claims.add((str(command), generation.plugin_id))
-        registry.validate_legacy_claims(sorted(claims))
+        if claims:
+            owners = ", ".join(f"{name}:{owner}" for name, owner in sorted(claims))
+            raise RuntimeError(
+                "v2 channel command ABI 已删除，请迁移到 COMMANDS: " + owners
+            )
 
     def _get_composition_memory_runtime(self) -> MemoryRuntimeInfo | None:
         """为本 Manager 构建的全部 Root 冻结同一份 Memory 描述能力。"""

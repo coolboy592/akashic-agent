@@ -2141,7 +2141,6 @@ async def test_turn_stop_idle_result_still_closes_stale_mobile_turn(
                     ),
                 ),
                 attachment_store=AttachmentStore(tmp_path / "uploads"),
-                mobile_bot_commands=[],
                 command_catalog_provider=None,
             ),
         )
@@ -2405,7 +2404,6 @@ async def test_command_list_uses_active_channel_catalog_without_stop(
                 push_tool=_PushTool(),
                 interrupt_controller=None,
                 attachment_store=AttachmentStore(tmp_path / "uploads"),
-                mobile_bot_commands=[],
                 command_catalog_provider=lambda: tuple(active_catalog),
             ),
         )
@@ -2464,8 +2462,7 @@ async def test_message_send_preserves_mobile_slash_command_for_bus(
                 push_tool=_PushTool(),
                 interrupt_controller=None,
                 attachment_store=AttachmentStore(tmp_path / "uploads"),
-                mobile_bot_commands=[("undo", "撤销上一轮对话")],
-                command_catalog_provider=None,
+                command_catalog_provider=lambda: (("undo", "撤销上一轮对话"),),
             ),
         )
     )

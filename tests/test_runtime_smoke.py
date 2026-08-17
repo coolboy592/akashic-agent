@@ -1100,7 +1100,8 @@ async def test_start_channels_wires_telegram_qq_and_plugin(
         async def start(self, ctx: Any) -> None:
             starts.append("plugin")
             attachment_roots.append(ctx.attachment_store.root)
-            mobile_catalogs.append(ctx.mobile_bot_commands)
+            provider = ctx.command_catalog_provider
+            mobile_catalogs.append([] if provider is None else list(provider()))
             ctx.push_tool.register_channel(self.name, deliver=self.deliver)
 
         async def deliver(self, _message: ChannelMessage) -> DeliveryReceipt:
@@ -1145,8 +1146,10 @@ async def test_start_channels_wires_telegram_qq_and_plugin(
         push_tool=cast(Any, _PushTool()),
         http_resources=resources,
         event_bus=event_bus,
-        telegram_bot_commands=[("telegram_only", "仅 Telegram")],
-        mobile_bot_commands=[("mobile_only", "仅 mobile")],
+        telegram_command_catalog_provider=lambda: (
+            ("telegram_only", "仅 Telegram"),
+        ),
+        mobile_command_catalog_provider=lambda: (("mobile_only", "仅 mobile"),),
         interrupt_controller=cast(Any, controller),
         plugin_channels=[cast(Any, _PluginChannel())],
     )
@@ -1162,7 +1165,9 @@ async def test_start_channels_wires_telegram_qq_and_plugin(
         ]
         assert telegram.kwargs["event_bus"] is event_bus
         assert telegram.kwargs["interrupt_controller"] is controller
-        assert telegram.kwargs["bot_commands"] == [("telegram_only", "仅 Telegram")]
+        assert telegram.kwargs["command_catalog_provider"]() == (
+            ("telegram_only", "仅 Telegram"),
+        )
         assert qq.kwargs["interrupt_controller"] is controller
         assert plugin.name == "plugin"
         assert attachment_roots == [tmp_path / "uploads"]

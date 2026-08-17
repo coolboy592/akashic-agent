@@ -263,7 +263,6 @@ class _ChannelResources:
             attachment_store=context.attachment_store,
             http_resources=context.http_resources,
             interrupt_controller=context.interrupt_controller,
-            mobile_bot_commands=context.mobile_bot_commands,
             log=context.log,
             command_catalog_provider=context.command_catalog_provider,
         )

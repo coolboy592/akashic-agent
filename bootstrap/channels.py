@@ -23,8 +23,6 @@ async def start_channels(
     push_tool: MessagePushTool,
     http_resources: SharedHttpResources,
     event_bus: EventBus,
-    telegram_bot_commands: list[tuple[str, str]] | None = None,
-    mobile_bot_commands: list[tuple[str, str]] | None = None,
     telegram_command_catalog_provider: Callable[
         [], tuple[tuple[str, str], ...]
     ] | None = None,
@@ -34,8 +32,6 @@ async def start_channels(
     interrupt_controller: InterruptController | None = None,
     plugin_channels: list[Channel] | None = None,
 ) -> ChannelHost:
-    # V2_REMOVAL(channel-command-catalog)：Telegram/mobile 改从 stable command catalog 投影后，
-    # 删除两个 list 参数；candidate catalog 不得经此启动路径提前发布。
     attachment_store = AttachmentStore(session_manager.workspace / "uploads")
 
     def _ctx_factory(channel: Channel) -> ChannelContext:
@@ -47,7 +43,6 @@ async def start_channels(
             attachment_store=attachment_store,
             http_resources=http_resources,
             interrupt_controller=interrupt_controller,
-            mobile_bot_commands=mobile_bot_commands or [],
             log=logging.getLogger(f"channels.{channel.name}"),
             command_catalog_provider=mobile_command_catalog_provider,
         )
@@ -63,7 +58,6 @@ async def start_channels(
             bus=bus,
             session_manager=session_manager,
             allow_from=tg.allow_from,
-            bot_commands=telegram_bot_commands,
             command_catalog_provider=telegram_command_catalog_provider,
             event_bus=event_bus,
             interrupt_controller=interrupt_controller,

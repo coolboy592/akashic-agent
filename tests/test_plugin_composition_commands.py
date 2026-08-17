@@ -377,8 +377,12 @@ async def test_manager_keeps_candidate_commands_private_until_promotion(
     await manager.load_all()
     old_snapshot = manager.current_snapshot
     assert old_snapshot is not None and old_snapshot.command_registry is not None
-    assert manager.telegram_bot_commands == [("hello", "old description")]
-    assert manager.mobile_bot_commands == [("hello", "old description")]
+    assert manager.stable_telegram_command_catalog() == (
+        ("hello", "old description"),
+    )
+    assert manager.stable_mobile_command_catalog() == (
+        ("hello", "old description"),
+    )
     endpoint_calls: list[tuple[tuple[str, str], ...]] = []
 
     async def endpoint_switcher(
@@ -396,8 +400,12 @@ async def test_manager_keeps_candidate_commands_private_until_promotion(
         assert provisional.accepting_leases is False
         assert old_snapshot.state == "committed"
         assert old_snapshot.accepting_leases is False
-        assert manager.telegram_bot_commands == [("hello", "old description")]
-        assert manager.mobile_bot_commands == [("hello", "old description")]
+        assert manager.stable_telegram_command_catalog() == (
+            ("hello", "old description"),
+        )
+        assert manager.stable_mobile_command_catalog() == (
+            ("hello", "old description"),
+        )
         with pytest.raises(RuntimeError, match="暂停接收"):
             manager.snapshot_store.lease()
         endpoint_calls.append(new_commands)
@@ -414,14 +422,23 @@ async def test_manager_keeps_candidate_commands_private_until_promotion(
     candidate = await manager.prepare_candidate("commands_v3")
     assert candidate is not None and candidate.runtime_snapshot is not None
     assert candidate.runtime_snapshot.snapshot_id != old_snapshot.snapshot_id
-    assert manager.telegram_bot_commands == [("hello", "old description")]
+    assert manager.stable_telegram_command_catalog() == (
+        ("hello", "old description"),
+    )
 
     result = await manager.publish_prepared("commands_v3")
 
     assert result["publication_state"] == "committed"
-    assert manager.telegram_bot_commands == [("hello", "new description")]
-    assert manager.mobile_bot_commands == [("hello", "new description")]
-    assert all(name != "hi" for name, _description in manager.telegram_bot_commands)
+    assert manager.stable_telegram_command_catalog() == (
+        ("hello", "new description"),
+    )
+    assert manager.stable_mobile_command_catalog() == (
+        ("hello", "new description"),
+    )
+    assert all(
+        name != "hi"
+        for name, _description in manager.stable_telegram_command_catalog()
+    )
     assert endpoint_calls == [(('hello', 'new description'),)]
     quiesce.assert_not_awaited()
     resume.assert_not_awaited()
@@ -477,7 +494,9 @@ async def test_command_catalog_failure_restores_old_stable_and_generation(
     ]
     assert manager.current_snapshot is old_snapshot
     assert manager.generation("commands_v3") is old_generation
-    assert manager.telegram_bot_commands == [("hello", "old description")]
+    assert manager.stable_telegram_command_catalog() == (
+        ("hello", "old description"),
+    )
     lease = manager.snapshot_store.lease()
     assert lease.snapshot is old_snapshot
     await lease.release()
@@ -503,7 +522,7 @@ async def test_mixed_v2_v3_command_collision_prevents_stable_publish(
     )
     manager = _manager(tmp_path)
 
-    with pytest.raises(CompositionError, match="hi"):
+    with pytest.raises(RuntimeError, match="v2 channel command ABI 已删除.*hi"):
         await manager.load_all()
 
     assert manager.current_snapshot is None
@@ -526,7 +545,7 @@ async def test_v2_only_command_collision_prevents_stable_publish(
         )
     manager = _manager(tmp_path)
 
-    with pytest.raises(CompositionError, match="same"):
+    with pytest.raises(RuntimeError, match="v2 channel command ABI 已删除.*same"):
         await manager.load_all()
 
     assert manager.current_snapshot is None
@@ -549,7 +568,7 @@ async def test_v2_command_cannot_claim_core_stop_namespace(tmp_path: Path) -> No
 
     assert manager.current_snapshot is None
     assert manager.loaded_count == 0
-    assert manager.telegram_bot_commands == []
+    assert manager.stable_telegram_command_catalog() == ()
 
 
 class _CommandProvider(ProviderContextBudgetStub):
