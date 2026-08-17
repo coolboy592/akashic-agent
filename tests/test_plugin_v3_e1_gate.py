@@ -19,10 +19,16 @@ def test_e1_catalog_is_exact_and_has_no_implicit_pass() -> None:
 
 def test_passive_webui_report_oracle_accepts_synthetic_pass(tmp_path: Path) -> None:
     locks = gate._select_e1_locks(gate.DEFAULT_LOCK)
+    core = gate.fleet_gate._core_evidence()
     report_path = tmp_path / "plugin-passive-webui-v3.json"
     payload: dict[str, object] = {
         "status": "passed",
         "scenario_profile": gate.PASSIVE_WEBUI_SCENARIO_PROFILE,
+        "core": {
+            "head": core["head"],
+            "tree": core["tree"],
+            "dirty_status": [],
+        },
         "sources": [
             {"kind": "contract", "id": "plugin_contracts"},
             {
@@ -52,7 +58,7 @@ def test_passive_webui_report_oracle_accepts_synthetic_pass(tmp_path: Path) -> N
     }
     report_path.write_text(json.dumps(payload), encoding="utf-8")
 
-    evidence = gate._validate_passive_webui_report(report_path, locks)
+    evidence = gate._validate_passive_webui_report(report_path, locks, core)
 
     assert evidence["status"] == "passed"
     assert evidence["source_shas"] == {
@@ -60,6 +66,29 @@ def test_passive_webui_report_oracle_accepts_synthetic_pass(tmp_path: Path) -> N
         "meme": locks["meme"].resolved_sha,
     }
     assert evidence["prompt_order"] == {"citation_index": 10, "meme_index": 20}
+
+
+def test_passive_webui_report_oracle_rejects_stale_core(tmp_path: Path) -> None:
+    locks = gate._select_e1_locks(gate.DEFAULT_LOCK)
+    core = gate.fleet_gate._core_evidence()
+    report_path = tmp_path / "plugin-passive-webui-v3.json"
+    report_path.write_text(
+        json.dumps(
+            {
+                "status": "passed",
+                "scenario_profile": gate.PASSIVE_WEBUI_SCENARIO_PROFILE,
+                "core": {
+                    "head": "0" * 40,
+                    "tree": core["tree"],
+                    "dirty_status": [],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(gate.E1GateError, match="Core head"):
+        gate._validate_passive_webui_report(report_path, locks, core)
 
 
 def test_sqlite_state_covers_without_rowid_tables(tmp_path: Path) -> None:

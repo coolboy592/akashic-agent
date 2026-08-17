@@ -245,7 +245,11 @@ def _validate_passive_assistant(report: dict[str, object]) -> dict[str, object]:
     }
 
 
-def _validate_passive_webui_report(path: Path, locks: dict[str, Any]) -> dict[str, object]:
+def _validate_passive_webui_report(
+    path: Path,
+    locks: dict[str, Any],
+    expected_core: dict[str, object],
+) -> dict[str, object]:
     """严格验证已完成的 WebUI Gate report，返回可并入 E1 的证据。"""
 
     if not path.is_file():
@@ -259,6 +263,15 @@ def _validate_passive_webui_report(path: Path, locks: dict[str, Any]) -> dict[st
         raise E1GateError(f"passive WebUI report.status 不是 passed: {report.get('status')!r}")
     if report.get("scenario_profile") != PASSIVE_WEBUI_SCENARIO_PROFILE:
         raise E1GateError(f"passive WebUI scenario_profile 不匹配: {report.get('scenario_profile')!r}")
+    report_core = _report_object(report.get("core"), "passive WebUI report.core")
+    if report_core.get("dirty_status") != []:
+        raise E1GateError("passive WebUI report 不是干净 Core 证据")
+    for field in ("head", "tree"):
+        if report_core.get(field) != expected_core.get(field):
+            raise E1GateError(
+                f"passive WebUI Core {field} 与当前 E1 不一致: "
+                f"expected={expected_core.get(field)!r} actual={report_core.get(field)!r}"
+            )
     source_shas = _validate_passive_sources(report, locks)
     runtime = _report_object(report.get("runtime"), "passive WebUI report.runtime")
     request = _report_object(runtime.get("model_request"), "passive WebUI model_request")
@@ -807,7 +820,11 @@ async def _run_gate(
         try:
             if not locks:
                 raise E1GateError("E1 fleet lock 不可用，无法绑定 passive WebUI source SHA")
-            passive = _validate_passive_webui_report(passive_webui_report, locks)
+            passive = _validate_passive_webui_report(
+                passive_webui_report,
+                locks,
+                core,
+            )
         except E1GateError as error:
             scenarios.append({
                 "id": "passive_prompt_metadata_media", "status": "blocked",
