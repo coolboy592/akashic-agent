@@ -382,7 +382,7 @@ class ProactiveFlowRuntime:
         try:
             state.base_score = await self._deliver_execute(ctx, state.decision)
         finally:
-            if ctx.drift_entered and (ctx.draft_message or ctx.draft_media):
+            if ctx.drift_entered and ctx.drift_finished:
                 sent = bool(self._deliverer.last_sent)
                 if self._drift_pipeline is not None:
                     self._drift_pipeline.record_commit_result(ctx, sent)

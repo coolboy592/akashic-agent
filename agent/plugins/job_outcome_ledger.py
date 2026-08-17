@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from contextlib import closing, contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from enum import StrEnum
 from pathlib import Path
-from typing import Iterator, Self
+from typing import Iterator, Mapping, Self
 
 
 OUTCOMES_DB_FILENAME = "outcomes.sqlite"
@@ -94,6 +95,51 @@ def _timestamp(value: datetime | None) -> str:
     return current.astimezone(timezone.utc).isoformat()
 
 
+def _normalize_event_payload(
+    value: Mapping[str, object] | None,
+    *,
+    event_id: str | None = None,
+) -> dict[str, object] | None:
+    """Validate and copy the small JSON payload retained for event recovery."""
+
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise TypeError("event_payload 必须是 JSON object")
+    payload = dict(value)
+    if any(not isinstance(key, str) or not key for key in payload):
+        raise TypeError("event_payload 的 key 必须是非空字符串")
+    if event_id is not None and "event_id" in payload:
+        if payload["event_id"] != event_id:
+            raise JobOutcomeIdentityError(
+                "event_payload.event_id 必须与 identity.event_id 一致"
+            )
+    try:
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("event_payload 必须可 JSON 序列化") from exc
+    return payload
+
+
+def _encode_event_payload(value: Mapping[str, object] | None) -> str | None:
+    payload = _normalize_event_payload(value)
+    if payload is None:
+        return None
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _decode_event_payload(value: object) -> dict[str, object] | None:
+    if value is None:
+        return None
+    try:
+        decoded = json.loads(str(value))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("JobOutcomeLedger 存在损坏的 event_payload_json") from exc
+    if not isinstance(decoded, dict):
+        raise RuntimeError("JobOutcomeLedger event_payload_json 必须是 JSON object")
+    return _normalize_event_payload(decoded)
+
+
 @dataclass(frozen=True, slots=True)
 class JobOutcomeIdentity:
     """Immutable binding and trigger identity captured at first admission."""
@@ -112,6 +158,7 @@ class JobOutcomeIdentity:
     event_id: str | None = None
     interval_bucket: str | None = None
     semantic_job_id: str | None = None
+    event_payload: Mapping[str, object] | None = None
 
     def __post_init__(self) -> None:
         # 1. Validate the immutable binding and semantic key.
@@ -147,6 +194,11 @@ class JobOutcomeIdentity:
         object.__setattr__(self, "semantic_job_id", semantic_job_id)
         object.__setattr__(self, "event_id", event_id)
         object.__setattr__(self, "interval_bucket", interval_bucket)
+        object.__setattr__(
+            self,
+            "event_payload",
+            _normalize_event_payload(self.event_payload, event_id=event_id),
+        )
 
     @property
     def trigger_identity(self) -> str:
@@ -189,6 +241,7 @@ class JobOutcomeRecord:
     created_at: str
     updated_at: str
     terminal_result_digest: str | None
+    event_payload: Mapping[str, object] | None = None
 
     @property
     def trigger_identity(self) -> str:
@@ -246,6 +299,7 @@ class JobOutcomeRecord:
             event_id=self.event_id,
             interval_bucket=self.interval_bucket,
             semantic_job_id=self.semantic_job_id,
+            event_payload=self.event_payload,
         )
 
 
@@ -279,6 +333,7 @@ _SCHEMA = (
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         terminal_result_digest TEXT,
+        event_payload_json TEXT,
         CHECK (semantic_job_id = plugin_id || ':' || job_name),
         CHECK ((event_id IS NOT NULL) != (interval_bucket IS NOT NULL)),
         CHECK (
@@ -355,13 +410,23 @@ class JobOutcomeLedger:
             if journal_mode.lower() != "wal":
                 raise RuntimeError(f"JobOutcomeLedger 必须使用 WAL: {journal_mode}")
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-            if version not in (0, 1):
+            if version not in (0, 1, 2):
                 raise RuntimeError(f"JobOutcomeLedger schema 版本不支持: {version}")
             connection.execute("BEGIN IMMEDIATE")
             try:
                 for statement in _SCHEMA:
                     connection.execute(statement)
-                connection.execute("PRAGMA user_version = 1")
+                columns = {
+                    str(row["name"])
+                    for row in connection.execute(
+                        "PRAGMA table_info(job_outcomes)"
+                    ).fetchall()
+                }
+                if "event_payload_json" not in columns:
+                    connection.execute(
+                        "ALTER TABLE job_outcomes ADD COLUMN event_payload_json TEXT"
+                    )
+                connection.execute("PRAGMA user_version = 2")
             except BaseException:
                 connection.rollback()
                 raise
@@ -401,6 +466,7 @@ class JobOutcomeLedger:
         lifecycle_revision: str | None = None,
         api_revision: str | None = None,
         semantic_job_id: str | None = None,
+        event_payload: Mapping[str, object] | None = None,
         now: datetime | None = None,
     ) -> JobOutcomeRecord:
         """Insert one queued invocation or return the existing event admission."""
@@ -427,6 +493,10 @@ class JobOutcomeLedger:
                 )
             ):
                 raise TypeError("identity 与显式 admission 字段不能同时提供")
+            if event_payload is not None:
+                if identity.event_payload is not None:
+                    raise TypeError("identity 已包含 event_payload")
+                identity = replace(identity, event_payload=event_payload)
         else:
             missing = {
                 field: value
@@ -462,6 +532,7 @@ class JobOutcomeLedger:
                 lifecycle_revision=lifecycle_revision,  # type: ignore[arg-type]
                 api_revision=api_revision,  # type: ignore[arg-type]
                 semantic_job_id=semantic_job_id,
+                event_payload=event_payload,
             )
         assert identity is not None
         created_at = _timestamp(now)
@@ -501,8 +572,8 @@ class JobOutcomeLedger:
                     model_generation_id, artifact_identity, source_revision,
                     handler_export, lifecycle_revision, api_revision, attempt,
                     state, phase, error, created_at, updated_at,
-                    terminal_result_digest
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, NULL, ?, ?, NULL)
+                    terminal_result_digest, event_payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, NULL, ?, ?, NULL, ?)
                 """,
                 (
                     identity.semantic_job_id,
@@ -523,6 +594,7 @@ class JobOutcomeLedger:
                     JobOutcomePhase.HANDLER.value,
                     created_at,
                     created_at,
+                    _encode_event_payload(identity.event_payload),
                 ),
             )
             row = connection.execute(
@@ -753,6 +825,7 @@ class JobOutcomeLedger:
                 if row["terminal_result_digest"] is None
                 else str(row["terminal_result_digest"])
             ),
+            event_payload=_decode_event_payload(row["event_payload_json"]),
         )
         try:
             JobOutcomeLedger._validate_outcome_fields(

@@ -87,6 +87,10 @@ class DriftTurnPipeline:
     def __init__(self, deps: DriftTurnPipelineDeps) -> None:
         self._store = deps.store
         self._tool_deps = deps.tool_deps
+        # The pipeline store is the durable run owner; tools must not write a
+        # parallel store and strand the event-to-run association.
+        if self._tool_deps.store is not self._store:
+            self._tool_deps.store = self._store
         self._veda_fn = deps.veda_fn
         self._max_steps = deps.max_steps
         self.step_recorder = deps.step_recorder
@@ -106,8 +110,13 @@ class DriftTurnPipeline:
         if not skills:
             return False
 
-        # 3. Prepare — 构建 tool registry 与初始 messages。
-        tools, messages = await self._prepare(ctx, skills)
+        event_token = self._store.bind_event_id(ctx.event_id)
+        try:
+            # 3. Prepare — 构建 tool registry 与初始 messages。
+            tools, messages = await self._prepare(ctx, skills)
+        except BaseException:
+            self._store.reset_event_id(event_token)
+            raise
 
         primary_error: BaseException | None = None
         try:
@@ -132,6 +141,8 @@ class DriftTurnPipeline:
                 if primary_error is None:
                     raise
                 logger.exception("[drift] shell cleanup 失败，保留原始执行异常")
+            finally:
+                self._store.reset_event_id(event_token)
 
     # ── 1. Scan（扫描）───────────────────────────────────────────────
 
@@ -524,11 +535,19 @@ class DriftTurnPipeline:
 
     def record_commit_result(self, ctx: AgentTickContext, sent: bool) -> None:
         message_result = "sent" if sent else "silent"
-        self._store.update_last_message_result(message_result)
+        event_id = ctx.event_id
+        if not self._store.has_event(event_id):
+            event_id = self._store.last_saved_event_id or event_id
+            ctx.event_id = event_id
+        self._store.update_last_message_result(
+            message_result,
+            event_id=event_id,
+        )
         event_bus = self._tool_deps.event_bus
         if event_bus is not None:
             event_bus.enqueue(
                 DriftFinished(
+                    event_id=event_id,
                     session_key=ctx.session_key,
                     skill_name=ctx.drift_selected_skill,
                     status=ctx.drift_finish_status,

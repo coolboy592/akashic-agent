@@ -231,6 +231,56 @@ def test_restart_reads_pending_records_with_exact_identity(tmp_path: Path) -> No
     assert record.state is JobOutcomeState.RUNNING
 
 
+def test_restart_reads_pending_event_payload_without_changing_binding(tmp_path: Path) -> None:
+    path = tmp_path / "outcomes.sqlite"
+    payload = {
+        "event_id": "drift:durable-1",
+        "session_key": "session-1",
+        "skill_name": "explore-curiosity",
+        "status": "completed",
+        "briefing": "done",
+        "message_result": "silent",
+        "timestamp": "2026-08-17T03:00:00+00:00",
+    }
+    identity = _identity(event_id="drift:durable-1")
+    first_ledger = JobOutcomeLedger(path)
+    first_ledger.admit(identity=identity, event_payload=payload)
+    first_ledger.transition("invocation-1", JobOutcomeState.RUNNING)
+    first_ledger.close()
+
+    restarted = JobOutcomeLedger(path)
+    pending = restarted.list_pending()
+
+    assert len(pending) == 1
+    record = pending[0]
+    assert record.event_id == "drift:durable-1"
+    assert dict(record.event_payload or {}) == payload
+    assert dict(record.identity().event_payload or {}) == payload
+    assert record.snapshot_id == "snapshot-1"
+    assert record.plugin_generation_id == "plugin-generation-1"
+
+
+def test_schema_migrates_old_outcome_table_without_payload_column(tmp_path: Path) -> None:
+    path = tmp_path / "outcomes.sqlite"
+    ledger = JobOutcomeLedger(path)
+    ledger.close()
+    with closing(sqlite3.connect(path)) as connection:
+        connection.execute("ALTER TABLE job_outcomes DROP COLUMN event_payload_json")
+        connection.execute("PRAGMA user_version = 1")
+        connection.commit()
+
+    migrated = JobOutcomeLedger(path)
+    with closing(sqlite3.connect(path)) as connection:
+        columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(job_outcomes)")
+        }
+        version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+    assert "event_payload_json" in columns
+    assert version == 2
+    assert migrated.list_all() == ()
+
+
 def test_transaction_rolls_back_real_sqlite_failure(tmp_path: Path) -> None:
     path = tmp_path / "outcomes.sqlite"
     ledger = JobOutcomeLedger(path)
