@@ -609,6 +609,22 @@ class ProactiveDocuments:
             os.chmod(path, 0o700)
         self._lock_path = state_root / ".pair.lock"
 
+    def read_pair(self) -> tuple[ProactiveDocumentDigests, ProactiveDocumentPair]:
+        """Return detached bytes and exact digests for the two authorized documents."""
+
+        with self._pair_lock():
+            states = {name: self._read_document(name) for name in DOCUMENT_NAMES}
+        return (
+            ProactiveDocumentDigests(
+                context=states[PROACTIVE_CONTEXT].digest,
+                pending=states[PROACTIVE_PENDING].digest,
+            ),
+            ProactiveDocumentPair(
+                context=states[PROACTIVE_CONTEXT].content,
+                pending=states[PROACTIVE_PENDING].content,
+            ),
+        )
+
     async def prepare_pair(
         self,
         expected: ProactiveDocumentDigests | Mapping[str, object],
@@ -860,6 +876,49 @@ class ProactiveDocuments:
             raise DocumentIntentError("receipt 不属于当前 invocation-bound documents port")
         with self._pair_lock():
             return self._load_terminal_locked()
+
+    def validate_terminal_truth(self) -> ProactiveDocumentReceipt | None:
+        """Verify one terminal receipt against domain truth and current documents."""
+
+        with self._pair_lock():
+            terminal = self._load_terminal_locked()
+            if terminal is None:
+                return None
+            assert terminal.intent_expected is not None
+            assert terminal.intent_new_digests is not None
+            intent = ProactiveDocumentIntent(
+                intent_id=terminal.intent_id,
+                invocation_id=terminal.invocation_id,
+                idempotency_key=terminal.idempotency_key,
+                effect_id=terminal.intent_effect_id,
+                path=self._intent_path(),
+                expected=terminal.intent_expected,
+                new_digests=terminal.intent_new_digests,
+                state=terminal.intent_state,
+                completed=(),
+                _token=terminal.intent_token,
+            )
+
+            # 1. Recheck the plugin-owned durable effect rather than trusting the receipt file alone.
+            lookup = self._lookup(intent)
+            if lookup.state is ReceiptLookupState.UNAVAILABLE:
+                raise MissingDomainEffectReceipt(lookup.error or "domain receipt 不可用")
+            if terminal.status is DocumentReceiptStatus.COMMITTED:
+                if lookup.state is ReceiptLookupState.ABSENT or lookup.receipt is None:
+                    raise MissingDomainEffectReceipt("terminal document receipt 缺少 domain truth")
+                lookup.receipt.validate_for(
+                    invocation_id=intent.invocation_id,
+                    effect_id=intent.effect_id,
+                    idempotency_key=intent.idempotency_key,
+                )
+                self._validate_terminal_effect(terminal, intent, lookup.receipt)
+                self._assert_targets_new(intent)
+            else:
+                if lookup.state is ReceiptLookupState.FOUND:
+                    raise ReceiptIdentityError("aborted terminal receipt 已存在 domain truth")
+                self._validate_terminal_effect(terminal, intent, None)
+                self._assert_targets_old(intent)
+            return terminal
 
     def _effect_id(self, override: str | None) -> str | None:
         if override is None:

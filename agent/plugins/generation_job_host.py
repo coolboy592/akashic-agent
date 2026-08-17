@@ -16,6 +16,7 @@ from contextvars import ContextVar, Token
 from collections.abc import Awaitable, Callable, Coroutine, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from types import MappingProxyType
 from typing import Any, TYPE_CHECKING, cast
 
@@ -39,6 +40,17 @@ from agent.plugins.job_outcome_ledger import (
     JobOutcomeRecord,
     JobOutcomeState,
 )
+from agent.plugins.proactive_documents import (
+    DomainEffectLookup,
+    DomainEffectReceipt,
+    DocumentReceiptStatus,
+    ProactiveDocumentDigests,
+    ProactiveDocumentIntent,
+    ProactiveDocumentPair,
+    ProactiveDocumentReceipt,
+    ProactiveDocuments,
+    ReceiptLookupState,
+)
 from agent.plugins.snapshot import (
     RuntimeSnapshotLease,
     RuntimeSnapshotStore,
@@ -54,6 +66,150 @@ if TYPE_CHECKING:
 DriftFinishedEvent = DriftFinished
 _JOB_LIFECYCLE_REVISION = "background-job-v3"
 _JOB_API_REVISION = "plugin-api-v3"
+_DOCUMENTS_ALLOWLIST = frozenset(
+    {
+        ("emotion", "merge_pending"),
+        ("emotion", "merge_proactive_pending"),
+    }
+)
+
+
+DomainTransaction = Callable[["DomainEffectContext"], object | Awaitable[object]]
+
+
+@dataclass(frozen=True, slots=True)
+class DomainEffectContext:
+    """Core identity passed to one plugin-owned domain transaction."""
+
+    invocation_id: str
+    plugin_id: str
+    job_name: str
+    semantic_job_id: str
+    event_id: str | None
+    snapshot_id: str
+    effect_id: str
+    idempotency_key: str
+    attempt: int
+
+
+class ProactiveDomainEffects:
+    """Issue Core receipt capabilities around an exact module lookup export."""
+
+    def __init__(
+        self,
+        *,
+        context: DomainEffectContext,
+        lookup: Callable[[DomainEffectContext], object | Awaitable[object]],
+    ) -> None:
+        self.context = context
+        self._lookup_export = lookup
+        self._issued: dict[tuple[str, str], DomainEffectReceipt] = {}
+        self._closed = False
+        self._prepared_guard: Callable[[], bool] | None = None
+
+    @property
+    def issued_receipt(self) -> DomainEffectReceipt | None:
+        return next(iter(self._issued.values()), None)
+
+    async def run(
+        self,
+        effect_id: str,
+        transaction: DomainTransaction,
+    ) -> DomainEffectReceipt:
+        """Look up, execute once when absent, and issue the exact Core receipt."""
+
+        if self._closed:
+            raise RuntimeError("ProactiveDomainEffects invocation 已结算")
+        if effect_id != self.context.effect_id:
+            raise ValueError("domain effect identity 不匹配")
+        if not callable(transaction):
+            raise TypeError("domain transaction 必须是 callable")
+        if self._prepared_guard is not None and not self._prepared_guard():
+            raise RuntimeError("domain effect 前必须先 prepare documents intent")
+
+        # 1. The exact plugin export is the domain truth; Core never treats its own receipt store as truth.
+        existing = await self._lookup_committed()
+        if existing is not None:
+            return self._issue(existing)
+
+        # 2. Run the plugin-owned SQLite transaction only after an explicit ABSENT lookup.
+        try:
+            result = transaction(self.context)
+            if inspect.isawaitable(result):
+                await result
+        except BaseException:
+            committed_after_failure = await self._lookup_committed()
+            if committed_after_failure is not None:
+                return self._issue(committed_after_failure)
+            raise
+
+        # 3. Require the durable domain record before signing a Core capability.
+        committed = await self._lookup_committed()
+        if committed is None:
+            raise RuntimeError("domain effect transaction 完成但 lookup 仍为 ABSENT")
+        return self._issue(committed)
+
+    def lookup(
+        self,
+        *,
+        invocation_id: str,
+        effect_id: str | None,
+        idempotency_key: str,
+    ) -> DomainEffectLookup:
+        """Synchronously expose the lookup port for document recovery."""
+
+        if self._closed:
+            raise RuntimeError("ProactiveDomainEffects invocation 已结算")
+        if invocation_id != self.context.invocation_id:
+            raise RuntimeError("domain effect invocation identity 不匹配")
+        if effect_id is not None and effect_id != self.context.effect_id:
+            raise RuntimeError("domain effect identity 不匹配")
+        if idempotency_key != self.context.idempotency_key:
+            raise RuntimeError("domain effect idempotency key 不匹配")
+        raw = self._lookup_export(self.context)
+        if inspect.isawaitable(raw):
+            raise RuntimeError("domain effect lookup export 必须是同步 callable")
+        committed = _committed_record(raw)
+        if committed is None:
+            return DomainEffectLookup(ReceiptLookupState.ABSENT)
+        return DomainEffectLookup(
+            ReceiptLookupState.FOUND,
+            receipt=self._issue(committed),
+        )
+
+    def close(self) -> None:
+        """Invalidate this invocation view after handler and document cleanup."""
+
+        self._closed = True
+
+    def _bind_prepared_guard(self, guard: Callable[[], bool]) -> None:
+        if self._prepared_guard is not None:
+            raise RuntimeError("domain effect prepared guard 已绑定")
+        self._prepared_guard = guard
+
+    async def _lookup_committed(self) -> Mapping[str, object] | object | None:
+        raw = self._lookup_export(self.context)
+        if inspect.isawaitable(raw):
+            raw = await raw
+        return _committed_record(raw)
+
+    def _issue(self, raw: Mapping[str, object] | object) -> DomainEffectReceipt:
+        _validate_committed_identity(raw, self.context)
+        key = (self.context.effect_id, self.context.idempotency_key)
+        issued = self._issued.get(key)
+        if issued is not None:
+            return issued
+        result_digest = _record_digest(raw)
+        issued = DomainEffectReceipt(
+            effect_id=self.context.effect_id,
+            idempotency_key=self.context.idempotency_key,
+            state="committed",
+            result_digest=result_digest,
+            invocation_id=self.context.invocation_id,
+            attempt=self.context.attempt,
+        )
+        self._issued[key] = issued
+        return issued
 
 
 @dataclass(frozen=True, slots=True)
@@ -239,6 +395,8 @@ class BackgroundJobContext:
     model_generation_id: str
     llm: GenerationLlmLease
     activation_token: object
+    domain_effects: ProactiveDomainEffects | None = None
+    documents: "_InvocationDocuments | None" = None
     _children: set[asyncio.Future[None]] = field(default_factory=set, init=False, repr=False)
     _closed: bool = field(default=False, init=False, repr=False)
 
@@ -302,6 +460,9 @@ class _MaterializedJob:
     source_revision: str
     artifact_identity: str
     snapshot_id: str
+    domain_effect_lookup: Callable[
+        [DomainEffectContext], object | Awaitable[object]
+    ] | None = None
 
     @property
     def admission_key(self) -> tuple[str, str, object, str]:
@@ -328,6 +489,140 @@ class _JobRequest:
     outcome: JobOutcomeRecord
     cancelled: bool = False
     lease_released: bool = False
+    resources: "_InvocationResources | None" = None
+
+    @property
+    def idempotency_key(self) -> str:
+        """Return the stable semantic trigger key shared by effect and documents."""
+
+        return f"{self.outcome.semantic_job_id}:{self.outcome.trigger_identity}"
+
+
+class _InvocationDocuments:
+    """Track one invocation's opaque pair intent and Core commit boundary."""
+
+    def __init__(
+        self,
+        inner: ProactiveDocuments,
+        commit: Callable[
+            [ProactiveDocumentIntent, DomainEffectReceipt],
+            Awaitable[ProactiveDocumentReceipt],
+        ],
+    ) -> None:
+        self._inner = inner
+        self._commit = commit
+        self._intent: ProactiveDocumentIntent | None = None
+        self._effect_receipt: DomainEffectReceipt | None = None
+        self._committed = False
+        self._aborted = False
+
+    @property
+    def invocation_id(self) -> str:
+        return self._inner.invocation_id
+
+    @property
+    def idempotency_key(self) -> str:
+        return self._inner.idempotency_key
+
+    @property
+    def intent(self) -> ProactiveDocumentIntent | None:
+        return self._intent
+
+    @property
+    def effect_receipt(self) -> DomainEffectReceipt | None:
+        return self._effect_receipt
+
+    @property
+    def committed(self) -> bool:
+        return self._committed
+
+    @property
+    def aborted(self) -> bool:
+        return self._aborted
+
+    def read_pair(self) -> tuple[ProactiveDocumentDigests, ProactiveDocumentPair]:
+        """Return detached document bytes without exposing workspace paths."""
+
+        if self._aborted or self._committed:
+            raise RuntimeError("documents invocation 已结算")
+        return self._inner.read_pair()
+
+    async def prepare_pair(
+        self,
+        expected: ProactiveDocumentDigests | Mapping[str, object],
+        content: ProactiveDocumentPair | Mapping[str, object],
+        *,
+        idempotency_key: str | None = None,
+        effect_id: str | None = None,
+    ) -> ProactiveDocumentIntent:
+        """Prepare exact old/new bytes and retain the opaque intent locally."""
+
+        if self._aborted or self._committed:
+            raise RuntimeError("documents invocation 已结算")
+        intent = await self._inner.prepare_pair(
+            expected,
+            content,
+            idempotency_key=idempotency_key,
+            effect_id=effect_id,
+        )
+        self._intent = intent
+        return intent
+
+    async def commit_after(
+        self,
+        intent: ProactiveDocumentIntent,
+        effect_receipt: DomainEffectReceipt,
+    ) -> ProactiveDocumentReceipt:
+        """Route document commit through the Host ledger/permit boundary."""
+
+        if self._intent is None or intent is not self._intent:
+            raise RuntimeError("document intent 不属于当前 invocation")
+        self._effect_receipt = effect_receipt
+        receipt = await self._commit(intent, effect_receipt)
+        self._committed = True
+        return receipt
+
+    async def abort_prepared(self, intent: ProactiveDocumentIntent) -> None:
+        """Abort only an uncommitted intent through the Core receipt fence."""
+
+        if self._intent is None or intent is not self._intent:
+            raise RuntimeError("document intent 不属于当前 invocation")
+        await self._inner.abort_prepared(intent)
+        self._aborted = True
+
+    async def finalize(self) -> None:
+        """Complete or abort a prepared intent after handler terminal cleanup."""
+
+        intent = self._intent
+        if intent is None or self._committed or self._aborted:
+            return
+        if self._effect_receipt is None:
+            await self._inner.abort_prepared(intent)
+            self._aborted = True
+            return
+        await self.commit_after(intent, self._effect_receipt)
+
+
+@dataclass(slots=True)
+class _InvocationResources:
+    effects: ProactiveDomainEffects | None
+    documents: _InvocationDocuments | None
+
+    @property
+    def effect_committed(self) -> bool:
+        return self.effects is not None and self.effects.issued_receipt is not None
+
+    async def finalize(self) -> None:
+        if self.documents is not None:
+            if (
+                self.documents.effect_receipt is None
+                and self.effects is not None
+                and self.effects.issued_receipt is not None
+            ):
+                self.documents._effect_receipt = self.effects.issued_receipt
+            await self.documents.finalize()
+        if self.effects is not None:
+            self.effects.close()
 
 
 @dataclass(slots=True)
@@ -381,8 +676,8 @@ class BackgroundJobActivityAdapter:
         invocation_id_factory: Callable[[], str] | None = None,
         interval_poll_seconds: float = 0.05,
     ) -> None:
-        if ledger is not None and (ledger_path is not None or workspace is not None):
-            raise TypeError("ledger 不能与 ledger_path/workspace 同时提供")
+        if ledger is not None and ledger_path is not None:
+            raise TypeError("ledger 不能与 ledger_path 同时提供")
         if interval_poll_seconds <= 0:
             raise ValueError("interval_poll_seconds 必须为正数")
         self._event_bus = event_bus
@@ -397,6 +692,7 @@ class BackgroundJobActivityAdapter:
             self._ledger = JobOutcomeLedger.for_workspace(workspace)
         else:
             self._ledger = None
+        self._workspace = None if workspace is None else Path(workspace).resolve()
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._invocation_id_factory = invocation_id_factory or (
             lambda: "invocation-" + secrets.token_hex(16)
@@ -498,6 +794,20 @@ class BackgroundJobActivityAdapter:
             for binding in plan.bindings:
                 generation = snapshot.generations[binding.plugin_id]
                 handler = self._resolve_handler(generation.instance, binding.handler_export)
+                domain_effect_lookup = None
+                if binding.definition.domain_effect is not None:
+                    if not _documents_binding_allowed(binding):
+                        raise RuntimeError(
+                            "BackgroundJob domain effect 不属于 Core allowlist: "
+                            f"{binding.plugin_id}:{binding.name}"
+                        )
+                    lookup_export = binding.definition.domain_effect_lookup_export
+                    if lookup_export is None:
+                        raise RuntimeError("BackgroundJob domain effect 缺少 lookup export")
+                    domain_effect_lookup = self._resolve_domain_lookup(
+                        generation.instance,
+                        lookup_export,
+                    )
                 source_revision = str(generation.source_revision)
                 key = f"{binding.plugin_id}:{binding.name}"
                 jobs[key] = _MaterializedJob(
@@ -507,6 +817,7 @@ class BackgroundJobActivityAdapter:
                     source_revision=source_revision,
                     artifact_identity=f"{plan.catalog_identity}:{key}",
                     snapshot_id=plan.snapshot_id,
+                    domain_effect_lookup=domain_effect_lookup,
                 )
             runtime = BackgroundJobRuntimeBinding(
                 snapshot_id=plan.snapshot_id,
@@ -914,6 +1225,8 @@ class BackgroundJobActivityAdapter:
                         "exact identity mismatch: " + ", ".join(mismatches),
                     )
                     continue
+                if await self._recover_document_record(job, record):
+                    continue
                 if record.state is not JobOutcomeState.QUEUED:
                     phase = record.phase.value
                     if phase == JobOutcomePhase.DOCUMENTS.value:
@@ -960,6 +1273,99 @@ class BackgroundJobActivityAdapter:
             raise
         return tuple(requests)
 
+    async def _recover_document_record(
+        self,
+        job: _MaterializedJob,
+        record: JobOutcomeRecord,
+    ) -> bool:
+        """Recover one durable document intent without replaying plugin code."""
+
+        if not _documents_binding_allowed(job.binding):
+            return False
+        if self._workspace is None or job.domain_effect_lookup is None:
+            raise RuntimeError("documents recovery 缺少 workspace 或 domain lookup")
+        effect_id = job.binding.definition.domain_effect
+        if effect_id is None:
+            raise RuntimeError("documents recovery 缺少 effect identity")
+        context = DomainEffectContext(
+            invocation_id=record.invocation_id,
+            plugin_id=record.plugin_id,
+            job_name=record.job_name,
+            semantic_job_id=record.semantic_job_id,
+            event_id=record.event_id,
+            snapshot_id=record.snapshot_id,
+            effect_id=effect_id,
+            idempotency_key=f"{record.semantic_job_id}:{record.trigger_identity}",
+            attempt=record.attempt,
+        )
+        effects = ProactiveDomainEffects(
+            context=context,
+            lookup=job.domain_effect_lookup,
+        )
+        documents = ProactiveDocuments(
+            self._workspace,
+            record.invocation_id,
+            idempotency_key=context.idempotency_key,
+            effect_id=effect_id,
+            receipt_lookup=effects,
+        )
+        pending = documents.pending_intent_ids()
+        if not pending:
+            try:
+                terminal = documents.validate_terminal_truth()
+            finally:
+                effects.close()
+            if terminal is None:
+                return False
+            if terminal.status is DocumentReceiptStatus.COMMITTED:
+                self._transition_outcome(
+                    record.invocation_id,
+                    JobOutcomeState.SUCCEEDED,
+                    terminal_result_digest=terminal.document_digest,
+                )
+            else:
+                self._transition_outcome(
+                    record.invocation_id,
+                    JobOutcomeState.FAILED,
+                    error="process restart found aborted document intent",
+                )
+            return True
+        try:
+            lookup = effects.lookup(
+                invocation_id=record.invocation_id,
+                effect_id=effect_id,
+                idempotency_key=context.idempotency_key,
+            )
+            if (
+                lookup.state is ReceiptLookupState.FOUND
+                and record.phase is not JobOutcomePhase.DOCUMENTS
+            ):
+                self._transition_outcome(
+                    record.invocation_id,
+                    JobOutcomeState.RETRY_PENDING,
+                    phase=JobOutcomePhase.DOCUMENTS,
+                    error="process restart found committed domain effect",
+                )
+            receipts = await documents.recover_pending()
+        finally:
+            effects.close()
+        if len(receipts) != 1:
+            raise RuntimeError("documents recovery 必须结算唯一 invocation intent")
+        receipt = receipts[0]
+        if receipt.status.value == "committed":
+            self._transition_outcome(
+                record.invocation_id,
+                JobOutcomeState.SUCCEEDED,
+                terminal_result_digest=receipt.document_digest,
+            )
+        else:
+            self._transition_outcome(
+                record.invocation_id,
+                JobOutcomeState.FAILED,
+                error="process restart aborted uncommitted document intent",
+            )
+        return True
+
     async def _worker_loop(self, runtime: BackgroundJobRuntimeBinding) -> None:
         while True:
             request = await runtime.queue.get()
@@ -991,6 +1397,82 @@ class BackgroundJobActivityAdapter:
             finally:
                 runtime.queue.task_done()
 
+    def _invocation_resources(
+        self,
+        request: _JobRequest,
+        record: JobOutcomeRecord,
+    ) -> _InvocationResources:
+        """Bind the optional Emotion effect and document ports to one invocation."""
+
+        job = request.job
+        effect_id = job.binding.definition.domain_effect
+        lookup = job.domain_effect_lookup
+        if effect_id is None:
+            return _InvocationResources(None, None)
+        if lookup is None or not _documents_binding_allowed(job.binding):
+            raise RuntimeError("BackgroundJob domain effect binding 不完整")
+        if self._workspace is None:
+            raise RuntimeError("BackgroundJob documents 需要 workspace owner")
+        effect_context = DomainEffectContext(
+            invocation_id=request.invocation_id,
+            plugin_id=job.binding.plugin_id,
+            job_name=job.binding.name,
+            semantic_job_id=record.semantic_job_id,
+            event_id=record.event_id,
+            snapshot_id=request.binding.snapshot_id,
+            effect_id=effect_id,
+            idempotency_key=request.idempotency_key,
+            attempt=record.attempt,
+        )
+        effects = ProactiveDomainEffects(context=effect_context, lookup=lookup)
+        inner = ProactiveDocuments(
+            self._workspace,
+            request.invocation_id,
+            idempotency_key=request.idempotency_key,
+            effect_id=effect_id,
+            receipt_lookup=effects,
+        )
+
+        async def commit(
+            intent: ProactiveDocumentIntent,
+            receipt: DomainEffectReceipt,
+        ) -> ProactiveDocumentReceipt:
+            current = self._require_ledger().get(request.invocation_id)
+            if current is None or current.terminal:
+                raise RuntimeError("documents commit 缺少 active job outcome")
+            if current.phase is not JobOutcomePhase.DOCUMENTS:
+                self._transition_outcome(
+                    request.invocation_id,
+                    JobOutcomeState.RETRY_PENDING,
+                    phase=JobOutcomePhase.DOCUMENTS,
+                    error="domain effect committed; documents pending",
+                )
+            return await inner.commit_after(intent, receipt)
+
+        documents = _InvocationDocuments(inner, commit)
+        effects._bind_prepared_guard(lambda: documents.intent is not None)
+        return _InvocationResources(effects, documents)
+
+    async def _finish_invocation_resources(
+        self,
+        request: _JobRequest,
+        resources: _InvocationResources,
+    ) -> bool:
+        """Finish the non-cancellable post-effect document boundary."""
+
+        task = asyncio.create_task(
+            resources.finalize(),
+            name=f"background_job_documents:{request.invocation_id}",
+        )
+        cancelled = False
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                cancelled = True
+        await task
+        return cancelled
+
     async def _execute_request(self, request: _JobRequest) -> None:
         ledger = self._require_ledger()
         binding = request.binding
@@ -1005,11 +1487,13 @@ class BackgroundJobActivityAdapter:
             async with model_execution_scope(provider) as model_binding:
                 model_generation_id = _model_binding_id(model_binding, provider)
                 while True:
-                    self._transition_outcome(
+                    running_record = self._transition_outcome(
                         request.invocation_id,
                         JobOutcomeState.RUNNING,
                         model_generation_id=model_generation_id,
                     )
+                    resources = self._invocation_resources(request, running_record)
+                    request.resources = resources
                     llm = GenerationLlmLease(
                         provider,
                         role=role,
@@ -1031,6 +1515,8 @@ class BackgroundJobActivityAdapter:
                         model_generation_id=model_generation_id,
                         llm=llm,
                         activation_token=request.job.binding.activation_token,
+                        domain_effects=resources.effects,
+                        documents=resources.documents,
                     )
                     invocation_token = _CURRENT_INVOCATION_TOKEN.set(
                         llm.invocation_token
@@ -1039,16 +1525,34 @@ class BackgroundJobActivityAdapter:
                         try:
                             result = await request.job.handler(ctx)
                             await ctx.drain_children()
-                            if request.cancelled:
+                            cancelled_during_finish = await self._finish_invocation_resources(
+                                request,
+                                resources,
+                            )
+                            if request.cancelled and not resources.effect_committed:
                                 self._transition_outcome(
                                     request.invocation_id,
                                     JobOutcomeState.CANCELLED,
                                     error=None,
                                 )
                                 return
-                        except asyncio.CancelledError:
+                            if cancelled_during_finish:
+                                request.cancelled = True
+                        except asyncio.CancelledError as cancelled_error:
                             llm.invalidate()
                             await ctx.cancel_children()
+                            try:
+                                await self._finish_invocation_resources(request, resources)
+                            except BaseException:
+                                raise cancelled_error
+                            if resources.effect_committed:
+                                digest = _documents_terminal_digest(resources)
+                                self._transition_outcome(
+                                    request.invocation_id,
+                                    JobOutcomeState.SUCCEEDED,
+                                    terminal_result_digest=digest,
+                                )
+                                raise
                             current = ledger.get(request.invocation_id)
                             if current is not None and not current.terminal:
                                 self._transition_outcome(
@@ -1060,6 +1564,14 @@ class BackgroundJobActivityAdapter:
                         except BaseException as error:
                             llm.invalidate()
                             await ctx.cancel_children()
+                            await self._finish_invocation_resources(request, resources)
+                            if resources.effect_committed:
+                                self._transition_outcome(
+                                    request.invocation_id,
+                                    JobOutcomeState.SUCCEEDED,
+                                    terminal_result_digest=_documents_terminal_digest(resources),
+                                )
+                                return
                             current = ledger.get(request.invocation_id)
                             if current is None or current.terminal:
                                 raise
@@ -1083,6 +1595,7 @@ class BackgroundJobActivityAdapter:
                                 )
                                 if delay:
                                     await asyncio.sleep(delay)
+                                request.resources = None
                                 continue
                             phase = (
                                 JobOutcomePhase.PROVIDER
@@ -1105,10 +1618,16 @@ class BackgroundJobActivityAdapter:
                         JobOutcomeState.SUCCEEDED,
                         terminal_result_digest=digest,
                     )
+                    request.resources = None
                     return
         except asyncio.CancelledError:
             current = ledger.get(request.invocation_id)
-            if current is not None and not current.terminal:
+            if (
+                current is not None
+                and not current.terminal
+                and current.phase is not JobOutcomePhase.DOCUMENTS
+                and not _documents_unsettled(request.resources)
+            ):
                 self._transition_outcome(
                     request.invocation_id,
                     JobOutcomeState.CANCELLED,
@@ -1117,7 +1636,12 @@ class BackgroundJobActivityAdapter:
             raise
         except BaseException as error:
             current = ledger.get(request.invocation_id)
-            if current is not None and not current.terminal:
+            if (
+                current is not None
+                and not current.terminal
+                and current.phase is not JobOutcomePhase.DOCUMENTS
+                and not _documents_unsettled(request.resources)
+            ):
                 self._transition_outcome(
                     request.invocation_id,
                     JobOutcomeState.FAILED,
@@ -1221,6 +1745,44 @@ class BackgroundJobActivityAdapter:
                 f"BackgroundJob handler 必须精确接受一个 ctx: {handler_export}"
             )
         return cast(Callable[[BackgroundJobContext], Awaitable[object]], value)
+
+    def _resolve_domain_lookup(
+        self,
+        instance: object,
+        lookup_export: str,
+    ) -> Callable[[DomainEffectContext], object | Awaitable[object]]:
+        """Resolve one exact synchronous or async domain lookup export."""
+
+        if not isinstance(instance, ComposablePlugin):
+            raise RuntimeError("BackgroundJob owner 不是 ComposablePlugin")
+        value: object = instance.module
+        for segment in lookup_export.replace(":", ".").split("."):
+            if not segment:
+                raise RuntimeError(f"domain_effect_lookup_export 无效: {lookup_export}")
+            try:
+                value = getattr(value, segment)
+            except AttributeError as error:
+                raise RuntimeError(
+                    "BackgroundJob domain lookup export 不存在: "
+                    f"{instance.name}:{lookup_export}"
+                ) from error
+        if not callable(value):
+            raise TypeError("domain effect lookup export 必须是 callable")
+        if inspect.iscoroutinefunction(value):
+            raise TypeError("domain effect lookup export 必须是同步 callable")
+        signature = inspect.signature(value)
+        try:
+            signature.bind(cast(object, None))
+        except TypeError as error:
+            raise TypeError(
+                "domain effect lookup export 必须精确接受一个 context"
+            ) from error
+        if len(signature.parameters) != 1:
+            raise TypeError("domain effect lookup export 必须精确接受一个 context")
+        return cast(
+            Callable[[DomainEffectContext], object | Awaitable[object]],
+            value,
+        )
 
     def _provider_for(self, job: _MaterializedJob) -> object:
         role = job.binding.definition.model_role
@@ -1450,6 +2012,68 @@ def _job_for(binding: BackgroundJobRuntimeBinding, key: str) -> _MaterializedJob
     if job is None:
         raise KeyError(f"BackgroundJob 不存在: {key}")
     return job
+
+
+def _documents_binding_allowed(binding: BackgroundJobBinding) -> bool:
+    return (
+        (binding.plugin_id, binding.name) in _DOCUMENTS_ALLOWLIST
+        and binding.definition.documents_scope == ("emotion",)
+        and binding.definition.domain_effect == "emotion.state"
+        and binding.definition.retry_policy.max_attempts == 1
+    )
+
+
+def _committed_record(raw: object) -> Mapping[str, object] | object | None:
+    if raw is None:
+        return None
+    state = _record_value(raw, "state", default="committed")
+    if state != "committed":
+        raise RuntimeError("domain effect lookup 只能返回 committed 或 None")
+    return raw
+
+
+def _validate_committed_identity(raw: object, context: DomainEffectContext) -> None:
+    expected: tuple[tuple[str, object], ...] = (
+        ("invocation_id", context.invocation_id),
+        ("effect_id", context.effect_id),
+        ("idempotency_key", context.idempotency_key),
+        ("attempt", context.attempt),
+    )
+    for field_name, value in expected:
+        if _record_value(raw, field_name) != value:
+            raise RuntimeError(f"domain effect durable receipt {field_name} 不匹配")
+
+
+def _record_digest(raw: object) -> str:
+    value = _record_value(raw, "result_digest")
+    if not isinstance(value, str) or not value:
+        raise RuntimeError("domain effect durable receipt 缺少 result_digest")
+    return value
+
+
+def _record_value(raw: object, name: str, *, default: object = None) -> object:
+    if isinstance(raw, Mapping):
+        return raw.get(name, default)
+    return getattr(raw, name, default)
+
+
+def _documents_terminal_digest(resources: _InvocationResources) -> str:
+    documents = resources.documents
+    if documents is None:
+        raise RuntimeError("documents terminal digest 缺少 documents port")
+    receipt = documents._inner.load_terminal_receipt()
+    if receipt is None or not documents.committed:
+        raise RuntimeError("documents forward recovery 尚未 terminal")
+    return receipt.document_digest
+
+
+def _documents_unsettled(resources: _InvocationResources | None) -> bool:
+    if resources is None or resources.documents is None:
+        return False
+    documents = resources.documents
+    if documents.intent is None:
+        return False
+    return not documents.committed and not documents.aborted
 
 
 def _has_event_trigger(binding: BackgroundJobBinding) -> bool:

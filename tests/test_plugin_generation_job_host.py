@@ -29,6 +29,14 @@ from agent.plugins.job_outcome_ledger import (
     JobOutcomePhase,
     JobOutcomeState,
 )
+from agent.plugins.proactive_documents import (
+    PROACTIVE_CONTEXT,
+    PROACTIVE_PENDING,
+    DomainEffectReceipt,
+    DomainEffectReceiptStore,
+    ProactiveDocumentPair,
+    ProactiveDocuments,
+)
 from agent.plugins.snapshot import (
     RuntimeSnapshotLease,
     bind_runtime_snapshot,
@@ -72,13 +80,20 @@ class _Health:
     healthy: bool = True
 
 
-def _module(handler: Any, *, name: str = "drift") -> ComposablePlugin:
+def _module(
+    handler: Any,
+    *,
+    name: str = "drift",
+    domain_lookup: Any | None = None,
+) -> ComposablePlugin:
     module = ModuleType(f"{name}_module")
     module.api_version = 3
     module.name = name
     module.version = "1.0.0"
     module.apply = _apply
     module.merge_pending = handler
+    if domain_lookup is not None:
+        module.lookup_emotion_effect = domain_lookup
     return ComposablePlugin.from_module(module)
 
 
@@ -97,8 +112,11 @@ def _fixture(
     clock: Any | None = None,
     triggers: tuple[Any, ...] | None = None,
     ledger_path: Any | None = None,
+    documents: bool = False,
+    domain_lookup: Any | None = None,
 ):
-    plugin = _module(handler)
+    plugin_id = "emotion" if documents else "drift"
+    plugin = _module(handler, name=plugin_id, domain_lookup=domain_lookup)
     job_triggers = triggers or (CoreEventTrigger(CoreEvent.DRIFT_FINISHED),)
     definition = BackgroundJobDefinition(
         name="merge_pending",
@@ -107,9 +125,14 @@ def _fixture(
         model_role=model_role,
         debounce_seconds=debounce_seconds,
         coalesce=coalesce,
+        documents_scope=(("emotion",) if documents else ()),
+        domain_effect=("emotion.state" if documents else None),
+        domain_effect_lookup_export=(
+            "lookup_emotion_effect" if documents else None
+        ),
     )
     descriptor = BackgroundJobDescriptor(
-        owner="drift",
+        owner=plugin_id,
         name=definition.name,
         triggers=definition.triggers,
         debounce_seconds=definition.debounce_seconds,
@@ -117,12 +140,14 @@ def _fixture(
         handler_export=definition.handler_export,
         retry_policy=definition.retry_policy,
         documents_scope=definition.documents_scope,
+        domain_effect=definition.domain_effect,
+        domain_effect_lookup_export=definition.domain_effect_lookup_export,
         model_role=definition.model_role,
     )
     fiber = _Fiber(object())
     binding = BackgroundJobBinding(
         generation_id="generation-1",
-        plugin_id="drift",
+        plugin_id=plugin_id,
         name=definition.name,
         descriptor=descriptor,
         definition=definition,
@@ -131,7 +156,7 @@ def _fixture(
         required_health=_Health(),
     )
     catalog = BackgroundJobCatalog(
-        {"drift:merge_pending": binding},
+        {f"{plugin_id}:merge_pending": binding},
         root_instance_token=object(),
     )
     generation = SimpleNamespace(
@@ -142,7 +167,7 @@ def _fixture(
     snapshot = SimpleNamespace(
         snapshot_id="snapshot-1",
         background_job_catalog=catalog,
-        generations={"drift": generation},
+        generations={plugin_id: generation},
         lease_count=0,
     )
     store = _Store(snapshot)
@@ -156,6 +181,7 @@ def _fixture(
         model_provider=provider,
         ledger=ledger,
         clock=clock,
+        workspace=(str(tmp_path / "workspace") if documents else None),
     )
     plan = adapter.prepare_components("tx-1", target_lease, catalog)
     return adapter, plan, target_lease, store, ledger
@@ -182,6 +208,17 @@ def _event_payload(event: DriftFinished) -> dict[str, str]:
         "briefing": event.briefing,
         "message_result": event.message_result,
         "timestamp": event.timestamp.isoformat(),
+    }
+
+
+def _domain_record(ctx: Any) -> dict[str, object]:
+    return {
+        "state": "committed",
+        "invocation_id": ctx.invocation_id,
+        "effect_id": ctx.effect_id,
+        "idempotency_key": ctx.idempotency_key,
+        "attempt": ctx.attempt,
+        "result_digest": "emotion-domain-result",
     }
 
 
@@ -252,13 +289,310 @@ async def test_prepare_is_pure_and_materialized_binding_is_closed(tmp_path) -> N
         "message_result": "ok",
         "timestamp": calls[0].event.timestamp.isoformat(),
     }
-    assert store.leases == 1  # the publication lease remains owned by the caller
+    assert store.leases == 1
 
     await adapter.close_components("tx-1", runtime)
     await target_lease.release()
     assert store.leases == 0
     assert adapter.subscription_count == 0
     assert adapter.timer_count == 0
+
+
+@pytest.mark.asyncio
+async def test_emotion_documents_finish_after_in_process_post_effect_failure(
+    tmp_path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / PROACTIVE_CONTEXT).write_text("old context\n", encoding="utf-8")
+    (workspace / PROACTIVE_PENDING).write_text("pending\n", encoding="utf-8")
+    durable: dict[str, object] = {}
+
+    def lookup(ctx):
+        return durable.get(ctx.invocation_id)
+
+    async def handler(ctx) -> None:
+        assert ctx.documents is not None and ctx.domain_effects is not None
+        expected, _ = ctx.documents.read_pair()
+        intent = await ctx.documents.prepare_pair(
+            expected,
+            ProactiveDocumentPair(b"new context\n", b""),
+        )
+
+        async def transaction(effect_ctx) -> None:
+            durable[effect_ctx.invocation_id] = _domain_record(effect_ctx)
+            raise RuntimeError("callback failed after SQLite commit")
+
+        _ = await ctx.domain_effects.run("emotion.state", transaction)
+        assert intent.invocation_id
+        raise RuntimeError("plugin failed after durable effect")
+
+    adapter, plan, target_lease, store, ledger = _fixture(
+        tmp_path,
+        handler,
+        documents=True,
+        domain_lookup=lookup,
+    )
+    runtime = await adapter.materialize_closed("tx-1", plan)
+    adapter.finalize_components("tx-1", runtime)
+    await adapter.enqueue_event(runtime, _event("event-docs-in-process"))
+    await adapter.drain(runtime)
+
+    outcome = ledger.find_by_event(
+        plugin_id="emotion",
+        job_name="merge_pending",
+        event_id="event-docs-in-process",
+    )
+    assert outcome is not None and outcome.state is JobOutcomeState.SUCCEEDED
+    assert (workspace / PROACTIVE_CONTEXT).read_bytes() == b"new context\n"
+    assert (workspace / PROACTIVE_PENDING).read_bytes() == b""
+    await adapter.close_components("shutdown", runtime)
+    await target_lease.release()
+    assert store.leases == 0
+
+
+@pytest.mark.asyncio
+async def test_emotion_documents_restart_forwards_without_handler_replay(tmp_path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / PROACTIVE_CONTEXT).write_text("old context\n", encoding="utf-8")
+    (workspace / PROACTIVE_PENDING).write_text("pending\n", encoding="utf-8")
+    durable: dict[str, object] = {}
+    handler_calls = 0
+
+    def lookup(ctx):
+        return durable.get(ctx.invocation_id)
+
+    async def handler(ctx) -> None:
+        nonlocal handler_calls
+        handler_calls += 1
+
+    ledger_path = tmp_path / "outcomes.sqlite"
+    adapter, plan, target_lease, store, ledger = _fixture(
+        tmp_path,
+        handler,
+        documents=True,
+        domain_lookup=lookup,
+        ledger_path=ledger_path,
+    )
+    event = _event("event-docs-restart")
+    identity = JobOutcomeIdentity(
+        plugin_id="emotion",
+        job_name="merge_pending",
+        invocation_id="invocation-restart",
+        event_id=event.event_id,
+        snapshot_id=plan.snapshot_id,
+        plugin_generation_id="generation-1",
+        model_generation_id="execution-pending",
+        artifact_identity=f"{plan.catalog_identity}:emotion:merge_pending",
+        source_revision="source-1",
+        handler_export="merge_pending",
+        lifecycle_revision="background-job-v3",
+        api_revision="plugin-api-v3",
+        event_payload=_event_payload(event),
+    )
+    _ = ledger.admit(identity)
+    running = ledger.transition(
+        identity.invocation_id,
+        JobOutcomeState.RUNNING,
+        model_generation_id="provider",
+    )
+    documents = ProactiveDocuments(
+        workspace,
+        identity.invocation_id,
+        idempotency_key=f"{running.semantic_job_id}:{running.trigger_identity}",
+        effect_id="emotion.state",
+    )
+    expected, _ = documents.read_pair()
+    _ = await documents.prepare_pair(
+        expected,
+        ProactiveDocumentPair(b"recovered context\n", b""),
+    )
+    effect_ctx = type(
+        "EffectCtx",
+        (),
+        {
+            "invocation_id": identity.invocation_id,
+            "effect_id": "emotion.state",
+            "idempotency_key": f"{running.semantic_job_id}:{running.trigger_identity}",
+            "attempt": running.attempt,
+        },
+    )()
+    durable[identity.invocation_id] = _domain_record(effect_ctx)
+
+    runtime = await adapter.materialize_closed("tx-1", plan)
+    await adapter.open(runtime)
+    await adapter.drain(runtime)
+    recovered = ledger.get(identity.invocation_id)
+    assert recovered is not None and recovered.state is JobOutcomeState.SUCCEEDED
+    assert handler_calls == 0
+    assert (workspace / PROACTIVE_CONTEXT).read_bytes() == b"recovered context\n"
+    assert (workspace / PROACTIVE_PENDING).read_bytes() == b""
+    await adapter.close_components("shutdown", runtime)
+    await target_lease.release()
+    assert store.leases == 0
+
+
+@pytest.mark.asyncio
+async def test_emotion_documents_cancel_aborts_prepared_intent_before_terminal(
+    tmp_path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / PROACTIVE_CONTEXT).write_text("old context\n", encoding="utf-8")
+    (workspace / PROACTIVE_PENDING).write_text("pending\n", encoding="utf-8")
+    prepared = asyncio.Event()
+
+    async def handler(ctx) -> None:
+        assert ctx.documents is not None
+        expected, _ = ctx.documents.read_pair()
+        _ = await ctx.documents.prepare_pair(
+            expected,
+            ProactiveDocumentPair(b"cancelled context\n", b""),
+        )
+        prepared.set()
+        await asyncio.Event().wait()
+
+    adapter, plan, target_lease, store, ledger = _fixture(
+        tmp_path,
+        handler,
+        documents=True,
+        domain_lookup=lambda _ctx: None,
+    )
+    runtime = await adapter.materialize_closed("tx-1", plan)
+    await adapter.open(runtime)
+    await adapter.enqueue_event(runtime, _event("event-docs-cancel"))
+    await prepared.wait()
+    await adapter.cancel_running(runtime)
+
+    outcome = ledger.find_by_event(
+        plugin_id="emotion",
+        job_name="merge_pending",
+        event_id="event-docs-cancel",
+    )
+    assert outcome is not None and outcome.state is JobOutcomeState.CANCELLED
+    documents = ProactiveDocuments(
+        workspace,
+        outcome.invocation_id,
+        idempotency_key=f"{outcome.semantic_job_id}:{outcome.trigger_identity}",
+        effect_id="emotion.state",
+    )
+    assert documents.pending_intent_ids() == ()
+    terminal = documents.load_terminal_receipt()
+    assert terminal is not None and terminal.status.value == "aborted"
+    assert (workspace / PROACTIVE_CONTEXT).read_bytes() == b"old context\n"
+    assert (workspace / PROACTIVE_PENDING).read_bytes() == b"pending\n"
+    await adapter.close_components("shutdown", runtime)
+    await target_lease.release()
+    assert store.leases == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("restart_drift", [None, "domain", "document"])
+async def test_emotion_documents_restart_closes_terminal_before_ledger_window(
+    tmp_path,
+    restart_drift: str | None,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / PROACTIVE_CONTEXT).write_text("old context\n", encoding="utf-8")
+    (workspace / PROACTIVE_PENDING).write_text("pending\n", encoding="utf-8")
+    ledger_path = tmp_path / "outcomes.sqlite"
+    durable: dict[str, object] = {}
+
+    async def handler(_ctx) -> None:
+        raise AssertionError("terminal receipt recovery must not replay handler")
+
+    adapter, plan, target_lease, store, ledger = _fixture(
+        tmp_path,
+        handler,
+        documents=True,
+        domain_lookup=lambda _ctx: durable,
+        ledger_path=ledger_path,
+    )
+    event = _event("event-docs-terminal-restart")
+    identity = JobOutcomeIdentity(
+        plugin_id="emotion",
+        job_name="merge_pending",
+        invocation_id="invocation-terminal-restart",
+        event_id=event.event_id,
+        snapshot_id=plan.snapshot_id,
+        plugin_generation_id="generation-1",
+        model_generation_id="execution-pending",
+        artifact_identity=f"{plan.catalog_identity}:emotion:merge_pending",
+        source_revision="source-1",
+        handler_export="merge_pending",
+        lifecycle_revision="background-job-v3",
+        api_revision="plugin-api-v3",
+        event_payload=_event_payload(event),
+    )
+    _ = ledger.admit(identity)
+    running = ledger.transition(
+        identity.invocation_id,
+        JobOutcomeState.RUNNING,
+        model_generation_id="provider",
+    )
+    pending = ledger.transition(
+        identity.invocation_id,
+        JobOutcomeState.RETRY_PENDING,
+        phase=JobOutcomePhase.DOCUMENTS,
+        error="process crashed before ledger terminal",
+    )
+    receipt_store = DomainEffectReceiptStore(tmp_path / "domain-effects.sqlite")
+    receipt = receipt_store.record(
+        DomainEffectReceipt(
+            invocation_id=identity.invocation_id,
+            effect_id="emotion.state",
+            idempotency_key=f"{pending.semantic_job_id}:{pending.trigger_identity}",
+            state="committed",
+            result_digest="emotion-domain-result",
+            attempt=running.attempt,
+        )
+    )
+    durable.update(receipt.as_dict())
+    documents = ProactiveDocuments(
+        workspace,
+        identity.invocation_id,
+        idempotency_key=receipt.idempotency_key,
+        effect_id=receipt.effect_id,
+        receipt_lookup=receipt_store,
+    )
+    expected, _ = documents.read_pair()
+    intent = await documents.prepare_pair(
+        expected,
+        ProactiveDocumentPair(b"terminal context\n", b""),
+    )
+    terminal = await documents.commit_after(intent, receipt)
+    assert documents.pending_intent_ids() == ()
+
+    if restart_drift == "domain":
+        durable.clear()
+    elif restart_drift == "document":
+        (workspace / PROACTIVE_CONTEXT).write_text("third party\n", encoding="utf-8")
+
+    runtime = await adapter.materialize_closed("tx-1", plan)
+    if restart_drift is not None:
+        with pytest.raises(RuntimeError):
+            await adapter.open(runtime)
+        retained = ledger.get(identity.invocation_id)
+        assert retained is not None
+        assert retained.state is JobOutcomeState.RETRY_PENDING
+        assert retained.phase is JobOutcomePhase.DOCUMENTS
+        await adapter.close_components("shutdown", runtime)
+        await target_lease.release()
+        assert store.leases == 0
+        return
+
+    await adapter.open(runtime)
+    await adapter.drain(runtime)
+    recovered = ledger.get(identity.invocation_id)
+    assert recovered is not None and recovered.state is JobOutcomeState.SUCCEEDED
+    assert recovered.terminal_result_digest == terminal.document_digest
+    assert (workspace / PROACTIVE_CONTEXT).read_bytes() == b"terminal context\n"
+    assert (workspace / PROACTIVE_PENDING).read_bytes() == b""
+    await adapter.close_components("shutdown", runtime)
+    await target_lease.release()
+    assert store.leases == 0
 
 
 @pytest.mark.asyncio

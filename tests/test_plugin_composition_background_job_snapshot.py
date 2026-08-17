@@ -12,6 +12,8 @@ from agent.plugin_composition import (
     PluginRuntime,
 )
 from agent.plugins.generation import GateResult, PluginContributions, PluginGeneration
+from agent.plugins.generation_activity_host import ActivityHost
+from agent.plugins.generation_job_host import BackgroundJobActivityAdapter
 from agent.plugins.manager import PluginManager
 from agent.plugins.scope import PluginScope
 from agent.plugins.snapshot import RuntimeSnapshotCompiler, RuntimeSnapshotStore
@@ -105,20 +107,35 @@ async def test_manager_provides_and_compiles_background_job_service(
         "name = 'emotion'\n"
         "version = '1.0.0'\n"
         "inject = (BACKGROUND_JOBS,)\n"
+        "async def merge_pending(ctx):\n"
+        "    return None\n"
         "async def apply(ctx, config):\n"
         "    await ctx.require(BACKGROUND_JOBS).register(ctx, BackgroundJobDefinition(\n"
         "        name='merge_pending',\n"
         "        triggers=(CoreEventTrigger(CoreEvent.DRIFT_FINISHED),),\n"
-        "        handler_export='runtime.merge_pending',\n"
+        "        handler_export='merge_pending',\n"
         "    ))\n",
         encoding="utf-8",
     )
+    event_bus = EventBus()
+    workspace = tmp_path / "workspace"
     manager = PluginManager(
         plugin_dirs=[tmp_path / "plugins"],
-        event_bus=EventBus(),
+        event_bus=event_bus,
         tool_registry=None,
-        workspace=tmp_path / "workspace",
+        workspace=workspace,
         installed_cache_root=tmp_path / "cache",
+    )
+    manager.bind_activity_host(
+        ActivityHost(
+            (
+                BackgroundJobActivityAdapter(
+                    event_bus,
+                    manager.snapshot_store,
+                    workspace=str(workspace),
+                ),
+            )
+        )
     )
 
     await manager.load_all()

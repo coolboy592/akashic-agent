@@ -43,6 +43,8 @@ def _definition(name: str = "merge_proactive_pending") -> BackgroundJobDefinitio
             max_delay_seconds=10.0,
         ),
         documents_scope=("emotion",),
+        domain_effect="emotion.state",
+        domain_effect_lookup_export="lookup_emotion_effect",
         model_role="proactive.merge",
     )
 

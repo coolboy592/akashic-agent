@@ -131,6 +131,8 @@ class BackgroundJobDefinition:
     coalesce: bool = True
     retry_policy: RetryPolicy = RetryPolicy()
     documents_scope: tuple[str, ...] = ()
+    domain_effect: str | None = None
+    domain_effect_lookup_export: str | None = None
     model_role: str | None = None
 
     def __post_init__(self) -> None:
@@ -159,6 +161,21 @@ class BackgroundJobDefinition:
         scopes = _text_tuple(self.documents_scope, "documents_scope")
         if any(_IDENTIFIER.fullmatch(scope) is None for scope in scopes):
             raise ValueError("documents_scope 包含无效 root")
+        if (self.domain_effect is None) != (
+            self.domain_effect_lookup_export is None
+        ):
+            raise ValueError(
+                "domain_effect 与 domain_effect_lookup_export 必须同时提供"
+            )
+        if self.domain_effect is not None:
+            _identifier(self.domain_effect, "domain_effect")
+            _export(self.domain_effect_lookup_export)
+        if scopes and (
+            self.domain_effect is None or self.domain_effect_lookup_export is None
+        ):
+            raise ValueError(
+                "documents_scope 非空时必须声明 domain_effect 与 lookup export"
+            )
         if self.model_role is not None:
             _identifier(self.model_role, "model_role")
 
@@ -175,7 +192,9 @@ class BackgroundJobDescriptor:
     handler_export: str
     retry_policy: RetryPolicy
     documents_scope: tuple[str, ...]
-    model_role: str | None
+    domain_effect: str | None = None
+    domain_effect_lookup_export: str | None = None
+    model_role: str | None = None
 
     def __post_init__(self) -> None:
         _text(self.owner, "owner")
@@ -187,10 +206,18 @@ class BackgroundJobDescriptor:
             coalesce=self.coalesce,
             retry_policy=self.retry_policy,
             documents_scope=self.documents_scope,
+            domain_effect=self.domain_effect,
+            domain_effect_lookup_export=self.domain_effect_lookup_export,
             model_role=self.model_role,
         )
         object.__setattr__(self, "triggers", definition.triggers)
         object.__setattr__(self, "documents_scope", definition.documents_scope)
+        object.__setattr__(self, "domain_effect", definition.domain_effect)
+        object.__setattr__(
+            self,
+            "domain_effect_lookup_export",
+            definition.domain_effect_lookup_export,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -377,6 +404,8 @@ class _BackgroundJobDeclarations:
             handler_export=definition.handler_export,
             retry_policy=definition.retry_policy,
             documents_scope=definition.documents_scope,
+            domain_effect=definition.domain_effect,
+            domain_effect_lookup_export=definition.domain_effect_lookup_export,
             model_role=definition.model_role,
         )
         registration = _Registration(
@@ -493,6 +522,8 @@ def _normalize_definition(definition: BackgroundJobDefinition) -> BackgroundJobD
         coalesce=definition.coalesce,
         retry_policy=definition.retry_policy,
         documents_scope=tuple(definition.documents_scope),
+        domain_effect=definition.domain_effect,
+        domain_effect_lookup_export=definition.domain_effect_lookup_export,
         model_role=definition.model_role,
     )
 
@@ -524,6 +555,8 @@ def _descriptor_identity(descriptor: BackgroundJobDescriptor) -> dict[str, objec
             "max_delay_seconds": descriptor.retry_policy.max_delay_seconds,
         },
         "documents_scope": list(descriptor.documents_scope),
+        "domain_effect": descriptor.domain_effect,
+        "domain_effect_lookup_export": descriptor.domain_effect_lookup_export,
         "model_role": descriptor.model_role,
     }
 
