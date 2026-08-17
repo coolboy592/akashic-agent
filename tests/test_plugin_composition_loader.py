@@ -85,7 +85,7 @@ async def test_installed_plugin_without_static_manifest_fails_before_import(
 ) -> None:
     """在任何插件代码或正式数据写入前拒绝无 manifest 的 installed artifact。"""
 
-    # 1. 构造仍可被 source resolver 发现的旧 installed artifact。
+    # 1. 构造缺少静态 admission manifest 的旧 installed artifact。
     plugin_dir = (
         tmp_path
         / "home"
@@ -108,7 +108,7 @@ async def test_installed_plugin_without_static_manifest_fails_before_import(
     manager = _manager(tmp_path)
 
     # 2. Admission 必须在 import、generation 和正式 data root 之前失败。
-    with pytest.raises(RuntimeError, match="缺少静态 v3 manifest"):
+    with pytest.raises(ValueError, match="缺少静态 v3 manifest"):
         await manager.load_all()
     assert not import_marker.exists()
     assert manager.current_snapshot is None

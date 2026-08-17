@@ -12,6 +12,14 @@ def _write_artifact(plugin_base: Path, artifact_id: str) -> Path:
     artifact = plugin_base / ".artifacts" / artifact_id
     artifact.mkdir(parents=True)
     (artifact / "plugin.py").write_text("", encoding="utf-8")
+    (artifact / "akashic.plugin.toml").write_text(
+        "schema_version = 1\n"
+        'name = "feed"\n'
+        'version = "3.0.0"\n'
+        "api_version = 3\n"
+        'entrypoint = "plugin.py"\n',
+        encoding="utf-8",
+    )
     return artifact
 
 
@@ -53,11 +61,11 @@ def test_installed_resolver_rejects_ambiguous_visible_versions(tmp_path: Path) -
         resolve_plugin_sources([], installed_cache_root=tmp_path / "cache")
 
 
-def test_installed_resolver_rejects_missing_plugin_file(tmp_path: Path) -> None:
+def test_installed_resolver_rejects_missing_static_manifest(tmp_path: Path) -> None:
     version_root = tmp_path / "cache" / "lab" / "feed" / "1.0.0"
     version_root.mkdir(parents=True)
 
-    with pytest.raises(ValueError, match="缺少 plugin.py"):
+    with pytest.raises(ValueError, match="缺少静态 v3 manifest"):
         resolve_plugin_sources([], installed_cache_root=tmp_path / "cache")
 
 
@@ -67,17 +75,21 @@ def test_installed_resolver_retries_version_moved_during_scan(
 ) -> None:
     version_root = tmp_path / "cache" / "lab" / "feed" / "1.0.0"
     version_root.mkdir(parents=True)
-    plugin_file = version_root / "plugin.py"
-    plugin_file.write_text("", encoding="utf-8")
+    _ = _write_artifact(version_root.parent.parent, version_root.name)
+    artifact_root = version_root.parent.parent / ".artifacts" / version_root.name
+    version_root.rmdir()
+    artifact_root.rename(version_root)
+    manifest_file = version_root / "akashic.plugin.toml"
     moved_root = tmp_path / "moved-version"
-    original_is_file = Path.is_file
+    original_exists = Path.exists
 
-    def move_before_file_check(path: Path) -> bool:
-        if path == plugin_file:
+    def move_before_manifest_check(path: Path) -> bool:
+        if path == manifest_file:
             version_root.rename(moved_root)
-        return original_is_file(path)
+            return False
+        return original_exists(path)
 
-    monkeypatch.setattr(Path, "is_file", move_before_file_check)
+    monkeypatch.setattr(Path, "exists", move_before_manifest_check)
 
     with pytest.raises(FileNotFoundError, match="扫描期间已变化"):
         resolve_plugin_sources([], installed_cache_root=tmp_path / "cache")

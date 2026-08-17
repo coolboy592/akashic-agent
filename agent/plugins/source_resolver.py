@@ -102,7 +102,7 @@ def _iter_installed_plugin_roots(
             has_pointers, selected = _resolve_installed_pointer(plugin_dir, selector)
             if has_pointers:
                 if selected is not None:
-                    static_manifest = _require_plugin_root(selected)
+                    static_manifest = _require_installed_plugin_root(selected)
                     _validate_installed_identity(
                         plugin_dir.name,
                         static_manifest,
@@ -113,11 +113,7 @@ def _iter_installed_plugin_roots(
                             source_type="installed",
                             marketplace=marketplace_dir.name,
                             plugin_name=plugin_dir.name,
-                            entrypoint=(
-                                static_manifest.entrypoint
-                                if static_manifest is not None
-                                else "plugin.py"
-                            ),
+                            entrypoint=static_manifest.entrypoint,
                             static_manifest=static_manifest,
                         )
                     )
@@ -134,7 +130,7 @@ def _iter_installed_plugin_roots(
                 raise ValueError(f"installed cache 可见版本冲突: {paths}")
             if len(version_dirs) != 1:
                 continue
-            static_manifest = _require_plugin_root(version_dirs[0])
+            static_manifest = _require_installed_plugin_root(version_dirs[0])
             _validate_installed_identity(plugin_dir.name, static_manifest)
             result.append(
                 ResolvedPluginSource(
@@ -142,11 +138,7 @@ def _iter_installed_plugin_roots(
                     source_type="installed",
                     marketplace=marketplace_dir.name,
                     plugin_name=plugin_dir.name,
-                    entrypoint=(
-                        static_manifest.entrypoint
-                        if static_manifest is not None
-                        else "plugin.py"
-                    ),
+                    entrypoint=static_manifest.entrypoint,
                     static_manifest=static_manifest,
                 )
             )
@@ -178,20 +170,13 @@ def _require_safe_cache_segment(path: Path, label: str) -> None:
         raise ValueError(f"installed cache {label} 路径段无效: {path}")
 
 
-def _require_plugin_root(path: Path) -> StaticPluginManifest | None:
+def _require_installed_plugin_root(path: Path) -> StaticPluginManifest:
     manifest_path = path / "akashic.plugin.toml"
     if manifest_path.exists() or manifest_path.is_symlink():
         return load_static_plugin_manifest(path)
-    # V2_REMOVAL(static-manifest-admission)：最后一个 v2 artifact 迁走后，
-    # plugin root 必须由静态 manifest admission；删除 plugin.py fallback。
-    plugin_file = path / "plugin.py"
-    if plugin_file.is_symlink():
-        raise ValueError(f"installed cache plugin.py 不能是符号链接: {plugin_file}")
-    if not plugin_file.is_file():
-        if not path.exists():
-            raise FileNotFoundError(f"installed cache 版本扫描期间已变化: {path}")
-        raise ValueError(f"installed cache 缺少 plugin.py: {plugin_file}")
-    return None
+    if not path.exists():
+        raise FileNotFoundError(f"installed cache 版本扫描期间已变化: {path}")
+    raise ValueError(f"installed cache 缺少静态 v3 manifest: {manifest_path}")
 
 
 def _load_optional_static_manifest(path: Path) -> StaticPluginManifest | None:
@@ -203,9 +188,9 @@ def _load_optional_static_manifest(path: Path) -> StaticPluginManifest | None:
 
 def _validate_installed_identity(
     cache_name: str,
-    manifest: StaticPluginManifest | None,
+    manifest: StaticPluginManifest,
 ) -> None:
-    if manifest is not None and manifest.name != cache_name:
+    if manifest.name != cache_name:
         raise ValueError(
             "installed cache 插件目录与静态 manifest name 不一致: "
             f"directory={cache_name} manifest={manifest.name}"
@@ -219,7 +204,7 @@ def _is_plugin_root(path: Path) -> bool:
     if manifest_path.exists() or manifest_path.is_symlink():
         _ = load_static_plugin_manifest(path)
         return True
-    # V2_REMOVAL(static-manifest-admission)：pure-v3 fleet 不再发现无 manifest root。
+    # Built-ins may keep the conventional plugin.py entrypoint without an install manifest.
     plugin_file = path / "plugin.py"
     return not plugin_file.is_symlink() and plugin_file.is_file()
 
