@@ -35,6 +35,26 @@ class SourceChannels(dict[str, list[dict[str, Any]]]):
         self.quarantined: list[QuarantinedItem] = []
         self.quarantine_overflow: dict[str, int] = {}
         self.quarantine_overflow_count = 0
+        self.skipped: dict[str, tuple[str, datetime | None]] = {}
+        self.failures: dict[str, tuple[str, bool]] = {}
+
+
+class SourceFetchSkipped(RuntimeError):
+    """Keep a typed v3 skip distinct from an empty successful fetch."""
+
+    def __init__(self, reason: str, retry_at: datetime | None) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.retry_at = retry_at
+
+
+class SourceFetchFailed(RuntimeError):
+    """Keep a typed v3 fetch failure and its retryability."""
+
+    def __init__(self, error: str, retryable: bool) -> None:
+        super().__init__(error)
+        self.error = error
+        self.retryable = retryable
 
 
 class McpGateway(Protocol):
@@ -101,8 +121,18 @@ async def fetch_sources_async(
     failures: list[str] = []
     for source, result in zip(sources, results):
         key = source_key(source)
+        if isinstance(result, SourceFetchSkipped):
+            succeeded += 1
+            channels.skipped[key] = (result.reason, result.retry_at)
+            continue
+        if isinstance(result, SourceFetchFailed):
+            failures.append(key)
+            channels.failures[key] = (result.error, result.retryable)
+            logger.warning("[proactive.source] fetch 失败 %s: %s", key, result.error)
+            continue
         if isinstance(result, BaseException):
             failures.append(key)
+            channels.failures[key] = (str(result), True)
             logger.warning("[proactive.source] fetch 失败 %s: %s", key, result)
             continue
         succeeded += 1
@@ -258,10 +288,10 @@ async def acknowledge_async(
     event_ids: list[str],
     *,
     feedback: str | None = None,
-) -> None:
+) -> list[str]:
     source = next((item for item in sources if source_key(item) == source_id), None)
     if not event_ids:
-        return
+        return []
     if source is None:
         raise RuntimeError(f"MCP ack source 不存在: {source_id}")
     if not source.spec.ack_tool:
@@ -269,4 +299,20 @@ async def acknowledge_async(
     args: dict[str, Any] = {"event_ids": event_ids}
     if feedback is not None:
         args["feedback"] = feedback
-    await pool.call(source.spec.server, source.spec.ack_tool, args)
+    result = await pool.call(source.spec.server, source.spec.ack_tool, args)
+    if not isinstance(result, dict) or "status" not in result:
+        return list(event_ids)
+    status = result.get("status")
+    if status == "skipped":
+        return []
+    if status != "committed":
+        raise RuntimeError(f"MCP ack 返回未知状态: {source_id}: {status!r}")
+    committed = result.get("ids")
+    if not isinstance(committed, list) or any(
+        not isinstance(item, str) for item in committed
+    ):
+        raise RuntimeError(f"MCP ack committed.ids 必须是字符串 list: {source_id}")
+    requested = set(event_ids)
+    if any(item not in requested for item in committed):
+        raise RuntimeError(f"MCP ack 返回未请求的 event id: {source_id}")
+    return list(dict.fromkeys(committed))

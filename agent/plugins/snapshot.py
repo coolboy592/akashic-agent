@@ -489,6 +489,8 @@ class RuntimeSnapshotCompiler:
                     proactive_component_catalog,
                     generations,
                     mcp_server_registry,
+                    sources,
+                    proactive_modules,
                 )
                 identity += (
                     f"|proactive-components-v3:{proactive_component_catalog.identity}"
@@ -605,6 +607,8 @@ class RuntimeSnapshotCompiler:
         catalog: ProactiveCatalog,
         generations: Mapping[str, PluginGeneration],
         mcp_registry: McpServerRegistry | None,
+        legacy_sources: Mapping[str, RegisteredProactiveSource],
+        legacy_modules: tuple[object, ...],
     ) -> None:
         """Validate exact generation routes without executing a source or module."""
 
@@ -649,7 +653,38 @@ class RuntimeSnapshotCompiler:
                         f"{descriptor.owner}:{descriptor.ack_tool}"
                     )
 
-        # 3. Frame lifecycle is Core-owned and produced capabilities are unique.
+        # 3. The bridge namespace and lifecycle slots remain exclusive across v2/v3.
+        for source in legacy_sources.values():
+            if source.spec.server.startswith("__v3_proactive__:"):
+                raise RuntimeError(
+                    "legacy proactive source 使用 Core 保留 server namespace: "
+                    f"{source.plugin_id}:{source.spec.id}"
+                )
+        legacy_slots = {
+            str(slot)
+            for slot in (getattr(module, "slot", None) for module in legacy_modules)
+            if isinstance(slot, str) and slot
+        }
+        legacy_produced = {
+            str(capability)
+            for module in legacy_modules
+            for capability in getattr(module, "produces", ())
+            if isinstance(capability, str) and capability
+        }
+        for binding in catalog.modules.values():
+            descriptor = binding.descriptor
+            if descriptor.slot in legacy_slots:
+                raise RuntimeError(
+                    f"v2/v3 proactive module slot 冲突: {descriptor.slot}"
+                )
+            conflict = legacy_produced.intersection(descriptor.produces)
+            if conflict:
+                raise RuntimeError(
+                    "v2/v3 proactive capability producer 冲突: "
+                    + ", ".join(sorted(conflict))
+                )
+
+        # 4. Frame lifecycle is Core-owned and produced capabilities are unique.
         produced: dict[str, str] = {}
         for binding in catalog.modules.values():
             descriptor = binding.descriptor
@@ -1360,6 +1395,19 @@ class RuntimeSnapshotStore:
         if not snapshot.accepting_leases:
             raise RuntimeError("RuntimeSnapshot 暂停接收新 lease")
         return self._claim_lease(snapshot)
+
+    def retain_publication_target(
+        self,
+        transaction: SnapshotTransaction,
+    ) -> RuntimeSnapshotLease:
+        """Retain the closed exact target for one Core publication participant."""
+
+        if self._pending is not transaction and self._provisional is not transaction:
+            raise RuntimeError("RuntimeSnapshot publication target 已失效")
+        candidate = transaction.candidate
+        if self._snapshots.get(candidate.snapshot_id) is not candidate:
+            raise RuntimeError("RuntimeSnapshot publication target 未被 Store 持有")
+        return self._claim_lease(candidate)
 
     def _claim_lease(self, snapshot: RuntimeSnapshot) -> RuntimeSnapshotLease:
         snapshot.lease_count += 1

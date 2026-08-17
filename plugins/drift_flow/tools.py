@@ -15,7 +15,6 @@ from agent.tools.base import (
 from agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
 from agent.tools.registry import ToolRegistry
 from agent.tools.shell import ShellTool
-from bus.events_lifecycle import DriftFinished
 from core.error_context import current_session_key
 from plugins.default_proactive.context import AgentTickContext
 from plugins.drift_flow.state import DriftStateStore
@@ -400,17 +399,6 @@ class FinishDriftTool(Tool):
         self._ctx.drift_finished = True
         self._ctx.drift_finish_status = status_value
         self._ctx.drift_finish_briefing = summary
-        if self._event_bus is not None and not self._ctx.drift_message_staged:
-            self._event_bus.enqueue(
-                DriftFinished(
-                    session_key=self._ctx.session_key,
-                    skill_name=skill_name,
-                    status=status_value,
-                    briefing=summary,
-                    message_result=message_result_value,
-                    timestamp=self._ctx.now_utc,
-                )
-            )
         logger.info(
             "[drift_tools] finish_drift ok: skill=%s status=%s briefing=%s",
             skill_name,

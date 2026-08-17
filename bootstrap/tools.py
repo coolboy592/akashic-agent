@@ -648,6 +648,23 @@ def build_core_runtime(
         installed_cache_root=plugins_root() / "cache",
         channel_attachment_store=channel_attachment_store,
     )
+    from agent.plugins.generation_activity_host import ActivityHost
+    from agent.plugins.generation_job_host import BackgroundJobActivityAdapter
+    from agent.plugins.generation_proactive_host import ProactiveActivityAdapter
+
+    proactive_activity = ProactiveActivityAdapter(
+        plugin_manager.composition_generation_host,
+    )
+    background_jobs = BackgroundJobActivityAdapter(
+        event_bus,
+        plugin_manager.snapshot_store,
+        model_provider=provider,
+        model_registry=model_registry,
+        workspace=str(workspace),
+    )
+    plugin_manager.bind_activity_host(
+        ActivityHost((proactive_activity, background_jobs))
+    )
     bus.bind_channel_outbound_dispatcher(
         plugin_manager.channel_generation_host.dispatch_outbound
     )

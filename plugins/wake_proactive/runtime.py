@@ -1073,7 +1073,7 @@ class WakeRuntime:
         grouped = self._state.pending_acknowledgements()
         for source_id, event_ids in grouped.items():
             try:
-                await mcp_sources.acknowledge_async(
+                acknowledged = await mcp_sources.acknowledge_async(
                     self._scope.mcp_gateway,
                     self._scope.proactive_sources,
                     source_id,
@@ -1087,7 +1087,8 @@ class WakeRuntime:
                     exc,
                 )
                 continue
-            self._state.mark_acknowledged(source_id, event_ids)
+            if acknowledged:
+                self._state.mark_acknowledged(source_id, acknowledged)
 
     def _read_memory(self) -> str:
         reader = getattr(self._scope.memory, "read_long_term", None)

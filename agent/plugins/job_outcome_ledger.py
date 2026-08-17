@@ -660,6 +660,7 @@ class JobOutcomeLedger:
         *,
         phase: JobOutcomePhase | str | None = None,
         attempt: int | None = None,
+        model_generation_id: str | None = None,
         error: str | None | object = _UNSET,
         terminal_result_digest: str | None | object = _UNSET,
         now: datetime | None = None,
@@ -681,6 +682,24 @@ class JobOutcomeLedger:
             current = self._record_from_row(row)
             target_phase = current.phase if phase is None else _coerce_phase(phase)
             target_attempt = self._next_attempt(current, target_state, target_phase, attempt)
+            target_model_generation_id = current.model_generation_id
+            if model_generation_id is not None:
+                bound_model_generation_id = _required_text(
+                    model_generation_id,
+                    "model_generation_id",
+                )
+                if target_state is not JobOutcomeState.RUNNING:
+                    raise JobOutcomeTransitionError(
+                        "model generation 只能在进入 running 时绑定"
+                    )
+                if current.model_generation_id not in {
+                    "execution-pending",
+                    bound_model_generation_id,
+                }:
+                    raise JobOutcomeIdentityError(
+                        "job outcome 已绑定另一份 model generation"
+                    )
+                target_model_generation_id = bound_model_generation_id
             target_error = (
                 current.error
                 if error is _UNSET
@@ -723,7 +742,8 @@ class JobOutcomeLedger:
                 """
                 UPDATE job_outcomes
                 SET attempt = ?, state = ?, phase = ?, error = ?,
-                    updated_at = ?, terminal_result_digest = ?
+                    updated_at = ?, terminal_result_digest = ?,
+                    model_generation_id = ?
                 WHERE invocation_id = ? AND state = ?
                 """,
                 (
@@ -733,6 +753,7 @@ class JobOutcomeLedger:
                     target_error,
                     updated_at,
                     target_digest,
+                    target_model_generation_id,
                     invocation_id,
                     current.state.value,
                 ),
@@ -968,7 +989,17 @@ class JobOutcomeLedger:
 
 
 def _same_identity(record: JobOutcomeRecord, identity: JobOutcomeIdentity) -> bool:
-    return all(getattr(record, column) == getattr(identity, column) for column in _IDENTITY_COLUMNS)
+    for column in _IDENTITY_COLUMNS:
+        if getattr(record, column) == getattr(identity, column):
+            continue
+        if (
+            column == "model_generation_id"
+            and identity.model_generation_id == "execution-pending"
+            and record.model_generation_id != "execution-pending"
+        ):
+            continue
+        return False
+    return True
 
 
 __all__ = [

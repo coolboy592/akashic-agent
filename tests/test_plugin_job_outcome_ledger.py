@@ -151,6 +151,37 @@ def test_provider_retry_phase_is_reachable(tmp_path: Path) -> None:
     assert pending.error == "provider request failed before domain effect"
 
 
+def test_running_binds_actual_model_generation_once(tmp_path: Path) -> None:
+    ledger = JobOutcomeLedger(tmp_path / "outcomes.sqlite")
+    pending_identity = replace(
+        _identity(),
+        model_generation_id="execution-pending",
+    )
+    ledger.admit(pending_identity)
+
+    running = ledger.transition(
+        "invocation-1",
+        JobOutcomeState.RUNNING,
+        model_generation_id="model-generation-2",
+    )
+    duplicate = ledger.admit(pending_identity)
+
+    assert running.model_generation_id == "model-generation-2"
+    assert duplicate == running
+
+    ledger.transition(
+        "invocation-1",
+        JobOutcomeState.RETRY_PENDING,
+        error="provider unavailable",
+    )
+    with pytest.raises(JobOutcomeIdentityError, match="model generation"):
+        ledger.transition(
+            "invocation-1",
+            JobOutcomeState.RUNNING,
+            model_generation_id="model-generation-3",
+        )
+
+
 def test_outcome_field_invariants_fail_loud(tmp_path: Path) -> None:
     ledger = JobOutcomeLedger(tmp_path / "outcomes.sqlite")
     ledger.admit(_identity())

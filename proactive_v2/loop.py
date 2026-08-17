@@ -9,10 +9,11 @@ import random as _random_module
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Awaitable, Callable
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, cast
 
 if TYPE_CHECKING:
     from core.memory.engine import MemoryRetrievalApi
+    from agent.plugins.generation_activity_host import ActivityHost
     from agent.plugins.snapshot import (
         RuntimeSnapshot,
         RuntimeSnapshotLease,
@@ -82,6 +83,7 @@ class ProactiveLoop:
         proactive_runtime_factories: list[object] | None = None,
         proactive_sources: list[RegisteredProactiveSource] | None = None,
         runtime_snapshot_store: RuntimeSnapshotStore | None = None,
+        activity_host: ActivityHost | None = None,
         state_store_owned: bool = False,
     ) -> None:
         self._sessions = session_manager
@@ -106,6 +108,12 @@ class ProactiveLoop:
         self._plugin_proactive_runtime_factories = proactive_runtime_factories or []
         self._plugin_proactive_sources = proactive_sources or []
         self._runtime_snapshot_store = runtime_snapshot_store
+        self._proactive_bridge = None
+        self._v3_proactive_runtime = None
+        if activity_host is not None:
+            from agent.plugins.generation_proactive_bridge import CommittedProactiveBridge
+
+            self._proactive_bridge = CommittedProactiveBridge(activity_host)
         self._active_snapshot_id: str | None = None
         self._kernel_started = False
         self._active_kernel_lease: RuntimeSnapshotLease | None = None
@@ -197,10 +205,15 @@ class ProactiveLoop:
             else self._shared_tools
         )
 
-        return SharedMcpGateway(
+        gateway = SharedMcpGateway(
             Path(self._sessions.workspace),
             tools,
         )
+        bridge = getattr(self, "_proactive_bridge", None)
+        if bridge is not None and self._v3_proactive_runtime is not None:
+            runtime = self._v3_proactive_runtime
+            return cast(Any, bridge.gateway(gateway, runtime))
+        return gateway
 
     def _build_kernel(self) -> ProactiveKernel:
         runtime = self._build_plugin_runtime()
@@ -208,6 +221,15 @@ class ProactiveLoop:
             *self._plugin_proactive_modules,
             *self._build_plugin_flow_modules(runtime),
         ]
+        bridge = getattr(self, "_proactive_bridge", None)
+        if bridge is not None and self._v3_proactive_runtime is not None:
+            proactive_runtime = self._v3_proactive_runtime
+            modules.extend(
+                bridge.lifecycle_modules(
+                    proactive_runtime,
+                    lifecycle_id=self._cfg.lifecycle,
+                )
+            )
         kernel = ProactiveKernel(
             modules,
             initial_slots_fn=self._build_initial_slots,
@@ -470,14 +492,27 @@ class ProactiveLoop:
             lease = await self._runtime_snapshot_store.acquire()
             from agent.plugins.snapshot import bind_runtime_snapshot, reset_runtime_snapshot
 
-            async with lease:
-                token = bind_runtime_snapshot(lease)
-                try:
-                    async with self._reload_lock:
-                        await self._switch_snapshot(lease.snapshot)
-                        return await self._tick_bound()
-                finally:
-                    reset_runtime_snapshot(token)
+            activity_lease = None
+            bridge = getattr(self, "_proactive_bridge", None)
+            if bridge is not None:
+                activity_lease = bridge.activity_host.acquire(lease)
+            try:
+                async with lease:
+                    token = bind_runtime_snapshot(lease)
+                    bridge_token = (
+                        None if bridge is None else bridge.bind_execution(lease)
+                    )
+                    try:
+                        async with self._reload_lock:
+                            await self._switch_snapshot(lease.snapshot)
+                            return await self._tick_bound()
+                    finally:
+                        if bridge is not None and bridge_token is not None:
+                            bridge.reset_execution(bridge_token)
+                        reset_runtime_snapshot(token)
+            finally:
+                if activity_lease is not None:
+                    await activity_lease.release()
 
     async def quiesce_for_reload(self) -> None:
         async with self._reload_lock:
@@ -636,6 +671,17 @@ class ProactiveLoop:
             snapshot.proactive_runtime_factories
         )
         self._plugin_proactive_sources = list(snapshot.proactive_sources.values())
+        bridge = getattr(self, "_proactive_bridge", None)
+        if bridge is not None:
+            activity = bridge.activity_host.active
+            if activity is None:
+                self._v3_proactive_runtime = None
+            else:
+                runtime = bridge.runtime_for(snapshot)
+                self._v3_proactive_runtime = runtime
+                self._plugin_proactive_sources.extend(
+                    bridge.registered_sources(runtime)
+                )
         self._tool_hooks = list(snapshot.tool_hooks)
 
 

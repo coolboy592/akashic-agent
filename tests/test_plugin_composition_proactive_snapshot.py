@@ -1,4 +1,6 @@
 from pathlib import Path
+from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
@@ -14,8 +16,12 @@ from agent.plugin_composition import (
 )
 from agent.plugin_composition.mcp_slots import PluginMcpServers
 from agent.plugins.generation import GateResult, PluginContributions, PluginGeneration
+from agent.plugins.activity_host import PreparedProactiveCatalog
+from agent.plugins.generation_activity_host import ActivityHost
+from agent.plugins.generation_proactive_host import ProactiveActivityAdapter
 from agent.plugins.manager import PluginManager
 from agent.plugins.scope import PluginScope
+from agent.plugins.specs import ProactiveSourceSpec, RegisteredProactiveSource
 from agent.plugins.snapshot import RuntimeSnapshotCompiler, RuntimeSnapshotStore
 from bus.event_bus import EventBus
 
@@ -169,6 +175,96 @@ async def test_snapshot_rejects_proactive_ack_in_candidate_allowlist(
     await root.dispose()
 
 
+async def _module_root(plugin_dir: Path) -> CompositionRoot:
+    root = CompositionRoot("calendar:test")
+    components = PluginProactiveComponents(root.instance_token)
+    _ = await root.context.provide(PROACTIVE_COMPONENTS, components)
+
+    async def apply(ctx) -> None:
+        await ctx.require(PROACTIVE_COMPONENTS).register(
+            ctx,
+            ProactiveModuleDefinition(
+                slot="proactive.calendar",
+                lifecycle_id="default.proactive.frame.v1",
+                produces=("calendar.alerts",),
+                handler_export="runtime.handle_calendar",
+            ),
+        )
+
+    _ = await root.mount(
+        apply,
+        name="calendar",
+        inject=(PROACTIVE_COMPONENTS,),
+        runtime=PluginRuntime(
+            plugin_id="calendar",
+            plugin_dir=plugin_dir,
+            data_dir=plugin_dir / "data",
+            workspace=plugin_dir / "workspace",
+            config=None,
+        ),
+    )
+    return root
+
+
+@pytest.mark.asyncio
+async def test_snapshot_rejects_v2_v3_proactive_module_collision(tmp_path: Path) -> None:
+    plugin_dir = tmp_path / "calendar"
+    plugin_dir.mkdir()
+    root = await _module_root(plugin_dir)
+    generation = _generation(plugin_dir)
+    legacy = SimpleNamespace(
+        slot="proactive.calendar",
+        produces=("calendar.alerts",),
+    )
+    generation = replace(
+        generation,
+        contributions=replace(
+            generation.contributions,
+            proactive_modules=(legacy,),
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="v2/v3 proactive module slot 冲突"):
+        RuntimeSnapshotCompiler().compile(
+            {generation.plugin_id: generation},
+            composition_root=root,
+        )
+    await root.dispose()
+
+
+@pytest.mark.asyncio
+async def test_snapshot_rejects_legacy_source_in_v3_bridge_namespace(
+    tmp_path: Path,
+) -> None:
+    plugin_dir = tmp_path / "calendar"
+    plugin_dir.mkdir()
+    root = await _module_root(plugin_dir)
+    generation = _generation(plugin_dir)
+    legacy = RegisteredProactiveSource(
+        plugin_id="legacy",
+        spec=ProactiveSourceSpec(
+            id="feed",
+            channels=("alert",),
+            server="__v3_proactive__:calendar:calendar",
+            fetch_tool="fetch",
+        ),
+    )
+    generation = replace(
+        generation,
+        proactive_catalog=PreparedProactiveCatalog(
+            generation_id=generation.generation_id,
+            sources={"legacy:feed": legacy},
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="Core 保留 server namespace"):
+        RuntimeSnapshotCompiler().compile(
+            {generation.plugin_id: generation},
+            composition_root=root,
+        )
+    await root.dispose()
+
+
 @pytest.mark.asyncio
 async def test_manager_provides_and_compiles_proactive_service(
     tmp_path: Path,
@@ -188,9 +284,11 @@ async def test_manager_provides_and_compiles_proactive_service(
         "        ProactiveModuleDefinition(\n"
         "            slot='proactive.calendar',\n"
         "            lifecycle_id='default.proactive.frame.v1',\n"
-        "            handler_export='runtime.handle_calendar',\n"
+        "            handler_export='handle_calendar',\n"
         "        )\n"
-        "    )\n",
+        "    )\n"
+        "async def handle_calendar(ctx, frame):\n"
+        "    return frame\n",
         encoding="utf-8",
     )
     manager = PluginManager(
@@ -200,6 +298,7 @@ async def test_manager_provides_and_compiles_proactive_service(
         workspace=tmp_path / "workspace",
         installed_cache_root=tmp_path / "cache",
     )
+    manager.bind_activity_host(ActivityHost((ProactiveActivityAdapter(),)))
 
     await manager.load_all()
 

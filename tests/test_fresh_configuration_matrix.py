@@ -149,6 +149,7 @@ async def test_fresh_init_core_configuration_matrix(
             "workspace_mcp_status",
         } <= runtime.tools.get_registered_names()
         assert runtime.memory_runtime.engine.describe().name == memory_name
+        assert runtime.plugin_manager.activity_host is not None
         expected_lifecycles = [] if proactive_name == "off" else [proactive_name]
         assert [
             lifecycle.id for lifecycle in runtime.plugin_manager.proactive_lifecycles

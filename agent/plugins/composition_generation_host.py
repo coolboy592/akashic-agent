@@ -31,6 +31,7 @@ from agent.plugins.mcp_generation_host import (
     McpGenerationHost,
     McpCleanupTombstone,
     McpMaterializedCommand,
+    McpRoute,
     McpServerView,
     McpToolView,
 )
@@ -264,6 +265,16 @@ class CompositionGenerationHost:
     def get(self, generation_id: str) -> CompositionRuntimeGeneration | None:
         owner = self._owners.get(generation_id)
         return None if owner is None else owner.generation
+
+    def route_for(self, generation_id: str, server_name: str) -> McpRoute:
+        """Return one exact formal MCP route for a generation-bound Core consumer."""
+
+        runtime = self.get(generation_id)
+        if runtime is None or runtime.mcp is None:
+            raise RuntimeError(
+                f"v3 runtime MCP generation 不存在: {generation_id}:{server_name}"
+            )
+        return runtime.mcp.route(server_name)
 
     def failure(self, generation_id: str) -> CompositionRuntimeFailure | None:
         """Return one aggregated failure receipt for both runtime hosts."""

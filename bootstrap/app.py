@@ -670,6 +670,9 @@ class AppRuntime:
                 runtime_snapshot_store=(
                     plugin_manager.snapshot_store if plugin_manager else None
                 ),
+                activity_host=(
+                    plugin_manager.activity_host if plugin_manager else None
+                ),
             )
             self.tasks.extend(proactive_tasks)
             if self.proactive_loop is not None:

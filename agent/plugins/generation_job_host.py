@@ -1,0 +1,1440 @@
+"""Generation-scoped execution host for the v3 background-job catalog.
+
+This module is intentionally independent from ``PluginJobRuntime``.  A job is
+bound to one committed snapshot and one exact ComposablePlugin module; all
+execution state (leases, queue entries, child tasks and ledger transitions) is
+owned by that binding.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import inspect
+import secrets
+from contextvars import ContextVar, Token
+from collections.abc import Awaitable, Callable, Coroutine, Mapping
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from types import MappingProxyType
+from typing import Any, TYPE_CHECKING, cast
+
+from agent.model_runtime.registry import (
+    RoleBoundProvider,
+    current_model_binding,
+    model_execution_scope,
+)
+from agent.plugin_composition.background_jobs import (
+    BackgroundJobBinding,
+    BackgroundJobCatalog,
+    CoreEvent,
+    CoreEventTrigger,
+    IntervalTrigger,
+)
+from agent.plugins.composable import ComposablePlugin
+from agent.plugins.job_outcome_ledger import (
+    JobOutcomeIdentity,
+    JobOutcomeLedger,
+    JobOutcomePhase,
+    JobOutcomeRecord,
+    JobOutcomeState,
+)
+from agent.plugins.snapshot import (
+    RuntimeSnapshotLease,
+    RuntimeSnapshotStore,
+    get_current_runtime_lease,
+)
+from bus.event_bus import EventBus, EventSubscription
+from bus.events_lifecycle import DriftFinished
+
+if TYPE_CHECKING:
+    from agent.plugins.generation_activity_host import ActivityCatalog
+
+
+DriftFinishedEvent = DriftFinished
+
+
+@dataclass(frozen=True, slots=True)
+class GenerationLlmResult:
+    """Return model text together with usage and exact model binding."""
+
+    text: str
+    model_usage: Mapping[str, object]
+    model_binding: Mapping[str, object]
+
+
+PluginLlmResult = GenerationLlmResult
+
+_CURRENT_INVOCATION_TOKEN: ContextVar[object | None] = ContextVar(
+    "background_job_invocation_token",
+    default=None,
+)
+
+
+class GenerationLlmLease:
+    """Narrow invocation-only LLM capability fenced by snapshot and model leases."""
+
+    __slots__ = (
+        "_provider",
+        "_role",
+        "_snapshot_lease",
+        "_snapshot_id",
+        "_plugin_generation_id",
+        "_model_generation_id",
+        "_invocation_token",
+        "_model_binding",
+        "_invalidated",
+        "_provider_called",
+    )
+
+    def __init__(
+        self,
+        provider: object,
+        *,
+        role: str,
+        snapshot_lease: RuntimeSnapshotLease,
+        snapshot_id: str,
+        plugin_generation_id: str,
+        model_generation_id: str,
+        invocation_token: object,
+        model_binding: object | None,
+    ) -> None:
+        self._provider = provider
+        self._role = role
+        self._snapshot_lease = snapshot_lease
+        self._snapshot_id = snapshot_id
+        self._plugin_generation_id = plugin_generation_id
+        self._model_generation_id = model_generation_id
+        self._invocation_token = invocation_token
+        self._model_binding = model_binding
+        self._invalidated = False
+        self._provider_called = False
+
+    @property
+    def provider_called(self) -> bool:
+        return self._provider_called
+
+    @property
+    def invocation_token(self) -> object:
+        return self._invocation_token
+
+    @property
+    def model_generation_id(self) -> str:
+        return self._model_generation_id
+
+    def invalidate(self) -> None:
+        self._invalidated = True
+
+    async def generate_text(
+        self,
+        *,
+        prompt: str,
+        system: str = "",
+        model: str | None = None,
+        max_tokens: int | None = None,
+    ) -> str:
+        return (
+            await self.generate(
+                prompt=prompt,
+                system=system,
+                model=model,
+                max_tokens=max_tokens,
+            )
+        ).text
+
+    async def generate(
+        self,
+        *,
+        prompt: str,
+        system: str = "",
+        model: str | None = None,
+        max_tokens: int | None = None,
+    ) -> GenerationLlmResult:
+        """Execute one model request while all four invocation fences remain live."""
+
+        # 1. Check the exact invocation and snapshot before crossing the provider boundary.
+        self._require_live()
+        if not isinstance(prompt, str):
+            raise TypeError("LLM prompt 必须是字符串")
+        messages: list[dict[str, str]] = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
+        provider = self._provider
+        if provider is None or not callable(getattr(provider, "chat", None)):
+            raise RuntimeError("BackgroundJobContext.llm 没有可用 provider")
+
+        # 2. Keep provider request inside the invocation's model-generation scope.
+        self._provider_called = True
+        request_model = model or str(getattr(provider, "model", ""))
+        request_max_tokens = 0 if max_tokens is None else max_tokens
+        response = await provider.chat(
+            messages=messages,
+            tools=[],
+            model=request_model,
+            max_tokens=request_max_tokens,
+        )
+        self._require_live()
+        usage = getattr(response, "usage", None)
+        model_binding = self._describe_binding()
+        return GenerationLlmResult(
+            text=str(getattr(response, "content", "") or "").strip(),
+            model_usage=_usage_dict(usage),
+            model_binding=model_binding,
+        )
+
+    def _require_live(self) -> None:
+        if self._invalidated:
+            raise RuntimeError("GenerationLlmLease 已失效")
+        if not self._snapshot_lease.active:
+            raise RuntimeError("GenerationLlmLease 的 RuntimeSnapshot lease 已释放")
+        if self._snapshot_lease.snapshot.snapshot_id != self._snapshot_id:
+            raise RuntimeError("GenerationLlmLease 的 snapshot identity 不匹配")
+        generations = getattr(self._snapshot_lease.snapshot, "generations", {})
+        if not any(
+            str(getattr(generation, "generation_id", ""))
+            == self._plugin_generation_id
+            for generation in generations.values()
+        ):
+            raise RuntimeError("GenerationLlmLease 的 plugin generation 不匹配")
+        if _CURRENT_INVOCATION_TOKEN.get() is not self._invocation_token:
+            raise RuntimeError("GenerationLlmLease 的 invocation token 不匹配")
+        binding = self._model_binding
+        if binding is not None:
+            current = current_model_binding()
+            if current is not binding:
+                raise RuntimeError("GenerationLlmLease 的 model execution scope 不匹配")
+            generation = getattr(binding, "generation", None)
+            generation_id = getattr(generation, "generation_id", None)
+            if str(generation_id) != self._model_generation_id:
+                raise RuntimeError("GenerationLlmLease 的 model generation 不匹配")
+
+    def _describe_binding(self) -> Mapping[str, object]:
+        binding = self._model_binding
+        if binding is None:
+            return MappingProxyType({"generation_id": self._model_generation_id})
+        describe = getattr(binding, "describe", None)
+        if not callable(describe):
+            raise RuntimeError("model execution binding 缺少 describe")
+        describe_binding = cast(Callable[..., Mapping[str, object]], describe)
+        roles = getattr(getattr(binding, "generation", None), "role_runtime_ids", {})
+        if self._role in roles:
+            return MappingProxyType(dict(describe_binding(self._role)))
+        return MappingProxyType(dict(describe_binding()))
+
+
+@dataclass(slots=True)
+class BackgroundJobContext:
+    """Invocation-scoped context exposed to one exact async plugin handler."""
+
+    plugin_id: str
+    event: object | None
+    reason: str
+    triggered_at: datetime
+    snapshot_id: str
+    generation_id: str
+    plugin_generation_id: str
+    model_generation_id: str
+    llm: GenerationLlmLease
+    activation_token: object
+    _children: set[asyncio.Future[None]] = field(default_factory=set, init=False, repr=False)
+    _closed: bool = field(default=False, init=False, repr=False)
+
+    def spawn_child(self, awaitable: Awaitable[None], *, name: str) -> None:
+        """Start a Core-owned child task that is drained before handler terminal state."""
+
+        if self._closed:
+            raise RuntimeError("BackgroundJobContext 已结算，不能 spawn child")
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("child name 必须是非空字符串")
+        if inspect.iscoroutine(awaitable):
+            task: asyncio.Future[None] = asyncio.create_task(
+                cast(Coroutine[Any, Any, None], awaitable),
+                name=f"background_job:{name}",
+            )
+        else:
+            task = asyncio.ensure_future(awaitable)
+        self._children.add(task)
+
+    async def drain_children(self) -> None:
+        """Wait for all children and preserve their first failure."""
+
+        self._closed = True
+        while self._children:
+            tasks = tuple(self._children)
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            self._children.difference_update(tasks)
+            for result in results:
+                if isinstance(result, BaseException):
+                    raise result
+
+    async def cancel_children(self) -> None:
+        """Cancel every child after handler failure and wait for child cleanup."""
+
+        self._closed = True
+        tasks = tuple(self._children)
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+
+@dataclass(frozen=True, slots=True)
+class BackgroundJobPlan:
+    """Pure materialization plan fixed to one exact snapshot and catalog."""
+
+    transaction_id: str
+    snapshot_id: str
+    catalog_identity: str
+    target_lease: RuntimeSnapshotLease
+    bindings: tuple[BackgroundJobBinding, ...]
+    snapshot_store: RuntimeSnapshotStore
+
+
+@dataclass(slots=True)
+class _MaterializedJob:
+    key: str
+    binding: BackgroundJobBinding
+    handler: Callable[[BackgroundJobContext], Awaitable[object]]
+    source_revision: str
+    artifact_identity: str
+    snapshot_id: str
+
+    @property
+    def admission_key(self) -> tuple[str, str, object, str]:
+        """Return the non-persistent binding identity used by queue admission."""
+
+        return (
+            self.snapshot_id,
+            self.binding.generation_id,
+            self.binding.activation_token,
+            self.key,
+        )
+
+
+@dataclass(slots=True)
+class _JobRequest:
+    binding: "BackgroundJobRuntimeBinding"
+    job: _MaterializedJob
+    reason: str
+    event: object | None
+    interval_bucket: str | None
+    event_id: str | None
+    invocation_id: str
+    snapshot_lease: RuntimeSnapshotLease
+    outcome: JobOutcomeRecord
+    cancelled: bool = False
+    lease_released: bool = False
+
+
+@dataclass(slots=True)
+class BackgroundJobRuntimeBinding:
+    """Closed or open resources materialized from one BackgroundJobPlan."""
+
+    snapshot_id: str
+    catalog_identity: str
+    jobs: Mapping[str, _MaterializedJob]
+    snapshot_store: RuntimeSnapshotStore
+    subscriptions: list[EventSubscription] = field(default_factory=list)
+    interval_task: asyncio.Task[None] | None = None
+    worker_task: asyncio.Task[None] | None = None
+    queue: asyncio.Queue[_JobRequest | None] = field(default_factory=asyncio.Queue)
+    pending_admission: set[asyncio.Task[None]] = field(default_factory=set)
+    admission_errors: list[BaseException] = field(default_factory=list, repr=False)
+    queued: dict[str, _JobRequest] = field(default_factory=dict)
+    running: dict[str, asyncio.Task[None]] = field(default_factory=dict)
+    running_requests: dict[str, _JobRequest] = field(default_factory=dict)
+    running_job_keys: dict[str, tuple[str, str, object, str]] = field(default_factory=dict)
+    admission_open: bool = False
+    closed: bool = False
+
+    @property
+    def subscription_count(self) -> int:
+        return sum(subscription.active for subscription in self.subscriptions)
+
+    @property
+    def timer_count(self) -> int:
+        return int(self.interval_task is not None and not self.interval_task.done())
+
+
+class BackgroundJobActivityAdapter:
+    """Materialize, admit, execute and drain generation-bound background jobs."""
+
+    name = "background_jobs"
+
+    def __init__(
+        self,
+        event_bus: EventBus | None = None,
+        snapshot_store: RuntimeSnapshotStore | None = None,
+        *,
+        model_provider: object | None = None,
+        model_registry: object | None = None,
+        ledger: JobOutcomeLedger | None = None,
+        ledger_path: str | None = None,
+        workspace: str | None = None,
+        clock: Callable[[], datetime] | None = None,
+        invocation_id_factory: Callable[[], str] | None = None,
+        interval_poll_seconds: float = 0.05,
+    ) -> None:
+        if ledger is not None and (ledger_path is not None or workspace is not None):
+            raise TypeError("ledger 不能与 ledger_path/workspace 同时提供")
+        if interval_poll_seconds <= 0:
+            raise ValueError("interval_poll_seconds 必须为正数")
+        self._event_bus = event_bus
+        self._snapshot_store = snapshot_store
+        self._model_provider = model_provider
+        self._model_registry = model_registry
+        if ledger is not None:
+            self._ledger = ledger
+        elif ledger_path is not None:
+            self._ledger = JobOutcomeLedger(ledger_path)
+        elif workspace is not None:
+            self._ledger = JobOutcomeLedger.for_workspace(workspace)
+        else:
+            self._ledger = None
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._invocation_id_factory = invocation_id_factory or (
+            lambda: "invocation-" + secrets.token_hex(16)
+        )
+        self._interval_poll_seconds = interval_poll_seconds
+        self._bindings: dict[str, BackgroundJobRuntimeBinding] = {}
+        self._plans: dict[str, BackgroundJobPlan] = {}
+        self._handler_resolution_count = 0
+        self._active: BackgroundJobRuntimeBinding | None = None
+
+    @property
+    def ledger(self) -> JobOutcomeLedger | None:
+        return self._ledger
+
+    @property
+    def active_binding(self) -> BackgroundJobRuntimeBinding | None:
+        return self._active
+
+    @property
+    def handler_resolution_count(self) -> int:
+        return self._handler_resolution_count
+
+    @property
+    def subscription_count(self) -> int:
+        return sum(binding.subscription_count for binding in self._bindings.values())
+
+    @property
+    def timer_count(self) -> int:
+        return sum(binding.timer_count for binding in self._bindings.values())
+
+    def prepare_components(
+        self,
+        transaction_id: str,
+        target_lease: RuntimeSnapshotLease,
+        target_catalog: object,
+    ) -> BackgroundJobPlan:
+        """Validate immutable target identity without starting handlers or resources."""
+
+        # 1. Validate only frozen snapshot/catalog identity; no handler or provider lookup is allowed here.
+        if not isinstance(transaction_id, str) or not transaction_id.strip():
+            raise ValueError("transaction_id 必须是非空字符串")
+        if not target_lease.active:
+            raise RuntimeError("BackgroundJob target snapshot lease 已失效")
+        catalog = _background_catalog(target_catalog)
+        snapshot = target_lease.snapshot
+        if snapshot.background_job_catalog is not catalog:
+            if snapshot.background_job_catalog is None or (
+                snapshot.background_job_catalog.identity != catalog.identity
+            ):
+                raise RuntimeError("BackgroundJob target catalog 与 snapshot 不匹配")
+        store = self._snapshot_store or _lease_store(target_lease)
+        if store is None:
+            raise RuntimeError("BackgroundJob 需要 RuntimeSnapshotStore")
+        bindings = tuple(catalog.values())
+        for binding in bindings:
+            generation = snapshot.generations.get(binding.plugin_id)
+            if generation is None:
+                raise RuntimeError(f"BackgroundJob owner 不属于 target snapshot: {binding.plugin_id}")
+            if generation.generation_id != binding.generation_id:
+                raise RuntimeError(f"BackgroundJob generation identity 不匹配: {binding.plugin_id}:{binding.name}")
+        plan = BackgroundJobPlan(
+            transaction_id=transaction_id,
+            snapshot_id=snapshot.snapshot_id,
+            catalog_identity=catalog.identity,
+            target_lease=target_lease,
+            bindings=bindings,
+            snapshot_store=store,
+        )
+        self._plans[transaction_id] = plan
+        return plan
+
+    async def materialize_closed(
+        self,
+        transaction_id: str,
+        plan: BackgroundJobPlan,
+    ) -> BackgroundJobRuntimeBinding:
+        """Resolve exact async exports and create closed resources without admission."""
+
+        # 1. Resolve exports only from the target snapshot's exact ComposablePlugin modules.
+        expected = self._plans.get(transaction_id)
+        if expected is not plan or plan.transaction_id != transaction_id:
+            raise RuntimeError("BackgroundJob materialization plan 已失效")
+        if not plan.target_lease.active:
+            raise RuntimeError("BackgroundJob target snapshot lease 已释放")
+        jobs: dict[str, _MaterializedJob] = {}
+        snapshot = plan.target_lease.snapshot
+        try:
+            for binding in plan.bindings:
+                generation = snapshot.generations[binding.plugin_id]
+                handler = self._resolve_handler(generation.instance, binding.handler_export)
+                source_revision = str(generation.source_revision)
+                key = f"{binding.plugin_id}:{binding.name}"
+                jobs[key] = _MaterializedJob(
+                    key=key,
+                    binding=binding,
+                    handler=handler,
+                    source_revision=source_revision,
+                    artifact_identity=f"{plan.catalog_identity}:{key}",
+                    snapshot_id=plan.snapshot_id,
+                )
+            runtime = BackgroundJobRuntimeBinding(
+                snapshot_id=plan.snapshot_id,
+                catalog_identity=plan.catalog_identity,
+                jobs=MappingProxyType(jobs),
+                snapshot_store=plan.snapshot_store,
+            )
+            # 2. Build producer resources while the binding remains closed.
+            if self._event_bus is not None:
+                runtime.subscriptions.append(
+                    self._event_bus.on_any(
+                        cast(Callable[[object], object], lambda event: self._on_event(runtime, event)),
+                    )
+                )
+            if any(
+                isinstance(trigger, IntervalTrigger)
+                for job in jobs.values()
+                for trigger in job.binding.definition.triggers
+            ):
+                runtime.interval_task = asyncio.create_task(
+                    self._interval_loop(runtime),
+                    name=f"background_job_intervals:{plan.snapshot_id}",
+                )
+            runtime.worker_task = asyncio.create_task(
+                self._worker_loop(runtime),
+                name=f"background_job_worker:{plan.snapshot_id}",
+            )
+            self._bindings[plan.snapshot_id] = runtime
+            self._handler_resolution_count += len(jobs)
+            return runtime
+        except BaseException:
+            if "runtime" in locals():
+                await self.close_components(transaction_id, runtime)
+            raise
+
+    async def stop_components(
+        self,
+        transaction_id: str,
+        old_binding: BackgroundJobRuntimeBinding,
+    ) -> None:
+        """Stop new admissions and drain accepted old requests before publication swap."""
+
+        self._require_binding(transaction_id, old_binding)
+        old_binding.admission_open = False
+        self._close_producers(old_binding)
+        try:
+            await self._drain_binding(old_binding, cancel_running=False)
+        finally:
+            await self._stop_worker(old_binding)
+
+    async def restore_components(
+        self,
+        transaction_id: str,
+        old_binding: BackgroundJobRuntimeBinding,
+    ) -> None:
+        """Reopen a previously stopped binding during publication rollback."""
+
+        self._require_binding(transaction_id, old_binding)
+        if old_binding.closed:
+            raise RuntimeError("BackgroundJob old binding 已关闭，不能 restore")
+        self._ensure_producers(old_binding)
+        self._ensure_worker(old_binding)
+        old_binding.admission_open = True
+        self._active = old_binding
+
+    async def close_components(
+        self,
+        transaction_id: str,
+        binding: BackgroundJobRuntimeBinding,
+    ) -> None:
+        """Cancel and fully clean one closed or discarded binding."""
+
+        self._require_binding(transaction_id, binding, allow_missing_plan=True)
+        if binding.closed:
+            return
+        binding.admission_open = False
+        self._close_producers(binding)
+        admission_errors = list(await self._wait_pending_admissions(binding))
+        await self.cancel_queued(binding)
+        await self.cancel_running(binding)
+        try:
+            await self._drain_binding(binding, cancel_running=False)
+        finally:
+            binding.closed = True
+            await self._stop_worker(binding)
+            self._bindings.pop(binding.snapshot_id, None)
+            if self._active is binding:
+                self._active = None
+        if admission_errors:
+            raise admission_errors[0]
+
+    async def open(self, binding: BackgroundJobRuntimeBinding) -> None:
+        """Open one finalized binding for typed event and interval admission."""
+
+        if binding.closed:
+            raise RuntimeError("BackgroundJob binding 已关闭")
+        if binding.snapshot_id not in self._bindings:
+            raise RuntimeError("BackgroundJob binding 不属于当前 adapter")
+        self._ensure_producers(binding)
+        self._ensure_worker(binding)
+        binding.admission_open = True
+        self._active = binding
+
+    def finalize_components(
+        self,
+        transaction_id: str,
+        binding: BackgroundJobRuntimeBinding,
+    ) -> None:
+        """Synchronously open a finalized child at the shared pointer commit boundary."""
+
+        self._require_binding(transaction_id, binding)
+        if binding.closed:
+            raise RuntimeError("BackgroundJob binding 已关闭")
+        if binding.snapshot_id not in self._bindings:
+            raise RuntimeError("BackgroundJob binding 不属于当前 adapter")
+        if binding.worker_task is None or binding.worker_task.done():
+            raise RuntimeError("BackgroundJob worker 尚未 materialize")
+        binding.admission_open = True
+        self._active = binding
+
+    def pause_components(self, binding: BackgroundJobRuntimeBinding) -> None:
+        """Synchronously reject new producer admissions after committed cleanup failed."""
+
+        if self._bindings.get(binding.snapshot_id) is not binding:
+            raise RuntimeError("BackgroundJob binding 不属于当前 adapter")
+        binding.admission_open = False
+
+    async def pause(self, binding: BackgroundJobRuntimeBinding) -> None:
+        """Close only new admission while retaining exact accepted requests."""
+
+        if binding.closed:
+            return
+        binding.admission_open = False
+        self._close_producers(binding)
+
+    async def drain(self, binding: BackgroundJobRuntimeBinding) -> None:
+        """Wait until queued and running accepted requests release all leases."""
+
+        await self._drain_binding(binding, cancel_running=False)
+
+    async def cancel_queued(self, binding: BackgroundJobRuntimeBinding) -> None:
+        """Durably cancel queued requests and release their exact snapshot leases."""
+
+        requests = tuple(binding.queued.values())
+        for request in requests:
+            if request.cancelled:
+                continue
+            request.cancelled = True
+            record = self._require_ledger().get(request.invocation_id)
+            if record is not None and record.state is JobOutcomeState.QUEUED:
+                self._transition_outcome(
+                    request.invocation_id,
+                    JobOutcomeState.CANCELLED,
+                    error=None,
+                )
+            await self._release_request_lease(request)
+
+    async def cancel_running(self, binding: BackgroundJobRuntimeBinding) -> None:
+        """Cancel handlers/children and wait for their provider and lease cleanup."""
+
+        for request in binding.running_requests.values():
+            request.cancelled = True
+        tasks = tuple(binding.running.values())
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    def enqueue(
+        self,
+        binding: BackgroundJobRuntimeBinding,
+        job_key: str,
+        *,
+        reason: str,
+        event: object | None = None,
+        interval_bucket: str | None = None,
+        accepted_snapshot_lease: RuntimeSnapshotLease | None = None,
+    ) -> asyncio.Task[None]:
+        """Schedule one exact binding admission without consulting a mutable current catalog."""
+
+        if binding.closed:
+            raise RuntimeError("BackgroundJob binding 已关闭")
+        task = asyncio.create_task(
+            self._admit(
+                binding,
+                job_key,
+                reason=reason,
+                event=event,
+                interval_bucket=interval_bucket,
+                accepted_snapshot_lease=accepted_snapshot_lease,
+            ),
+            name=f"background_job_admission:{job_key}",
+        )
+        binding.pending_admission.add(task)
+        task.add_done_callback(
+            lambda completed: self._on_admission_done(binding, completed)
+        )
+        return task
+
+    async def enqueue_event(
+        self,
+        binding: BackgroundJobRuntimeBinding,
+        event: DriftFinishedEvent,
+    ) -> None:
+        """Admit a typed drift event and wait for admission bookkeeping."""
+
+        if not isinstance(event, DriftFinishedEvent):
+            raise TypeError("BackgroundJob 只接受带 event_id 的 DriftFinishedEvent")
+        tasks = [
+            self.enqueue(binding, key, reason="event", event=event)
+            for key, job in binding.jobs.items()
+            if _has_event_trigger(job.binding)
+        ]
+        if tasks:
+            await asyncio.gather(*tasks)
+
+    async def enqueue_interval(
+        self,
+        binding: BackgroundJobRuntimeBinding,
+        job_key: str,
+        *,
+        interval_bucket: str | None = None,
+    ) -> None:
+        """Admit one deterministic interval bucket for tests and Core timer ownership."""
+
+        job = _job_for(binding, job_key)
+        interval = next(
+            trigger.seconds
+            for trigger in job.binding.definition.triggers
+            if isinstance(trigger, IntervalTrigger)
+        )
+        bucket = interval_bucket or _interval_bucket(self._clock(), interval)
+        await self.enqueue(
+            binding,
+            job_key,
+            reason="interval",
+            interval_bucket=bucket,
+        )
+
+    async def aclose(self) -> None:
+        """Stop and clean every binding owned by this adapter."""
+
+        for binding in tuple(self._bindings.values()):
+            await self.close_components("shutdown", binding)
+
+    async def _admit(
+        self,
+        runtime: BackgroundJobRuntimeBinding,
+        job_key: str,
+        *,
+        reason: str,
+        event: object | None,
+        interval_bucket: str | None,
+        accepted_snapshot_lease: RuntimeSnapshotLease | None = None,
+    ) -> None:
+        # 1. Validate trigger identity before acquiring durable execution resources.
+        job = _job_for(runtime, job_key)
+        event_id = _event_id_for(event)
+        if event is not None and event_id is None:
+            raise ValueError("Core event 必须提供 event_id")
+        if event is not None and not _has_event_trigger(job.binding):
+            raise RuntimeError(f"BackgroundJob 不接受 event trigger: {job_key}")
+        if interval_bucket is not None and not _has_interval_trigger(job.binding):
+            raise RuntimeError(f"BackgroundJob 不接受 interval trigger: {job_key}")
+        if event is None and interval_bucket is None:
+            raise ValueError("BackgroundJob admission 必须有 event 或 interval_bucket")
+        accepted = accepted_snapshot_lease is not None
+        if not runtime.admission_open and not accepted:
+            return
+        store = runtime.snapshot_store
+        snapshot_lease = accepted_snapshot_lease
+        if snapshot_lease is None:
+            snapshot_lease = await self._acquire_exact_lease(store, runtime.snapshot_id)
+        request: _JobRequest | None = None
+        try:
+            if runtime.closed:
+                return
+            if snapshot_lease.snapshot.snapshot_id != runtime.snapshot_id:
+                raise RuntimeError("BackgroundJob admission snapshot identity 不匹配")
+            if not accepted and not runtime.admission_open:
+                return
+            if not job.binding.is_live():
+                return
+            ledger = self._require_ledger()
+            invocation_id = self._invocation_id_factory()
+            identity = JobOutcomeIdentity(
+                plugin_id=job.binding.plugin_id,
+                job_name=job.binding.name,
+                invocation_id=invocation_id,
+                event_id=event_id,
+                interval_bucket=interval_bucket,
+                snapshot_id=runtime.snapshot_id,
+                plugin_generation_id=job.binding.generation_id,
+                # The model lease is deliberately selected at execution start.
+                # The ledger schema is immutable, so this marker is not used as
+                # an execution fence; _execute_request records the actual lease
+                # in BackgroundJobContext and holds it through all retries.
+                model_generation_id="execution-pending",
+                artifact_identity=job.artifact_identity,
+                source_revision=job.source_revision,
+                handler_export=job.binding.handler_export,
+                lifecycle_revision="background-job-v3",
+                api_revision="plugin-api-v3",
+                event_payload=_event_payload_for(event),
+            )
+            outcome = ledger.admit(identity, now=self._clock())
+            if outcome.invocation_id != invocation_id:
+                # Dedupe retains the first generation's exact handler and lease owner.
+                return
+            if outcome.state is not JobOutcomeState.QUEUED:
+                return
+            if job.binding.definition.coalesce and (
+                any(
+                    queued.job.admission_key == job.admission_key
+                    for queued in runtime.queued.values()
+                )
+                or any(
+                    running_key == job.admission_key
+                    for running_key in runtime.running_job_keys.values()
+                )
+            ):
+                self._transition_outcome(
+                    invocation_id,
+                    JobOutcomeState.CANCELLED,
+                    error=None,
+                )
+                return
+            if self._debounced(job):
+                self._transition_outcome(
+                    invocation_id,
+                    JobOutcomeState.CANCELLED,
+                    error=None,
+                )
+                return
+            request = _JobRequest(
+                binding=runtime,
+                job=job,
+                reason=reason,
+                event=event,
+                interval_bucket=interval_bucket,
+                event_id=event_id,
+                invocation_id=invocation_id,
+                snapshot_lease=snapshot_lease,
+                outcome=outcome,
+            )
+            runtime.queued[invocation_id] = request
+            await runtime.queue.put(request)
+            snapshot_lease = None  # type: ignore[assignment]
+        finally:
+            if snapshot_lease is not None and snapshot_lease.active:
+                await snapshot_lease.release()
+
+    async def _worker_loop(self, runtime: BackgroundJobRuntimeBinding) -> None:
+        while True:
+            request = await runtime.queue.get()
+            try:
+                if request is None:
+                    return
+                runtime.queued.pop(request.invocation_id, None)
+                if request.cancelled:
+                    await self._release_request_lease(request)
+                    continue
+                task = asyncio.create_task(
+                    self._execute_request(request),
+                    name=f"background_job_run:{request.job.key}:{request.invocation_id}",
+                )
+                runtime.running[request.invocation_id] = task
+                runtime.running_requests[request.invocation_id] = request
+                runtime.running_job_keys[request.invocation_id] = request.job.admission_key
+                try:
+                    result = (await asyncio.gather(task, return_exceptions=True))[0]
+                    if isinstance(result, asyncio.CancelledError):
+                        if not request.cancelled:
+                            raise result
+                    elif isinstance(result, BaseException):
+                        raise result
+                finally:
+                    runtime.running.pop(request.invocation_id, None)
+                    runtime.running_requests.pop(request.invocation_id, None)
+                    runtime.running_job_keys.pop(request.invocation_id, None)
+            finally:
+                runtime.queue.task_done()
+
+    async def _execute_request(self, request: _JobRequest) -> None:
+        ledger = self._require_ledger()
+        binding = request.binding
+        try:
+            provider = self._provider_for(request.job)
+            role = request.job.binding.definition.model_role or getattr(
+                provider,
+                "role",
+                "agent",
+            )
+            # 1. Select and retain the model generation at actual execution start.
+            async with model_execution_scope(provider) as model_binding:
+                model_generation_id = _model_binding_id(model_binding, provider)
+                while True:
+                    self._transition_outcome(
+                        request.invocation_id,
+                        JobOutcomeState.RUNNING,
+                        model_generation_id=model_generation_id,
+                    )
+                    llm = GenerationLlmLease(
+                        provider,
+                        role=role,
+                        snapshot_lease=request.snapshot_lease,
+                        snapshot_id=binding.snapshot_id,
+                        plugin_generation_id=request.job.binding.generation_id,
+                        model_generation_id=model_generation_id,
+                        invocation_token=object(),
+                        model_binding=model_binding,
+                    )
+                    ctx = BackgroundJobContext(
+                        plugin_id=request.job.binding.plugin_id,
+                        event=request.event,
+                        reason=request.reason,
+                        triggered_at=self._clock(),
+                        snapshot_id=binding.snapshot_id,
+                        generation_id=request.job.binding.generation_id,
+                        plugin_generation_id=request.job.binding.generation_id,
+                        model_generation_id=model_generation_id,
+                        llm=llm,
+                        activation_token=request.job.binding.activation_token,
+                    )
+                    invocation_token = _CURRENT_INVOCATION_TOKEN.set(
+                        llm.invocation_token
+                    )
+                    try:
+                        try:
+                            result = await request.job.handler(ctx)
+                            await ctx.drain_children()
+                            if request.cancelled:
+                                self._transition_outcome(
+                                    request.invocation_id,
+                                    JobOutcomeState.CANCELLED,
+                                    error=None,
+                                )
+                                return
+                        except asyncio.CancelledError:
+                            llm.invalidate()
+                            await ctx.cancel_children()
+                            current = ledger.get(request.invocation_id)
+                            if current is not None and not current.terminal:
+                                self._transition_outcome(
+                                    request.invocation_id,
+                                    JobOutcomeState.CANCELLED,
+                                    error=None,
+                                )
+                            raise
+                        except BaseException as error:
+                            llm.invalidate()
+                            await ctx.cancel_children()
+                            current = ledger.get(request.invocation_id)
+                            if current is None or current.terminal:
+                                raise
+                            retry_policy = request.job.binding.definition.retry_policy
+                            if current.attempt < retry_policy.max_attempts:
+                                phase = (
+                                    JobOutcomePhase.PROVIDER
+                                    if llm.provider_called
+                                    else JobOutcomePhase.HANDLER
+                                )
+                                self._transition_outcome(
+                                    request.invocation_id,
+                                    JobOutcomeState.RETRY_PENDING,
+                                    phase=phase,
+                                    error=_error_text(error),
+                                )
+                                delay = min(
+                                    retry_policy.max_delay_seconds,
+                                    retry_policy.base_delay_seconds
+                                    * (2 ** max(0, current.attempt - 1)),
+                                )
+                                if delay:
+                                    await asyncio.sleep(delay)
+                                continue
+                            phase = (
+                                JobOutcomePhase.PROVIDER
+                                if llm.provider_called
+                                else JobOutcomePhase.HANDLER
+                            )
+                            self._transition_outcome(
+                                request.invocation_id,
+                                JobOutcomeState.FAILED,
+                                phase=phase,
+                                error=_error_text(error),
+                            )
+                            return
+                    finally:
+                        llm.invalidate()
+                        _CURRENT_INVOCATION_TOKEN.reset(invocation_token)
+                    digest = hashlib.sha256(repr(result).encode("utf-8")).hexdigest()
+                    self._transition_outcome(
+                        request.invocation_id,
+                        JobOutcomeState.SUCCEEDED,
+                        terminal_result_digest=digest,
+                    )
+                    return
+        except asyncio.CancelledError:
+            current = ledger.get(request.invocation_id)
+            if current is not None and not current.terminal:
+                self._transition_outcome(
+                    request.invocation_id,
+                    JobOutcomeState.CANCELLED,
+                    error=None,
+                )
+            raise
+        except BaseException as error:
+            current = ledger.get(request.invocation_id)
+            if current is not None and not current.terminal:
+                self._transition_outcome(
+                    request.invocation_id,
+                    JobOutcomeState.FAILED,
+                    phase=JobOutcomePhase.PROVIDER,
+                    error=_error_text(error),
+                )
+            return
+        finally:
+            await self._release_request_lease(request)
+
+    async def _interval_loop(self, runtime: BackgroundJobRuntimeBinding) -> None:
+        seen: set[tuple[str, str]] = set()
+        due: dict[tuple[str, int], float] = {}
+        while not runtime.closed:
+            await asyncio.sleep(self._interval_poll_seconds)
+            if not runtime.admission_open:
+                continue
+            now = self._clock()
+            monotonic_now = asyncio.get_running_loop().time()
+            for key, job in runtime.jobs.items():
+                for index, trigger in enumerate(job.binding.definition.triggers):
+                    if not isinstance(trigger, IntervalTrigger):
+                        continue
+                    schedule_key = (key, index)
+                    deadline = due.setdefault(
+                        schedule_key,
+                        monotonic_now + trigger.seconds,
+                    )
+                    if monotonic_now < deadline:
+                        continue
+                    bucket = _interval_bucket(now, trigger.seconds)
+                    marker = (key, bucket)
+                    if marker not in seen:
+                        seen.add(marker)
+                        self.enqueue(
+                            runtime,
+                            key,
+                            reason="interval",
+                            interval_bucket=bucket,
+                        )
+                    due[schedule_key] = monotonic_now + trigger.seconds
+
+    def _on_event(self, runtime: BackgroundJobRuntimeBinding, event: object) -> None:
+        if runtime.closed:
+            return
+        if not isinstance(event, DriftFinishedEvent):
+            return
+        if _event_id_for(event) is None:
+            raise ValueError("Core event 必须提供 event_id")
+        jobs = tuple(
+            key
+            for key, job in runtime.jobs.items()
+            if _has_event_trigger(job.binding)
+        )
+        source_lease = get_current_runtime_lease()
+        if not runtime.admission_open and source_lease is None:
+            return
+        # EventBus invokes observers under the source snapshot lease. Fork it
+        # before returning so a concurrent publication pause cannot erase an
+        # event that was already accepted by this old binding.
+        for key in jobs:
+            accepted_snapshot_lease = (
+                source_lease.fork() if source_lease is not None else None
+            )
+            self.enqueue(
+                runtime,
+                key,
+                reason="event",
+                event=event,
+                accepted_snapshot_lease=accepted_snapshot_lease,
+            )
+
+    def _resolve_handler(
+        self,
+        instance: object,
+        handler_export: str,
+    ) -> Callable[[BackgroundJobContext], Awaitable[object]]:
+        if not isinstance(instance, ComposablePlugin):
+            raise RuntimeError("BackgroundJob owner 不是 ComposablePlugin")
+        value: object = instance.module
+        for segment in handler_export.replace(":", ".").split("."):
+            if not segment:
+                raise RuntimeError(f"handler_export 无效: {handler_export}")
+            try:
+                value = getattr(value, segment)
+            except AttributeError as error:
+                raise RuntimeError(
+                    f"BackgroundJob handler_export 不存在: {instance.name}:{handler_export}"
+                ) from error
+        if not inspect.iscoroutinefunction(value):
+            raise TypeError(f"BackgroundJob handler 必须是 async: {handler_export}")
+        signature = inspect.signature(value)
+        try:
+            signature.bind(cast(object, None))
+        except TypeError as error:
+            raise TypeError(
+                f"BackgroundJob handler 必须精确接受一个 ctx: {handler_export}"
+            ) from error
+        if len(signature.parameters) != 1:
+            raise TypeError(
+                f"BackgroundJob handler 必须精确接受一个 ctx: {handler_export}"
+            )
+        return cast(Callable[[BackgroundJobContext], Awaitable[object]], value)
+
+    def _provider_for(self, job: _MaterializedJob) -> object:
+        role = job.binding.definition.model_role
+        if self._model_registry is not None:
+            provider_factory = getattr(self._model_registry, "provider", None)
+            if not callable(provider_factory):
+                raise RuntimeError("model_registry 缺少 provider")
+            return provider_factory(role or "agent")
+        return self._model_provider
+
+    def _model_generation_id(self, job: _MaterializedJob) -> str:
+        provider = self._provider_for(job)
+        if isinstance(provider, RoleBoundProvider):
+            return str(provider.registry.current.generation_id)
+        registry = getattr(provider, "registry", None)
+        current = getattr(registry, "current", None)
+        generation_id = getattr(current, "generation_id", None)
+        return str(generation_id) if generation_id is not None else "provider"
+
+    def _require_ledger(self) -> JobOutcomeLedger:
+        if self._ledger is None:
+            raise RuntimeError("BackgroundJob 需要 Core-owned JobOutcomeLedger")
+        return self._ledger
+
+    def _transition_outcome(
+        self,
+        invocation_id: str,
+        state: JobOutcomeState,
+        *,
+        phase: JobOutcomePhase | None = None,
+        model_generation_id: str | None = None,
+        error: str | None = None,
+        terminal_result_digest: str | None = None,
+    ) -> JobOutcomeRecord:
+        return self._require_ledger().transition(
+            invocation_id,
+            state,
+            phase=phase,
+            model_generation_id=model_generation_id,
+            error=error,
+            terminal_result_digest=terminal_result_digest,
+            now=self._clock(),
+        )
+
+    def _require_binding(
+        self,
+        transaction_id: str,
+        binding: BackgroundJobRuntimeBinding,
+        *,
+        allow_missing_plan: bool = False,
+    ) -> None:
+        if binding.closed:
+            raise RuntimeError("BackgroundJob binding 已关闭")
+        plan = self._plans.get(transaction_id)
+        if plan is None and not allow_missing_plan and transaction_id != "shutdown":
+            raise RuntimeError("BackgroundJob transaction 不存在")
+        if self._bindings.get(binding.snapshot_id) is not binding:
+            raise RuntimeError("BackgroundJob binding 不属于当前 adapter")
+
+    def _close_producers(self, binding: BackgroundJobRuntimeBinding) -> None:
+        for subscription in binding.subscriptions:
+            subscription.close()
+        binding.subscriptions.clear()
+        task = binding.interval_task
+        if task is not None and not task.done():
+            task.cancel()
+
+    def _ensure_producers(self, binding: BackgroundJobRuntimeBinding) -> None:
+        if self._event_bus is not None and not binding.subscriptions:
+            binding.subscriptions.append(
+                self._event_bus.on_any(
+                    cast(Callable[[object], object], lambda event: self._on_event(binding, event)),
+                )
+            )
+        if binding.interval_task is None or binding.interval_task.done():
+            if any(
+                isinstance(trigger, IntervalTrigger)
+                for job in binding.jobs.values()
+                for trigger in job.binding.definition.triggers
+            ):
+                binding.interval_task = asyncio.create_task(
+                    self._interval_loop(binding),
+                    name=f"background_job_intervals:{binding.snapshot_id}",
+                )
+
+    async def _drain_binding(
+        self,
+        binding: BackgroundJobRuntimeBinding,
+        *,
+        cancel_running: bool,
+    ) -> None:
+        interval_task = binding.interval_task
+        if interval_task is not None:
+            await asyncio.gather(interval_task, return_exceptions=True)
+            binding.interval_task = None
+        admission_errors = list(await self._wait_pending_admissions(binding))
+        if cancel_running:
+            await self.cancel_running(binding)
+        await binding.queue.join()
+        running = tuple(binding.running.values())
+        if running:
+            await asyncio.gather(*running, return_exceptions=True)
+        if admission_errors:
+            raise admission_errors[0]
+
+    def _on_admission_done(
+        self,
+        binding: BackgroundJobRuntimeBinding,
+        task: asyncio.Task[None],
+    ) -> None:
+        binding.pending_admission.discard(task)
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None and not any(
+            existing is error for existing in binding.admission_errors
+        ):
+            binding.admission_errors.append(error)
+
+    async def _wait_pending_admissions(
+        self,
+        binding: BackgroundJobRuntimeBinding,
+    ) -> tuple[BaseException, ...]:
+        """Await every producer admission and return errors for the owner to raise."""
+
+        # 1. Wait for already-created admissions; closing producers prevents new ones.
+        pending = tuple(binding.pending_admission)
+        results: tuple[object, ...] = ()
+        if pending:
+            results = tuple(await asyncio.gather(*pending, return_exceptions=True))
+            binding.pending_admission.difference_update(pending)
+            await asyncio.sleep(0)
+
+        # 2. Reconcile callback-captured errors so observer failures are never silent.
+        errors = list(binding.admission_errors)
+        binding.admission_errors.clear()
+        for result in results:
+            if not isinstance(result, BaseException) or isinstance(
+                result, asyncio.CancelledError
+            ):
+                continue
+            if not any(existing is result for existing in errors):
+                errors.append(result)
+        return tuple(errors)
+
+    async def _acquire_exact_lease(
+        self,
+        store: object,
+        snapshot_id: str,
+    ) -> RuntimeSnapshotLease:
+        lease = getattr(store, "lease", None)
+        if callable(lease):
+            return cast(RuntimeSnapshotLease, lease(snapshot_id))
+        acquire = getattr(store, "acquire", None)
+        if not callable(acquire):
+            raise RuntimeError("RuntimeSnapshotStore 缺少 exact lease acquisition")
+        pending = cast(Awaitable[RuntimeSnapshotLease], acquire(snapshot_id))
+        return await pending
+
+    def _debounced(self, job: _MaterializedJob) -> bool:
+        seconds = job.binding.definition.debounce_seconds
+        if seconds <= 0:
+            return False
+        ledger = self._require_ledger()
+        records = tuple(
+            record
+            for record in ledger.list_all()
+            if record.semantic_job_id == f"{job.binding.plugin_id}:{job.binding.name}"
+            and record.state is JobOutcomeState.SUCCEEDED
+        )
+        if not records:
+            return False
+        latest = max(records, key=lambda record: record.updated_at)
+        try:
+            last = datetime.fromisoformat(latest.updated_at)
+        except ValueError as error:
+            raise RuntimeError("JobOutcomeLedger updated_at 无效") from error
+        if last.tzinfo is None:
+            raise RuntimeError("JobOutcomeLedger updated_at 缺少时区")
+        now = self._clock().astimezone(timezone.utc)
+        return (now - last.astimezone(timezone.utc)).total_seconds() < seconds
+
+    async def _stop_worker(self, binding: BackgroundJobRuntimeBinding) -> None:
+        task = binding.worker_task
+        if task is None or task.done():
+            binding.worker_task = None
+            return
+        await binding.queue.put(None)
+        await asyncio.gather(task, return_exceptions=True)
+        binding.worker_task = None
+
+    def _ensure_worker(self, binding: BackgroundJobRuntimeBinding) -> None:
+        if binding.closed:
+            raise RuntimeError("BackgroundJob binding 已关闭")
+        if binding.worker_task is None or binding.worker_task.done():
+            binding.worker_task = asyncio.create_task(
+                self._worker_loop(binding),
+                name=f"background_job_worker:{binding.snapshot_id}",
+            )
+
+    async def _release_request_lease(self, request: _JobRequest) -> None:
+        if request.lease_released:
+            return
+        request.lease_released = True
+        if request.snapshot_lease.active:
+            await request.snapshot_lease.release()
+
+GenerationJobHost = BackgroundJobActivityAdapter
+
+
+def _background_catalog(value: object) -> BackgroundJobCatalog:
+    catalog = getattr(value, "background_jobs", value)
+    if not isinstance(catalog, BackgroundJobCatalog):
+        raise TypeError("target catalog 不是 BackgroundJobCatalog")
+    return catalog
+
+
+def _lease_store(lease: RuntimeSnapshotLease) -> RuntimeSnapshotStore | None:
+    store = getattr(lease, "_store", None)
+    return store if isinstance(store, RuntimeSnapshotStore) else None
+
+
+def _job_for(binding: BackgroundJobRuntimeBinding, key: str) -> _MaterializedJob:
+    job = binding.jobs.get(key)
+    if job is None:
+        raise KeyError(f"BackgroundJob 不存在: {key}")
+    return job
+
+
+def _has_event_trigger(binding: BackgroundJobBinding) -> bool:
+    return any(
+        isinstance(trigger, CoreEventTrigger)
+        and trigger.event is CoreEvent.DRIFT_FINISHED
+        for trigger in binding.definition.triggers
+    )
+
+
+def _has_interval_trigger(binding: BackgroundJobBinding) -> bool:
+    return any(isinstance(trigger, IntervalTrigger) for trigger in binding.definition.triggers)
+
+
+def _event_id_for(event: object | None) -> str | None:
+    if event is None:
+        return None
+    if not isinstance(event, DriftFinishedEvent):
+        return None
+    event_id = getattr(event, "event_id", None)
+    if (
+        not isinstance(event_id, str)
+        or not event_id.strip()
+        or event_id != event_id.strip()
+    ):
+        return None
+    return event_id
+
+
+def _event_payload_for(event: object | None) -> Mapping[str, object] | None:
+    """Freeze the supported Core event into its durable recovery payload."""
+
+    if event is None:
+        return None
+    if not isinstance(event, DriftFinishedEvent):
+        raise TypeError("BackgroundJob 只支持持久化 DriftFinished event")
+    return MappingProxyType(
+        {
+            "event_id": event.event_id,
+            "session_key": event.session_key,
+            "skill_name": event.skill_name,
+            "status": event.status,
+            "briefing": event.briefing,
+            "message_result": event.message_result,
+            "timestamp": event.timestamp.isoformat(),
+        }
+    )
+
+
+def _interval_bucket(value: datetime, seconds: int) -> str:
+    timestamp = value.astimezone(timezone.utc).timestamp()
+    bucket = int(timestamp // seconds) * seconds
+    return datetime.fromtimestamp(bucket, timezone.utc).isoformat()
+
+
+def _model_binding_id(binding: object | None, provider: object) -> str:
+    if binding is not None:
+        generation = getattr(binding, "generation", None)
+        generation_id = getattr(generation, "generation_id", None)
+        if generation_id is None:
+            raise RuntimeError("model execution binding 缺少 generation_id")
+        return str(generation_id)
+    registry = getattr(provider, "registry", None)
+    current = getattr(registry, "current", None)
+    generation_id = getattr(current, "generation_id", None)
+    return str(generation_id) if generation_id is not None else "provider"
+
+
+def _usage_dict(usage: object | None) -> Mapping[str, object]:
+    if usage is None:
+        return MappingProxyType({"coverage": "unavailable"})
+    values = {
+        name: getattr(usage, name)
+        for name in (
+            "input_tokens",
+            "cache_write_input_tokens",
+            "cached_input_tokens",
+            "output_tokens",
+            "reasoning_output_tokens",
+            "coverage",
+        )
+        if hasattr(usage, name)
+    }
+    coverage = values.get("coverage")
+    if hasattr(coverage, "value"):
+        values["coverage"] = coverage.value
+    return MappingProxyType(values)
+
+
+def _error_text(error: BaseException) -> str:
+    message = str(error).strip()
+    return f"{type(error).__name__}: {message}" if message else type(error).__name__
+
+
+__all__ = [
+    "BackgroundJobActivityAdapter",
+    "BackgroundJobContext",
+    "BackgroundJobPlan",
+    "BackgroundJobRuntimeBinding",
+    "DriftFinishedEvent",
+    "GenerationJobHost",
+    "GenerationLlmLease",
+    "GenerationLlmResult",
+    "PluginLlmResult",
+]

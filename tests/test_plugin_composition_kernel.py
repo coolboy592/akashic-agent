@@ -973,6 +973,29 @@ async def test_provider_restart_alone_invalidates_sealed_revision() -> None:
 
 
 @pytest.mark.asyncio
+async def test_publication_participant_can_retain_closed_exact_target() -> None:
+    compiler = RuntimeSnapshotCompiler()
+    store = RuntimeSnapshotStore()
+    stable = compiler.compile({}, snapshot_revision="stable")
+    candidate = compiler.compile({}, snapshot_revision="candidate")
+    store.install(stable)
+    transaction = store.begin_publish(candidate)
+
+    with pytest.raises(RuntimeError, match="不可租用"):
+        store.lease(candidate.snapshot_id)
+    retained = store.retain_publication_target(transaction)
+
+    assert retained.snapshot is candidate
+    assert retained.active
+    assert candidate.lease_count == 1
+    await retained.release()
+    await store.abort(transaction)
+    with pytest.raises(RuntimeError, match="target 已失效"):
+        store.retain_publication_target(transaction)
+    await store.close()
+
+
+@pytest.mark.asyncio
 async def test_fiber_replace_alone_invalidates_sealed_revision() -> None:
     root = CompositionRoot("fiber-revision")
     fiber = await root.mount(lambda _: None, name="plain")

@@ -98,12 +98,21 @@ class ProactiveFinished:
 
 @dataclass(frozen=True)
 class DriftFinished:
+    event_id: str
     session_key: str
     skill_name: str
     status: str
     briefing: str
     message_result: str
     timestamp: datetime
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.event_id, str) or not self.event_id.strip():
+            raise ValueError("DriftFinished.event_id 必须是非空字符串")
+        if self.event_id != self.event_id.strip():
+            raise ValueError("DriftFinished.event_id 不能有首尾空白")
+        if self.timestamp.tzinfo is None:
+            raise ValueError("DriftFinished.timestamp 必须带时区")
 
 
 @dataclass(frozen=True)
