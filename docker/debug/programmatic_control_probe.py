@@ -279,7 +279,7 @@ def _wait_tool_started(
     raise GateFailure(f"等待工具 started 超时：turn={turn_id} tool={tool_name}")
 
 
-def _turn_projection(turn: dict[str, Any]) -> dict[str, object]:
+def _turn_projection(turn: dict[str, Any]) -> dict[str, Any]:
     """移除随机标识与时间，只保留 channel parity 所需领域事实。"""
 
     raw_items = turn.get("items")
@@ -1530,6 +1530,24 @@ def _inside_failure_matrix(report_dir: Path) -> int:
         clients.remove(slow)
 
         # 6. 可达 gate failure 发生在 tool started 后，owner 闭合 failed item。
+        _http_json(
+            "PUT",
+            f"{model_url}/control/script",
+            [
+                {
+                    "mode": "stream",
+                    "deltas": [],
+                    "tool_calls": [
+                        {
+                            "id": "call_pc10_open",
+                            "name": "pc10_failure_probe",
+                            "arguments": {"probe": True},
+                        }
+                    ],
+                },
+                {"mode": "complete", "content": "unreachable pc10 reply"},
+            ],
+        )
         failed_thread = _start_thread(second, "PC-10")
         failed_turn = _start_turn(second, failed_thread, "pc10 fail after tool started")
         failed_terminal = second.wait_terminal(failed_turn)
@@ -1572,7 +1590,7 @@ def _inside_failure_matrix(report_dir: Path) -> int:
                     "terminalEventCount": failed_terminal_count,
                     "toolStarted": pc10_started,
                     "toolCompleted": pc10_completed,
-                    "failureSource": "gate before_reasoning fixture",
+                    "failureSource": "v3 after_reasoning fixture",
                 },
             )
         )
@@ -2282,21 +2300,38 @@ def _install_control_failure_plugin(sandbox: Path) -> None:
     manifest = sandbox / "home/.akashic-plugin/manifest.toml"
     cache.mkdir(parents=True, exist_ok=True)
     _ = (cache / "plugin.py").write_text(
-        "from agent.control.context import running_turn_id\n"
-        "from agent.plugins import Plugin, on_before_reasoning\n"
-        "from bus.events_lifecycle import ToolCallStarted\n"
-        "class ControlFailurePlugin(Plugin):\n"
-        "    name = 'control_failure'\n"
-        "    version = '1.0.0'\n"
-        "    @on_before_reasoning()\n"
-        "    async def fail_after_started(self, event):\n"
-        "        if event.content != 'pc10 fail after tool started': return\n"
-        "        await self.context.event_bus.observe(ToolCallStarted(\n"
-        "            session_key=event.session_key, channel=event.channel,\n"
-        "            chat_id=event.chat_id, iteration=1, call_id='call_pc10_open',\n"
-        "            tool_name='pc10_failure_probe', arguments={'probe': True},\n"
-        "            turn_id=running_turn_id.get()))\n"
-        "        raise RuntimeError('pc10 gate failure after tool started')\n",
+        "from agent.lifecycle.composition import AFTER_REASONING_PREPROCESS_EVENT\n"
+        "from agent.plugin_composition import TOOL_CATALOG, PluginToolDefinition\n"
+        "api_version = 3\n"
+        "name = 'control_failure'\n"
+        "version = '1.0.0'\n"
+        "inject = (TOOL_CATALOG,)\n"
+        "async def pc10_failure_probe(context, arguments):\n"
+        "    raise RuntimeError('pc10 tool failure')\n"
+        "async def fail_after_started(event):\n"
+        "    calls = (call for group in event.tool_chain "
+        "for call in group.get('calls', ()))\n"
+        "    if not any(call.get('name') == 'pc10_failure_probe' "
+        "for call in calls): return\n"
+        "    raise RuntimeError('pc10 gate failure after tool started')\n"
+        "async def apply(ctx, config):\n"
+        "    await ctx.require(TOOL_CATALOG).register(ctx, PluginToolDefinition(\n"
+        "        name='pc10_failure_probe',\n"
+        "        description='Fail after emitting the PC10 tool lifecycle.',\n"
+        "        parameters={'type': 'object', 'properties': {\n"
+        "            'probe': {'type': 'boolean'}}, 'required': ['probe'],\n"
+        "            'additionalProperties': False},\n"
+        "        handler_export='pc10_failure_probe', risk='read-only',\n"
+        "        always_on=True))\n"
+        "    await ctx.on(AFTER_REASONING_PREPROCESS_EVENT, fail_after_started)\n",
+        encoding="utf-8",
+    )
+    _ = (cache / "akashic.plugin.toml").write_text(
+        "schema_version = 1\n"
+        "name = 'control_failure'\n"
+        "version = '1.0.0'\n"
+        "api_version = 3\n"
+        "entrypoint = 'plugin.py'\n",
         encoding="utf-8",
     )
     manifest.parent.mkdir(parents=True, exist_ok=True)

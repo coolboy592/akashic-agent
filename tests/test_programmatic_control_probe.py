@@ -12,6 +12,7 @@ from docker.debug.programmatic_control_probe import (
     JsonRpcSocketClient,
     _extract_id,
     _memory_context_request_kinds,
+    _install_control_failure_plugin,
     _is_terminal_event,
     _prepare_host_sandbox,
     _recorded_turn_notifications,
@@ -19,6 +20,9 @@ from docker.debug.programmatic_control_probe import (
     _turn_projection,
     _tool_lifecycle,
 )
+from agent.plugins.manager import PluginManager
+from agent.tools.registry import ToolRegistry
+from bus.event_bus import EventBus
 
 
 def test_memory_context_request_kinds_require_summary_business_markdown_order() -> None:
@@ -88,6 +92,36 @@ def test_control_gate_prepares_external_static_mount_without_repo_static(
         "${AKASHIC_CONTROL_SANDBOX:?set by programmatic_control_probe.py}"
         "/static:/app/static"
     ) in compose
+
+
+@pytest.mark.asyncio
+async def test_control_failure_fixture_loads_as_exact_v3_plugin(
+    tmp_path: Path,
+) -> None:
+    _install_control_failure_plugin(tmp_path)
+    manager = PluginManager(
+        plugin_dirs=[],
+        event_bus=EventBus(),
+        tool_registry=ToolRegistry(validate_semantic_schema=False),
+        workspace=tmp_path / "workspace",
+        installed_cache_root=tmp_path / "home/.akashic-plugin/cache",
+    )
+
+    await manager.load_all()
+    try:
+        snapshot = manager.current_snapshot
+        assert snapshot is not None
+        generation = snapshot.generations["control_failure@gate"]
+        assert generation.instance.api_version == 3
+        assert snapshot.plugin_tool_catalog is not None
+        assert "pc10_failure_probe" in snapshot.plugin_tool_catalog
+        assert snapshot.composition_root is not None
+        assert (
+            snapshot.plugin_tool_catalog.root_instance_token
+            is snapshot.composition_root.instance_token
+        )
+    finally:
+        await manager.terminate_all()
 
 
 def test_socket_client_correlates_response_and_buffers_notifications(
