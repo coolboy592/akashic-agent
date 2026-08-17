@@ -111,7 +111,7 @@ Gate 报告。分支名、PR 号和浮动 ref 不能代替 commit。
 
 | ID | 能力 owner | 状态 | 验收 oracle | 首个真实 consumer |
 |---|---|---|---|---|
-| C11 | committed channel command catalog | `CANDIDATE` | command/provisional 独立复核 25 tests、累计 command/kernel/loader/Manager/hot-reload 339 tests、Basedpyright/compileall/diff-check 已通过；Terra xhigh review 无 P0/P1，待 Status Commands 首个 consumer Gate | Status Commands |
+| C11 | committed channel command catalog | `CANDIDATE` | command/provisional 独立复核 25 tests、累计 command/kernel/loader/Manager/hot-reload 339 tests、Basedpyright/compileall/diff-check 已通过；Status Commands `eb245ad` 已以真实 Manager committed registry 执行 `/memorystatus`，无 v2 command shell；待 E3 全量命令目录 | Status Commands |
 | C12 | scoped MCP capability | `CANDIDATE` | `8653bab0` 已接入 Root-local declaration、candidate/formal MCP catalog fence、exact snapshot route、跨 boot durable recovery；Calendar `654d078d` 的真实 Manager Gate 完成 stdio handshake、完整 14-tool catalog 与零 CallTool/Google 调用，24 个插件/迁移/Host tests、Pyright 0、独立 review 无 P0/P1；待最终 E2 exact lock | Calendar MCP |
 | C13 | managed process capability | `CANDIDATE` | `8653bab0` 已接入 generation-scoped start/readiness/port/log、sibling drain、retained tombstone 与不可取消 recovery；Calendar `654d078d` 的正式 `calendar_api` readiness `/health=200`，terminate 后端口、进程、task、Root Effect/listener 全零；待最终 E2 process 族 Gate | Calendar MCP |
 | C14 | inbound/outbound channel capability | `CANDIDATE` | `5e58d38d` 已在 `fc1a2a76` 基础上补齐 exact-binding control、typed turn presentation、EventBus owner-task bridge、provider identity 与同步 snapshot claim；provisional pause/drain 真实 Store oracle、Channel/Bus/Manager 相关 88～116 tests、Pyright 0，独立复核无 P0/P1。待 Feishu/QQ v3 adapter、Core built-in transition 与 E3 才进入 `READY` | Feishu / QQBot |
@@ -124,7 +124,7 @@ Gate 报告。分支名、PR 号和浮动 ref 不能代替 commit。
 | C21 | generation-scoped background job / LLM capability | `CANDIDATE` | Core `de08b698` + `467a4c93` 已完成 committed catalog、trigger/interval、exact LLM lease、cancel/drain、Emotion domain receipt 与 paired-document recovery；105 个 job/documents/ledger/activity/snapshot 回归、BasedPyright/compileall/diff-check、独立只读复审无 P0/P1。Emotion `3584b49` 的 candidate apply unit 与临时复制 artifact 的真实 Manager stable load 均未创建 `emotion.db`；formal snapshot 冻结 exact effect/lookup/documents identity，terminate 后 listener/effect 为零。插件其他能力仍待 C09/C15/C17 与 E1/E3 | Emotion |
 | C22 | static v3 artifact manifest / install staging | `CANDIDATE` | 集成 head `3e1f5c10`（独立复审 head `b6967d13`）已在 import 前校验 identity/runtime/validation、custom entrypoint 与 C12/C13 descriptor，不成功 staging 不创建正式 data/artifact/pointer；Calendar `654d078d` 已由真实 Host 消费 exact staged `.venv/bin/python`，manifest/apply/runtime identity 一致且候选排除 credential/receipt；待全部 external v3 与最终 artifact Gate | Calendar MCP / 全部 external v3 |
 | C23 | Core-owned Channel attachment artifact / Session binding | `CANDIDATE` | `0bd2d928` 已完成 immutable opaque artifact、fixed-ID resumable Mobile import、SessionDB 原子 message binding、exact fd read lease、无自动 GC 与目录/SQLite 可恢复备份；Mobile 114、Bus/lifecycle/Host 124、最终 ownership 聚焦 201 tests、Basedpyright 0，独立 review 无 P0/P1；待 Feishu/QQ 与复制 workspace E3/E4 进入 `READY` | Feishu / QQBot / Core channels |
-| C24 | read-only existing Session projection | `CANDIDATE` | formal 只经 `get_existing` 返回 detached snapshot；candidate 同名 Service 调用即 fail-loud，零 Session lookup/write；4 个 service/Manager tests 已通过，待 Status Commands committed command + Mobile query Gate | Status Commands |
+| C24 | read-only existing Session projection | `CANDIDATE` | Core `cb2011b4` formal 只经 `get_existing` 返回 detached snapshot，candidate 同名 Service 调用即 fail-loud；Status Commands `eb245ad` 的真实 active compaction ledger 同时驱动 committed command 与 Mobile query，查询前后 `sessions.db*` 摘要不变。Core 38、插件 6、面板 7 tests、Pyright/contract/compileall/diff-check 通过；待 E3 复制 workspace | Status Commands |
 
 实现原则：C11～C17、C21～C22 只由表中的首个真实 consumer 拉动，不提前复制
 `commands()/mcp_servers()/managed_services()/channels()/jobs()/proactive_*()/mobile_ui()` 旧方法。
@@ -170,7 +170,7 @@ Gate 报告。分支名、PR 号和浮动 ref 不能代替 commit。
 | Plugin Undo | command、before-turn、显式 interaction 撤销 | C02/C11 | `OPEN` | E1/E3 |
 | Observe | Dashboard、mobile、committed event observers | C02/C17 | `OPEN` | E1 |
 | Setup Helper | lifecycle、command | C02/C11 | `OPEN` | E3 |
-| Status Commands | mobile、command、只读 Session projection | C11/C17/C24 | `OPEN` | E3 |
+| Status Commands | mobile、command、只读 Session projection | C11/C17/C24 | `CANDIDATE` | Core `cb2011b4` + plugin `eb245ad`；真实 Manager command/Mobile/ledger oracle 通过，待 E3 复制 workspace |
 | Computer Use Linux | Skill、MCP | C09/C12 | `OPEN` | E2 |
 | Feed MCP | Skill、MCP、proactive source | C09/C12/C15 | `OPEN` | E2/E3 |
 | Feishu | channel | C14 | `OPEN` | E3 |
