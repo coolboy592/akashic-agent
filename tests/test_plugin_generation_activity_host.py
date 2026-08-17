@@ -579,11 +579,6 @@ async def test_initial_stable_activity_prepare_failure_discards_pending_candidat
     with pytest.raises(RuntimeError, match="private prepare failed"):
         await manager._commit_snapshot_with_publication_participants(
             transaction,
-            plugin_id="stable-boot",
-            old_services={},
-            new_services={},
-            old_channels=(),
-            new_channels=(),
             old_commands=(),
             new_commands=(),
             promote_latest=False,

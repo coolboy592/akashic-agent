@@ -6,7 +6,7 @@ from contextvars import ContextVar, Token
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Literal, cast
+from typing import Literal
 
 from agent.mcp.generation import WorkspaceMcpGeneration
 from agent.plugins.generation import PluginGeneration
@@ -54,8 +54,6 @@ from agent.plugin_composition.tool_catalog import (
     PluginToolCatalog,
     _freeze_plugin_tools,
 )
-from infra.channels.contract import Channel
-
 SnapshotState = Literal[
     "compiled",
     "validating",
@@ -70,7 +68,6 @@ RuntimeSelector = Literal["stable", "latest"]
 class RuntimeSnapshot:
     snapshot_id: str
     generations: Mapping[str, PluginGeneration]
-    channels: Mapping[str, Channel]
     skill_catalog_generation_id: str | None
     workspace_mcp_generation: WorkspaceMcpGeneration | None = None
     dashboard_bindings: tuple[object, ...] = ()
@@ -148,13 +145,6 @@ class RuntimeSnapshotCompiler:
         ordered = [generations[key] for key in sorted(generations)]
         if any(generation.plugin_id != key for key, generation in generations.items()):
             raise RuntimeError("RuntimeSnapshot generation key 与 plugin_id 不一致")
-        channels: dict[str, Channel] = {}
-        for generation in ordered:
-            for channel in generation.contributions.channels:
-                name = str(channel.name).strip()
-                if not name or name in channels:
-                    raise RuntimeError(f"RuntimeSnapshot Channel 名称冲突: {name}")
-                channels[name] = channel
         catalog_owner = catalog_generation or next(
             (generation for generation in reversed(ordered) if generation.skill_catalog),
             None,
@@ -226,22 +216,6 @@ class RuntimeSnapshotCompiler:
                         "RuntimeSnapshot UI Slots freeze 返回值无效"
                     )
                 mobile_ui_registry = frozen_registry
-                for owner in mobile_ui_registry:
-                    generation = generations.get(owner)
-                    if generation is None:
-                        raise RuntimeError(
-                            "RuntimeSnapshot Mobile UI owner 不属于 generations: "
-                            f"{owner}"
-                        )
-                    if (
-                        generation.contributions.mobile_ui_asset is not None
-                        or generation.contributions.mobile_ui_query is not None
-                        or generation.contributions.mobile_ui_available is not None
-                    ):
-                        raise RuntimeError(
-                            "RuntimeSnapshot v2/v3 Mobile UI contribution 冲突: "
-                            f"{owner}"
-                        )
                 identity += f"|mobile-ui:{mobile_ui_registry.identity}"
             commands = composition_root.context.get(COMMANDS)
             if commands is not None:
@@ -263,14 +237,6 @@ class RuntimeSnapshotCompiler:
                         for generation in ordered
                     },
                 )
-                collisions = set(channels).intersection(
-                    descriptor.name for descriptor in channel_registry.descriptors
-                )
-                if collisions:
-                    raise RuntimeError(
-                        "RuntimeSnapshot v2/v3 Channel 名称冲突: "
-                        + ", ".join(sorted(collisions))
-                    )
                 frozen_channels: set[tuple[str, str]] = set()
                 for descriptor in channel_registry.descriptors:
                     generation = generations.get(descriptor.owner)
@@ -418,7 +384,6 @@ class RuntimeSnapshotCompiler:
         return RuntimeSnapshot(
             snapshot_id=snapshot_id,
             generations=MappingProxyType(dict(generations)),
-            channels=MappingProxyType(channels),
             skill_catalog_generation_id=(
                 catalog_owner.skill_catalog.generation_id
                 if catalog_owner is not None and catalog_owner.skill_catalog is not None

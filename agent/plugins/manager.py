@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import copy
-import functools
 import hashlib
 import importlib.util
 import inspect
@@ -13,7 +12,7 @@ import secrets
 import shutil
 import sys
 import tomllib
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from types import MappingProxyType, ModuleType, UnionType
 from collections.abc import Awaitable, Callable, Mapping
@@ -34,7 +33,6 @@ from agent.plugin_composition import (
     BACKGROUND_JOBS,
     TOOL_CATALOG,
     UI_SLOTS,
-    CommandRegistry,
     CompositionRoot,
     CredentialRef,
     FiberState,
@@ -51,7 +49,6 @@ from agent.plugin_composition import (
     PluginTools,
     PluginRuntime,
     SessionReadService,
-    resolve_mobile_ui_asset,
     ServiceView,
 )
 from core.memory.plugin import MemoryTurnRuntimeApi
@@ -91,11 +88,6 @@ from agent.plugins.packages import (
     _select_enabled_plugin_packages,  # pyright: ignore[reportPrivateUsage]
     discover_plugin_packages,
 )
-from agent.plugins.specs import (
-    ManagedServiceSpec,
-    McpServerSpec,
-    MobileUiContribution,
-)
 from infra.channels.base import SessionIdentityIndex
 from infra.channels.artifacts import ChannelAttachmentArtifactStore
 from agent.plugins.registry import plugin_registry
@@ -115,7 +107,6 @@ from agent.plugins.scope import CleanupFailure, PluginScope
 from agent.plugins.generation import (
     GateCheckResult,
     GateResult,
-    MobileUiAsset,
     PluginContributions,
     PluginGeneration,
     PluginSemanticCheck,
@@ -138,7 +129,7 @@ from agent.plugins.reload_journal import (
 )
 from agent.plugins.skill_host import PluginSkillHost, PreparedSkillCatalog
 from agent.mcp.generation import WorkspaceMcpGeneration
-from agent.mcp.host import McpGenerationHost, PreparedMcpCatalog
+from agent.mcp.host import McpGenerationHost
 from agent.plugins.generation_activity_host import (
     ActivityCatalog,
     ActivityHost,
@@ -157,7 +148,6 @@ from agent.plugins.snapshot import (
     get_current_runtime_snapshot,
 )
 from bus.event_bus import EventBus
-from infra.channels.contract import Channel
 from infra.persistence.json_store import atomic_save_json
 
 logger = logging.getLogger(__name__)
@@ -267,13 +257,6 @@ class PluginManager:
             _UNRESOLVED_MEMORY_RUNTIME if memory_engine is not None else None
         )
         self._installed_cache_root = installed_cache_root
-        self._channel_switcher: (
-            Callable[
-                [str, tuple[Channel, ...], tuple[Channel, ...]],
-                Awaitable[None],
-            ]
-            | None
-        ) = None
         self._dashboard_preparer: Callable[[RuntimeSnapshot], None] | None = None
         self._dashboard_validation_releaser: (
             Callable[[RuntimeSnapshot], Awaitable[None]] | None
@@ -283,11 +266,6 @@ class PluginManager:
         self._endpoint_switcher: (
             Callable[
                 [
-                    str,
-                    dict[str, dict[str, Any]],
-                    dict[str, dict[str, Any]],
-                    tuple[Channel, ...],
-                    tuple[Channel, ...],
                     tuple[tuple[str, str], ...],
                     tuple[tuple[str, str], ...],
                 ],
@@ -296,7 +274,6 @@ class PluginManager:
             | None
         ) = None
         self._loaded: set[str] = set()
-        self._channels: list[Channel] = []
         self._active_plugins: dict[str, ActivePluginInfo] = {}
         self._scopes: dict[str, PluginScope] = {}
         self._cleanup_failures: list[CleanupFailure] = []
@@ -352,15 +329,6 @@ class PluginManager:
     @property
     def loaded_count(self) -> int:
         return len(self._loaded)
-
-    # V2_REMOVAL(plugin-manager-projections)：channels/proactive/jobs 是 v2 固定贡献的
-    # Manager 投影。每个族群迁入 stable Root capability/catalog 且 bootstrap consumer 改读新
-    # owner 后，删除下面的属性与 mutable fallback。
-    @property
-    def channels(self) -> list[Channel]:
-        if self.current_snapshot is not None:
-            return list(self.current_snapshot.channels.values())
-        return list(self._channels)
 
     @property
     def plugin_dirs(self) -> list[Path]:
@@ -610,15 +578,6 @@ class PluginManager:
                 f"workspace MCP 与插件 server 名称冲突: {', '.join(conflicts)}"
             )
 
-    def bind_channel_switcher(
-        self,
-        switcher: Callable[
-            [str, tuple[Channel, ...], tuple[Channel, ...]],
-            Awaitable[None],
-        ],
-    ) -> None:
-        self._channel_switcher = switcher
-
     def bind_dashboard_preparer(
         self,
         preparer: Callable[[RuntimeSnapshot], None],
@@ -646,11 +605,6 @@ class PluginManager:
         self,
         switcher: Callable[
             [
-                str,
-                dict[str, dict[str, Any]],
-                dict[str, dict[str, Any]],
-                tuple[Channel, ...],
-                tuple[Channel, ...],
                 tuple[tuple[str, str], ...],
                 tuple[tuple[str, str], ...],
             ],
@@ -2357,8 +2311,6 @@ class PluginManager:
             await self._dispose_unreferenced_composition_root(snapshot)
             raise
 
-        old_services: dict[str, dict[str, Any]] = {}
-        old_channels: tuple[Channel, ...] = ()
         old_commands = self.stable_telegram_command_catalog()
         new_commands = self._snapshot_bot_commands(snapshot)
         current_snapshot = self.current_snapshot
@@ -2421,11 +2373,6 @@ class PluginManager:
             _, commit_cancelled = await _complete_critical(
                 self._commit_snapshot_with_publication_participants(
                     transaction,
-                    plugin_id=plugin_id,
-                    old_services=old_services,
-                    new_services={},
-                    old_channels=old_channels,
-                    new_channels=(),
                     old_commands=old_commands,
                     new_commands=new_commands,
                     promote_latest=False,
@@ -2454,11 +2401,6 @@ class PluginManager:
             raise commit_error
 
         _ = self._active_generations.pop(plugin_id)
-        self._channels = [
-            channel
-            for generation in self._active_generations.values()
-            for channel in generation.contributions.channels
-        ]
         resume_cancelled = False
         if self._endpoint_resumer is not None and exclusive_endpoint_changed:
             _, resume_cancelled = await _complete_critical(self._endpoint_resumer())
@@ -2479,43 +2421,22 @@ class PluginManager:
 
     async def _switch_plugin_endpoints(
         self,
-        plugin_id: str,
-        old_services: dict[str, dict[str, Any]],
-        new_services: dict[str, dict[str, Any]],
-        old_channels: tuple[Channel, ...],
-        new_channels: tuple[Channel, ...],
         old_commands: tuple[tuple[str, str], ...],
         new_commands: tuple[tuple[str, str], ...],
     ) -> None:
-        services_changed = old_services != new_services
-        channels_changed = old_channels != new_channels
         if self._endpoint_switcher is not None:
             await self._endpoint_switcher(
-                plugin_id,
-                old_services,
-                new_services,
-                old_channels,
-                new_channels,
                 old_commands,
                 new_commands,
             )
             return
-        if services_changed:
-            raise RuntimeError("v3 publication 不接受 legacy managed service")
-        if channels_changed:
-            if self._channel_switcher is None:
-                raise RuntimeError("Channel 宿主未绑定")
-            await self._channel_switcher(plugin_id, old_channels, new_channels)
+        if old_commands != new_commands:
+            raise RuntimeError("command catalog host 尚未绑定")
 
     async def _commit_snapshot_with_publication_participants(
         self,
         transaction: SnapshotTransaction,
         *,
-        plugin_id: str,
-        old_services: dict[str, dict[str, Any]],
-        new_services: dict[str, dict[str, Any]],
-        old_channels: tuple[Channel, ...],
-        new_channels: tuple[Channel, ...],
         old_commands: tuple[tuple[str, str], ...],
         new_commands: tuple[tuple[str, str], ...],
         promote_latest: bool,
@@ -2527,11 +2448,7 @@ class PluginManager:
         """Publish one snapshot around a single closed external-participant step."""
 
         # 1. Snapshots without external participants retain the one-step path.
-        endpoints_changed = (
-            old_services != new_services
-            or old_channels != new_channels
-            or old_commands != new_commands
-        )
+        endpoints_changed = old_commands != new_commands
         channel_catalog_changed = (
             self._channel_catalog_identity(transaction.previous)
             != self._channel_catalog_identity(transaction.candidate)
@@ -2595,11 +2512,6 @@ class PluginManager:
                 participants_switch_attempted = True
                 try:
                     await self._switch_plugin_endpoints(
-                        plugin_id,
-                        old_services,
-                        new_services,
-                        old_channels,
-                        new_channels,
                         old_commands,
                         new_commands,
                     )
@@ -2683,11 +2595,6 @@ class PluginManager:
             if participants_switch_attempted and not channel_cleanup_failed:
                 try:
                     await self._switch_plugin_endpoints(
-                        plugin_id,
-                        new_services,
-                        old_services,
-                        new_channels,
-                        old_channels,
                         new_commands,
                         old_commands,
                     )
@@ -2809,10 +2716,6 @@ class PluginManager:
             if self._reload_journal.get(tx_id).phase != "latest_ready":
                 raise RuntimeError("latest candidate 已被 runtime recovery 撤销准入")
 
-            old_services: dict[str, dict[str, Any]] = {}
-            new_services: dict[str, dict[str, Any]] = {}
-            old_channels: tuple[Channel, ...] = ()
-            new_channels: tuple[Channel, ...] = ()
             old_commands = self.stable_telegram_command_catalog()
             new_commands = self._snapshot_bot_commands(ready.snapshot)
             stable_snapshot = self.current_snapshot
@@ -2826,11 +2729,7 @@ class PluginManager:
                     plugin_id,
                 )
             )
-            exclusive_endpoint_changed = (
-                old_services != new_services
-                or old_channels != new_channels
-                or v3_runtime_handoff
-            )
+            exclusive_endpoint_changed = v3_runtime_handoff
             command_catalog_changed = old_commands != new_commands
             v3_channel_catalog_changed = (
                 self._channel_catalog_identity(stable_snapshot)
@@ -2996,11 +2895,6 @@ class PluginManager:
                 self._active_generations[plugin_id] = generation
                 if ready.previous is not None:
                     self._retire_generation(ready.previous)
-                self._channels = [
-                    channel
-                    for item in self._active_generations.values()
-                    for channel in item.contributions.channels
-                ]
 
             previous_snapshot = self.current_snapshot
             if previous_snapshot is not None:
@@ -3013,11 +2907,6 @@ class PluginManager:
                             previous=previous_snapshot,
                             candidate=ready.snapshot,
                         ),
-                        plugin_id=plugin_id,
-                        old_services=old_services,
-                        new_services=new_services,
-                        old_channels=old_channels,
-                        new_channels=new_channels,
                         old_commands=old_commands,
                         new_commands=new_commands,
                         promote_latest=True,
@@ -3733,10 +3622,6 @@ class PluginManager:
             )
             return result
 
-        old_services: dict[str, dict[str, Any]] = {}
-        new_services: dict[str, dict[str, Any]] = {}
-        old_channels: tuple[Channel, ...] = ()
-        new_channels: tuple[Channel, ...] = ()
         old_commands = self.stable_telegram_command_catalog()
         new_commands = self._snapshot_bot_commands(snapshot)
         current = self.current_snapshot
@@ -3747,11 +3632,7 @@ class PluginManager:
             current is not None
             and self._composition_runtime_declared(current, plugin_id)
         )
-        exclusive_endpoint_changed = (
-            old_services != new_services
-            or old_channels != new_channels
-            or v3_runtime_handoff
-        )
+        exclusive_endpoint_changed = v3_runtime_handoff
         command_catalog_changed = old_commands != new_commands
         v3_channel_catalog_changed = (
             self._channel_catalog_identity(current)
@@ -3947,11 +3828,6 @@ class PluginManager:
                 _, final_commit_cancelled = await _complete_critical(
                     self._commit_snapshot_with_publication_participants(
                         transaction,
-                        plugin_id=plugin_id,
-                        old_services=old_services,
-                        new_services=new_services,
-                        old_channels=old_channels,
-                        new_channels=new_channels,
                         old_commands=old_commands,
                         new_commands=new_commands,
                         promote_latest=False,
@@ -4091,11 +3967,6 @@ class PluginManager:
         generation.replaced_composition_runtime_generation = None
         if active is not None:
             active.state = "retired"
-        self._channels = [
-            channel
-            for item in self._active_generations.values()
-            for channel in item.contributions.channels
-        ]
         resume_cancelled = False
         if self._endpoint_resumer is not None and exclusive_endpoint_changed:
             _, resume_cancelled = await _complete_critical(self._endpoint_resumer())
@@ -6047,11 +5918,6 @@ class PluginManager:
                 transaction = self._snapshot_store.begin_publish(snapshot)
                 await self._commit_snapshot_with_publication_participants(
                     transaction,
-                    plugin_id="stable-boot",
-                    old_services={},
-                    new_services={},
-                    old_channels=(),
-                    new_channels=(),
                     old_commands=(),
                     new_commands=(),
                     promote_latest=False,
@@ -6068,11 +5934,6 @@ class PluginManager:
         ):
             await self._commit_snapshot_with_publication_participants(
                 transaction,
-                plugin_id="stable-batch",
-                old_services={},
-                new_services={},
-                old_channels=(),
-                new_channels=(),
                 old_commands=(),
                 new_commands=(),
                 promote_latest=False,
@@ -6302,7 +6163,6 @@ class PluginManager:
             _ = self._active_plugins.pop(mp, None)
         self._loaded.clear()
         self._active_plugins.clear()
-        self._channels.clear()
         self._scopes.clear()
         self._active_generations.clear()
         self._draining_generations.clear()
@@ -6824,27 +6684,6 @@ def _resolve_dashboard_module(plugin_dir: Path, declared: str | None) -> Path | 
     return path
 
 
-def _resolve_composable_mobile_ui_asset(
-    plugin_dir: Path,
-    *,
-    module: str,
-    stylesheet: str | None,
-    navigation_label: str | None,
-    navigation_description: str | None,
-    slots: tuple[str, ...],
-) -> MobileUiAsset:
-    """Use the same strict asset boundary for v2 and v3 declarations."""
-
-    return resolve_mobile_ui_asset(
-        plugin_dir,
-        module=module,
-        stylesheet=stylesheet,
-        navigation_label=navigation_label,
-        navigation_description=navigation_description,
-        slots=slots,
-    )
-
-
 def _remove_validation_data_dir(path: Path) -> None:
     if path.exists():
         shutil.rmtree(path)
@@ -6925,7 +6764,6 @@ def _replace_snapshot_payload(
         raise RuntimeError("只能刷新无 lease 的 candidate snapshot")
     for name in (
         "generations",
-        "channels",
         "skill_catalog_generation_id",
         "workspace_mcp_generation",
         "dashboard_bindings",

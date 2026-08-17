@@ -363,8 +363,6 @@ async def test_manager_publishes_v3_registry_without_generation_contribution(
     snapshot = manager.current_snapshot
     assert generation is not None and snapshot is not None
     assert snapshot.mobile_ui_registry is not None
-    assert generation.contributions.mobile_ui_asset is None
-    assert generation.contributions.mobile_ui_query is None
     provider = PluginMobileUiProvider(manager)
     item = cast(list[dict[str, object]], provider.catalog()["items"])[0]
     assert item["id"] == "ui_probe"
@@ -408,9 +406,6 @@ async def test_manager_candidate_registry_stays_private_until_publish(
         and candidate.runtime_snapshot.mobile_ui_registry["ui_probe"].asset.module
         == "export const version = 2;\n"
     )
-    assert stable_generation.contributions.mobile_ui_query is None
-    assert stable_generation.contributions.mobile_ui_asset is None
-
     provider = PluginMobileUiProvider(manager)
     stable_item = cast(list[dict[str, object]], provider.catalog()["items"])[0]
     assert stable_item["module_bytes"] == len("export const version = 1;\n".encode())

@@ -5,11 +5,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
-
-    from agent.plugin_composition.ui_slots import MobileUiQueryHandler
     from agent.plugins.scope import PluginScope, ScopedEventBus
-    from infra.channels.contract import Channel
     from agent.plugins.skill_host import PreparedSkillCatalog
     from agent.plugins.static_manifest import StaticPluginManifest
     from agent.plugins.snapshot import RuntimeSnapshot
@@ -60,13 +56,7 @@ class PluginContributions:
     manifest: dict[str, object]
     skill_roots: tuple[Path, ...] = ()
     drift_skill_roots: tuple[Path, ...] = ()
-    channels: tuple[Channel, ...] = ()
     dashboard_module: Path | None = None
-    mobile_ui_asset: MobileUiAsset | None = None
-    # V2_REMOVAL(mobile-ui-contribution-v2)：仅在旧 generation 迁移完成前保留这组三元组；
-    # v3 handler 只存在 RuntimeSnapshot.mobile_ui_registry 的 exact Root binding。
-    mobile_ui_query: MobileUiQueryHandler | None = None
-    mobile_ui_available: Callable[[], bool] | None = None
 
 
 @dataclass

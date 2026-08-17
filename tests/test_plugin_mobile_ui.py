@@ -139,9 +139,7 @@ def _provider(*, available: bool = True) -> PluginMobileUiProvider:
     snapshot = RuntimeSnapshot(
         snapshot_id="snapshot-1",
         generations=MappingProxyType({"sample@github": generation}),
-        channels=MappingProxyType({}),
         skill_catalog_generation_id=None,
-        mcp_catalog_generation_ids=MappingProxyType({}),
         mobile_ui_registry=MobileUiRegistry({"sample@github": binding}),
         composition_active_plugin_ids=frozenset({"sample@github"}),
     )
@@ -179,15 +177,9 @@ def test_mobile_ui_catalog_separates_metadata_from_content_addressed_assets() ->
 
 
 @pytest.mark.asyncio
-async def test_mobile_ui_does_not_fallback_to_generation_contribution() -> None:
+async def test_mobile_ui_requires_exact_registry_binding() -> None:
     provider = _provider()
     manager = cast(Any, provider)._manager
-    generation = manager.current_snapshot.generations["sample@github"]
-    generation.contributions = SimpleNamespace(
-        mobile_ui_asset=manager.current_snapshot.mobile_ui_registry[
-            "sample@github"
-        ].asset,
-    )
     manager.current_snapshot.mobile_ui_registry = None
 
     assert provider.catalog()["items"] == []
