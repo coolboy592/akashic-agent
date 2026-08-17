@@ -196,6 +196,62 @@ def test_manifest_reserved_name_rejects_descendants_at_admission(
         )
 
 
+def test_read_only_directory_modes_are_applied_after_copy_and_restore(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "read-only"
+    nested = source / "nested"
+    nested.mkdir(parents=True)
+    (nested / "readme").write_text("immutable\n", encoding="utf-8")
+    os.chmod(nested, 0o555)
+    os.chmod(source, 0o555)
+
+    snapshot = create_snapshot(
+        sources=[BackupSource("data", source, "directory")],
+        destination=tmp_path / "backups",
+    )
+    restored = restore_snapshot(snapshot, tmp_path / "restored-read-only")
+
+    assert (restored / "data/nested/readme").read_text(encoding="utf-8") == (
+        "immutable\n"
+    )
+    assert stat.S_IMODE((snapshot / "data").stat().st_mode) == 0o555
+    assert stat.S_IMODE((restored / "data/nested").stat().st_mode) == 0o555
+
+
+@pytest.mark.parametrize("name", ["foo/./bar", "foo//bar"])
+def test_programmatic_source_names_must_already_be_canonical(
+    tmp_path: Path,
+    name: str,
+) -> None:
+    source = tmp_path / "source.txt"
+    source.write_text("source", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="规范路径"):
+        create_snapshot(
+            sources=[BackupSource(name, source, "file")],
+            destination=tmp_path / "backups",
+        )
+
+
+def test_manifest_rejects_invalid_directory_mode_before_restore(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    snapshot = create_snapshot(
+        sources=[BackupSource("data", source, "directory")],
+        destination=tmp_path / "backups",
+    )
+    manifest_path = snapshot / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["directories"]["data"]["mode"] = "bad"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="mode 无效"):
+        verify_snapshot(snapshot)
+
+
 def test_directory_source_rejects_symlinks_and_destination_inside_source(
     tmp_path: Path,
 ) -> None:

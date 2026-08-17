@@ -206,7 +206,9 @@ def _validate_sources(sources: Iterable[BackupSource]) -> list[BackupSource]:
     if not validated:
         raise ValueError("至少需要一个 --file、--sqlite 或 --directory 源")
     for source in validated:
-        _ = _validate_snapshot_name(source.name)
+        normalized_name = _validate_snapshot_name(source.name)
+        if normalized_name != source.name:
+            raise ValueError(f"快照源名称必须是规范路径: {source.name!r}")
         if source.name == "manifest.json" or source.name.startswith("manifest.json/"):
             raise ValueError("快照源不能覆盖保留的 manifest.json")
         if source.kind not in {"file", "sqlite", "directory"}:
@@ -370,16 +372,14 @@ def _copy_directory(
     root = _validate_directory_root(source.path)
     root_mode, scanned = _scan_directory_entries(root)
     destination = snapshot / source.name
-    destination.mkdir(parents=True, exist_ok=False)
-    os.chmod(destination, root_mode)
+    destination.mkdir(parents=True, exist_ok=False, mode=0o700)
 
     # 1. 按冻结的路径集合复制，目录先创建，文件逐项重新 hash。
     for entry_index, entry in enumerate(scanned):
         source_item = root / Path(entry.relative_path)
         target_item = destination / Path(entry.relative_path)
         if entry.kind == "directory":
-            target_item.mkdir(parents=True, exist_ok=False)
-            os.chmod(target_item, entry.mode)
+            target_item.mkdir(parents=True, exist_ok=False, mode=0o700)
             continue
         target_item.parent.mkdir(parents=True, exist_ok=True)
         size, digest = _copy_regular_file(source_item, target_item)
@@ -403,8 +403,26 @@ def _copy_directory(
         source_item = root / Path(entry.relative_path)
         if _sha256(source_item) != entry.sha256:
             raise RuntimeError(f"目录源文件内容在快照期间发生变化: {source_item}")
+    _apply_directory_modes(destination, root_mode, scanned)
     _fsync_tree(destination)
     return root_mode, scanned
+
+
+def _apply_directory_modes(
+    root: Path,
+    root_mode: int,
+    entries: Iterable[DirectoryEntry],
+) -> None:
+    """Apply final directory modes only after all child writes have completed."""
+
+    directories = sorted(
+        (entry for entry in entries if entry.kind == "directory"),
+        key=lambda entry: len(PurePosixPath(entry.relative_path).parts),
+        reverse=True,
+    )
+    for entry in directories:
+        os.chmod(root / Path(entry.relative_path), entry.mode)
+    os.chmod(root, root_mode)
 
 
 def _copy_source(
@@ -496,11 +514,24 @@ def _load_manifest(snapshot: Path) -> dict[str, Any]:
         manifest = json.load(handle)
     if not isinstance(manifest, dict):
         raise ValueError("快照 manifest 必须是对象")
+    schema_version = manifest.get("schema_version")
+    if schema_version is not None and schema_version != 2:
+        raise ValueError(f"不支持的快照 manifest schema_version: {schema_version}")
     files = manifest.get("files", {})
     directories = manifest.get("directories", {})
     if not isinstance(files, dict) or not isinstance(directories, dict):
         raise ValueError("快照 manifest 的 files/directories 必须是对象")
     return manifest
+
+
+def _manifest_mode(value: object, label: str) -> int:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not 0 <= value <= 0o7777
+    ):
+        raise ValueError(f"快照 manifest mode 无效: {label}")
+    return value
 
 
 def _manifest_file_records(
@@ -614,21 +645,28 @@ def _manifest_expected_tree(
     for name, record in files.items():
         if not isinstance(name, str) or not isinstance(record, dict):
             raise ValueError("快照 manifest 普通文件记录无效")
+        if record.get("kind") not in {"file", "sqlite"}:
+            raise ValueError(f"快照 manifest 普通文件 kind 无效: {name}")
         path = PurePosixPath(_validate_snapshot_name(name))
         add_ancestors(path)
         mode = record.get("mode")
-        expected[name] = ("file", mode if isinstance(mode, int) else None)
+        expected[name] = (
+            "file",
+            _manifest_mode(mode, name) if mode is not None else None,
+        )
 
     directories = manifest.get("directories", {})
     for name, raw_directory in directories.items():
         if not isinstance(name, str) or not isinstance(raw_directory, dict):
             raise ValueError("快照 manifest 目录记录无效")
         root_path = PurePosixPath(_validate_snapshot_name(name))
+        if raw_directory.get("kind") != "directory":
+            raise ValueError(f"快照 manifest 目录 kind 无效: {name}")
         add_ancestors(root_path)
         root_mode = raw_directory.get("mode")
         expected[name] = (
             "directory",
-            root_mode if isinstance(root_mode, int) else None,
+            _manifest_mode(root_mode, name) if root_mode is not None else None,
         )
         entries = raw_directory.get("entries")
         if not isinstance(entries, list):
@@ -645,7 +683,7 @@ def _manifest_expected_tree(
             mode = raw_entry.get("mode")
             expected[path.as_posix()] = (
                 cast(str, kind),
-                mode if isinstance(mode, int) else None,
+                _manifest_mode(mode, path.as_posix()) if mode is not None else None,
             )
     if include_manifest:
         expected["manifest.json"] = ("file", None)
@@ -730,11 +768,11 @@ def _restore_directory_sources(
         if not isinstance(directory_name, str) or not isinstance(raw_directory, dict):
             raise ValueError(f"快照 manifest 目录记录无效: {directory_name}")
         root_target = temporary / Path(directory_name)
-        root_target.mkdir(parents=True, exist_ok=False)
+        root_target.mkdir(parents=True, exist_ok=False, mode=0o700)
         root_mode = raw_directory.get("mode")
         if not isinstance(root_mode, int):
             raise ValueError(f"快照 manifest 目录 mode 无效: {directory_name}")
-        os.chmod(root_target, root_mode)
+        restored_entries: list[DirectoryEntry] = []
         entries = raw_directory.get("entries")
         if not isinstance(entries, list):
             raise ValueError(f"快照 manifest 目录 entries 无效: {directory_name}")
@@ -748,8 +786,10 @@ def _restore_directory_sources(
                 raise ValueError(f"快照 manifest 目录条目字段无效: {directory_name}")
             target = root_target / Path(relative_path)
             if kind == "directory":
-                target.mkdir(parents=True, exist_ok=False)
-                os.chmod(target, mode)
+                target.mkdir(parents=True, exist_ok=False, mode=0o700)
+                restored_entries.append(
+                    DirectoryEntry(relative_path, "directory", mode, 0)
+                )
             elif kind == "file":
                 _copy_restored_file(
                     snapshot / Path(directory_name) / Path(relative_path),
@@ -758,6 +798,7 @@ def _restore_directory_sources(
                 )
             else:
                 raise ValueError(f"快照 manifest 目录条目类型无效: {kind}")
+        _apply_directory_modes(root_target, root_mode, restored_entries)
 
 
 def restore_snapshot(snapshot: Path, destination: Path) -> Path:
