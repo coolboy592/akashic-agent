@@ -52,6 +52,8 @@ if TYPE_CHECKING:
 
 
 DriftFinishedEvent = DriftFinished
+_JOB_LIFECYCLE_REVISION = "background-job-v3"
+_JOB_API_REVISION = "plugin-api-v3"
 
 
 @dataclass(frozen=True, slots=True)
@@ -346,6 +348,8 @@ class BackgroundJobRuntimeBinding:
     running: dict[str, asyncio.Task[None]] = field(default_factory=dict)
     running_requests: dict[str, _JobRequest] = field(default_factory=dict)
     running_job_keys: dict[str, tuple[str, str, object, str]] = field(default_factory=dict)
+    recovery_scanned: bool = False
+    recovery_reports: list[str] = field(default_factory=list)
     admission_open: bool = False
     closed: bool = False
 
@@ -422,6 +426,16 @@ class BackgroundJobActivityAdapter:
     @property
     def timer_count(self) -> int:
         return sum(binding.timer_count for binding in self._bindings.values())
+
+    @property
+    def recovery_reports(self) -> tuple[str, ...]:
+        """Return restart recovery findings retained by every materialized binding."""
+
+        return tuple(
+            report
+            for binding in self._bindings.values()
+            for report in binding.recovery_reports
+        )
 
     def prepare_components(
         self,
@@ -592,6 +606,23 @@ class BackgroundJobActivityAdapter:
             raise RuntimeError("BackgroundJob binding 不属于当前 adapter")
         self._ensure_producers(binding)
         self._ensure_worker(binding)
+        if not binding.recovery_scanned:
+            recovered = await self._recover_pending(binding)
+            try:
+                for request in recovered:
+                    if (
+                        request.invocation_id in binding.queued
+                        or request.invocation_id in binding.running
+                    ):
+                        await self._release_request_lease(request)
+                        continue
+                    binding.queued[request.invocation_id] = request
+                    await binding.queue.put(request)
+            except BaseException:
+                for request in recovered:
+                    await self._release_request_lease(request)
+                raise
+            binding.recovery_scanned = True
         binding.admission_open = True
         self._active = binding
 
@@ -794,8 +825,8 @@ class BackgroundJobActivityAdapter:
                 artifact_identity=job.artifact_identity,
                 source_revision=job.source_revision,
                 handler_export=job.binding.handler_export,
-                lifecycle_revision="background-job-v3",
-                api_revision="plugin-api-v3",
+                lifecycle_revision=_JOB_LIFECYCLE_REVISION,
+                api_revision=_JOB_API_REVISION,
                 event_payload=_event_payload_for(event),
             )
             outcome = ledger.admit(identity, now=self._clock())
@@ -844,6 +875,79 @@ class BackgroundJobActivityAdapter:
         finally:
             if snapshot_lease is not None and snapshot_lease.active:
                 await snapshot_lease.release()
+
+    async def _recover_pending(
+        self,
+        runtime: BackgroundJobRuntimeBinding,
+    ) -> tuple[_JobRequest, ...]:
+        """Rebuild only exact queued outcomes and report every unsafe pending state."""
+
+        ledger = self._require_ledger()
+        jobs = {
+            f"{job.binding.plugin_id}:{job.binding.name}": job
+            for job in runtime.jobs.values()
+        }
+        requests: list[_JobRequest] = []
+        try:
+            # 1. Scan durable pending outcomes without consulting the current catalog.
+            for record in ledger.list_pending():
+                job = jobs.get(record.semantic_job_id)
+                if job is None:
+                    _report_recovery(runtime, record, "exact job binding unavailable")
+                    continue
+                mismatches = _recovery_identity_mismatches(runtime, job, record)
+                if mismatches:
+                    _report_recovery(
+                        runtime,
+                        record,
+                        "exact identity mismatch: " + ", ".join(mismatches),
+                    )
+                    continue
+                if record.state is not JobOutcomeState.QUEUED:
+                    phase = record.phase.value
+                    if phase == JobOutcomePhase.DOCUMENTS.value:
+                        detail = "documents phase retained; automatic replay disabled"
+                    else:
+                        detail = (
+                            f"{record.state.value}/{phase} retained; no durable "
+                            "domain-effect receipt permits automatic replay"
+                        )
+                    _report_recovery(runtime, record, detail)
+                    continue
+                if record.model_generation_id != "execution-pending":
+                    _report_recovery(
+                        runtime,
+                        record,
+                        "queued outcome has a bound model generation",
+                    )
+                    continue
+                try:
+                    event, reason = _recovery_trigger(record, job)
+                except (TypeError, ValueError, RuntimeError) as error:
+                    _report_recovery(runtime, record, f"payload rejected: {error}")
+                    continue
+                snapshot_lease = await self._acquire_exact_lease(
+                    runtime.snapshot_store,
+                    runtime.snapshot_id,
+                )
+                requests.append(
+                    _JobRequest(
+                        binding=runtime,
+                        job=job,
+                        reason=reason,
+                        event=event,
+                        interval_bucket=record.interval_bucket,
+                        event_id=record.event_id,
+                        invocation_id=record.invocation_id,
+                        snapshot_lease=snapshot_lease,
+                        outcome=record,
+                    )
+                )
+        except BaseException:
+            for request in requests:
+                await self._release_request_lease(request)
+            raise
+        return tuple(requests)
 
     async def _worker_loop(self, runtime: BackgroundJobRuntimeBinding) -> None:
         while True:
@@ -1379,6 +1483,98 @@ def _event_payload_for(event: object | None) -> Mapping[str, object] | None:
             "message_result": event.message_result,
             "timestamp": event.timestamp.isoformat(),
         }
+    )
+
+
+def _recovery_identity_mismatches(
+    runtime: BackgroundJobRuntimeBinding,
+    job: _MaterializedJob,
+    record: JobOutcomeRecord,
+) -> tuple[str, ...]:
+    expected = {
+        "semantic_job_id": f"{job.binding.plugin_id}:{job.binding.name}",
+        "snapshot_id": runtime.snapshot_id,
+        "plugin_generation_id": job.binding.generation_id,
+        "artifact_identity": job.artifact_identity,
+        "source_revision": job.source_revision,
+        "handler_export": job.binding.handler_export,
+        "lifecycle_revision": _JOB_LIFECYCLE_REVISION,
+        "api_revision": _JOB_API_REVISION,
+    }
+    return tuple(
+        f"{field} expected={value!r} actual={getattr(record, field)!r}"
+        for field, value in expected.items()
+        if getattr(record, field) != value
+    )
+
+
+def _report_recovery(
+    runtime: BackgroundJobRuntimeBinding,
+    record: JobOutcomeRecord,
+    detail: str,
+) -> None:
+    runtime.recovery_reports.append(
+        "background job restart recovery degraded "
+        f"invocation={record.invocation_id} semantic_job_id={record.semantic_job_id}: "
+        f"{detail}"
+    )
+
+
+def _recovery_trigger(
+    record: JobOutcomeRecord,
+    job: _MaterializedJob,
+) -> tuple[DriftFinishedEvent | None, str]:
+    if record.event_id is not None:
+        if not _has_event_trigger(job.binding):
+            raise RuntimeError("durable event 不属于当前 job trigger")
+        return _event_from_payload(record), "event"
+    if record.interval_bucket is not None:
+        if not _has_interval_trigger(job.binding):
+            raise RuntimeError("durable interval 不属于当前 job trigger")
+        if record.event_payload is not None:
+            raise ValueError("interval outcome 不得包含 event payload")
+        return None, "interval"
+    raise ValueError("durable outcome 缺少 event/interval identity")
+
+
+def _event_from_payload(record: JobOutcomeRecord) -> DriftFinishedEvent:
+    payload = record.event_payload
+    if payload is None:
+        raise ValueError("queued event outcome 缺少 durable event payload")
+    expected_keys = {
+        "event_id",
+        "session_key",
+        "skill_name",
+        "status",
+        "briefing",
+        "message_result",
+        "timestamp",
+    }
+    if set(payload) != expected_keys:
+        raise ValueError("queued event payload schema 不匹配")
+
+    def text_field(name: str) -> str:
+        value = payload[name]
+        if not isinstance(value, str):
+            raise TypeError(f"queued event payload.{name} 必须是字符串")
+        return value
+
+    event_id = text_field("event_id")
+    if event_id != record.event_id:
+        raise ValueError("queued event payload.event_id 与 outcome 不匹配")
+    timestamp_text = text_field("timestamp")
+    try:
+        timestamp = datetime.fromisoformat(timestamp_text)
+    except ValueError as error:
+        raise ValueError("queued event payload.timestamp 无效") from error
+    return DriftFinished(
+        event_id=event_id,
+        session_key=text_field("session_key"),
+        skill_name=text_field("skill_name"),
+        status=text_field("status"),
+        briefing=text_field("briefing"),
+        message_result=text_field("message_result"),
+        timestamp=timestamp,
     )
 
 

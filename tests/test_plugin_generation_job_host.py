@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from types import ModuleType, SimpleNamespace
 from typing import Any
@@ -15,6 +15,7 @@ from agent.plugin_composition.background_jobs import (
     BackgroundJobDescriptor,
     CoreEvent,
     CoreEventTrigger,
+    IntervalTrigger,
 )
 from agent.plugin_composition.model import FiberState
 from agent.plugins.composable import ComposablePlugin
@@ -22,7 +23,12 @@ from agent.plugins.generation_job_host import (
     BackgroundJobActivityAdapter,
     DriftFinishedEvent,
 )
-from agent.plugins.job_outcome_ledger import JobOutcomeLedger, JobOutcomeState
+from agent.plugins.job_outcome_ledger import (
+    JobOutcomeIdentity,
+    JobOutcomeLedger,
+    JobOutcomePhase,
+    JobOutcomeState,
+)
 from agent.plugins.snapshot import (
     RuntimeSnapshotLease,
     bind_runtime_snapshot,
@@ -89,11 +95,14 @@ def _fixture(
     debounce_seconds: int = 0,
     coalesce: bool = True,
     clock: Any | None = None,
+    triggers: tuple[Any, ...] | None = None,
+    ledger_path: Any | None = None,
 ):
     plugin = _module(handler)
+    job_triggers = triggers or (CoreEventTrigger(CoreEvent.DRIFT_FINISHED),)
     definition = BackgroundJobDefinition(
         name="merge_pending",
-        triggers=(CoreEventTrigger(CoreEvent.DRIFT_FINISHED),),
+        triggers=job_triggers,
         handler_export="merge_pending",
         model_role=model_role,
         debounce_seconds=debounce_seconds,
@@ -140,7 +149,7 @@ def _fixture(
     snapshot.lease_count += 1
     store.leases += 1
     target_lease = RuntimeSnapshotLease(store, snapshot)
-    ledger = JobOutcomeLedger(tmp_path / "outcomes.sqlite")
+    ledger = JobOutcomeLedger(ledger_path or tmp_path / "outcomes.sqlite")
     adapter = BackgroundJobActivityAdapter(
         EventBus(),
         store,
@@ -161,6 +170,43 @@ def _event(event_id: str) -> DriftFinished:
         briefing="briefing",
         message_result="ok",
         timestamp=datetime.now(timezone.utc),
+    )
+
+
+def _event_payload(event: DriftFinished) -> dict[str, str]:
+    return {
+        "event_id": event.event_id,
+        "session_key": event.session_key,
+        "skill_name": event.skill_name,
+        "status": event.status,
+        "briefing": event.briefing,
+        "message_result": event.message_result,
+        "timestamp": event.timestamp.isoformat(),
+    }
+
+
+def _pending_identity(
+    plan,
+    *,
+    invocation_id: str,
+    event: DriftFinished | None = None,
+    interval_bucket: str | None = None,
+) -> JobOutcomeIdentity:
+    return JobOutcomeIdentity(
+        plugin_id="drift",
+        job_name="merge_pending",
+        invocation_id=invocation_id,
+        event_id=None if event is None else event.event_id,
+        interval_bucket=interval_bucket,
+        snapshot_id=plan.snapshot_id,
+        plugin_generation_id="generation-1",
+        model_generation_id="execution-pending",
+        artifact_identity=f"{plan.catalog_identity}:drift:merge_pending",
+        source_revision="source-1",
+        handler_export="merge_pending",
+        lifecycle_revision="background-job-v3",
+        api_revision="plugin-api-v3",
+        event_payload=None if event is None else _event_payload(event),
     )
 
 
@@ -534,6 +580,300 @@ async def test_event_accepted_before_pause_is_admitted_on_old_binding(tmp_path) 
     )
     assert outcome is not None and outcome.state is JobOutcomeState.SUCCEEDED
     await adapter.close_components("shutdown", runtime)
+    await target_lease.release()
+
+
+@pytest.mark.asyncio
+async def test_restart_requeues_exact_queued_event_once_with_original_invocation(tmp_path) -> None:
+    calls: list[tuple[str, str]] = []
+    path = tmp_path / "restart-event.sqlite"
+
+    async def handler(ctx) -> None:
+        calls.append((ctx.event.event_id, ctx.reason))
+
+    first, first_plan, first_lease, _store, first_ledger = _fixture(
+        tmp_path,
+        handler,
+        ledger_path=path,
+    )
+    event = _event("restart-event")
+    first_ledger.admit(
+        _pending_identity(first_plan, invocation_id="restart-invocation", event=event)
+    )
+    await first_lease.release()
+
+    adapter, plan, target_lease, _store, ledger = _fixture(
+        tmp_path,
+        handler,
+        ledger_path=path,
+    )
+    runtime = await adapter.materialize_closed("tx-1", plan)
+    await adapter.open(runtime)
+    await adapter.drain(runtime)
+    await adapter.enqueue_event(runtime, event)
+    await adapter.drain(runtime)
+
+    outcome = ledger.get("restart-invocation")
+    assert calls == [("restart-event", "event")]
+    assert outcome is not None
+    assert outcome.state is JobOutcomeState.SUCCEEDED
+    assert outcome.invocation_id == "restart-invocation"
+    assert len(ledger.list_all()) == 1
+
+    await adapter.close_components("tx-1", runtime)
+    await target_lease.release()
+
+
+@pytest.mark.asyncio
+async def test_restart_requeues_exact_queued_interval_once(tmp_path) -> None:
+    calls: list[tuple[object, str]] = []
+    path = tmp_path / "restart-interval.sqlite"
+    bucket = "2026-08-17T03:00:00+00:00"
+
+    async def handler(ctx) -> None:
+        calls.append((ctx.event, ctx.reason))
+
+    first, first_plan, first_lease, _store, first_ledger = _fixture(
+        tmp_path,
+        handler,
+        triggers=(IntervalTrigger(60),),
+        ledger_path=path,
+    )
+    first_ledger.admit(
+        _pending_identity(
+            first_plan,
+            invocation_id="restart-interval-invocation",
+            interval_bucket=bucket,
+        )
+    )
+    await first_lease.release()
+
+    adapter, plan, target_lease, _store, ledger = _fixture(
+        tmp_path,
+        handler,
+        triggers=(IntervalTrigger(60),),
+        ledger_path=path,
+    )
+    runtime = await adapter.materialize_closed("tx-1", plan)
+    await adapter.open(runtime)
+    for _ in range(100):
+        outcome = ledger.get("restart-interval-invocation")
+        if outcome is not None and outcome.state is JobOutcomeState.SUCCEEDED:
+            break
+        await asyncio.sleep(0)
+
+    outcome = ledger.get("restart-interval-invocation")
+    assert calls == [(None, "interval")]
+    assert outcome is not None
+    assert outcome.state is JobOutcomeState.SUCCEEDED
+    assert outcome.interval_bucket == bucket
+
+    await adapter.close_components("tx-1", runtime)
+    await target_lease.release()
+
+
+@pytest.mark.asyncio
+async def test_restart_retains_running_retry_and_documents_without_handler_replay(tmp_path) -> None:
+    calls: list[str] = []
+    path = tmp_path / "restart-pending.sqlite"
+
+    async def handler(ctx) -> None:
+        calls.append(ctx.event.event_id)
+
+    first, first_plan, first_lease, _store, first_ledger = _fixture(
+        tmp_path,
+        handler,
+        ledger_path=path,
+    )
+    for suffix, phase in (
+        ("running", None),
+        ("provider-retry", JobOutcomePhase.PROVIDER),
+        ("documents-retry", JobOutcomePhase.DOCUMENTS),
+    ):
+        event = _event(f"restart-{suffix}")
+        invocation_id = f"restart-{suffix}-invocation"
+        first_ledger.admit(
+            _pending_identity(first_plan, invocation_id=invocation_id, event=event)
+        )
+        first_ledger.transition(
+            invocation_id,
+            JobOutcomeState.RUNNING,
+            model_generation_id="model-restart",
+        )
+        if phase is not None:
+            first_ledger.transition(
+                invocation_id,
+                JobOutcomeState.RETRY_PENDING,
+                phase=phase,
+                error=f"{suffix} interrupted",
+            )
+    await first_lease.release()
+
+    adapter, plan, target_lease, _store, ledger = _fixture(
+        tmp_path,
+        handler,
+        ledger_path=path,
+    )
+    runtime = await adapter.materialize_closed("tx-1", plan)
+    await adapter.open(runtime)
+    await adapter.drain(runtime)
+
+    assert calls == []
+    assert len(adapter.recovery_reports) == 3
+    assert any("running/handler" in report for report in adapter.recovery_reports)
+    assert any("retry_pending/provider" in report for report in adapter.recovery_reports)
+    assert any("documents phase retained" in report for report in adapter.recovery_reports)
+    assert all(
+        record.state in {JobOutcomeState.RUNNING, JobOutcomeState.RETRY_PENDING}
+        for record in ledger.list_pending()
+    )
+
+    await adapter.close_components("tx-1", runtime)
+    await target_lease.release()
+
+
+@pytest.mark.asyncio
+async def test_restart_rejects_each_changed_binding_identity_without_current_fallback(
+    tmp_path,
+) -> None:
+    calls: list[str] = []
+    path = tmp_path / "restart-identity.sqlite"
+    fields = (
+        "snapshot_id",
+        "plugin_generation_id",
+        "artifact_identity",
+        "source_revision",
+        "handler_export",
+        "lifecycle_revision",
+        "api_revision",
+    )
+
+    async def handler(ctx) -> None:
+        calls.append(ctx.event.event_id)
+
+    first, first_plan, first_lease, _store, first_ledger = _fixture(
+        tmp_path,
+        handler,
+        ledger_path=path,
+    )
+    for index, field in enumerate(fields):
+        event = _event(f"identity-mismatch-{field}")
+        identity = _pending_identity(
+            first_plan,
+            invocation_id=f"identity-mismatch-{index}",
+            event=event,
+        )
+        identity = replace(identity, **{field: f"wrong-{field}"})
+        first_ledger.admit(identity)
+    await first_lease.release()
+
+    adapter, plan, target_lease, _store, ledger = _fixture(
+        tmp_path,
+        handler,
+        ledger_path=path,
+    )
+    runtime = await adapter.materialize_closed("tx-1", plan)
+    await adapter.open(runtime)
+    await adapter.drain(runtime)
+
+    assert calls == []
+    assert len(adapter.recovery_reports) == len(fields)
+    for field in fields:
+        assert any(f"{field} expected=" in report for report in adapter.recovery_reports)
+    assert all(record.state is JobOutcomeState.QUEUED for record in ledger.list_pending())
+
+    await adapter.close_components("tx-1", runtime)
+    await target_lease.release()
+
+
+@pytest.mark.asyncio
+async def test_restart_reports_pending_outcome_without_exact_current_job_binding(tmp_path) -> None:
+    calls: list[str] = []
+    path = tmp_path / "restart-missing-job.sqlite"
+
+    async def handler(ctx) -> None:
+        calls.append(ctx.event.event_id)
+
+    first, first_plan, first_lease, _store, first_ledger = _fixture(
+        tmp_path,
+        handler,
+        ledger_path=path,
+    )
+    event = _event("missing-job-event")
+    missing_job_identity = replace(
+        _pending_identity(
+            first_plan,
+            invocation_id="missing-job-invocation",
+            event=event,
+        ),
+        job_name="retired_job",
+        semantic_job_id=None,
+        handler_export="retired_handler",
+    )
+    first_ledger.admit(missing_job_identity)
+    await first_lease.release()
+
+    adapter, plan, target_lease, _store, ledger = _fixture(
+        tmp_path,
+        handler,
+        ledger_path=path,
+    )
+    runtime = await adapter.materialize_closed("tx-1", plan)
+    await adapter.open(runtime)
+    await adapter.drain(runtime)
+
+    assert calls == []
+    assert any(
+        "exact job binding unavailable" in report
+        for report in adapter.recovery_reports
+    )
+    outcome = ledger.get("missing-job-invocation")
+    assert outcome is not None and outcome.state is JobOutcomeState.QUEUED
+
+    await adapter.close_components("tx-1", runtime)
+    await target_lease.release()
+
+
+@pytest.mark.asyncio
+async def test_restart_rejects_malformed_event_payload_without_running_handler(tmp_path) -> None:
+    calls: list[str] = []
+    path = tmp_path / "restart-payload.sqlite"
+
+    async def handler(ctx) -> None:
+        calls.append(ctx.event.event_id)
+
+    first, first_plan, first_lease, _store, first_ledger = _fixture(
+        tmp_path,
+        handler,
+        ledger_path=path,
+    )
+    event = _event("malformed-restart-event")
+    identity = replace(
+        _pending_identity(
+            first_plan,
+            invocation_id="malformed-restart-invocation",
+            event=event,
+        ),
+        event_payload={"event_id": event.event_id},
+    )
+    first_ledger.admit(identity)
+    await first_lease.release()
+
+    adapter, plan, target_lease, _store, ledger = _fixture(
+        tmp_path,
+        handler,
+        ledger_path=path,
+    )
+    runtime = await adapter.materialize_closed("tx-1", plan)
+    await adapter.open(runtime)
+    await adapter.drain(runtime)
+
+    assert calls == []
+    assert any("payload rejected" in report for report in adapter.recovery_reports)
+    outcome = ledger.get("malformed-restart-invocation")
+    assert outcome is not None and outcome.state is JobOutcomeState.QUEUED
+
+    await adapter.close_components("tx-1", runtime)
     await target_lease.release()
 
 
