@@ -456,11 +456,6 @@ class EventBus:
     def _handlers_for(self, event_type: type[object]) -> list[Handler[object]]:
         handlers = list(self._handlers.get(event_type, []))
         handlers.extend(self._handlers.get(_AnyEvent, []))
-        from agent.plugins.snapshot import get_current_runtime_snapshot
-
-        snapshot = get_current_runtime_snapshot()
-        if snapshot is not None:
-            handlers.extend(snapshot.event_handlers.get(event_type, ()))
         return handlers
 
     def _on_observe_task_done(
