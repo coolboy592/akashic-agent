@@ -102,6 +102,7 @@ class ProactiveModuleDefinition:
     collects: tuple[str, ...] = ()
     handler_export: str = ""
     domain_effect: str | None = None
+    domain_effect_lookup_export: str | None = None
 
     def __post_init__(self) -> None:
         slot = _identifier(self.slot, "slot")
@@ -117,8 +118,15 @@ class ProactiveModuleDefinition:
             if any(_IDENTIFIER.fullmatch(item) is None for item in items):
                 raise ValueError(f"{field} 包含无效 capability")
         _export(self.handler_export)
+        if (self.domain_effect is None) != (
+            self.domain_effect_lookup_export is None
+        ):
+            raise ValueError(
+                "domain_effect 与 domain_effect_lookup_export 必须同时提供"
+            )
         if self.domain_effect is not None:
             _identifier(self.domain_effect, "domain_effect")
+            _export(self.domain_effect_lookup_export, "domain_effect_lookup_export")
 
 
 @dataclass(frozen=True, slots=True)
@@ -241,6 +249,7 @@ class ProactiveModuleDescriptor:
     collects: tuple[str, ...]
     handler_export: str
     domain_effect: str | None
+    domain_effect_lookup_export: str | None = None
 
     def __post_init__(self) -> None:
         _text(self.owner, "owner")
@@ -252,6 +261,7 @@ class ProactiveModuleDescriptor:
             collects=self.collects,
             handler_export=self.handler_export,
             domain_effect=self.domain_effect,
+            domain_effect_lookup_export=self.domain_effect_lookup_export,
         )
         for field in ("requires", "produces", "collects"):
             object.__setattr__(self, field, getattr(definition, field))
@@ -533,6 +543,7 @@ class _ProactiveDeclarations:
                 collects=definition.collects,
                 handler_export=definition.handler_export,
                 domain_effect=definition.domain_effect,
+                domain_effect_lookup_export=definition.domain_effect_lookup_export,
             )
             self._module_slots[key] = token
         registration = _Registration(
@@ -678,6 +689,7 @@ def _normalize_definition(
             collects=tuple(definition.collects),
             handler_export=definition.handler_export,
             domain_effect=definition.domain_effect,
+            domain_effect_lookup_export=definition.domain_effect_lookup_export,
         )
     raise TypeError(
         "PluginProactiveComponents.register 只接受 ProactiveSourceDefinition 或 ProactiveModuleDefinition"
@@ -720,6 +732,7 @@ def _module_identity(descriptor: ProactiveModuleDescriptor) -> dict[str, object]
         "collects": list(descriptor.collects),
         "handler_export": descriptor.handler_export,
         "domain_effect": descriptor.domain_effect,
+        "domain_effect_lookup_export": descriptor.domain_effect_lookup_export,
     }
 
 

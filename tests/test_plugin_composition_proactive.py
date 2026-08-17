@@ -289,3 +289,28 @@ def test_proactive_results_are_frozen_and_do_not_merge_fetch_ack_states() -> Non
 def test_proactive_definitions_reject_invalid_contract(factory) -> None:
     with pytest.raises((TypeError, ValueError)):
         factory()
+
+
+def test_domain_effect_requires_a_frozen_lookup_export() -> None:
+    with pytest.raises(ValueError, match="必须同时提供"):
+        ProactiveModuleDefinition(
+            slot="proactive.emotion",
+            lifecycle_id="default.proactive.frame.v1",
+            handler_export="run_emotion",
+            domain_effect="emotion.state",
+        )
+    with pytest.raises(ValueError, match="必须同时提供"):
+        ProactiveModuleDefinition(
+            slot="proactive.emotion",
+            lifecycle_id="default.proactive.frame.v1",
+            handler_export="run_emotion",
+            domain_effect_lookup_export="lookup_emotion_effect",
+        )
+    definition = ProactiveModuleDefinition(
+        slot="proactive.emotion",
+        lifecycle_id="default.proactive.frame.v1",
+        handler_export="run_emotion",
+        domain_effect="emotion.state",
+        domain_effect_lookup_export="lookup_emotion_effect",
+    )
+    assert definition.domain_effect_lookup_export == "lookup_emotion_effect"

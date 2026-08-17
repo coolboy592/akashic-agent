@@ -83,13 +83,13 @@ class _Route:
 _UNSET = object()
 
 
-def _plugin(handler: object) -> ComposablePlugin:
+def _plugin(handler: object, lookup: object | None = None) -> ComposablePlugin:
     module = ModuleType("calendar_plugin")
     module.api_version = 3
     module.name = "calendar"
     module.version = "1.0.0"
     module.apply = _apply
-    module.runtime = SimpleNamespace(handle_calendar=handler)
+    module.runtime = SimpleNamespace(handle_calendar=handler, lookup_effect=lookup)
     return ComposablePlugin.from_module(module)
 
 
@@ -97,7 +97,12 @@ async def _apply(ctx: object, config: object) -> None:
     return None
 
 
-def _fixture(handler: object):
+def _fixture(
+    handler: object,
+    *,
+    domain_effect: str | None = None,
+    domain_lookup: object | None = None,
+):
     fiber = _Fiber()
     source_definition = ProactiveSourceDefinition(
         name="calendar",
@@ -129,6 +134,10 @@ def _fixture(handler: object):
         lifecycle_id="default.proactive.frame.v1",
         produces=("calendar.alerts",),
         handler_export="runtime.handle_calendar",
+        domain_effect=domain_effect,
+        domain_effect_lookup_export=(
+            "runtime.lookup_effect" if domain_effect is not None else None
+        ),
     )
     module_descriptor = ProactiveModuleDescriptor(
         owner="calendar",
@@ -139,6 +148,7 @@ def _fixture(handler: object):
         collects=module_definition.collects,
         handler_export=module_definition.handler_export,
         domain_effect=module_definition.domain_effect,
+        domain_effect_lookup_export=module_definition.domain_effect_lookup_export,
     )
     module_binding = ProactiveModuleBinding(
         descriptor=module_descriptor,
@@ -153,7 +163,7 @@ def _fixture(handler: object):
         {"calendar:proactive.calendar": module_binding},
         root_instance_token=object(),
     )
-    plugin = _plugin(handler)
+    plugin = _plugin(handler, domain_lookup)
     snapshot = SimpleNamespace(
         snapshot_id="snapshot-1",
         generations={
@@ -358,3 +368,163 @@ async def test_activity_host_finalize_opens_the_child_at_the_shared_boundary() -
 
     await host.close()
     assert adapter.active_binding is None
+
+
+@pytest.mark.asyncio
+async def test_domain_effects_are_fresh_per_tick_and_lookup_is_idempotent() -> None:
+    records: dict[str, dict[str, object]] = {}
+    transaction_contexts = []
+    handler_contexts = []
+
+    def lookup(context):
+        return records.get(context.invocation_id)
+
+    async def handler(ctx: ProactiveModuleContext, frame):
+        assert ctx.domain_effects is not None
+        handler_contexts.append(ctx)
+
+        async def transaction(effect_context):
+            transaction_contexts.append(effect_context)
+            records[effect_context.invocation_id] = {
+                "state": "committed",
+                "invocation_id": effect_context.invocation_id,
+                "effect_id": effect_context.effect_id,
+                "idempotency_key": effect_context.idempotency_key,
+                "attempt": effect_context.attempt,
+                "result_digest": "digest-1",
+            }
+
+        receipt = await ctx.domain_effects.run("emotion.state", transaction)
+        frame.slots["receipt"] = receipt.result_digest
+        return frame
+
+    adapter, activity_catalog, target, execution, _route = _fixture(
+        handler,
+        domain_effect="emotion.state",
+        domain_lookup=lookup,
+    )
+    plan = adapter.prepare_components("tx-1", target, activity_catalog)
+    runtime = await adapter.materialize_closed("tx-1", plan)
+    adapter.finalize_components("tx-1", runtime)
+
+    frame = new_proactive_frame("session-1")
+    await runtime.module("proactive.calendar").transform(execution, frame)
+    await runtime.module("proactive.calendar").transform(execution, frame)
+
+    assert len(transaction_contexts) == 1
+    first = transaction_contexts[0]
+    assert first.snapshot_id == "snapshot-1"
+    assert first.generation_id == "calendar:generation-1"
+    assert first.job_name == "proactive.calendar"
+    assert first.semantic_job_id == "calendar:proactive.calendar"
+    assert first.event_id == first.tick_id
+    assert first.tick_id is not None
+    assert first.idempotency_key == f"{first.tick_id}:{first.semantic_job_id}"
+    assert handler_contexts[0].domain_effects is not handler_contexts[1].domain_effects
+    assert handler_contexts[0].domain_effects is not None
+    assert handler_contexts[0].domain_effects.closed
+    assert handler_contexts[1].domain_effects is not None
+    assert handler_contexts[1].domain_effects.closed
+    assert adapter.module_invocations == 2
+
+    await adapter.close_components("shutdown", runtime)
+
+
+@pytest.mark.asyncio
+async def test_domain_effect_failure_and_cancel_close_invocation_view() -> None:
+    captured = []
+    started = asyncio.Event()
+
+    def lookup(_context):
+        return None
+
+    async def handler(ctx: ProactiveModuleContext, frame):
+        assert ctx.domain_effects is not None
+        captured.append(ctx.domain_effects)
+        if len(captured) == 1:
+            async def fail(_effect_context):
+                raise RuntimeError("transaction failed")
+
+            await ctx.domain_effects.run("emotion.state", fail)
+        started.set()
+        await asyncio.Future()
+        return frame
+
+    adapter, activity_catalog, target, execution, _route = _fixture(
+        handler,
+        domain_effect="emotion.state",
+        domain_lookup=lookup,
+    )
+    plan = adapter.prepare_components("tx-1", target, activity_catalog)
+    runtime = await adapter.materialize_closed("tx-1", plan)
+    adapter.finalize_components("tx-1", runtime)
+
+    with pytest.raises(RuntimeError, match="transaction failed"):
+        await runtime.module("proactive.calendar").transform(
+            execution,
+            new_proactive_frame("session-1"),
+        )
+    assert captured[0].closed
+
+    task = asyncio.create_task(
+        runtime.module("proactive.calendar").transform(
+            execution,
+            new_proactive_frame("session-1"),
+        )
+    )
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert captured[1].closed
+    await adapter.close_components("shutdown", runtime)
+
+
+@pytest.mark.asyncio
+async def test_domain_effect_reentry_after_commit_failure_does_not_repeat_transaction() -> None:
+    records: dict[str, dict[str, object]] = {}
+    transaction_calls = 0
+    first_attempt = True
+
+    def lookup(context):
+        return records.get(context.invocation_id)
+
+    async def handler(ctx: ProactiveModuleContext, frame):
+        nonlocal first_attempt, transaction_calls
+        assert ctx.domain_effects is not None
+
+        async def transaction(effect_context):
+            nonlocal first_attempt, transaction_calls
+            transaction_calls += 1
+            records[effect_context.invocation_id] = {
+                "state": "committed",
+                "invocation_id": effect_context.invocation_id,
+                "effect_id": effect_context.effect_id,
+                "idempotency_key": effect_context.idempotency_key,
+                "attempt": effect_context.attempt,
+                "result_digest": "digest-after-crash",
+            }
+            if first_attempt:
+                first_attempt = False
+                raise SystemExit("simulated Core crash after plugin commit")
+
+        receipt = await ctx.domain_effects.run("emotion.state", transaction)
+        frame.slots["receipt"] = receipt.result_digest
+        return frame
+
+    adapter, activity_catalog, target, execution, _route = _fixture(
+        handler,
+        domain_effect="emotion.state",
+        domain_lookup=lookup,
+    )
+    plan = adapter.prepare_components("tx-1", target, activity_catalog)
+    runtime = await adapter.materialize_closed("tx-1", plan)
+    adapter.finalize_components("tx-1", runtime)
+    frame = new_proactive_frame("session-1")
+
+    await runtime.module("proactive.calendar").transform(execution, frame)
+    await runtime.module("proactive.calendar").transform(execution, frame)
+
+    assert transaction_calls == 1
+    assert frame.slots["receipt"] == "digest-after-crash"
+    await adapter.close_components("shutdown", runtime)

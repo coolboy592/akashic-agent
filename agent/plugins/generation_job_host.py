@@ -87,9 +87,11 @@ class DomainEffectContext:
     semantic_job_id: str
     event_id: str | None
     snapshot_id: str
+    generation_id: str
     effect_id: str
     idempotency_key: str
     attempt: int
+    tick_id: str | None = None
 
 
 class ProactiveDomainEffects:
@@ -110,6 +112,12 @@ class ProactiveDomainEffects:
     @property
     def issued_receipt(self) -> DomainEffectReceipt | None:
         return next(iter(self._issued.values()), None)
+
+    @property
+    def closed(self) -> bool:
+        """Report whether this invocation-scoped capability has been closed."""
+
+        return self._closed
 
     async def run(
         self,
@@ -1297,6 +1305,7 @@ class BackgroundJobActivityAdapter:
             effect_id=effect_id,
             idempotency_key=f"{record.semantic_job_id}:{record.trigger_identity}",
             attempt=record.attempt,
+            generation_id=job.binding.generation_id,
         )
         effects = ProactiveDomainEffects(
             context=context,
@@ -1423,6 +1432,7 @@ class BackgroundJobActivityAdapter:
             effect_id=effect_id,
             idempotency_key=request.idempotency_key,
             attempt=record.attempt,
+            generation_id=job.binding.generation_id,
         )
         effects = ProactiveDomainEffects(context=effect_context, lookup=lookup)
         inner = ProactiveDocuments(

@@ -34,6 +34,10 @@ Session commit
 - 当前 request 没有 composition Root 时保持 no-op；继承到错误 task 或已释放 lease 的绑定 fail-loud。事件只从 request-bound snapshot 取得 Root，不读取全局最新 generation。
 - listener 是所属 Fiber 的 Effect，reload、依赖消失和 dispose 后不残留。
 - Core 不新增 Observe 领域 Service、priority、waterfall 或领域数据库接口。
+- Proactive Feedback 使用独立的 Core-owned `ProactiveFeedbackCommitted` frozen DTO 与
+  `ObserveEventKey("proactive.feedback.committed")`；producer 只在自己的 feedback DB commit 后
+  `ctx.observe` 该 DTO。该 seam 只传递稳定 id、score/reason 与 bounded previews，不修改
+  `TurnCommitted.extra`，Core 也不读取插件 DB，Emotion 不 import Proactive Feedback。
 
 ## Change and persistence
 

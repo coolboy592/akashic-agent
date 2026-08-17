@@ -12,6 +12,7 @@ import inspect
 import json
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import datetime
 from types import MappingProxyType
 from typing import Protocol, TypeAlias, cast
 
@@ -32,6 +33,7 @@ from agent.plugin_composition.proactive import (
 )
 from agent.plugins.composable import ComposablePlugin
 from agent.plugins.generation_activity_host import ActivityCatalog
+from agent.plugins.generation_job_host import DomainEffectContext, ProactiveDomainEffects
 from agent.plugins.snapshot import RuntimeSnapshotLease
 from proactive_v2.frame import ProactiveFrame
 
@@ -58,7 +60,7 @@ class ProactiveModuleContext:
     snapshot_id: str
     generation_id: str
     slot: str
-    domain_effects: object | None = None
+    domain_effects: ProactiveDomainEffects | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,6 +95,9 @@ class _MaterializedModule:
         [ProactiveModuleContext, ProactiveFrame],
         Awaitable[ProactiveModuleOutcome | None],
     ]
+    domain_effect_lookup: Callable[
+        [DomainEffectContext], object | Awaitable[object]
+    ] | None = None
 
 
 @dataclass(slots=True)
@@ -286,30 +291,48 @@ class ProactiveModuleFacade:
         adapter._authorize(self._runtime, snapshot_lease, binding)
         if not isinstance(frame, ProactiveFrame):
             raise TypeError("Proactive module frame 必须是 ProactiveFrame")
-        if (
-            binding.definition.domain_effect is not None
-            and adapter._domain_effects is None
-        ):
-            raise RuntimeError(
-                "Proactive module domain_effect 没有 Core-owned effects facade"
+        effects: ProactiveDomainEffects | None = None
+        if binding.definition.domain_effect is not None:
+            lookup = self._materialized.domain_effect_lookup
+            if lookup is None:
+                raise RuntimeError(
+                    "Proactive module domain_effect 缺少 exact lookup export"
+                )
+            tick_id = _proactive_tick_id(frame)
+            semantic_job_id = f"{binding.descriptor.owner}:{binding.descriptor.slot}"
+            effects = ProactiveDomainEffects(
+                context=DomainEffectContext(
+                    invocation_id=f"proactive:{semantic_job_id}:{tick_id}",
+                    plugin_id=binding.descriptor.owner,
+                    job_name=binding.descriptor.slot,
+                    semantic_job_id=semantic_job_id,
+                    event_id=tick_id,
+                    snapshot_id=self._runtime.snapshot_id,
+                    effect_id=binding.definition.domain_effect,
+                    idempotency_key=f"{tick_id}:{semantic_job_id}",
+                    attempt=1,
+                    generation_id=binding.generation_id,
+                    tick_id=tick_id,
+                ),
+                lookup=lookup,
             )
         adapter._module_invocations += 1
         context = ProactiveModuleContext(
             snapshot_id=self._runtime.snapshot_id,
             generation_id=binding.generation_id,
             slot=binding.descriptor.slot,
-            domain_effects=(
-                adapter._domain_effects
-                if binding.definition.domain_effect is not None
-                else None
-            ),
+            domain_effects=effects,
         )
-        result = await self._materialized.handler(context, frame)
-        if result is None:
-            return frame
-        if not isinstance(result, ProactiveFrame):
-            raise TypeError("Proactive module handler 必须返回 ProactiveFrame 或 None")
-        return result
+        try:
+            result = await self._materialized.handler(context, frame)
+            if result is None:
+                return frame
+            if not isinstance(result, ProactiveFrame):
+                raise TypeError("Proactive module handler 必须返回 ProactiveFrame 或 None")
+            return result
+        finally:
+            if effects is not None:
+                effects.close()
 
     run = transform
 
@@ -322,11 +345,8 @@ class ProactiveActivityAdapter:
 
     name = "proactive_components"
 
-    def __init__(
-        self, mcp_route: object | None = None, *, domain_effects: object | None = None
-    ):
+    def __init__(self, mcp_route: object | None = None):
         self._mcp_route = mcp_route
-        self._domain_effects = domain_effects
         self._plans: dict[str, ProactiveActivityPlan] = {}
         self._bindings: dict[str, ProactiveRuntimeBinding] = {}
         self._active: ProactiveRuntimeBinding | None = None
@@ -473,7 +493,27 @@ class ProactiveActivityAdapter:
                     generation.instance,
                     binding.definition,
                 )
-                resolved.append(_MaterializedModule(binding=binding, handler=handler))
+                lookup = None
+                if binding.definition.domain_effect is not None:
+                    if (
+                        binding.descriptor.domain_effect_lookup_export
+                        != binding.definition.domain_effect_lookup_export
+                    ):
+                        raise RuntimeError(
+                            "Proactive module descriptor/lookup export 不一致: "
+                            f"{binding.owner}:{binding.descriptor.slot}"
+                        )
+                    lookup = self._resolve_domain_lookup(
+                        generation.instance,
+                        binding.definition.domain_effect_lookup_export,
+                    )
+                resolved.append(
+                    _MaterializedModule(
+                        binding=binding,
+                        handler=handler,
+                        domain_effect_lookup=lookup,
+                    )
+                )
             runtime = ProactiveRuntimeBinding(
                 transaction_id=transaction_id,
                 snapshot_id=plan.snapshot_id,
@@ -679,6 +719,50 @@ class ProactiveActivityAdapter:
                 [ProactiveModuleContext, ProactiveFrame],
                 Awaitable[ProactiveModuleOutcome | None],
             ],
+            value,
+        )
+
+    def _resolve_domain_lookup(
+        self,
+        instance: object,
+        lookup_export: str | None,
+    ) -> Callable[[DomainEffectContext], object | Awaitable[object]]:
+        """Resolve one exact synchronous domain receipt lookup export."""
+
+        if lookup_export is None:
+            raise RuntimeError("Proactive module domain effect 缺少 lookup export")
+        if not isinstance(instance, ComposablePlugin):
+            raise RuntimeError("Proactive module owner 不是 ComposablePlugin")
+        value: object = instance.module
+        for segment in lookup_export.replace(":", ".").split("."):
+            if not segment:
+                raise RuntimeError(
+                    f"Proactive module domain_effect_lookup_export 无效: {lookup_export}"
+                )
+            try:
+                value = getattr(value, segment)
+            except AttributeError as error:
+                raise RuntimeError(
+                    "Proactive module domain lookup export 不存在: "
+                    f"{instance.name}:{lookup_export}"
+                ) from error
+        if not callable(value):
+            raise TypeError("Proactive module domain lookup export 必须是 callable")
+        if inspect.iscoroutinefunction(value):
+            raise TypeError("Proactive module domain lookup export 必须是同步 callable")
+        signature = inspect.signature(value)
+        try:
+            signature.bind(None)
+        except TypeError as error:
+            raise TypeError(
+                "Proactive module domain lookup export 必须精确接受一个 context"
+            ) from error
+        if len(signature.parameters) != 1:
+            raise TypeError(
+                "Proactive module domain lookup export 必须精确接受一个 context"
+            )
+        return cast(
+            Callable[[DomainEffectContext], object | Awaitable[object]],
             value,
         )
 
@@ -905,6 +989,22 @@ def _require_transaction_id(value: object) -> None:
         raise ValueError("transaction_id 必须是非空且无首尾空白的字符串")
 
 
+def _proactive_tick_id(frame: ProactiveFrame) -> str:
+    """Derive the stable tick identity shared by one frame retry."""
+
+    session_key = frame.input.session_key
+    started_at = frame.input.started_at
+    if not isinstance(session_key, str) or not session_key.strip():
+        raise TypeError("Proactive tick session_key 必须是非空字符串")
+    if (
+        not isinstance(started_at, datetime)
+        or started_at.tzinfo is None
+        or started_at.utcoffset() is None
+    ):
+        raise TypeError("Proactive tick started_at 必须是 timezone-aware datetime")
+    return f"{session_key}:{started_at.isoformat()}"
+
+
 def _error_text(error: BaseException) -> str:
     message = str(error).strip()
     return f"{type(error).__name__}: {message}" if message else type(error).__name__
@@ -912,6 +1012,8 @@ def _error_text(error: BaseException) -> str:
 
 __all__ = [
     "GenerationProactiveHost",
+    "DomainEffectContext",
+    "ProactiveDomainEffects",
     "ProactiveActivityPlan",
     "ProactiveActivityAdapter",
     "ProactiveMcpRoute",

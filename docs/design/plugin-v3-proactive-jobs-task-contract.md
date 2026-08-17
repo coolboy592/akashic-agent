@@ -94,13 +94,17 @@ ProactiveModuleDefinition(
     ),
     collects=(),
     handler_export="run_daynight_gate",
+    domain_effect="emotion.state",  # 仅需领域写入的 module
+    domain_effect_lookup_export="lookup_emotion_domain_effect_v3",
 )
 ```
 
 - 保留现有 `lifecycle_id/slot/requires/produces/collects` DAG 语义以保证 Daynight/Emotion 行为等价；
   `lifecycle_id` 只能引用 Core 已注册 proactive frame lifecycle，不能提供任意 callable/runtime factory。Core 编译依赖和
-  duplicate producer；descriptor 只保存 `handler_export`，candidate/formal 从 exact Root 各自绑定 handler，callable 不进 hash。
-- descriptor 进入 snapshot identity；candidate/formal handler 分别来自各自 Root，candidate 不执行。
+  duplicate producer；descriptor 只保存 `handler_export` 与可选的 exact `domain_effect_lookup_export`，candidate/formal 从
+  exact Root 各自绑定 handler/lookup，callable 不进 hash。
+- descriptor 进入 snapshot identity；candidate/formal handler 与 lookup 分别来自各自 Root，candidate 不执行任何 handler、lookup
+  或 transaction。
 - module handler 默认只修改本次 `ProactiveFrame` 投影，不持有 Session repository、push tool 或任意 MCP client。
   需要领域状态写入的首个例外是 Emotion：descriptor 显式声明 `domain_effect="emotion.state"`，handler 只能把
   transaction closure 交给 invocation-scoped `ProactiveDomainEffects.run()`；Core 等待该 effect terminal 并记录
@@ -122,7 +126,11 @@ BackgroundJobDefinition(
 )
 ```
 
-`ProactiveModuleContext` 提供 invocation-scoped `domain_effects`，不是 Root/public ServiceKey：
+`ProactiveModuleContext` 提供 invocation-scoped `domain_effects`，不是 Root/public ServiceKey。每次 formal module tick 都由 Core
+按 exact `snapshot_id + generation_id + module slot + tick_id` 新建 `DomainEffectContext` 与 `ProactiveDomainEffects`；
+`invocation_id` 与 `idempotency_key` 使用 `semantic module id + tick_id`，从而同一 tick 在 Core 进程崩溃后可重入而不重复
+plugin transaction。lookup export 只在 formal invocation 的 `run()` 中调用，且必须返回该 invocation 的 durable committed receipt；
+普通失败、取消和 handler cleanup 都关闭该 view。bootstrap 不向 adapter 注入共享 effects singleton。
 
 ```python
 class ProactiveDomainEffects(Protocol):
@@ -173,7 +181,7 @@ terminal receipt 并删除 staging bytes；若目标已经偏移则 fail-loud，
 正常提交在同一个 Core pair lock 下、第一次 replace 前重新读取两份目标：必须逐字节等于 intent 的 old bytes/absent marker，
 任一偏移即进入 degraded，保留 DB receipt 与 intent，且不写正文。
 
-只有 descriptor 声明的 `domain_effect` 能调用 `run()`；只有 Core allowlist 的 Emotion merge job 得到 documents port，
+只有 descriptor 同时声明 `domain_effect` 与 `domain_effect_lookup_export` 的 module 能调用 `run()`；只有 Core allowlist 的 Emotion merge job 得到 documents port，
 其他插件为 `None`。Core 只拥有 effect terminal/journal 与两份文档原子恢复，不理解 Emotion DB/schema/content。
 
 - 第一版 triggers 只支持正整数 interval 与 `CoreEvent` typed enum。plugin-defined event class/字符串不作为跨 clone
@@ -254,7 +262,7 @@ legacy `DriftFinished`。
 3. candidate catalog 不进入 active proactive loop/job runtime；discard 后 handler、subscription、timer、task 引用归零。
 4. snapshot identity 分别拼入两个 canonical digest：source descriptor 固定
    `owner/name/channels/mcp_server/fetch_tool/ack_tool/fetch_page_size`；module 固定
-   `owner/lifecycle_id/slot/requires/produces/collects/handler_export/domain_effect`；job 固定
+   `owner/lifecycle_id/slot/requires/produces/collects/handler_export/domain_effect/domain_effect_lookup_export`；job 固定
    `owner/name/triggers/debounce/coalesce/handler_export/retry_policy/documents_scope/model_role`。tuple 按 owner/name/slot
    排序，enum/trigger 用 canonical value；handler callable、Fiber/token/Health/Root 临时身份不进 hash。
 5. snapshot compiler 计算 `activity_changed`，覆盖上述 descriptor digest 与 exact handler binding revision。任何
@@ -317,6 +325,8 @@ legacy `DriftFinished`。
 - job：event/interval、跨 generation 同名 job、debounce/coalesce、queue、Fiber token/Health、exact lease、invocation LLM
   token、provider 阻塞 cancel/drain、handler 返回后 child LLM 拒绝、单一 failure Incident、restart；
 - proactive：fixed clock + recording MCP/sink，覆盖 empty/skip/fetch failure/model failure/delivery/ack failure；
+- proactive domain effect：Manager → ActivityHost formal tick 覆盖成功、普通 transaction failure、caller cancellation 后 view 清理、
+  plugin receipt 已提交而 Core 进程崩溃后的同 tick lookup/re-entry；candidate module invocation、lookup 和 transaction 均为 0；
 - event：dedupe key 固定为 `event_id + semantic job id`，不含 generation/token；第一次 admission 把 exact binding 写入
   JobOutcomeLedger。事件投递、promotion、worker restart 任意交错，同一 key 最多一次 LLM merge；后续 generation 不得
   重跑，除非原 ledger 明确 retry_pending 且仍可恢复 exact 原 binding。不同 skill/status 保持旧过滤行为；
