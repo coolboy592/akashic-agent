@@ -15,8 +15,8 @@ class InteractionUndoResult:
     message_ids: tuple[str, ...]
     backup_path: str
     reconciliation_pending: bool
-    old_last_consolidated: int = 0
-    new_last_consolidated: int = 0
+    old_last_consolidated: int
+    new_last_consolidated: int
 
 
 UndoLatest = Callable[[str], Awaitable[InteractionUndoResult | None]]
