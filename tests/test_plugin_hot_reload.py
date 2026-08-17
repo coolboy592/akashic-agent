@@ -56,12 +56,8 @@ from bus.events_lifecycle import TurnCommitted
 
 @pytest.fixture(autouse=True)
 def _clean_registry():
-    plugin_registry._handlers._handlers.clear()
-    plugin_registry._classes.clear()
     plugin_registry._instances.clear()
     yield
-    plugin_registry._handlers._handlers.clear()
-    plugin_registry._classes.clear()
     plugin_registry._instances.clear()
 
 
