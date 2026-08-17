@@ -112,17 +112,17 @@ Gate 报告。分支名、PR 号和浮动 ref 不能代替 commit。
 | ID | 能力 owner | 状态 | 验收 oracle | 首个真实 consumer |
 |---|---|---|---|---|
 | C11 | committed channel command catalog | `CANDIDATE` | command/provisional 独立复核 25 tests、累计 command/kernel/loader/Manager/hot-reload 339 tests、Basedpyright/compileall/diff-check 已通过；Terra xhigh review 无 P0/P1，待 Status Commands 首个 consumer Gate | Status Commands |
-| C12 | scoped MCP capability | `CANDIDATE` | `8653bab0` 已接入 Root-local declaration、candidate/formal MCP catalog fence、exact snapshot route、跨 boot durable recovery；C12/C13/Journal focused 44、Manager 63、Hot Reload 147、loader 59、Basedpyright/compileall/diff-check 通过，Terra xhigh 无 P0/P1；待 Calendar exact artifact Gate | Calendar MCP |
-| C13 | managed process capability | `CANDIDATE` | `8653bab0` 已接入 generation-scoped start/readiness/port/log、sibling drain、retained tombstone 与不可取消 recovery；与 C12 共用上述 313 个回归及真实 watchdog/cleanup probes，待 Calendar exact artifact Gate | Calendar MCP |
+| C12 | scoped MCP capability | `CANDIDATE` | `8653bab0` 已接入 Root-local declaration、candidate/formal MCP catalog fence、exact snapshot route、跨 boot durable recovery；Calendar `654d078d` 的真实 Manager Gate 完成 stdio handshake、完整 14-tool catalog 与零 CallTool/Google 调用，24 个插件/迁移/Host tests、Pyright 0、独立 review 无 P0/P1；待最终 E2 exact lock | Calendar MCP |
+| C13 | managed process capability | `CANDIDATE` | `8653bab0` 已接入 generation-scoped start/readiness/port/log、sibling drain、retained tombstone 与不可取消 recovery；Calendar `654d078d` 的正式 `calendar_api` readiness `/health=200`，terminate 后端口、进程、task、Root Effect/listener 全零；待最终 E2 process 族 Gate | Calendar MCP |
 | C14 | inbound/outbound channel capability | `CANDIDATE` | `5e58d38d` 已在 `fc1a2a76` 基础上补齐 exact-binding control、typed turn presentation、EventBus owner-task bridge、provider identity 与同步 snapshot claim；provisional pause/drain 真实 Store oracle、Channel/Bus/Manager 相关 88～116 tests、Pyright 0，独立复核无 P0/P1。待 Feishu/QQ v3 adapter、Core built-in transition 与 E3 才进入 `READY` | Feishu / QQBot |
-| C15 | timer / proactive source / turn enqueue capability | `OPEN` | skip/failure 可区分、timer 回收、turn owner、无候选发送 | Calendar MCP |
+| C15 | timer / proactive source / turn enqueue capability | `CANDIDATE` | `25a2ec81` + Calendar `654d078d` 已证明 exact committed source/MCP binding、candidate recording 零 OAuth/远端/ack、empty/items/failure/committed 可区分、ActivityHost cleanup 全零；v2→v3 数据由独占锁、源保留、SQLite integrity 与可恢复 receipt 明确迁移。待 Feed/Fitbit/Steam sources 与最终 fixed-clock E3 | Calendar MCP |
 | C16 | v3 admission/lifecycle 收口 | `CANDIDATE` | `4ba266ad` 已通过独立 review；non-callable listener、spawn coroutine、apply signature、wrong-task lifecycle 全部 fail-loud，malformed admission 零 data-dir 写入 | Core |
 | C17 | mobile UI/query capability | `CANDIDATE` | `2c6e4f71` + `b173f551` 已通过独立 review；activation token、strict JSON、candidate 不发布与 exact lease 已由 372 个集成回归、Basedpyright/compileall/diff-check 验证，待 Akasha/Observe 迁移后进入 E1/E4 | Akasha / Observe |
 | C18 | Core-private v3 generation metadata | `CANDIDATE` | `2d9fb408` 已通过独立 review；v3 stable load、candidate clone 与 formal rebuild 不再构造或读取 `PluginContext`，59 loader + 208 Manager/hot-reload 回归通过 | Core |
 | C19 | full-fleet Health/Incident/Topology inspection | `CANDIDATE` | stable lease 按插件投影 current Fiber/Health、累计与 bounded Incident、Topology；mixed active/inactive v3 + v2 inspection 与 kernel/protocol 回归通过，独立 review 的 inactive projection P1 已关闭 | 全量 runtime |
 | C20 | Proactive 私有兼容岛 | `OPEN` | Core-private registry 只接收六个内建 module identity；外部 v2 manifest/import/discovery fail-loud | Default/Wake Proactive |
 | C21 | generation-scoped background job / LLM capability | `CANDIDATE` | Core `de08b698` + `467a4c93` 已完成 committed catalog、trigger/interval、exact LLM lease、cancel/drain、Emotion domain receipt 与 paired-document recovery；105 个 job/documents/ledger/activity/snapshot 回归、BasedPyright/compileall/diff-check、独立只读复审无 P0/P1。Emotion `3584b49` 的 candidate apply unit 与临时复制 artifact 的真实 Manager stable load 均未创建 `emotion.db`；formal snapshot 冻结 exact effect/lookup/documents identity，terminate 后 listener/effect 为零。插件其他能力仍待 C09/C15/C17 与 E1/E3 | Emotion |
-| C22 | static v3 artifact manifest / install staging | `CANDIDATE` | 集成 head `3e1f5c10`（独立复审 head `b6967d13`）已在 import 前校验 identity/runtime/validation、custom entrypoint 与 C12/C13 descriptor，不成功 staging 不创建正式 data/artifact/pointer；candidate 缺正式 data 时只建隔离空副本，Python argv 冻结为 exact artifact `.venv`；final focused 42、累计相关回归 440、Basedpyright/compileall/diff-check 通过，Terra xhigh 无 P0/P1。C12b/C13b Host 真消费该 argv 前不宣称 runtime activation 完成 | Calendar MCP / 全部 external v3 |
+| C22 | static v3 artifact manifest / install staging | `CANDIDATE` | 集成 head `3e1f5c10`（独立复审 head `b6967d13`）已在 import 前校验 identity/runtime/validation、custom entrypoint 与 C12/C13 descriptor，不成功 staging 不创建正式 data/artifact/pointer；Calendar `654d078d` 已由真实 Host 消费 exact staged `.venv/bin/python`，manifest/apply/runtime identity 一致且候选排除 credential/receipt；待全部 external v3 与最终 artifact Gate | Calendar MCP / 全部 external v3 |
 | C23 | Core-owned Channel attachment artifact / Session binding | `CANDIDATE` | `0bd2d928` 已完成 immutable opaque artifact、fixed-ID resumable Mobile import、SessionDB 原子 message binding、exact fd read lease、无自动 GC 与目录/SQLite 可恢复备份；Mobile 114、Bus/lifecycle/Host 124、最终 ownership 聚焦 201 tests、Basedpyright 0，独立 review 无 P0/P1；待 Feishu/QQ 与复制 workspace E3/E4 进入 `READY` | Feishu / QQBot / Core channels |
 
 实现原则：C11～C17、C21～C22 只由表中的首个真实 consumer 拉动，不提前复制
@@ -157,6 +157,7 @@ Gate 报告。分支名、PR 号和浮动 ref 不能代替 commit。
 | Shell Safety | `tool.execution.authorize` | `CANDIDATE` | E2 |
 | Tool Loop Guard | typed authorization、per-generation state | `CANDIDATE` | E2 |
 | Default Memory | static Memory capability、result observer、Dashboard | `CANDIDATE` | E1 |
+| Calendar MCP | MCP、managed process、proactive source | `CANDIDATE` | E2/E3 |
 
 ### 4.2 待迁移 external plugins
 
@@ -169,7 +170,6 @@ Gate 报告。分支名、PR 号和浮动 ref 不能代替 commit。
 | Observe | Dashboard、mobile、committed event observers | C02/C17 | `OPEN` | E1 |
 | Setup Helper | lifecycle、command | C02/C11 | `OPEN` | E3 |
 | Status Commands | mobile、command、before-turn | C02/C11/C17 | `OPEN` | E3 |
-| Calendar MCP | MCP、managed process、proactive source | C12/C13/C15 | `OPEN` | E2/E3 |
 | Computer Use Linux | Skill、MCP | C09/C12 | `OPEN` | E2 |
 | Feed MCP | Skill、MCP、proactive source | C09/C12/C15 | `OPEN` | E2/E3 |
 | Feishu | channel | C14 | `OPEN` | E3 |

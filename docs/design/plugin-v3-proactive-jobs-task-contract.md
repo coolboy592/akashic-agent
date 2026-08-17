@@ -1,11 +1,12 @@
 # 插件 v3 Proactive / background job capability 任务合同
 
-- 状态：implemented / C21 candidate；C15 与外部 consumer 迁移继续
+- 状态：implemented / C15、C21 candidate；其余 external consumer 迁移继续
 - 日期：2026-08-16
 - 实现起点：`19f2cca2`（只有 legacy prepared catalogs，C15/C21 public registry 尚未实现）
 - 清单：C15、C21、C20 的前置
 - 首个 consumers：Calendar MCP、Daynight Gate、Emotion
-- 独立评审：十轮 owner、transaction、lease、DB/Markdown crash recovery review 后无 P0/P1
+- 独立评审：C21 十轮 owner、transaction、lease、DB/Markdown crash recovery review 后无 P0/P1；
+  C15 首个 Calendar consumer 的声明、recording、数据迁移和真实 Host Gate 复审后无 P0/P1
 
 ## 1. 目标与拆分
 
