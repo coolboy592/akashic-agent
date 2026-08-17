@@ -624,9 +624,6 @@ class AppRuntime:
                     self.chat_server.serve(),
                     name="chat_server",
                 )
-            # V2_REMOVAL(proactive-capability-v2)：全部 legacy proactive/job consumer 迁入 v3
-            # timer/turn-enqueue capability 或明确删除，并由 full-fleet Gate 覆盖后，删除
-            # proactive_* 固定参数投影。
             proactive_tasks, self.proactive_loop = build_proactive_runtime(
                 self.config,
                 self.workspace,
@@ -637,27 +634,6 @@ class AppRuntime:
                 presence=self.presence,
                 agent_loop=self.agent_loop,
                 event_bus=event_bus,
-                proactive_modules=(
-                    list(plugin_manager.proactive_modules) if plugin_manager else None
-                ),
-                proactive_lifecycles=(
-                    list(plugin_manager.proactive_lifecycles)
-                    if plugin_manager
-                    else None
-                ),
-                proactive_module_factories=(
-                    list(plugin_manager.proactive_module_factories)
-                    if plugin_manager
-                    else None
-                ),
-                proactive_runtime_factories=(
-                    list(plugin_manager.proactive_runtime_factories)
-                    if plugin_manager
-                    else None
-                ),
-                proactive_sources=(
-                    list(plugin_manager.proactive_sources) if plugin_manager else None
-                ),
                 runtime_snapshot_store=(
                     plugin_manager.snapshot_store if plugin_manager else None
                 ),

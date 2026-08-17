@@ -215,7 +215,7 @@ async def test_v3_skip_and_failure_remain_distinct_in_source_aggregation() -> No
     assert store.leases == 0
 
 
-def test_legacy_only_snapshot_does_not_require_active_activity_binding() -> None:
+def test_snapshot_without_private_binding_fails_loud() -> None:
     bridge = CommittedProactiveBridge(ActivityHost(()))
     loop = object.__new__(ProactiveLoop)
     loop._proactive_bridge = bridge
@@ -228,7 +228,5 @@ def test_legacy_only_snapshot_does_not_require_active_activity_binding() -> None
         private_proactive_catalog=None,
     )
 
-    loop._apply_snapshot(snapshot)
-
-    assert loop._v3_proactive_runtime is None
-    assert loop._plugin_proactive_sources == []
+    with pytest.raises(RuntimeError, match="Private proactive Activity binding"):
+        loop._apply_snapshot(snapshot)

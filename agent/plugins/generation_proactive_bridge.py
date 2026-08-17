@@ -6,7 +6,7 @@ import asyncio
 from collections.abc import Mapping
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from agent.plugin_composition.proactive import (
     AckCommitted,
@@ -31,6 +31,9 @@ from proactive_v2.mcp_sources import (
     SourceFetchFailed,
     SourceFetchSkipped,
 )
+
+if TYPE_CHECKING:
+    from agent.plugins.generation_private_proactive_host import PrivateProactiveBinding
 
 
 _V3_SERVER_PREFIX = "__v3_proactive__:"
@@ -63,6 +66,29 @@ class CommittedProactiveBridge:
         if runtime.snapshot is not snapshot:
             raise RuntimeError("Proactive child 没有绑定 exact snapshot")
         return runtime
+
+    def private_binding_for(self, snapshot: object) -> PrivateProactiveBinding:
+        """Resolve the exact Core-private Default/Wake child for one snapshot."""
+
+        from agent.plugins.generation_private_proactive_host import (
+            PrivateProactiveBinding,
+        )
+
+        binding = self._activity_host.active
+        snapshot_id = getattr(snapshot, "snapshot_id", None)
+        if binding is None or binding.snapshot_id != snapshot_id:
+            raise RuntimeError("Private proactive Activity binding 与 snapshot 不匹配")
+        private = binding.child_bindings.get("private_proactive")
+        if not isinstance(private, PrivateProactiveBinding):
+            raise RuntimeError("Activity binding 缺少 private proactive child")
+        if private.snapshot is not snapshot:
+            raise RuntimeError("private proactive child 没有绑定 exact snapshot")
+        catalog = getattr(snapshot, "private_proactive_catalog", None)
+        if private.catalog is not catalog:
+            raise RuntimeError("private proactive child catalog identity 不匹配")
+        if not private.active:
+            raise RuntimeError("private proactive Activity binding 尚未开放")
+        return private
 
     def registered_sources(
         self,

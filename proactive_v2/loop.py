@@ -26,8 +26,6 @@ from agent.looping.ports import SessionServices
 from agent.core.proactive_kernel import ProactiveKernel
 from agent.provider import LLMProvider
 from agent.model_runtime.registry import model_execution_scope
-from agent.plugins.specs import RegisteredProactiveSource
-from agent.tool_hooks import ToolHook
 from agent.tools.message_push import MessagePushTool
 from agent.tools.registry import ToolRegistry
 from agent.turns.outbound import PushToolOutboundPort
@@ -77,12 +75,6 @@ class ProactiveLoop:
         passive_busy_fn: Callable[[str], bool] | None = None,
         shared_tools: ToolRegistry | None = None,
         event_bus: EventBus | None = None,
-        tool_hooks: list[ToolHook] | None = None,
-        proactive_modules: list[object] | None = None,
-        proactive_lifecycles: list[object] | None = None,
-        proactive_module_factories: list[object] | None = None,
-        proactive_runtime_factories: list[object] | None = None,
-        proactive_sources: list[RegisteredProactiveSource] | None = None,
         runtime_snapshot_store: RuntimeSnapshotStore | None = None,
         activity_host: ActivityHost | None = None,
         state_store_owned: bool = False,
@@ -102,12 +94,7 @@ class ProactiveLoop:
         self._passive_busy_fn = passive_busy_fn
         self._shared_tools = shared_tools
         self._event_bus = event_bus
-        self._tool_hooks = tool_hooks or []
-        self._plugin_proactive_modules = proactive_modules or []
-        self._plugin_proactive_lifecycles = proactive_lifecycles or []
-        self._plugin_proactive_module_factories = proactive_module_factories or []
-        self._plugin_proactive_runtime_factories = proactive_runtime_factories or []
-        self._plugin_proactive_sources = proactive_sources or []
+        self._activity_sources: list[Any] = []
         self._runtime_snapshot_store = runtime_snapshot_store
         self._proactive_bridge = None
         self._private_proactive_binding: PrivateProactiveBinding | None = None
@@ -177,24 +164,20 @@ class ProactiveLoop:
             shared_tools=self._shared_tools,
             event_bus=self._event_bus,
             mcp_gateway=self._mcp_gateway,
-            proactive_sources=self._plugin_proactive_sources,
-            tool_hooks=self._tool_hooks,
+            proactive_sources=self._activity_sources,
             schedule_fn=self._scheduler.next_interval,
         )
 
     def _build_plugin_runtime(self) -> object:
-        selected = [
-            factory
-            for factory in self._plugin_proactive_runtime_factories
-            if getattr(factory, "lifecycle_id", None) == self._cfg.lifecycle
-        ]
-        if len(selected) != 1:
-            raise RuntimeError(
-                f"主动 Runtime provider 数量错误: {self._cfg.lifecycle}={len(selected)}"
-            )
-        factory = selected[0]
+        binding = self._require_private_binding()
+        factory = binding.runtime_factory
         if not callable(factory):
-            raise RuntimeError("插件 proactive_runtime_factories 返回了不可调用对象")
+            raise RuntimeError("private proactive runtime factory 不可调用")
+        if getattr(factory, "lifecycle_id", None) != self._cfg.lifecycle:
+            raise RuntimeError(
+                "private proactive runtime factory lifecycle 不匹配: "
+                f"{self._cfg.lifecycle}"
+            )
         return factory(self._build_runtime_scope())
 
     def _build_mcp_gateway(self) -> SharedMcpGateway:
@@ -215,23 +198,23 @@ class ProactiveLoop:
         if bridge is not None and self._v3_proactive_runtime is not None:
             runtime = self._v3_proactive_runtime
             return cast(Any, bridge.gateway(gateway, runtime))
-        return gateway
+        if bridge is None:
+            return gateway
+        raise RuntimeError("主动 runtime 缺少 exact ActivityHost binding")
 
     def _build_kernel(self) -> ProactiveKernel:
         runtime = self._build_plugin_runtime()
-        modules = [
-            *self._plugin_proactive_modules,
-            *self._build_plugin_flow_modules(runtime),
-        ]
+        modules = self._build_plugin_flow_modules(runtime)
         bridge = getattr(self, "_proactive_bridge", None)
-        if bridge is not None and self._v3_proactive_runtime is not None:
-            proactive_runtime = self._v3_proactive_runtime
-            modules.extend(
-                bridge.lifecycle_modules(
-                    proactive_runtime,
-                    lifecycle_id=self._cfg.lifecycle,
-                )
+        proactive_runtime = self._v3_proactive_runtime
+        if bridge is None or proactive_runtime is None:
+            raise RuntimeError("主动 kernel 缺少 exact ActivityHost binding")
+        modules.extend(
+            bridge.lifecycle_modules(
+                proactive_runtime,
+                lifecycle_id=self._cfg.lifecycle,
             )
+        )
         kernel = ProactiveKernel(
             modules,
             initial_slots_fn=self._build_initial_slots,
@@ -244,39 +227,43 @@ class ProactiveLoop:
         self,
         runtime: object,
     ) -> list[object]:
-        if not self._plugin_proactive_module_factories:
-            raise RuntimeError("主动 Lifecycle 缺少 Module provider")
+        binding = self._require_private_binding()
+        if not binding.module_factories:
+            raise RuntimeError("private proactive Lifecycle 缺少 Module provider")
         modules: list[object] = []
         factories = [
             factory
-            for factory in self._plugin_proactive_module_factories
+            for factory in binding.module_factories
             if getattr(factory, "lifecycle_id", None) == self._cfg.lifecycle
         ]
         if not factories:
-            raise RuntimeError(f"主动 Lifecycle 缺少 Module provider: {self._cfg.lifecycle}")
+            raise RuntimeError(
+                f"private proactive Lifecycle 缺少 Module provider: {self._cfg.lifecycle}"
+            )
         for factory in factories:
             if not callable(factory):
-                raise RuntimeError("插件 proactive_module_factories 返回了不可调用对象")
+                raise RuntimeError("private proactive module factory 不可调用")
             provided = factory(runtime)
             if not isinstance(provided, list):
                 raise RuntimeError("主动 Module factory 必须返回 list")
-            modules.extend(provided)
+            modules.extend(cast(list[object], provided))
         return modules
 
     def _select_lifecycle(self) -> ProactiveLifecycleSpec:
-        selected: list[ProactiveLifecycleSpec] = []
-        for candidate in self._plugin_proactive_lifecycles:
-            if not isinstance(candidate, ProactiveLifecycleSpec):
-                raise RuntimeError(
-                    "插件 proactive_lifecycles 返回值不是 ProactiveLifecycleSpec"
-                )
-            if candidate.id == self._cfg.lifecycle:
-                selected.append(candidate)
-        if len(selected) > 1:
-            raise RuntimeError(f"主动 Lifecycle provider 冲突: {self._cfg.lifecycle}")
-        if selected:
-            return selected[0]
-        raise RuntimeError(f"主动 Lifecycle 不存在: {self._cfg.lifecycle}")
+        lifecycle = self._require_private_binding().lifecycle
+        if not isinstance(lifecycle, ProactiveLifecycleSpec):
+            raise RuntimeError("private proactive lifecycle 不是 ProactiveLifecycleSpec")
+        if lifecycle.id != self._cfg.lifecycle:
+            raise RuntimeError(
+                f"private proactive Lifecycle 不匹配: {self._cfg.lifecycle}"
+            )
+        return lifecycle
+
+    def _require_private_binding(self) -> PrivateProactiveBinding:
+        binding = self._private_proactive_binding
+        if binding is None or not binding.active:
+            raise RuntimeError("主动 runtime 缺少 active private proactive binding")
+        return binding
 
     def _build_initial_slots(self, session_key: str) -> dict[str, Any]:
         last_user_at = (
@@ -310,8 +297,7 @@ class ProactiveLoop:
             trace_fn=self._trace_proactive_rate_decision,
         )
         if self._runtime_snapshot_store is None:
-            self._mcp_gateway = self._build_mcp_gateway()
-            self._proactive_kernel = self._build_kernel()
+            raise RuntimeError("主动 runtime 必须绑定 RuntimeSnapshotStore")
         # 4. 启动时把当前 proactive 配置落一份 trace，方便回看。
         self._trace_proactive_config_snapshot()
 
@@ -672,72 +658,13 @@ class ProactiveLoop:
             reset_runtime_snapshot(token)
 
     def _apply_snapshot(self, snapshot: RuntimeSnapshot) -> None:
-        private_binding = self._private_binding_for(snapshot)
-        self._private_proactive_binding = private_binding
-        if private_binding is not None:
-            # Private C20 binding is the sole runtime/factory/lifecycle owner.  The
-            # legacy snapshot lists remain only for the migration path without C20.
-            assert private_binding.lifecycle is not None
-            assert private_binding.runtime_factory is not None
-            self._plugin_proactive_modules = []
-            self._plugin_proactive_lifecycles = [private_binding.lifecycle]
-            self._plugin_proactive_module_factories = list(
-                private_binding.module_factories
-            )
-            self._plugin_proactive_runtime_factories = [
-                private_binding.runtime_factory
-            ]
-            self._plugin_proactive_sources = list(snapshot.proactive_sources.values())
-        else:
-            self._plugin_proactive_modules = list(snapshot.proactive_modules)
-            self._plugin_proactive_lifecycles = list(snapshot.proactive_lifecycles)
-            self._plugin_proactive_module_factories = list(
-                snapshot.proactive_module_factories
-            )
-            self._plugin_proactive_runtime_factories = list(
-                snapshot.proactive_runtime_factories
-            )
-            self._plugin_proactive_sources = list(snapshot.proactive_sources.values())
-        bridge = getattr(self, "_proactive_bridge", None)
-        if bridge is not None:
-            activity = bridge.activity_host.active
-            if activity is None:
-                self._v3_proactive_runtime = None
-            else:
-                runtime = bridge.runtime_for(snapshot)
-                self._v3_proactive_runtime = runtime
-                self._plugin_proactive_sources.extend(
-                    bridge.registered_sources(runtime)
-                )
-
-    def _private_binding_for(
-        self,
-        snapshot: RuntimeSnapshot,
-    ) -> PrivateProactiveBinding | None:
-        """Resolve the exact private child without consulting Manager lists."""
-
-        if snapshot.private_proactive_catalog is None:
-            return None
         bridge = getattr(self, "_proactive_bridge", None)
         if bridge is None:
-            raise RuntimeError("private proactive snapshot 缺少 ActivityHost")
-        activity = bridge.activity_host.active
-        if activity is None or activity.snapshot_id != snapshot.snapshot_id:
-            raise RuntimeError("private proactive Activity binding 与 snapshot 不匹配")
-        binding = activity.child_bindings.get("private_proactive")
-        from agent.plugins.generation_private_proactive_host import (
-            PrivateProactiveBinding as Binding,
-        )
-
-        if not isinstance(binding, Binding):
-            raise RuntimeError("Activity binding 缺少 private proactive child")
-        if binding.catalog is not snapshot.private_proactive_catalog:
-            raise RuntimeError("private proactive binding catalog identity 不匹配")
-        if binding.snapshot is not snapshot:
-            raise RuntimeError("private proactive binding snapshot identity 不匹配")
-        if binding.family is None or not binding.active:
-            raise RuntimeError("private proactive binding 尚未开放")
-        return binding
+            raise RuntimeError("主动 runtime 缺少 exact ActivityHost")
+        self._private_proactive_binding = bridge.private_binding_for(snapshot)
+        runtime = bridge.runtime_for(snapshot)
+        self._v3_proactive_runtime = runtime
+        self._activity_sources = bridge.registered_sources(runtime)
 
 
 def build_proactive_loop(**kwargs: Any) -> ProactiveLoop:
