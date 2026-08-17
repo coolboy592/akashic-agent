@@ -78,8 +78,6 @@ _PERSISTED_USER_SLOT = "reasoning:persisted_user"
 _PERSISTED_ASSISTANT_SLOT = "reasoning:persisted_assistant"
 _SEALED_ASSISTANT_METADATA_SLOT = "reasoning:assistant_metadata"
 _PENDING_SESSION_METADATA_SLOT = "reasoning:session_metadata"
-_PERSIST_USER_PREFIX = "persist:user:"
-_PERSIST_ASSISTANT_PREFIX = "persist:assistant:"
 _OUTBOUND_METADATA_PREFIX = "outbound:metadata:"
 _OUTBOUND_MEDIA_PREFIX = "outbound:media:"
 _ASSISTANT_FIXED_FIELDS = {
@@ -240,7 +238,7 @@ class _PersistUserMessageModule:
         llm_context_frame = ctx.context_retry.get("llm_context_frame")
         if isinstance(llm_context_frame, str) and llm_context_frame.strip():
             user_kwargs["llm_context_frame"] = llm_context_frame
-        shared_user_kwargs = _collect_persist_user_metadata(ctx, frame.slots)
+        shared_user_kwargs = _collect_persist_user_metadata(ctx)
         control_turn_id = str(msg.metadata.get("control_turn_id") or "")
         persisted_users: list[dict[str, Any]] = []
         for index, turn_input in enumerate(_turn_user_inputs(msg)):
@@ -568,7 +566,7 @@ class _SealAssistantMetadataModule:
     async def run(self, frame: AfterReasoningFrame) -> AfterReasoningFrame:
         ctx = cast(AfterReasoningCtx, frame.slots[_CTX_SLOT])
         frame.slots[_SEALED_ASSISTANT_METADATA_SLOT] = (
-            _collect_persist_assistant_metadata(ctx, frame.slots)
+            _collect_persist_assistant_metadata(ctx)
         )
         return frame
 
@@ -592,76 +590,29 @@ def _pending_message(
     return message
 
 
-def _collect_persist_assistant_slots(slots: dict[str, object]) -> dict[str, object]:
-    # V2_REMOVAL(assistant-metadata-slots)：所有 phase 插件迁到
-    # AfterReasoningCtx.persist_assistant_metadata 后删除 legacy slot 收集。
-    forbidden = {
-        key.removeprefix(_PERSIST_ASSISTANT_PREFIX)
-        for key in slots
-        if key.startswith(_PERSIST_ASSISTANT_PREFIX)
-        and key.removeprefix(_PERSIST_ASSISTANT_PREFIX)
-        in _ASSISTANT_FORBIDDEN_PLUGIN_FIELDS
-    }
-    if forbidden:
-        fields = ", ".join(sorted(forbidden))
-        raise ValueError(f"legacy assistant plugin metadata 字段不可写: {fields}")
-    return collect_prefixed_slots(
-        slots,
-        _PERSIST_ASSISTANT_PREFIX,
-    )
-
-
 def _collect_persist_assistant_metadata(
     ctx: AfterReasoningCtx,
-    slots: dict[str, object],
 ) -> dict[str, object]:
-    """合并 v3 metadata 与 legacy slot，并拒绝所有字段所有权冲突。"""
+    """校验并冻结 v3 assistant metadata。"""
 
-    # 1. 固定字段与退役字段只由 Core 拥有。
     metadata = dict(ctx.persist_assistant_metadata)
     forbidden = set(metadata) & _ASSISTANT_FORBIDDEN_PLUGIN_FIELDS
     if forbidden:
         fields = ", ".join(sorted(forbidden))
         raise ValueError(f"assistant plugin metadata 字段不可写: {fields}")
-
-    # 2. 迁移期间两套插件出口不能静默覆盖同一事实。
-    legacy = _collect_persist_assistant_slots(slots)
-    duplicated = set(metadata) & set(legacy)
-    if duplicated:
-        fields = ", ".join(sorted(duplicated))
-        raise ValueError(f"assistant plugin metadata 字段重复: {fields}")
-    metadata.update(legacy)
     return metadata
-
-
-def _collect_persist_user_slots(slots: dict[str, object]) -> dict[str, object]:
-    return collect_prefixed_slots(
-        slots,
-        _PERSIST_USER_PREFIX,
-        reserved=_USER_FIXED_FIELDS,
-    )
 
 
 def _collect_persist_user_metadata(
     ctx: AfterReasoningCtx,
-    slots: dict[str, object],
 ) -> dict[str, object]:
-    """Merge v3 user metadata with legacy slots before pending rows are built."""
+    """校验并冻结 v3 user metadata。"""
 
-    # 1. Message identity and Core persistence fields are not plugin-owned.
     metadata = dict(ctx.persist_user_metadata)
     forbidden = set(metadata) & _USER_CORE_METADATA_FIELDS
     if forbidden:
         fields = ", ".join(sorted(forbidden))
         raise ValueError(f"user plugin metadata 字段不可写: {fields}")
-
-    # 2. During migration, a v3 value cannot silently replace a legacy slot.
-    legacy = _collect_persist_user_slots(slots)
-    duplicated = set(metadata) & set(legacy)
-    if duplicated:
-        fields = ", ".join(sorted(duplicated))
-        raise ValueError(f"user plugin metadata 字段重复: {fields}")
-    metadata.update(legacy)
     return metadata
 
 

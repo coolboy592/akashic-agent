@@ -1551,7 +1551,7 @@ async def test_after_step_collects_telemetry_slots_before_fanout():
 
 
 @pytest.mark.asyncio
-async def test_after_reasoning_collects_persist_and_outbound_slots():
+async def test_after_reasoning_collects_v3_metadata_and_outbound_slots():
     class SlotModule:
         slot = "test.after_reasoning.slot"
         requires = ("after_reasoning.emit", "reasoning:ctx")
@@ -1562,8 +1562,6 @@ async def test_after_reasoning_collects_persist_and_outbound_slots():
                 "target_message_ids": ["message-1"]
             }
             ctx.persist_assistant_metadata["citation_ids"] = ["mem_1"]
-            frame.slots["persist:user:user_flag"] = "u"
-            frame.slots["persist:assistant:assistant_flag"] = "a"
             frame.slots["outbound:metadata:plugin_flag"] = "m"
             frame.slots["outbound:media:image"] = ["/tmp/a.png", None, 1]
             return frame
@@ -1608,12 +1606,10 @@ async def test_after_reasoning_collects_persist_and_outbound_slots():
 
     result = await phase.run(AfterReasoningInput(state=state, turn_result=turn_result))
 
-    assert session.messages[0]["user_flag"] == "u"
     assert session.messages[0]["akasha_reinforce"] == {
         "target_message_ids": ["message-1"]
     }
     assert session.messages[0]["client_message_id"] == "01ARZ3NDEKTSV4RRFFQ69G5FAV"
-    assert session.messages[1]["assistant_flag"] == "a"
     assert session.messages[1]["citation_ids"] == ["mem_1"]
     assert session.messages[1]["media"] == ["/tmp/from-turn.png", "/tmp/a.png"]
     assert result.outbound.metadata["before_turn_flag"] == "bt"
@@ -1642,7 +1638,7 @@ def test_after_reasoning_rejects_fixed_assistant_metadata_field() -> None:
     ctx.persist_assistant_metadata["tools_used"] = ["spoof"]
 
     with pytest.raises(ValueError, match="metadata 字段不可写: tools_used"):
-        _ = _collect_persist_assistant_metadata(ctx, {})
+        _ = _collect_persist_assistant_metadata(ctx)
 
 
 def test_after_reasoning_rejects_core_owned_user_metadata_field() -> None:
@@ -1650,29 +1646,7 @@ def test_after_reasoning_rejects_core_owned_user_metadata_field() -> None:
     ctx.persist_user_metadata["control_turn_id"] = "spoof"
 
     with pytest.raises(ValueError, match="user plugin metadata 字段不可写"):
-        _ = _collect_persist_user_metadata(ctx, {})
-
-
-def test_after_reasoning_rejects_v3_and_legacy_user_metadata_collision() -> None:
-    ctx = _assistant_metadata_ctx()
-    ctx.persist_user_metadata["akasha_reinforce"] = {"source": "v3"}
-
-    with pytest.raises(ValueError, match="user plugin metadata 字段重复"):
-        _ = _collect_persist_user_metadata(
-            ctx,
-            {"persist:user:akasha_reinforce": {"source": "v2"}},
-        )
-
-
-def test_after_reasoning_rejects_v3_and_legacy_metadata_collision() -> None:
-    ctx = _assistant_metadata_ctx()
-    ctx.persist_assistant_metadata["cited_memory_ids"] = ["v3"]
-
-    with pytest.raises(ValueError, match="metadata 字段重复: cited_memory_ids"):
-        _ = _collect_persist_assistant_metadata(
-            ctx,
-            {"persist:assistant:cited_memory_ids": ["v2"]},
-        )
+        _ = _collect_persist_user_metadata(ctx)
 
 
 @pytest.mark.parametrize(
@@ -1690,124 +1664,7 @@ def test_after_reasoning_rejects_core_owned_assistant_metadata(field: str) -> No
     ctx.persist_assistant_metadata[field] = "spoof"
 
     with pytest.raises(ValueError, match=f"metadata 字段不可写: {field}"):
-        _ = _collect_persist_assistant_metadata(ctx, {})
-
-
-@pytest.mark.parametrize(
-    "field",
-    [
-        "tools_used",
-        "role",
-        "control_turn_id",
-        "skip_post_memory",
-        "react_compaction",
-    ],
-)
-def test_after_reasoning_rejects_legacy_core_owned_assistant_metadata(
-    field: str,
-) -> None:
-    ctx = _assistant_metadata_ctx()
-
-    with pytest.raises(
-        ValueError,
-        match=f"legacy assistant plugin metadata 字段不可写: {field}",
-    ):
-        _ = _collect_persist_assistant_metadata(
-            ctx,
-            {f"persist:assistant:{field}": "spoof"},
-        )
-
-
-@pytest.mark.asyncio
-async def test_assistant_metadata_collision_precedes_session_mutation(
-    tmp_path: Path,
-) -> None:
-    class ConflictingMetadataModule:
-        slot = "test.after_reasoning.metadata_collision"
-        requires = ("after_reasoning.emit", "reasoning:ctx")
-
-        async def run(self, frame: AfterReasoningFrame) -> AfterReasoningFrame:
-            ctx = cast(AfterReasoningCtx, frame.slots["reasoning:ctx"])
-            ctx.persist_assistant_metadata["cited_memory_ids"] = ["v3"]
-            frame.slots["persist:assistant:cited_memory_ids"] = ["v2"]
-            return frame
-
-    manager = SessionManager(tmp_path / "workspace")
-    session = manager.get_or_create("telegram:metadata-collision")
-    state = TurnState(
-        msg=_inbound(),
-        session_key=session.key,
-        dispatch_outbound=True,
-        session=session,
-    )
-    phase = Phase(
-        default_after_reasoning_modules(
-            EventBus(),
-            cast(Any, SimpleNamespace(presence=None, session_manager=manager)),
-            plugin_modules=[ConflictingMetadataModule()],
-        ),
-        frame_factory=AfterReasoningFrame,
-    )
-
-    with pytest.raises(ValueError, match="metadata 字段重复: cited_memory_ids"):
-        _ = await phase.run(
-            AfterReasoningInput(
-                state=state,
-                turn_result=TurnRunResult(reply="reply"),
-            )
-        )
-
-    assert session.messages == []
-    manager.save(session)
-    manager.close()
-    reloaded = SessionManager(tmp_path / "workspace")
-    assert reloaded.get_or_create(session.key).messages == []
-    reloaded.close()
-
-
-@pytest.mark.asyncio
-async def test_late_legacy_assistant_metadata_writer_is_sealed_before_commit(
-    tmp_path: Path,
-) -> None:
-    class LateMetadataModule:
-        slot = "test.after_reasoning.late_metadata"
-        requires = ("after_reasoning.persist_user", "reasoning:ctx")
-        async def run(self, frame: AfterReasoningFrame) -> AfterReasoningFrame:
-            frame.slots["persist:assistant:cited_memory_ids"] = ["late"]
-            return frame
-
-    manager = SessionManager(tmp_path / "workspace")
-    session = manager.get_or_create("telegram:late-metadata")
-
-    phase = Phase(
-        default_after_reasoning_modules(
-            EventBus(),
-            cast(Any, SimpleNamespace(presence=None, session_manager=manager)),
-            plugin_modules=[LateMetadataModule()],
-        ),
-        frame_factory=AfterReasoningFrame,
-    )
-
-    _ = await phase.run(
-        AfterReasoningInput(
-            state=TurnState(
-                msg=_inbound(),
-                session_key=session.key,
-                dispatch_outbound=True,
-                session=session,
-            ),
-            turn_result=TurnRunResult(reply="reply"),
-        )
-    )
-
-    assert len(session.messages) == 2
-    assert session.messages[1]["cited_memory_ids"] == ["late"]
-    manager.close()
-    reloaded = SessionManager(tmp_path / "workspace")
-    reloaded_messages = reloaded.get_or_create(session.key).messages
-    assert len(reloaded_messages) == 2
-    assert reloaded_messages[1]["cited_memory_ids"] == ["late"]
-    reloaded.close()
+        _ = _collect_persist_assistant_metadata(ctx)
 
 
 @pytest.mark.asyncio
