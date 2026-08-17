@@ -1333,18 +1333,12 @@ class PluginManager:
     def _registry_active(self, module_path: str) -> bool:
         if module_path not in self._active_plugins:
             return False
-        instance = plugin_registry.get_instance(module_path)
-        if instance is None:
-            return True
-        if (
-            isinstance(instance, ComposablePlugin)
-            and self.current_snapshot is not None
-        ):
-            return any(
-                generation.module_path == module_path
-                for generation in self.current_snapshot.active_generations()
-            )
-        return plugin_is_active(instance, plugin_id=module_path)
+        if self.current_snapshot is None:
+            return False
+        return any(
+            generation.module_path == module_path
+            for generation in self.current_snapshot.active_generations()
+        )
 
     def stable_telegram_command_catalog(self) -> tuple[tuple[str, str], ...]:
         """Return discovery commands from the exact committed stable snapshot."""
@@ -1699,7 +1693,6 @@ class PluginManager:
         staged: list[PluginGeneration] = []
         snapshot: RuntimeSnapshot | None = None
         catalog_id: str | None = None
-        published_count = self._legacy_publication_counts()
         try:
             # 1. 只导入、校验并准备声明，不开放任何 stable snapshot。
             for mod in mods:
@@ -1720,8 +1713,7 @@ class PluginManager:
                     mode="formal",
                 )
 
-            # 3. legacy v2 只作为待迁移参与者在事务内 prepare/activate；
-            #    v3 lifecycle 已由完整 CompositionRoot mount。
+            # 3. Root mount 已完成全部 v3 lifecycle，登记待发布 generation。
             await self._activate_stable_batch(staged)
 
             # 4. 全部准备成功后才登记 stable owner，并一次安装快照。
@@ -1734,7 +1726,6 @@ class PluginManager:
                     staged,
                     snapshot=snapshot,
                     catalog_id=catalog_id,
-                    published_count=published_count,
                 )
             )
             if cleanup_cancelled:
@@ -1765,19 +1756,12 @@ class PluginManager:
         self,
         staged: list[PluginGeneration],
     ) -> None:
-        """准备 legacy 参与者，但不发布它们的注册项。"""
+        """Mark every fully mounted v3 generation ready for publication."""
 
         for generation in staged:
-            instance = cast(Any, generation.instance)
             try:
                 await self._prepare_generation(generation)
                 generation.state = "activating"
-                if not isinstance(instance, ComposablePlugin):
-                    instance.context.data_dir = generation.data_dir
-                    instance.context.session_manager = self._session_manager
-                    instance.context.memory_engine = self._memory_engine
-                    instance.context.llm = self._llm
-                    instance.activate()
             except Exception as error:
                 raise _StablePluginFailed(generation, "prepare", error) from error
 
@@ -1790,18 +1774,7 @@ class PluginManager:
         """登记全部 stable owner 并一次安装批次快照。"""
 
         for generation in staged:
-            instance = cast(Any, generation.instance)
             try:
-                self._register_tools(
-                    instance,
-                    generation.module_path,
-                    generation.plugin_id,
-                    [],
-                )
-                self._publish_contributions(generation.contributions)
-                self._channels.extend(generation.contributions.channels)
-                if generation.staged_event_bus is not None:
-                    generation.staged_event_bus.publish()
                 generation.minimum_resource_count = generation.scope.resource_count
                 self._scopes[generation.module_path] = generation.scope
                 self._loaded.add(generation.module_path)
@@ -1810,7 +1783,6 @@ class PluginManager:
                 self._activate_published_generation(generation, None)
             except Exception as error:
                 raise _StablePluginFailed(generation, "publish", error) from error
-        self._commit_stable_kv(staged)
         self._snapshot_skill_catalogs[snapshot.snapshot_id] = catalog_id
         await self._publish_committed_snapshot(snapshot)
         for generation in staged:
@@ -1825,11 +1797,9 @@ class PluginManager:
         *,
         snapshot: RuntimeSnapshot | None,
         catalog_id: str | None,
-        published_count: tuple[int, ...],
     ) -> None:
         """释放只归属于未发布启动批次的全部资源。"""
 
-        self._restore_legacy_publication_counts(published_count)
         pending = self._snapshot_store.pending_transaction
         store_owned_pending = (
             snapshot is not None
@@ -1856,7 +1826,6 @@ class PluginManager:
                 if generation.boot_created_data_dir:
                     _remove_validation_data_dir(generation.data_dir)
                     generation.boot_created_data_dir = False
-        self._rollback_stable_kv(staged)
         if (
             not store_owned_pending
             and snapshot is not None
@@ -1889,77 +1858,6 @@ class PluginManager:
             mod for mod in mods if _resolve_plugin_id(mod) != generation.plugin_id
         )
         await self._load_stable_batch(remaining)
-
-    @staticmethod
-    def _commit_stable_kv(staged: list[PluginGeneration]) -> None:
-        """在快照安装前提交全部已准备的 v2 KV。"""
-
-        from agent.plugins.context import PreparedPluginKVStore
-
-        for generation in staged:
-            if isinstance(generation.instance, ComposablePlugin):
-                continue
-            kv_store = cast(Any, generation.instance).context.kv_store
-            try:
-                if isinstance(kv_store, PreparedPluginKVStore):
-                    kv_store.commit()
-            except Exception as error:
-                raise _StablePluginFailed(generation, "publish", error) from error
-
-    @staticmethod
-    def _rollback_stable_kv(staged: list[PluginGeneration]) -> None:
-        """失败批次全部任务停止后恢复 v2 KV 文件。"""
-
-        from agent.plugins.context import PreparedPluginKVStore
-
-        for generation in reversed(staged):
-            if isinstance(generation.instance, ComposablePlugin):
-                continue
-            kv_store = cast(Any, generation.instance).context.kv_store
-            if isinstance(kv_store, PreparedPluginKVStore):
-                kv_store.rollback_commit()
-
-    def _legacy_publication_counts(self) -> tuple[int, ...]:
-        """记录启动回滚可移除的 v2 发布尾部。"""
-
-        return (
-            len(self._before_turn_modules),
-            len(self._before_reasoning_modules),
-            len(self._prompt_render_modules),
-            len(self._before_step_modules),
-            len(self._after_step_modules),
-            len(self._after_reasoning_modules),
-            len(self._after_turn_modules),
-            len(self._proactive_modules),
-            len(self._proactive_lifecycles),
-            len(self._proactive_module_factories),
-            len(self._proactive_runtime_factories),
-            len(self._proactive_sources),
-            len(self._jobs),
-            len(self._channels),
-        )
-
-    def _restore_legacy_publication_counts(self, counts: tuple[int, ...]) -> None:
-        """只移除失败启动批次发布的 v2 兼容尾部。"""
-
-        collections = (
-            self._before_turn_modules,
-            self._before_reasoning_modules,
-            self._prompt_render_modules,
-            self._before_step_modules,
-            self._after_step_modules,
-            self._after_reasoning_modules,
-            self._after_turn_modules,
-            self._proactive_modules,
-            self._proactive_lifecycles,
-            self._proactive_module_factories,
-            self._proactive_runtime_factories,
-            self._proactive_sources,
-            self._jobs,
-            self._channels,
-        )
-        for collection, count in zip(collections, counts, strict=True):
-            del collection[count:]
 
     @staticmethod
     def _require_unique_recovery_plugins(
@@ -2363,23 +2261,6 @@ class PluginManager:
         self._draining_generations.setdefault(generation.plugin_id, []).append(
             generation
         )
-        if isinstance(generation.instance, ComposablePlugin):
-            return
-        try:
-            cast(Any, generation.instance).retire()
-        except Exception as error:
-            error_text = str(error) or type(error).__name__
-            logger.warning(
-                "插件 retire 失败 (%s): %s",
-                generation.plugin_id,
-                error_text,
-            )
-            self._cleanup_failures.append(
-                CleanupFailure(
-                    resource=f"plugin:{generation.plugin_id}:retire",
-                    error=error_text,
-                )
-            )
 
     def _forget_drained_generation(self, generation: PluginGeneration) -> None:
         tracked = self._draining_generations.get(generation.plugin_id)
@@ -3085,7 +2966,6 @@ class PluginManager:
                 self._active_workspace_mcp,
                 snapshot.plugin_tool_catalog,
             )
-            self._validate_snapshot_command_claims(snapshot)
             return snapshot, catalog_id
         except BaseException:
             self._skill_host.close(catalog_id)
@@ -4727,37 +4607,8 @@ class PluginManager:
     ) -> None:
         if generation.prepare_started:
             return
-        if isinstance(generation.instance, ComposablePlugin):
-            assert generation.runtime_snapshot is not None
-            generation.prepare_started = True
-            generation.minimum_resource_count = generation.scope.resource_count
-            return
-        from agent.plugins.context import PreparedPluginKVStore
-
-        instance = cast(Any, generation.instance)
-        context = instance.context
-        staged_event_bus = ScopedEventBus(
-            self._event_bus,
-            generation.scope,
-            staged=True,
-        )
-        generation.staged_event_bus = staged_event_bus
-        context.event_bus = staged_event_bus
-        context.kv_store = PreparedPluginKVStore(
-            generation.data_dir / ".kv.json",
-            can_write=lambda: _generation_can_write(generation),
-            writer_id=generation.generation_id,
-        )
-        context._can_start_tasks = lambda: generation.state in {
-            "activating",
-            "active",
-            "candidate",
-        }
-        context.scope = generation.scope
         assert generation.runtime_snapshot is not None
-        context.tool_registry = generation.runtime_snapshot.tool_registry
         generation.prepare_started = True
-        await instance.prepare()
         generation.minimum_resource_count = generation.scope.resource_count
 
     async def _post_publish_invariants(
@@ -5166,21 +5017,6 @@ class PluginManager:
         ):
             logger.info("插件已禁用（manifest.toml）: %s", initial_plugin_id)
             return None
-        tool_names: list[str] = []
-        before_turn_count_before = len(self._before_turn_modules)
-        before_reasoning_count_before = len(self._before_reasoning_modules)
-        prompt_render_count_before = len(self._prompt_render_modules)
-        before_step_count_before = len(self._before_step_modules)
-        after_step_count_before = len(self._after_step_modules)
-        after_reasoning_count_before = len(self._after_reasoning_modules)
-        after_turn_count_before = len(self._after_turn_modules)
-        proactive_module_count_before = len(self._proactive_modules)
-        proactive_lifecycle_count_before = len(self._proactive_lifecycles)
-        proactive_factory_count_before = len(self._proactive_module_factories)
-        proactive_runtime_factory_count_before = len(self._proactive_runtime_factories)
-        proactive_source_count_before = len(self._proactive_sources)
-        job_count_before = len(self._jobs)
-        channel_count_before = len(self._channels)
         created_activation_data_dir = False
         self._generation_sequence += 1
         generation_sequence = self._generation_sequence
@@ -5285,8 +5121,7 @@ class PluginManager:
                 error=f"plugin_module: {error_text}",
             )
             raise RuntimeError(error_text)
-        # V2_REMOVAL(static-manifest-admission)：无 manifest 的 plugin.py import
-        # 仅服务迁移期 v2/旧 v3；pure-v3 fleet 必须先完成 import-free admission。
+        # Builtin v3 may omit a manifest; installed artifacts were rejected above.
         try:
             self._import_plugin(mp, Path(module_path))
         except Exception as error:
@@ -5372,8 +5207,8 @@ class PluginManager:
         try:
             if not isinstance(loaded_module, ModuleType):
                 raise RuntimeError("v3 插件模块未保留在 import registry")
-            instance: Any = ComposablePlugin.from_module(loaded_module)
-            config_model = instance.ConfigModel
+            instance = ComposablePlugin.from_module(loaded_module)
+            config_model = cast(type[BaseModel] | None, instance.ConfigModel)
             name = str(instance.name or mod["name"]).strip()
             if not name:
                 raise RuntimeError("插件缺少 name")
@@ -5424,7 +5259,6 @@ class PluginManager:
             ensure_workspace_plugin_data_dir(data_dir, self._workspace)
         scope = PluginScope(plugin_id)
         plugin_registry.register_instance(mp, instance)
-        prepare_started = False
         generation: PluginGeneration | None = None
 
         async def rollback_load(error: str) -> None:
@@ -5440,22 +5274,6 @@ class PluginManager:
                 await self._dispose_unreferenced_composition_root(
                     generation.runtime_snapshot
                 )
-            terminator = getattr(instance, "terminate", None)
-            if prepare_started and callable(terminator):
-                try:
-                    typed_terminator = cast(
-                        Callable[[], Awaitable[None]],
-                        terminator,
-                    )
-                    await typed_terminator()
-                except (asyncio.CancelledError, Exception) as terminate_error:
-                    self._cleanup_failures.append(
-                        CleanupFailure(
-                            resource=f"plugin:{plugin_id}:terminate",
-                            error=str(terminate_error)
-                            or type(terminate_error).__name__,
-                        )
-                    )
             self._cleanup_failures.extend(await scope.aclose())
             if created_activation_data_dir:
                 _remove_validation_data_dir(data_dir)
@@ -5463,30 +5281,10 @@ class PluginManager:
                 _remove_validation_data_dir(generation.data_dir)
                 generation.boot_created_data_dir = False
             self._remove_module_tree(mp)
-            for tool_name in tool_names:
-                if self._tool_registry is not None:
-                    self._tool_registry.unregister(tool_name)
-            del self._before_turn_modules[before_turn_count_before:]
-            del self._before_reasoning_modules[before_reasoning_count_before:]
-            del self._prompt_render_modules[prompt_render_count_before:]
-            del self._before_step_modules[before_step_count_before:]
-            del self._after_step_modules[after_step_count_before:]
-            del self._after_reasoning_modules[after_reasoning_count_before:]
-            del self._after_turn_modules[after_turn_count_before:]
-            del self._proactive_modules[proactive_module_count_before:]
-            del self._proactive_lifecycles[proactive_lifecycle_count_before:]
-            del self._proactive_module_factories[proactive_factory_count_before:]
-            del self._proactive_runtime_factories[
-                proactive_runtime_factory_count_before:
-            ]
-            del self._proactive_sources[proactive_source_count_before:]
-            del self._jobs[job_count_before:]
-            del self._channels[channel_count_before:]
 
         try:
             load_phase = "declarations"
-            if isinstance(instance, ComposablePlugin):
-                instance.bind_static_services(self._composition_service_view())
+            instance.bind_static_services(self._composition_service_view())
             contributions = self._collect_candidate_contributions(
                 instance=instance,
                 plugin_id=plugin_id,
@@ -5512,16 +5310,8 @@ class PluginManager:
                 config_revision=config_revision,
                 plugin_dir=plugin_dir,
                 data_dir=data_dir,
-                config=(
-                    plugin_config
-                    if isinstance(instance, ComposablePlugin)
-                    else None
-                ),
-                config_projection=(
-                    config_projection
-                    if isinstance(instance, ComposablePlugin)
-                    else {}
-                ),
+                config=plugin_config,
+                config_projection=config_projection,
                 instance=instance,
                 scope=scope,
                 contributions=contributions,
@@ -5793,26 +5583,10 @@ class PluginManager:
                 generation,
                 allow_pending_composition=True,
             )
-            from agent.plugins.context import PreparedPluginKVStore
-
             load_phase = "prepare"
-            prepare_started = not isinstance(instance, ComposablePlugin)
             await self._prepare_generation(generation)
             generation.state = "activating"
-            if not isinstance(instance, ComposablePlugin):
-                instance.context.data_dir = data_dir
-                instance.context.session_manager = self._session_manager
-                instance.context.memory_engine = self._memory_engine
-                instance.context.llm = self._llm
-                instance.activate()
-                if isinstance(instance.context.kv_store, PreparedPluginKVStore):
-                    instance.context.kv_store.commit()
             load_phase = "publish"
-            self._register_tools(instance, mp, generation.plugin_id, tool_names)
-            self._publish_contributions(contributions)
-            self._channels.extend(contributions.channels)
-            if generation.staged_event_bus is not None:
-                generation.staged_event_bus.publish()
             generation.minimum_resource_count = scope.resource_count
         except asyncio.CancelledError:
             rollback_task = asyncio.create_task(
@@ -5919,7 +5693,6 @@ class PluginManager:
                 self._active_workspace_mcp,
                 snapshot.plugin_tool_catalog,
             )
-            self._validate_snapshot_command_claims(snapshot)
             return snapshot
         except Exception as error:
             if created_root and composition_root is not None:
@@ -6144,32 +5917,6 @@ class PluginManager:
             raise
         return root, True
 
-    def _validate_snapshot_command_claims(
-        self,
-        snapshot: RuntimeSnapshot,
-    ) -> None:
-        """Validate v2 claims against the frozen v3 command namespace."""
-
-        claims: set[tuple[str, str]] = set()
-        for generation in snapshot.generations.values():
-            if isinstance(generation.instance, ComposablePlugin):
-                continue
-            for getter_name in (
-                "telegram_bot_commands",
-                "mobile_bot_commands",
-            ):
-                getter = getattr(generation.instance, getter_name, None)
-                if getter is None:
-                    continue
-                typed_getter = cast(Callable[[], list[tuple[str, str]]], getter)
-                for command, _description in typed_getter():
-                    claims.add((str(command), generation.plugin_id))
-        if claims:
-            owners = ", ".join(f"{name}:{owner}" for name, owner in sorted(claims))
-            raise RuntimeError(
-                "v2 channel command ABI 已删除，请迁移到 COMMANDS: " + owners
-            )
-
     def _get_composition_memory_runtime(self) -> MemoryRuntimeInfo | None:
         """为本 Manager 构建的全部 Root 冻结同一份 Memory 描述能力。"""
 
@@ -6199,12 +5946,10 @@ class PluginManager:
     ) -> list[PluginGeneration]:
         """用 snapshot 相同的 active 合同过滤静态 catalog。"""
 
-        # V2_REMOVAL(static-active)：v2 删除后不再保留未冻结的 legacy generation。
         return [
             generation
             for generation in generations
-            if not isinstance(generation.instance, ComposablePlugin)
-            or plugin_is_active(
+            if plugin_is_active(
                 generation.instance, plugin_id=generation.plugin_id
             )
         ]

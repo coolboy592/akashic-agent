@@ -2180,11 +2180,12 @@ async def test_cancelled_stable_batch_finishes_all_cleanup(tmp_path: Path) -> No
     _write_plugin(
         tmp_path / "plugins",
         "a_first",
-        "from agent.plugins import Plugin\n"
-        "class FirstPlugin(Plugin):\n"
-        "    name = 'a_first'\n"
-        "    async def prepare(self):\n"
-        f"        self.context.defer('marker', lambda: open({str(first_cleanup)!r}, 'w').close())\n",
+        "from pathlib import Path\n"
+        "api_version = 3\n"
+        "name = 'a_first'\n"
+        "version = '1.0.0'\n"
+        "async def apply(ctx, config):\n"
+        f"    await ctx.effect(lambda: lambda: Path({str(first_cleanup)!r}).touch(), label='marker')\n",
     )
     _write_plugin(
         tmp_path / "plugins",
@@ -2201,12 +2202,12 @@ async def test_cancelled_stable_batch_finishes_all_cleanup(tmp_path: Path) -> No
         "z_blocking",
         "import asyncio\n"
         "from pathlib import Path\n"
-        "from agent.plugins import Plugin\n"
-        "class BlockingPlugin(Plugin):\n"
-        "    name = 'z_blocking'\n"
-        "    async def prepare(self):\n"
-        f"        Path({str(blocking_started)!r}).touch()\n"
-        "        await asyncio.Event().wait()\n",
+        "api_version = 3\n"
+        "name = 'z_blocking'\n"
+        "version = '1.0.0'\n"
+        "async def apply(ctx, config):\n"
+        f"    Path({str(blocking_started)!r}).touch()\n"
+        "    await asyncio.Event().wait()\n",
     )
     manager = _manager(tmp_path)
     original_discard = manager._discard_stable_batch
