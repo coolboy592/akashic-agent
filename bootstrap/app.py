@@ -17,6 +17,7 @@ from agent.host_bridge.monitor import claim_host_bridge_boot
 from agent.restart import RestartCoordinator
 from agent.config_models import Config
 from bootstrap.channel_host import ChannelHost
+from bootstrap.channel_presentation import ChannelTurnPresentationBridge
 from bootstrap.channels import start_channels
 from bootstrap.chat_api import build_chat_server
 from bootstrap.cleanup import run_cleanup_steps
@@ -217,6 +218,7 @@ class AppRuntime:
         self.plugin_turn_rollout: TurnPluginRollout | None = None
         self.passive_worker: PassiveMessageWorker | None = None
         self.channel_host: ChannelHost | None = None
+        self.channel_presentation: ChannelTurnPresentationBridge | None = None
         self.core: CoreRuntime | None = None
         self.agent_loop = None
         self.bus = None
@@ -280,6 +282,7 @@ class AppRuntime:
             self.bus = self.core.bus
             event_bus = self.core.event_bus
             self.event_bus = event_bus
+            self.channel_presentation = ChannelTurnPresentationBridge(event_bus)
             self.tools = self.core.tools
             self.push_tool = self.core.push_tool
             self.session_manager = self.core.session_manager
@@ -367,6 +370,33 @@ class AppRuntime:
                 self.conversation_runtime,
                 self.agent_loop,
                 attachment_store=channel_attachment_store,
+            )
+
+            # 1. v3 control 始终通过 exact Channel binding 中断并回送收据。
+            async def interrupt_v3_channel(raw: Any) -> str:
+                assert self.conversation_runtime is not None
+                result = self.conversation_runtime.request_interrupt(
+                    raw.session_key,
+                    sender=raw.message.sender,
+                    command=raw.message.content,
+                )
+                return result.status
+
+            async def dispatch_v3_control_response(
+                envelope: Any,
+                binding: Any,
+            ) -> Any:
+                return await self.bus.publish_channel_outbound_awaited(
+                    envelope,
+                    binding,
+                    passive=True,
+                )
+
+            manager.channel_generation_host.bind_control_interrupter(
+                interrupt_v3_channel
+            )
+            manager.channel_generation_host.bind_control_response_dispatcher(
+                dispatch_v3_control_response
             )
             if self.restart_coordinator is not None:
                 coordinator = self.restart_coordinator
@@ -889,6 +919,14 @@ class AppRuntime:
                     (
                         self.conversation_runtime.shutdown
                         if self.conversation_runtime
+                        else _noop_async
+                    ),
+                ),
+                (
+                    "channel_presentation.aclose",
+                    (
+                        self.channel_presentation.aclose
+                        if self.channel_presentation
                         else _noop_async
                     ),
                 ),

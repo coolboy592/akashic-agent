@@ -45,6 +45,7 @@ from session.store import SessionStore
 from agent.looping.interrupt import InterruptResult
 
 if TYPE_CHECKING:
+    from agent.plugins.channel_generation_host import ChannelBindingLease
     from agent.plugins.snapshot import RuntimeSnapshotLease
 
 logger = logging.getLogger(__name__)
@@ -282,6 +283,7 @@ class ConversationRuntime:
         request: TurnRequest,
         *,
         runtime_snapshot_lease: RuntimeSnapshotLease | None = None,
+        channel_binding_lease: ChannelBindingLease | None = None,
         live_media: tuple[str, ...] = (),
     ) -> TurnHandle:
         """拒绝 active thread，并仅把本次进程可用的 media 交给 executor。"""
@@ -370,6 +372,7 @@ class ConversationRuntime:
                 attempt_replay=attempt_replay,
                 prior_tool_chain=prior_tool_chain,
                 runtime_snapshot_lease=runtime_snapshot_lease,
+                channel_binding_lease=channel_binding_lease,
             ),
             name=f"conversation-turn:{turn_id}",
         )
@@ -847,6 +850,7 @@ class ConversationRuntime:
         attempt_replay: list[dict[str, Any]],
         prior_tool_chain: list[dict[str, Any]],
         runtime_snapshot_lease: RuntimeSnapshotLease | None,
+        channel_binding_lease: ChannelBindingLease | None,
     ) -> None:
         """执行已按 thread 和容量准入的 turn，并保证只写一个终态。"""
 
@@ -941,15 +945,28 @@ class ConversationRuntime:
 
             execution_request.metadata["_controlItemEvent"] = publish_item
             snapshot_token = None
+            channel_token = None
             if runtime_snapshot_lease is not None:
                 if not runtime_snapshot_lease.active:
                     raise RuntimeError("turn exact RuntimeSnapshot lease 已关闭")
                 from agent.plugins.snapshot import bind_runtime_snapshot
 
                 snapshot_token = bind_runtime_snapshot(runtime_snapshot_lease)
+            if channel_binding_lease is not None:
+                from agent.plugins.channel_generation_host import (
+                    bind_channel_turn_binding,
+                )
+
+                channel_token = bind_channel_turn_binding(channel_binding_lease)
             try:
                 execution = await self._executor(execution_request)
             finally:
+                if channel_token is not None:
+                    from agent.plugins.channel_generation_host import (
+                        reset_channel_turn_binding,
+                    )
+
+                    reset_channel_turn_binding(channel_token)
                 if snapshot_token is not None:
                     from agent.plugins.snapshot import reset_runtime_snapshot
 

@@ -18,6 +18,7 @@ from agent.plugin_composition.channels import (
     ChannelFactoryFreezeInput,
     ChannelReady,
     ChannelInboundMessage,
+    ControlResponseBodies,
     InboundIdentity,
     CredentialRef,
     DeliveryStatus,
@@ -28,8 +29,13 @@ from agent.plugin_composition.channels import (
     ProviderClientFactory,
     ProviderDeliveryReceipt,
     ProviderDeliveryRequest,
+    PresentationReceipt,
     RawInbound,
+    StreamDeltaPresentation,
     StopReceipt,
+    TurnStartedPresentation,
+    TurnStreamEvent,
+    TurnStreamEventKind,
     _freeze_plugin_channels,
     channel_config_revision,
 )
@@ -37,10 +43,23 @@ from agent.plugin_composition.model import CompositionError, ServiceKey
 from agent.plugins.channel_generation_host import (
     ChannelGenerationHost,
     ChannelStartRecord,
+    bind_channel_turn_binding,
+    get_current_channel_turn_binding,
+    reset_channel_turn_binding,
 )
 from agent.plugins.composable import ComposablePlugin
 from agent.plugins.generation import GateResult, PluginContributions, PluginGeneration
+from agent.plugins.snapshot import RuntimeSnapshotCompiler, RuntimeSnapshotStore
 from bus.queue import MessageBus
+from bus.event_bus import EventBus
+from bus.events_lifecycle import (
+    StreamDeltaReady,
+    ToolCallCompleted,
+    ToolCallStarted,
+    TurnOutputCompleted,
+    TurnStarted,
+)
+from bootstrap.channel_presentation import ChannelTurnPresentationBridge
 
 
 @dataclass
@@ -110,6 +129,11 @@ class Adapter:
         if self.fail_stop:
             raise RuntimeError("stop failed")
         return StopReceipt(self.context.binding_token, True)
+
+
+class PresentationAdapter(Adapter):
+    def attach_presentation(self, ports: Any) -> None:
+        self.presentation_ports = ports
 
 
 async def _noop_record(record: ChannelStartRecord) -> None:
@@ -368,7 +392,7 @@ async def _make_snapshot(
             factory_events.append("factory")
         if cancel_factory:
             raise asyncio.CancelledError
-        adapter = Adapter(
+        adapter = adapter_cls(
             context,
             fail_start=fail_start or (fail_after is not None and factory_count >= fail_after),
             fail_stop=fail_stop,
@@ -409,6 +433,538 @@ async def test_formal_binding_starts_closed_and_delivers_after_open() -> None:
     assert receipt.delivery_id == "d1"
     await generation.stop()
     assert factories["feishu"].closed == 1
+
+
+@pytest.mark.asyncio
+async def test_c14d_control_uses_exact_binding_and_bounded_dedupe() -> None:
+    snapshot, factories, adapters = await _make_snapshot(
+        adapter_cls=PresentationAdapter,
+        capabilities=frozenset(ChannelCapability),
+    )
+    sources: list[_FakeSnapshotLease] = []
+    requested_snapshot_ids: list[str] = []
+
+    def acquire(snapshot_id: str) -> _FakeSnapshotLease:
+        assert snapshot_id == snapshot.snapshot_id
+        requested_snapshot_ids.append(snapshot_id)
+        source = _FakeSnapshotLease(snapshot)
+        sources.append(source)
+        return source
+
+    interrupted: list[str] = []
+    dispatched: list[tuple[str, str]] = []
+
+    async def interrupt(raw: RawInbound) -> bool:
+        interrupted.append(raw.message_id)
+        return raw.message_id != "stop-idle"
+
+    async def dispatch(envelope: OutboundEnvelope, binding: Any) -> ChannelDeliveryReceipt:
+        dispatched.append((envelope.binding_token, binding.binding_token))
+        return ChannelDeliveryReceipt(envelope.delivery_id, DeliveryStatus.DELIVERED)
+
+    host = _host(
+        snapshot_lease_acquirer=acquire,
+        control_interrupter=interrupt,
+        control_response_dispatcher=dispatch,
+    )
+    generation = await host.start(snapshot, factories)
+    generation.open_admission()
+    adapter = tuple(adapters.values())[0]
+    ports = adapter.presentation_ports
+    assert ports.control is not None
+    assert ports.turn_stream is not None
+    raw = RawInbound(
+        message_id="stop-1",
+        provider_identity="account-1",
+        recipient="chat-1",
+        message=ChannelInboundMessage(
+            channel="feishu",
+            sender="user",
+            chat_id="chat-1",
+            content="/stop",
+            timestamp=datetime.now(timezone.utc),
+            metadata={},
+        ),
+    )
+
+    first = await ports.control.interrupt(
+        raw,
+        response_bodies=ControlResponseBodies("interrupted", "idle"),
+    )
+    duplicate = await ports.control.interrupt(
+        raw,
+        response_bodies=ControlResponseBodies("interrupted", "idle"),
+    )
+    assert first.accepted is True
+    assert first.reason == "interrupted"
+    assert first.response is not None
+    assert duplicate.accepted is False and duplicate.reason == "duplicate"
+    assert interrupted == ["stop-1"]
+    assert len(dispatched) == 1
+    assert dispatched[0][0] == dispatched[0][1]
+    assert len(sources) == 1
+    assert not sources[0].active and not sources[0].forks[0].active
+    idle = RawInbound(
+        message_id="stop-idle",
+        provider_identity="account-1",
+        recipient="chat-1",
+        message=raw.message,
+    )
+    idle_receipt = await ports.control.interrupt(
+        idle,
+        response_bodies=ControlResponseBodies("interrupted", "idle"),
+    )
+    assert idle_receipt.accepted is False and idle_receipt.reason == "idle"
+    assert idle_receipt.response is not None
+    assert requested_snapshot_ids == [snapshot.snapshot_id, snapshot.snapshot_id]
+    await generation.stop()
+
+
+@pytest.mark.asyncio
+async def test_c14d_existing_turn_lease_can_finish_stream_after_close_admission() -> None:
+    snapshot, factories, adapters = await _make_snapshot(
+        adapter_cls=PresentationAdapter,
+        capabilities=frozenset(ChannelCapability),
+    )
+    host = _host(snapshot_lease_acquirer=lambda snapshot_id: _lease_for(snapshot))
+    generation = await host.start(snapshot, factories)
+    generation.open_admission()
+    adapter = tuple(adapters.values())[0]
+    events: list[str] = []
+    callback_started = asyncio.Event()
+    callback_release = asyncio.Event()
+
+    async def callback(event: TurnStreamEvent) -> PresentationReceipt:
+        events.append(event.kind.value)
+        if event.kind is TurnStreamEventKind.STREAM_DELTA:
+            callback_started.set()
+            await callback_release.wait()
+        return PresentationReceipt(event.presentation_id, DeliveryStatus.DELIVERED)
+
+    ports = adapter.presentation_ports
+    assert ports.turn_stream is not None
+    subscription = ports.turn_stream.subscribe(callback)
+    binding = generation.channel("feishu")
+    source = _FakeSnapshotLease(snapshot)
+    lease = host.acquire_binding(source, "feishu")
+    await binding.publish_turn_event(
+        TurnStreamEvent(
+            "preview-1",
+            TurnStreamEventKind.TURN_STARTED,
+            TurnStartedPresentation("turn-1", "client-1"),
+        )
+    )
+    binding.close_admission()
+    blocked = asyncio.create_task(
+        lease.publish_turn_event(
+            TurnStreamEvent(
+                "preview-1",
+                TurnStreamEventKind.STREAM_DELTA,
+                StreamDeltaPresentation("turn-1", 1, "hello", ""),
+            )
+        )
+    )
+    await callback_started.wait()
+    stop = asyncio.create_task(generation.stop())
+    await asyncio.sleep(0)
+    assert not stop.done()
+    callback_release.set()
+    assert len(await blocked) == 1
+    await lease.aclose()
+    await stop
+    await subscription.close()
+    assert events == ["turn.started", "stream.delta"]
+
+
+@pytest.mark.asyncio
+async def test_c14d_control_claim_blocks_old_binding_drain_before_lease_acquire() -> None:
+    snapshot, factories, adapters = await _make_snapshot(
+        adapter_cls=PresentationAdapter,
+        capabilities=frozenset(ChannelCapability),
+    )
+    interrupt_started = asyncio.Event()
+    interrupt_release = asyncio.Event()
+
+    def acquire(snapshot_id: str) -> _FakeSnapshotLease:
+        assert snapshot_id == snapshot.snapshot_id
+        return _FakeSnapshotLease(snapshot)
+
+    async def interrupt(_raw: RawInbound) -> str:
+        interrupt_started.set()
+        await interrupt_release.wait()
+        return "interrupted"
+
+    async def dispatch(
+        envelope: OutboundEnvelope,
+        _binding: object,
+    ) -> ChannelDeliveryReceipt:
+        return ChannelDeliveryReceipt(envelope.delivery_id, DeliveryStatus.DELIVERED)
+
+    host = _host(
+        snapshot_lease_acquirer=acquire,
+        control_interrupter=interrupt,
+        control_response_dispatcher=dispatch,
+    )
+    generation = await host.start(snapshot, factories)
+    generation.open_admission()
+    control = tuple(adapters.values())[0].presentation_ports.control
+    assert control is not None
+    raw = RawInbound(
+        message_id="control-race",
+        message=ChannelInboundMessage(
+            channel="feishu",
+            sender="sender",
+            chat_id="chat",
+            content="/stop",
+            timestamp=datetime.now(timezone.utc),
+            metadata={},
+        ),
+    )
+    task = asyncio.create_task(
+        control.interrupt(
+            raw,
+            response_bodies=ControlResponseBodies("stopped", "idle"),
+        )
+    )
+    await interrupt_started.wait()
+    generation.channel("feishu").close_admission()
+    drain = asyncio.create_task(generation.channel("feishu").drain())
+    await asyncio.sleep(0)
+    assert not drain.done()
+    interrupt_release.set()
+    assert (await task).accepted is True
+    await drain
+    await generation.stop()
+
+
+@pytest.mark.asyncio
+async def test_c14d_control_claim_survives_real_store_provisional_pause() -> None:
+    prototype, factories, adapters = await _make_snapshot(
+        adapter_cls=PresentationAdapter,
+        capabilities=frozenset(ChannelCapability),
+    )
+    compiler = RuntimeSnapshotCompiler()
+    stable = compiler.compile(prototype.generations, snapshot_revision="stable")
+    latest = compiler.compile(prototype.generations, snapshot_revision="latest")
+    store = RuntimeSnapshotStore()
+    store.install(stable)
+    stable.composition_root = prototype.composition_root
+    stable.channel_registry = prototype.channel_registry
+    stable.channel_registry_identity = prototype.channel_registry_identity
+    interrupted = asyncio.Event()
+    release = asyncio.Event()
+
+    async def interrupt(_raw: RawInbound) -> str:
+        interrupted.set()
+        await release.wait()
+        return "interrupted"
+
+    async def dispatch(
+        envelope: OutboundEnvelope,
+        _binding: object,
+    ) -> ChannelDeliveryReceipt:
+        return ChannelDeliveryReceipt(envelope.delivery_id, DeliveryStatus.DELIVERED)
+
+    host = _host(
+        snapshot_lease_acquirer=store.lease,
+        control_interrupter=interrupt,
+        control_response_dispatcher=dispatch,
+    )
+    generation = await host.start(stable, factories)
+    generation.open_admission()
+    control = tuple(adapters.values())[0].presentation_ports.control
+    assert control is not None
+    task = asyncio.create_task(
+        control.interrupt(
+            RawInbound(
+                message_id="control-provisional",
+                message=ChannelInboundMessage(
+                    channel="feishu",
+                    sender="sender",
+                    chat_id="chat",
+                    content="/stop",
+                    timestamp=datetime.now(timezone.utc),
+                    metadata={},
+                ),
+            ),
+            response_bodies=ControlResponseBodies("stopped", "idle"),
+        )
+    )
+    await interrupted.wait()
+    transaction = store.begin_publish(latest)
+    await store.commit_provisional(transaction)
+    generation.channel("feishu").close_admission()
+    drain = asyncio.create_task(generation.channel("feishu").drain())
+    await asyncio.sleep(0)
+    assert not drain.done()
+    release.set()
+    assert (await task).accepted is True
+    await drain
+    await generation.stop()
+    await store.rollback_provisional(transaction, keep_candidate_latest=False)
+    await store.abort(transaction)
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_c14d_production_bridge_preserves_old_binding_and_typed_sequence() -> None:
+    snapshot, factories, adapters = await _make_snapshot(
+        adapter_cls=PresentationAdapter,
+        capabilities=frozenset(ChannelCapability),
+    )
+    host = _host()
+    generation = await host.start(snapshot, factories)
+    generation.open_admission()
+    adapter = tuple(adapters.values())[0]
+    received: list[TurnStreamEvent] = []
+
+    async def callback(event: TurnStreamEvent) -> PresentationReceipt:
+        received.append(event)
+        return PresentationReceipt(event.presentation_id, DeliveryStatus.DELIVERED)
+
+    assert adapter.presentation_ports.turn_stream is not None
+    adapter.presentation_ports.turn_stream.subscribe(callback)
+    source = _FakeSnapshotLease(snapshot)
+    lease = host.acquire_binding(source, "feishu")
+    bus = EventBus()
+    bridge = ChannelTurnPresentationBridge(bus)
+    token = bind_channel_turn_binding(lease)
+    try:
+        await bus.observe(
+            TurnStarted(
+                session_key="feishu:chat",
+                channel="feishu",
+                chat_id="chat",
+                content="hello",
+                timestamp=datetime.now(timezone.utc),
+                turn_id="turn-bridge",
+                client_message_id="provider-message",
+            )
+        )
+        generation.channel("feishu").close_admission()
+        await bus.observe(
+            StreamDeltaReady(
+                "feishu:chat",
+                "feishu",
+                "chat",
+                "turn-bridge",
+                "delta",
+                "thinking",
+            )
+        )
+        await bus.observe(
+            ToolCallStarted(
+                "feishu:chat",
+                "feishu",
+                "chat",
+                1,
+                "call-1",
+                "search",
+                {},
+                "turn-bridge",
+            )
+        )
+        await bus.observe(
+            ToolCallCompleted(
+                "feishu:chat",
+                "feishu",
+                "chat",
+                1,
+                "call-1",
+                "search",
+                {},
+                {},
+                "success",
+                "ok",
+                {},
+                "turn-bridge",
+            )
+        )
+        await bus.observe(
+            TurnOutputCompleted(
+                "feishu:chat",
+                "feishu",
+                "chat",
+                "turn-bridge",
+                "provider-message",
+            )
+        )
+    finally:
+        reset_channel_turn_binding(token)
+        await bridge.aclose()
+        await lease.aclose()
+        await generation.stop()
+
+    assert [event.kind for event in received] == list(TurnStreamEventKind)
+    assert received[0].payload.client_message_id == "provider-message"
+    assert [event.payload.sequence for event in received[1:]] == [1, 2, 3, 4]
+
+
+@pytest.mark.asyncio
+async def test_c14d_turn_binding_does_not_leak_into_child_task() -> None:
+    snapshot, factories, _adapters = await _make_snapshot(
+        adapter_cls=PresentationAdapter,
+        capabilities=frozenset(ChannelCapability),
+    )
+    host = _host()
+    generation = await host.start(snapshot, factories)
+    generation.open_admission()
+    lease = host.acquire_binding(_FakeSnapshotLease(snapshot), "feishu")
+    token = bind_channel_turn_binding(lease)
+    try:
+        assert get_current_channel_turn_binding() is lease
+        async def inherited_binding() -> object:
+            return get_current_channel_turn_binding()
+
+        child = asyncio.create_task(inherited_binding())
+        assert await child is None
+    finally:
+        reset_channel_turn_binding(token)
+        await lease.aclose()
+        await generation.stop()
+
+
+@pytest.mark.asyncio
+async def test_c14d_callback_failure_settles_unknown_and_stops_presentation() -> None:
+    snapshot, factories, adapters = await _make_snapshot(
+        adapter_cls=PresentationAdapter,
+        capabilities=frozenset(ChannelCapability),
+    )
+    host = _host()
+    generation = await host.start(snapshot, factories)
+    generation.open_admission()
+    adapter = tuple(adapters.values())[0]
+    ports = adapter.presentation_ports
+    assert ports.turn_stream is not None
+
+    async def broken(_event: TurnStreamEvent) -> PresentationReceipt:
+        raise RuntimeError("provider after-effect failure")
+
+    ports.turn_stream.subscribe(broken)
+    event = TurnStreamEvent(
+        "preview-failure",
+        TurnStreamEventKind.TURN_STARTED,
+        TurnStartedPresentation("turn-failure", "client-failure"),
+    )
+    receipts = await generation.channel("feishu").publish_turn_event(event)
+    assert receipts[0].status is DeliveryStatus.UNKNOWN
+    assert host.presentation_incidents
+    with pytest.raises(RuntimeError, match="已因 UNKNOWN 终止"):
+        await generation.channel("feishu").publish_turn_event(
+            TurnStreamEvent(
+                "preview-failure",
+                TurnStreamEventKind.STREAM_DELTA,
+                StreamDeltaPresentation("turn-failure", 1, "x", ""),
+            )
+        )
+    await generation.stop()
+
+
+@pytest.mark.asyncio
+async def test_c14d_callback_contract_mismatch_settles_unknown_before_raise() -> None:
+    snapshot, factories, adapters = await _make_snapshot(
+        adapter_cls=PresentationAdapter,
+        capabilities=frozenset(ChannelCapability),
+    )
+    host = _host()
+    generation = await host.start(snapshot, factories)
+    generation.open_admission()
+    adapter = tuple(adapters.values())[0]
+    ports = adapter.presentation_ports
+    assert ports.turn_stream is not None
+
+    async def wrong_receipt(_event: TurnStreamEvent) -> PresentationReceipt:
+        return PresentationReceipt("wrong-presentation", DeliveryStatus.DELIVERED)
+
+    ports.turn_stream.subscribe(wrong_receipt)
+    with pytest.raises(TypeError, match="identity 不匹配"):
+        await generation.channel("feishu").publish_turn_event(
+            TurnStreamEvent(
+                "preview-mismatch",
+                TurnStreamEventKind.TURN_STARTED,
+                TurnStartedPresentation("turn-mismatch", "client-mismatch"),
+            )
+        )
+    assert host.presentation_incidents[-1][1] == "preview-mismatch"
+    await generation.stop()
+
+
+@pytest.mark.asyncio
+async def test_c14d_callback_cancellation_waits_for_terminal_cleanup() -> None:
+    snapshot, factories, adapters = await _make_snapshot(
+        adapter_cls=PresentationAdapter,
+        capabilities=frozenset(ChannelCapability),
+    )
+    host = _host()
+    generation = await host.start(snapshot, factories)
+    generation.open_admission()
+    adapter = tuple(adapters.values())[0]
+    ports = adapter.presentation_ports
+    assert ports.turn_stream is not None
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow(_event: TurnStreamEvent) -> PresentationReceipt:
+        started.set()
+        await release.wait()
+        return PresentationReceipt("preview-cancel", DeliveryStatus.DELIVERED)
+
+    ports.turn_stream.subscribe(slow)
+    task = asyncio.create_task(
+        generation.channel("feishu").publish_turn_event(
+            TurnStreamEvent(
+                "preview-cancel",
+                TurnStreamEventKind.TURN_STARTED,
+                TurnStartedPresentation("turn-cancel", "client-cancel"),
+            )
+        )
+    )
+    await started.wait()
+    task.cancel()
+    await asyncio.sleep(0)
+    assert not task.done()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert generation.channel("feishu").in_flight == 0
+    await generation.stop()
+
+
+@pytest.mark.asyncio
+async def test_c14d_ports_are_capability_gated_per_binding() -> None:
+    snapshot, factories, adapters = await _make_snapshot(
+        adapter_cls=PresentationAdapter,
+        capabilities=frozenset({ChannelCapability.OUTBOUND, ChannelCapability.CONTROL}),
+    )
+    host = _host()
+    generation = await host.start(snapshot, factories)
+    adapter = tuple(adapters.values())[0]
+    ports = adapter.presentation_ports
+    assert ports.control is not None
+    assert ports.turn_stream is None
+    assert adapter.context.control is ports.control
+    assert adapter.context.turn_stream is None
+    generation.open_admission()
+    with pytest.raises(RuntimeError, match="exact snapshot lease"):
+        await ports.control.interrupt(
+            RawInbound(
+                message_id="control-no-lease",
+                message=ChannelInboundMessage(
+                    channel="feishu",
+                    sender="sender",
+                    chat_id="chat",
+                    content="/stop",
+                    timestamp=datetime.now(timezone.utc),
+                    metadata={},
+                ),
+            ),
+            response_bodies=ControlResponseBodies("interrupted", "idle"),
+        )
+    await generation.stop()
+
+
+async def _lease_for(snapshot: Any) -> _FakeSnapshotLease:
+    return _FakeSnapshotLease(snapshot)
 
 
 @pytest.mark.asyncio
@@ -506,7 +1062,8 @@ async def test_formal_ingress_acquires_exact_binding_and_deduplicates() -> None:
     )
     sources: list[_FakeSnapshotLease] = []
 
-    async def acquire() -> _FakeSnapshotLease:
+    def acquire(snapshot_id: str) -> _FakeSnapshotLease:
+        assert snapshot_id == snapshot.snapshot_id
         source = _FakeSnapshotLease(snapshot)
         sources.append(source)
         return source
@@ -547,7 +1104,8 @@ async def test_outbound_only_binding_rejects_ingress_before_runtime_ports() -> N
     snapshot, factories, adapters = await _make_snapshot()
     acquired = 0
 
-    async def acquire() -> _FakeSnapshotLease:
+    def acquire(snapshot_id: str) -> _FakeSnapshotLease:
+        assert snapshot_id == snapshot.snapshot_id
         nonlocal acquired
         acquired += 1
         return _FakeSnapshotLease(snapshot)
@@ -592,7 +1150,8 @@ async def test_formal_ingress_rejects_different_stable_snapshot_and_releases_cla
     right = _FakeSnapshotLease(snapshot)
     acquired = [wrong, right]
 
-    async def acquire() -> _FakeSnapshotLease:
+    def acquire(snapshot_id: str) -> _FakeSnapshotLease:
+        assert snapshot_id == snapshot.snapshot_id
         return acquired.pop(0)
 
     bus = MessageBus()
@@ -633,7 +1192,8 @@ async def test_formal_ingress_scopes_dedupe_by_provider_identity_and_persists_ma
     )
     mapping: dict[tuple[str, str], str] = {}
 
-    async def acquire() -> _FakeSnapshotLease:
+    def acquire(snapshot_id: str) -> _FakeSnapshotLease:
+        assert snapshot_id == snapshot.snapshot_id
         return _FakeSnapshotLease(snapshot)
 
     async def remember(channel: str, identity: str, recipient: str) -> None:
@@ -690,7 +1250,8 @@ async def test_identity_write_failure_releases_dedupe_claim_before_snapshot_acqu
     acquire_calls = 0
     fail = True
 
-    async def acquire() -> _FakeSnapshotLease:
+    def acquire(snapshot_id: str) -> _FakeSnapshotLease:
+        assert snapshot_id == snapshot.snapshot_id
         nonlocal acquire_calls
         acquire_calls += 1
         return _FakeSnapshotLease(snapshot)
@@ -749,7 +1310,8 @@ async def test_identity_write_is_owned_by_binding_drain_during_publication() -> 
     remember_release = asyncio.Event()
     mapping: dict[str, str] = {}
 
-    async def acquire() -> _FakeSnapshotLease:
+    def acquire(snapshot_id: str) -> _FakeSnapshotLease:
+        assert snapshot_id == snapshot.snapshot_id
         return _FakeSnapshotLease(snapshot)
 
     async def remember(_channel: str, identity: str, recipient: str) -> None:

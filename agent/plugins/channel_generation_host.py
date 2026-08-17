@@ -13,9 +13,10 @@ import json
 import uuid
 from collections import deque
 from collections.abc import Awaitable, Callable, Coroutine, Mapping
+from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from types import ModuleType
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from agent.plugin_composition.channels import (
     AttachmentKind,
@@ -26,11 +27,16 @@ from agent.plugin_composition.channels import (
     ChannelAttachmentReadPort,
     ChannelCapability,
     ChannelCleanupFailure,
+    ChannelControlPort,
     ChannelDeliveryReceipt,
     ChannelFactoryContext,
+    ChannelPresentationPorts,
     ChannelReady,
     ChannelRegistrySnapshot,
     CredentialRef,
+    ControlReceipt,
+    ControlResponseBodies,
+    DeliveryStatus,
     InboundEnvelope,
     InboundIdentity,
     InboundOwner,
@@ -38,8 +44,15 @@ from agent.plugin_composition.channels import (
     ProviderClientFactory,
     ProviderDeliveryReceipt,
     ProviderDeliveryRequest,
+    PresentationReceipt,
     RawInbound,
+    StreamSubscription,
     StopReceipt,
+    TurnStreamCallback,
+    TurnStreamEvent,
+    TurnStreamEventKind,
+    TurnStreamPort,
+    TurnStartedPresentation,
     channel_config_revision,
 )
 from agent.plugins.composable import ComposablePlugin
@@ -50,10 +63,21 @@ if TYPE_CHECKING:
 BeforeStartCallback = Callable[["ChannelStartRecord"], Awaitable[None]]
 ConfigRevisionChecker = Callable[["ChannelStartRecord"], Awaitable[None]]
 FailureCallback = Callable[["ChannelCleanupTombstone"], Awaitable[None] | None]
-SnapshotLeaseAcquirer = Callable[[], Awaitable["RuntimeSnapshotLease"]]
+SnapshotLeaseAcquirer = Callable[[str], "RuntimeSnapshotLease"]
 InboundPublisher = Callable[[InboundEnvelope], Awaitable[None]]
 IdentityResolver = Callable[[str, str], str | None]
 IdentityRememberer = Callable[[str, str, str], Coroutine[object, object, None]]
+ControlInterrupter = Callable[[RawInbound], Awaitable[object]]
+ControlResponseDispatcher = Callable[..., Awaitable[ChannelDeliveryReceipt]]
+PresentationIncidentReporter = Callable[
+    [str, str, str], Awaitable[None] | None
+]
+
+
+class _PresentationContractFailure(TypeError):
+    def __init__(self, message: str, receipt: PresentationReceipt) -> None:
+        super().__init__(message)
+        self.receipt = receipt
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,6 +184,15 @@ class _ChannelBindingState:
     factory_close_succeeded: bool = False
     inbound_message_ids: deque[tuple[str, str]] = field(default_factory=deque)
     inbound_message_id_set: set[tuple[str, str]] = field(default_factory=set)
+    control_port: _ChannelControl | None = None
+    turn_stream_port: _ChannelTurnStream | None = None
+    subscriptions: dict[int, _ChannelStreamSubscription] = field(default_factory=dict)
+    control_message_ids: deque[tuple[str, str]] = field(default_factory=deque)
+    control_message_id_set: set[tuple[str, str]] = field(default_factory=set)
+    presentation_sequences: dict[str, int] = field(default_factory=dict)
+    presentation_turn_ids: dict[str, str] = field(default_factory=dict)
+    completed_presentations: set[str] = field(default_factory=set)
+    failed_presentations: set[str] = field(default_factory=set)
 
     def __post_init__(self) -> None:
         self.drain_event.set()
@@ -205,6 +238,21 @@ class ChannelBinding:
         return self._host._binding(self._key).in_flight
 
     @property
+    def presentation(self) -> ChannelPresentationPorts:
+        """Return only the capabilities attached to this exact binding."""
+
+        state = self._host._binding(self._key)
+        return ChannelPresentationPorts(state.control_port, state.turn_stream_port)
+
+    @property
+    def control(self) -> ChannelControlPort | None:
+        return self._host._binding(self._key).control_port
+
+    @property
+    def turn_stream(self) -> TurnStreamPort | None:
+        return self._host._binding(self._key).turn_stream_port
+
+    @property
     def stopped(self) -> bool:
         state = self._host._bindings.get(self._key)
         return state is None or state.stopped
@@ -228,6 +276,18 @@ class ChannelBinding:
         """Deliver one text request through this exact binding."""
 
         return await self._host._deliver(self._key, request)
+
+    async def publish_turn_event(
+        self,
+        event: TurnStreamEvent,
+    ) -> tuple[PresentationReceipt, ...]:
+        """Publish one typed turn event through this binding's subscriptions."""
+
+        return await self._host.publish_turn_event(
+            self.snapshot_id,
+            self.channel_name,
+            event,
+        )
 
     async def stop(self) -> StopReceipt:
         """Close admission, drain and stop this binding."""
@@ -300,6 +360,21 @@ class ChannelBindingLease:
             error=receipt.error,
         )
 
+    async def publish_turn_event(
+        self,
+        event: TurnStreamEvent,
+    ) -> tuple[PresentationReceipt, ...]:
+        """Publish a preview while this exact old-turn binding lease remains active."""
+
+        if self._closed:
+            raise RuntimeError("Channel binding lease 已关闭")
+        return await self._host.publish_turn_event(
+            self.snapshot_id,
+            self.channel_name,
+            event,
+            binding=self,
+        )
+
     async def aclose(self) -> None:
         """Release both owners completely before propagating caller cancellation."""
 
@@ -317,6 +392,51 @@ class ChannelBindingLease:
             self._binding_released = True
         await self.snapshot_lease.release()
         self._closed = True
+
+
+@dataclass(frozen=True, slots=True)
+class _ChannelTurnBinding:
+    lease: ChannelBindingLease
+    owner_task: asyncio.Task[object] | None
+
+
+_current_channel_binding: ContextVar[_ChannelTurnBinding | None] = ContextVar(
+    "current_channel_binding",
+    default=None,
+)
+
+
+def bind_channel_turn_binding(
+    binding: object,
+) -> Token[_ChannelTurnBinding | None]:
+    """Bind the exact inbound Channel owner for one ConversationRuntime task."""
+
+    active = getattr(binding, "active", None)
+    if active is not True:
+        raise RuntimeError("turn Channel binding 必须是当前 Host 的 active lease")
+    return _current_channel_binding.set(
+        _ChannelTurnBinding(
+            cast(ChannelBindingLease, binding),
+            asyncio.current_task(),
+        )
+    )
+
+
+def reset_channel_turn_binding(
+    token: Token[_ChannelTurnBinding | None],
+) -> None:
+    _current_channel_binding.reset(token)
+
+
+def get_current_channel_turn_binding() -> ChannelBindingLease | None:
+    binding = _current_channel_binding.get()
+    if (
+        binding is None
+        or binding.owner_task is not asyncio.current_task()
+        or not binding.lease.active
+    ):
+        return None
+    return binding.lease
 
 
 class _ChannelIngress:
@@ -347,6 +467,228 @@ class _ChannelIdentity:
 
     def resolve(self, provider_identity: str) -> str | None:
         return self._host._resolve_identity(self._key, provider_identity)
+
+
+class _ChannelControl:
+    """Expose one exact binding's deduplicated interrupt facade."""
+
+    def __init__(self, host: ChannelGenerationHost, key: tuple[str, str]) -> None:
+        self._host = host
+        self._key = key
+
+    async def interrupt(
+        self,
+        raw: RawInbound,
+        *,
+        response_bodies: ControlResponseBodies,
+    ) -> ControlReceipt:
+        """Claim, interrupt, and settle one provider control message."""
+
+        if not isinstance(raw, RawInbound):
+            raise TypeError("channel control 只接受 RawInbound")
+        if not isinstance(response_bodies, ControlResponseBodies):
+            raise TypeError("response_bodies 必须是 ControlResponseBodies")
+        state = self._host._binding(self._key)
+        if raw.message.channel != state.channel_name:
+            raise RuntimeError("RawInbound channel 与 exact binding 不一致")
+        if not state.admission_open or state.stopping or state.stopped:
+            return ControlReceipt(False, "binding_closed")
+        scope = raw.provider_identity or ""
+        dedupe_key = (scope, raw.message_id)
+        if dedupe_key in state.control_message_id_set:
+            return ControlReceipt(False, "duplicate")
+        state.control_message_id_set.add(dedupe_key)
+        state.control_message_ids.append(dedupe_key)
+        self._host._begin_presentation_operation(self._key, allow_closed=False)
+        try:
+            binding = await self._host._acquire_control_binding(self._key)
+        except BaseException:
+            state.control_message_id_set.discard(dedupe_key)
+            try:
+                state.control_message_ids.remove(dedupe_key)
+            except ValueError:
+                pass
+            self._host._release_presentation_operation(self._key)
+            raise
+        try:
+            task = asyncio.create_task(
+                self._host._handle_control(
+                    self._key,
+                    raw,
+                    response_bodies,
+                    binding,
+                ),
+                name=f"channel-control:{state.channel_name}:{raw.message_id}",
+            )
+            return cast(ControlReceipt, await _await_task_after_cancellation(task))
+        finally:
+            try:
+                await binding.aclose()
+            finally:
+                self._host._release_presentation_operation(self._key)
+                while len(state.control_message_ids) > 500:
+                    expired = state.control_message_ids.popleft()
+                    state.control_message_id_set.discard(expired)
+
+
+class _ChannelTurnStream:
+    """Register callback subscriptions on one exact binding."""
+
+    def __init__(self, host: ChannelGenerationHost, key: tuple[str, str]) -> None:
+        self._host = host
+        self._key = key
+
+    def subscribe(self, callback: TurnStreamCallback) -> StreamSubscription:
+        """Attach one async callback until it is explicitly closed."""
+
+        if not _is_async_callback(callback):
+            raise TypeError("turn stream callback 必须是 async callable")
+        state = self._host._binding(self._key)
+        if state.stopping or state.stopped or not state.start_attempted:
+            raise RuntimeError("turn stream binding 已关闭或尚未 start")
+        subscription = _ChannelStreamSubscription(self._host, self._key, callback)
+        state.subscriptions[id(subscription)] = subscription
+        return subscription
+
+
+class _ChannelStreamSubscription:
+    """Own accepted presentation callbacks and participate in exact drain."""
+
+    def __init__(
+        self,
+        host: ChannelGenerationHost,
+        key: tuple[str, str],
+        callback: TurnStreamCallback,
+    ) -> None:
+        self._host = host
+        self._key = key
+        self._callback = callback
+        self._admission_open = True
+        self._closed = False
+        self._running = 0
+        self._quiescent = asyncio.Event()
+        self._quiescent.set()
+
+    def close_admission(self) -> None:
+        """Synchronously reject new events while retaining accepted callbacks."""
+
+        self._admission_open = False
+
+    def _admit(self, *, allow_closed: bool = False) -> bool:
+        if self._closed or (not self._admission_open and not allow_closed):
+            return False
+        state = self._host._binding(self._key)
+        if state.stopped or (not allow_closed and (not state.admission_open or state.stopping)):
+            return False
+        self._running += 1
+        self._quiescent.clear()
+        try:
+            self._host._begin_presentation_operation(
+                self._key,
+                allow_closed=allow_closed,
+            )
+        except BaseException:
+            self._running -= 1
+            if self._running == 0:
+                self._quiescent.set()
+            raise
+        return True
+
+    async def invoke(self, event: TurnStreamEvent) -> PresentationReceipt:
+        """Invoke one already-admitted callback and settle its typed receipt."""
+
+        try:
+            result = self._callback(event)
+            if not inspect.isawaitable(result):
+                receipt = self._host._unknown_presentation_receipt(
+                    event,
+                    "turn stream callback 必须返回 awaitable",
+                )
+                self._host._mark_presentation_failed(
+                    self._key,
+                    event.presentation_id,
+                    receipt.error or "callback contract failure",
+                )
+                raise _PresentationContractFailure(
+                    "turn stream callback 必须返回 awaitable",
+                    receipt,
+                )
+            result = await result
+            if not isinstance(result, PresentationReceipt):
+                receipt = self._host._unknown_presentation_receipt(
+                    event,
+                    "turn stream callback 必须返回 PresentationReceipt",
+                )
+                self._host._mark_presentation_failed(
+                    self._key,
+                    event.presentation_id,
+                    receipt.error or "callback contract failure",
+                )
+                raise _PresentationContractFailure(
+                    "turn stream callback 必须返回 PresentationReceipt",
+                    receipt,
+                )
+            if result.presentation_id != event.presentation_id:
+                receipt = self._host._unknown_presentation_receipt(
+                    event,
+                    "presentation receipt identity 不匹配",
+                )
+                self._host._mark_presentation_failed(
+                    self._key,
+                    event.presentation_id,
+                    receipt.error or "callback contract failure",
+                )
+                raise _PresentationContractFailure(
+                    "presentation receipt identity 不匹配",
+                    receipt,
+                )
+            if result.status is DeliveryStatus.UNKNOWN:
+                self._host._mark_presentation_failed(
+                    self._key,
+                    event.presentation_id,
+                    result.error or "provider returned UNKNOWN",
+                )
+            return result
+        except _PresentationContractFailure:
+            raise
+        except asyncio.CancelledError:
+            receipt = self._host._unknown_presentation_receipt(
+                event,
+                "turn stream callback cancelled",
+            )
+            self._host._mark_presentation_failed(
+                self._key,
+                event.presentation_id,
+                receipt.error or "turn stream callback cancelled",
+            )
+            return receipt
+        except BaseException as error:
+            receipt = self._host._unknown_presentation_receipt(event, str(error))
+            self._host._mark_presentation_failed(
+                self._key,
+                event.presentation_id,
+                receipt.error or type(error).__name__,
+            )
+            return receipt
+        finally:
+            self._running -= 1
+            self._host._release_presentation_operation(self._key)
+            if self._running == 0:
+                self._quiescent.set()
+
+    async def await_quiescence(self) -> None:
+        await self._quiescent.wait()
+
+    async def close(self) -> None:
+        """Detach after admission is closed and every callback is terminal."""
+
+        if self._closed:
+            return
+        self.close_admission()
+        await self.await_quiescence()
+        self._closed = True
+        state = self._host._binding(self._key)
+        state.subscriptions.pop(id(self), None)
 
 
 class _ChannelAttachmentImport:
@@ -542,6 +884,9 @@ class ChannelGenerationHost:
         identity_rememberer: IdentityRememberer | None = None,
         attachment_import: ChannelAttachmentImportPort | None = None,
         attachment_read: ChannelAttachmentReadPort | None = None,
+        control_interrupter: ControlInterrupter | None = None,
+        control_response_dispatcher: ControlResponseDispatcher | None = None,
+        on_presentation_incident: PresentationIncidentReporter | None = None,
     ) -> None:
         if not callable(on_before_start):
             raise TypeError("on_before_start 必须是 async callback")
@@ -569,6 +914,16 @@ class ChannelGenerationHost:
             getattr(attachment_read, "acquire", None)
         ):
             raise TypeError("attachment_read 必须提供 acquire(ref)")
+        if control_interrupter is not None and not callable(control_interrupter):
+            raise TypeError("control_interrupter 必须可调用")
+        if control_response_dispatcher is not None and not callable(
+            control_response_dispatcher
+        ):
+            raise TypeError("control_response_dispatcher 必须可调用")
+        if on_presentation_incident is not None and not callable(
+            on_presentation_incident
+        ):
+            raise TypeError("on_presentation_incident 必须可调用")
         self._on_before_start = on_before_start
         self._config_revision_checker = config_revision_checker
         self._on_failure = on_failure
@@ -578,6 +933,10 @@ class ChannelGenerationHost:
         self._identity_rememberer = identity_rememberer
         self._attachment_import = attachment_import
         self._attachment_read = attachment_read
+        self._control_interrupter = control_interrupter
+        self._control_response_dispatcher = control_response_dispatcher
+        self._on_presentation_incident = on_presentation_incident
+        self._presentation_incidents: list[tuple[str, str, str]] = []
         self._bindings: dict[tuple[str, str], _ChannelBindingState] = {}
         self._tombstones: dict[tuple[str, str], ChannelCleanupTombstone] = {}
         self._start_counts: dict[tuple[str, str], int] = {}
@@ -591,6 +950,55 @@ class ChannelGenerationHost:
         if self._inbound_publisher is not None:
             raise RuntimeError("Channel inbound publisher 已绑定")
         self._inbound_publisher = publisher
+
+    def bind_control_interrupter(self, interrupter: ControlInterrupter) -> None:
+        """Bind Core's typed interrupt effect owner exactly once."""
+
+        if not callable(interrupter):
+            raise TypeError("control interrupter 必须可调用")
+        if self._control_interrupter is not None:
+            raise RuntimeError("control interrupter 已绑定")
+        self._control_interrupter = interrupter
+
+    def bind_control_handler(self, interrupter: ControlInterrupter) -> None:
+        """Compatibility spelling for the Core interrupt owner."""
+
+        self.bind_control_interrupter(interrupter)
+
+    def bind_control_response_dispatcher(
+        self,
+        dispatcher: ControlResponseDispatcher,
+    ) -> None:
+        """Bind same-binding awaited control response dispatch exactly once."""
+
+        if not callable(dispatcher):
+            raise TypeError("control response dispatcher 必须可调用")
+        if self._control_response_dispatcher is not None:
+            raise RuntimeError("control response dispatcher 已绑定")
+        self._control_response_dispatcher = dispatcher
+
+    def bind_control_responder(self, dispatcher: ControlResponseDispatcher) -> None:
+        """Compatibility spelling for same-binding control response dispatch."""
+
+        self.bind_control_response_dispatcher(dispatcher)
+
+    def bind_presentation_incident_reporter(
+        self,
+        reporter: PresentationIncidentReporter,
+    ) -> None:
+        """Bind the owner-specific presentation incident sink exactly once."""
+
+        if not callable(reporter):
+            raise TypeError("presentation incident reporter 必须可调用")
+        if self._on_presentation_incident is not None:
+            raise RuntimeError("presentation incident reporter 已绑定")
+        self._on_presentation_incident = reporter
+
+    @property
+    def presentation_incidents(self) -> tuple[tuple[str, str, str], ...]:
+        """Expose in-process presentation incident evidence for inspection."""
+
+        return tuple(self._presentation_incidents)
 
     async def start(
         self,
@@ -847,6 +1255,8 @@ class ChannelGenerationHost:
         self,
         snapshot_lease: RuntimeSnapshotLease,
         channel_name: str,
+        *,
+        _allow_claimed_after_close: bool = False,
     ) -> ChannelBindingLease:
         """Fork one exact stable lease and retain its live Channel binding."""
 
@@ -866,7 +1276,10 @@ class ChannelGenerationHost:
             for descriptor in registry.descriptors
         ):
             raise RuntimeError("Channel binding 不属于 exact RuntimeSnapshot catalog")
-        if not state.admission_open or state.stopping or state.stopped:
+        if state.stopped or (
+            not _allow_claimed_after_close
+            and (not state.admission_open or state.stopping)
+        ):
             raise RuntimeError("channel admission 已关闭")
         forked = snapshot_lease.fork()
         state.in_flight += 1
@@ -883,6 +1296,266 @@ class ChannelGenerationHost:
         if not isinstance(binding, ChannelBindingLease) or binding._host is not self:
             raise RuntimeError("v3 Channel outbound binding 不属于当前 Host")
         return await binding.deliver(envelope)
+
+    async def publish_turn_event(
+        self,
+        snapshot_id: str,
+        channel_name: str,
+        event: TurnStreamEvent,
+        *,
+        binding: ChannelBindingLease | None = None,
+    ) -> tuple[PresentationReceipt, ...]:
+        """Publish one typed event to callbacks attached to an exact binding."""
+
+        if not isinstance(event, TurnStreamEvent):
+            raise TypeError("turn stream 只接受 TurnStreamEvent")
+        state = self._binding((_text(snapshot_id, "snapshot_id"), _text(channel_name, "channel_name")))
+        if ChannelCapability.TURN_STREAM not in state.capabilities:
+            raise RuntimeError("channel 未声明 turn stream capability")
+        if binding is not None:
+            if binding._host is not self or binding._key != (snapshot_id, channel_name):
+                raise RuntimeError("turn stream binding lease 不属于 exact binding")
+            if not binding.active:
+                raise RuntimeError("turn stream binding lease 已关闭")
+        elif not state.admission_open or state.stopping or state.stopped:
+            raise RuntimeError("turn stream admission 已关闭")
+        self._validate_presentation_event(state, event)
+        tasks: list[asyncio.Task[PresentationReceipt]] = []
+        for subscription in tuple(state.subscriptions.values()):
+            if not subscription._admit(allow_closed=binding is not None):
+                continue
+            tasks.append(
+                asyncio.create_task(
+                    subscription.invoke(event),
+                    name=(
+                        f"channel-presentation:{state.channel_name}:"
+                        f"{event.presentation_id}"
+                    ),
+                )
+            )
+        receipts: list[PresentationReceipt] = []
+        cancelled = False
+        contract_errors: list[_PresentationContractFailure] = []
+        for task in tasks:
+            try:
+                receipts.append(
+                    cast(PresentationReceipt, await _await_task_after_cancellation(task))
+                )
+            except asyncio.CancelledError:
+                cancelled = True
+            except _PresentationContractFailure as error:
+                receipts.append(error.receipt)
+                contract_errors.append(error)
+        if cancelled:
+            raise asyncio.CancelledError
+        if contract_errors:
+            raise contract_errors[0]
+        return tuple(receipts)
+
+    async def publish_stream_event(
+        self,
+        snapshot_id: str,
+        channel_name: str,
+        event: TurnStreamEvent,
+    ) -> tuple[PresentationReceipt, ...]:
+        """Alias used by Core stream publishers during the C14d transition."""
+
+        return await self.publish_turn_event(snapshot_id, channel_name, event)
+
+    async def _acquire_control_binding(
+        self,
+        key: tuple[str, str],
+    ) -> ChannelBindingLease:
+        """Fork an exact snapshot lease for one control effect."""
+
+        acquirer = self._snapshot_lease_acquirer
+        if acquirer is None:
+            raise RuntimeError("Channel control exact snapshot lease owner 未绑定")
+        state = self._binding(key)
+        source = acquirer(state.snapshot_id)
+        try:
+            if source.snapshot.snapshot_id != state.snapshot_id:
+                raise RuntimeError("Channel control 与当前 stable snapshot 不一致")
+            return self.acquire_binding(
+                source,
+                state.channel_name,
+                _allow_claimed_after_close=True,
+            )
+        finally:
+            release = asyncio.create_task(
+                source.release(),
+                name=f"channel-control-source-release:{state.channel_name}",
+            )
+            await _await_task_after_cancellation(release)
+
+    async def emit_turn_event(
+        self,
+        snapshot_id: str,
+        channel_name: str,
+        event: TurnStreamEvent,
+    ) -> tuple[PresentationReceipt, ...]:
+        """Alias for adapters and focused host tests."""
+
+        return await self.publish_turn_event(snapshot_id, channel_name, event)
+
+    async def _handle_control(
+        self,
+        key: tuple[str, str],
+        raw: RawInbound,
+        response_bodies: ControlResponseBodies,
+        binding: ChannelBindingLease,
+    ) -> ControlReceipt:
+        interrupter = self._control_interrupter
+        if interrupter is None:
+            raise RuntimeError("Channel control interrupt owner 未绑定")
+        result = interrupter(raw)
+        if not inspect.isawaitable(result):
+            raise TypeError("control interrupter 必须返回 awaitable")
+        result = await result
+        reason = _control_reason(result)
+        accepted = reason == "interrupted"
+        response = await self._dispatch_control_response(
+            key,
+            raw,
+            response_bodies.interrupted if accepted else response_bodies.idle,
+            binding,
+        )
+        return ControlReceipt(accepted, reason, response)
+
+    async def _dispatch_control_response(
+        self,
+        key: tuple[str, str],
+        raw: RawInbound,
+        body: str,
+        binding: ChannelBindingLease,
+    ) -> ChannelDeliveryReceipt | None:
+        dispatcher = self._control_response_dispatcher
+        state = self._binding(key)
+        delivery_id = _control_delivery_id(state.binding_token, raw.message_id)
+        envelope = OutboundEnvelope(
+            logical_delivery_id=delivery_id,
+            delivery_id=delivery_id,
+            attempt_sequence=1,
+            snapshot_id=state.snapshot_id,
+            generation_id=state.generation_id,
+            binding_token=state.binding_token,
+            channel=state.channel_name,
+            recipient=raw.recipient or raw.message.chat_id,
+            body=body,
+            metadata={"control_message_id": raw.message_id},
+        )
+        try:
+            if dispatcher is None:
+                result = binding.deliver(envelope)
+            else:
+                result = _invoke_control_dispatcher(dispatcher, envelope, binding)
+            if not inspect.isawaitable(result):
+                raise TypeError("control response dispatcher 必须返回 awaitable")
+            result = await result
+            if not isinstance(result, ChannelDeliveryReceipt):
+                raise TypeError("control response dispatcher 必须返回 ChannelDeliveryReceipt")
+            if result.delivery_id != delivery_id:
+                raise RuntimeError("control response receipt identity 不匹配")
+            return result
+        except asyncio.CancelledError:
+            return ChannelDeliveryReceipt(
+                delivery_id,
+                DeliveryStatus.UNKNOWN,
+                error="control response cancelled",
+            )
+        except Exception as error:
+            return ChannelDeliveryReceipt(
+                delivery_id,
+                DeliveryStatus.UNKNOWN,
+                error=str(error) or type(error).__name__,
+            )
+
+    def _validate_presentation_event(
+        self,
+        state: _ChannelBindingState,
+        event: TurnStreamEvent,
+    ) -> None:
+        presentation_id = event.presentation_id
+        if presentation_id in state.failed_presentations:
+            raise RuntimeError(
+                f"presentation 已因 UNKNOWN 终止，禁止继续 patch: {presentation_id}"
+            )
+        payload = event.payload
+        turn_id = payload.turn_id
+        previous_turn_id = state.presentation_turn_ids.get(presentation_id)
+        if previous_turn_id is not None and previous_turn_id != turn_id:
+            raise RuntimeError("presentation turn_id 不一致")
+        state.presentation_turn_ids[presentation_id] = turn_id
+        previous_sequence = state.presentation_sequences.get(presentation_id)
+        if (
+            presentation_id in state.completed_presentations
+            and event.kind is not TurnStreamEventKind.TURN_OUTPUT_COMPLETED
+        ):
+            raise RuntimeError("turn.output.completed 后禁止继续 patch")
+        if event.kind is TurnStreamEventKind.TURN_STARTED:
+            if previous_sequence is not None:
+                raise RuntimeError("turn.started 不能重复")
+            if not isinstance(payload, TurnStartedPresentation):
+                raise TypeError("turn.started payload 类型无效")
+            state.presentation_sequences[presentation_id] = 0
+            return
+        sequence = getattr(payload, "sequence", None)
+        if previous_sequence is None:
+            raise RuntimeError("turn stream 必须先发送 turn.started")
+        if not isinstance(sequence, int) or sequence <= previous_sequence:
+            raise RuntimeError("turn stream sequence 必须单调递增")
+        state.presentation_sequences[presentation_id] = sequence
+        if event.kind is TurnStreamEventKind.TURN_OUTPUT_COMPLETED:
+            state.completed_presentations.add(presentation_id)
+
+    def _unknown_presentation_receipt(
+        self,
+        event: TurnStreamEvent,
+        error: str,
+    ) -> PresentationReceipt:
+        return PresentationReceipt(
+            presentation_id=event.presentation_id,
+            status=DeliveryStatus.UNKNOWN,
+            error=error or "turn stream callback failed",
+        )
+
+    def _mark_presentation_failed(
+        self,
+        key: tuple[str, str],
+        presentation_id: str,
+        error: str,
+    ) -> None:
+        state = self._binding(key)
+        state.failed_presentations.add(presentation_id)
+        incident = (state.binding_token, presentation_id, error or "unknown")
+        self._presentation_incidents.append(incident)
+        reporter = self._on_presentation_incident
+        if reporter is None:
+            return
+        try:
+            result = reporter(*incident)
+        except Exception:
+            return
+        if inspect.isawaitable(result):
+            asyncio.create_task(
+                _ignore_awaitable(result),
+                name=f"channel-presentation-incident:{presentation_id}",
+            )
+
+    def _begin_presentation_operation(
+        self,
+        key: tuple[str, str],
+        *,
+        allow_closed: bool = False,
+    ) -> None:
+        state = self._binding(key)
+        if state.stopped or (not allow_closed and (state.stopping or not state.admission_open)):
+            raise RuntimeError("presentation binding admission 已关闭")
+        state.in_flight += 1
+        state.drain_event.clear()
+
+    def _release_presentation_operation(self, key: tuple[str, str]) -> None:
+        self._release_in_flight(key)
 
     async def _admit_inbound(
         self,
@@ -915,14 +1588,19 @@ class ChannelGenerationHost:
         # 1. Claim before any await so concurrent duplicate callbacks serialize.
         state.inbound_message_id_set.add(dedupe_key)
         state.inbound_message_ids.append(dedupe_key)
+        self._begin_presentation_operation(key, allow_closed=False)
         accepted = False
         binding: ChannelBindingLease | None = None
         try:
-            source = await acquirer()
+            source = acquirer(state.snapshot_id)
             try:
                 if source.snapshot.snapshot_id != key[0]:
                     raise RuntimeError("Channel ingress 与当前 stable snapshot 不一致")
-                binding = self.acquire_binding(source, state.channel_name)
+                binding = self.acquire_binding(
+                    source,
+                    state.channel_name,
+                    _allow_claimed_after_close=True,
+                )
             finally:
                 release = asyncio.create_task(
                     source.release(),
@@ -962,14 +1640,17 @@ class ChannelGenerationHost:
                 state.inbound_message_id_set.remove(expired)
             return True
         finally:
-            if not accepted:
-                state.inbound_message_id_set.discard(dedupe_key)
-                try:
-                    state.inbound_message_ids.remove(dedupe_key)
-                except ValueError:
-                    pass
-                if binding is not None and binding.active:
-                    await binding.aclose()
+            try:
+                if not accepted:
+                    state.inbound_message_id_set.discard(dedupe_key)
+                    try:
+                        state.inbound_message_ids.remove(dedupe_key)
+                    except ValueError:
+                        pass
+                    if binding is not None and binding.active:
+                        await binding.aclose()
+            finally:
+                self._release_presentation_operation(key)
 
     def _resolve_identity(
         self,
@@ -1076,6 +1757,16 @@ class ChannelGenerationHost:
             state.factory_export,
         )
         credentials = _resolve_credentials(state.config, state.credential_paths)
+        state.control_port = (
+            _ChannelControl(self, key)
+            if ChannelCapability.CONTROL in state.capabilities
+            else None
+        )
+        state.turn_stream_port = (
+            _ChannelTurnStream(self, key)
+            if ChannelCapability.TURN_STREAM in state.capabilities
+            else None
+        )
         state.factory_context = ChannelFactoryContext(
             snapshot_id=state.snapshot_id,
             generation_id=state.generation_id,
@@ -1104,6 +1795,8 @@ class ChannelGenerationHost:
                 if self._attachment_read is not None
                 else None
             ),
+            control=state.control_port,
+            turn_stream=state.turn_stream_port,
         )
         try:
             adapter = state.factory(state.factory_context)
@@ -1117,6 +1810,24 @@ class ChannelGenerationHost:
         state.adapter = cast(ChannelAdapter, adapter)
         self._start_counts[key] = self._start_counts.get(key, 0) + 1
         state.start_attempted = True
+        if (
+            ChannelCapability.CONTROL in state.capabilities
+            or ChannelCapability.TURN_STREAM in state.capabilities
+        ):
+            attach_presentation = getattr(adapter, "attach_presentation", None)
+            if not callable(attach_presentation):
+                raise TypeError(
+                    f"channel adapter 缺少 attach_presentation: {state.channel_name}"
+                )
+            attached = attach_presentation(
+                ChannelPresentationPorts(
+                    control=state.control_port,
+                    turn_stream=state.turn_stream_port,
+                )
+            )
+            if inspect.isawaitable(attached):
+                _close_awaitable(attached)
+                raise TypeError("channel adapter.attach_presentation 必须同步返回")
         try:
             result = await _invoke_async(cast(ChannelAdapter, state.adapter), "start")
         except asyncio.CancelledError:
@@ -1206,8 +1917,13 @@ class ChannelGenerationHost:
         if state.stopped and state.stop_receipt is not None:
             return state.stop_receipt
         state.stopping = True
+        for subscription in tuple(state.subscriptions.values()):
+            subscription.close_admission()
         await state.drain_event.wait()
         try:
+            subscriptions = tuple(state.subscriptions.values())
+            for subscription in subscriptions:
+                await subscription.close()
             failures: list[ChannelCleanupFailure] = []
             receipt = state.stop_receipt
             if not state.adapter_stop_succeeded:
@@ -1617,6 +2333,45 @@ def _task_succeeded(task: asyncio.Task[Any]) -> bool:
         return task.exception() is None
     except asyncio.CancelledError:
         return False
+
+
+def _control_reason(
+    value: object,
+) -> Literal["interrupted", "idle"]:
+    if value is True or value == "interrupted":
+        return "interrupted"
+    if value is False or value == "idle":
+        return "idle"
+    raise TypeError("control interrupter 必须返回 interrupted/idle 或 bool")
+
+
+def _control_delivery_id(binding_token: str, message_id: str) -> str:
+    payload = f"control\x00{binding_token}\x00{message_id}".encode("utf-8")
+    return "control:" + hashlib.sha256(payload).hexdigest()
+
+
+def _invoke_control_dispatcher(
+    dispatcher: ControlResponseDispatcher,
+    envelope: OutboundEnvelope,
+    binding: ChannelBindingLease,
+) -> object:
+    """Dispatch one control response through its exact retained binding."""
+
+    return dispatcher(envelope, binding)
+
+
+def _is_async_callback(callback: object) -> bool:
+    return inspect.iscoroutinefunction(callback) or inspect.iscoroutinefunction(
+        getattr(callback, "__call__", None)
+    )
+
+
+async def _ignore_awaitable(value: object) -> None:
+    if inspect.isawaitable(value):
+        try:
+            await value
+        except Exception:
+            return
 
 
 __all__ = [

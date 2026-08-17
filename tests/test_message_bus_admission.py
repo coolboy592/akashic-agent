@@ -1020,10 +1020,15 @@ async def test_v3_channel_worker_preserves_exact_binding_through_terminal_delive
     seen_request: list[TurnRequest] = []
 
     async def execute(request: TurnRequest) -> str:
+        from agent.plugins.channel_generation_host import (
+            get_current_channel_turn_binding,
+        )
         from agent.plugins.snapshot import get_current_runtime_snapshot
 
         assert get_current_runtime_snapshot() is not None
         assert get_current_runtime_snapshot().snapshot_id == "snapshot-1"
+        channel_binding = get_current_channel_turn_binding()
+        assert channel_binding is lease
         seen_request.append(request)
         return f"echo:{request.input}"
 
@@ -1057,6 +1062,10 @@ async def test_v3_channel_worker_preserves_exact_binding_through_terminal_delive
 
     assert len(seen_request) == 1
     assert seen_request[0].metadata["channelBindingToken"] == lease.binding_token
+    assert (
+        seen_request[0].metadata["inboundMetadata"]["client_message_id"]
+        == envelope.message_id
+    )
     assert len(delivered) == 1
     outbound, binding = delivered[0]
     assert outbound.body == "echo:hello"

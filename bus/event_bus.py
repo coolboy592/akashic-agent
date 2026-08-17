@@ -49,10 +49,11 @@ class EventBus:
         handler: Handler[E],
     ) -> EventSubscription:
         # 1. 按注册顺序保存 handler，语义由 emit / observe 调用点决定。
-        handlers = self._handlers.setdefault(cast(type[object], event_type), [])
+        raw_event_type = _event_type(event_type)
+        handlers = self._handlers.setdefault(raw_event_type, [])
         raw_handler = cast(Handler[object], handler)
         handlers.append(raw_handler)
-        return EventSubscription(self, cast(type[object], event_type), raw_handler)
+        return EventSubscription(self, raw_event_type, raw_handler)
 
     def on_any(self, handler: Handler[object]) -> EventSubscription:
         handlers = self._handlers.setdefault(_AnyEvent, [])
@@ -292,15 +293,24 @@ class EventBus:
         """在隔离 task 中运行单个 observer，并区分 observer 与调用方取消。"""
 
         from agent.plugins.snapshot import get_current_runtime_lease
+        from agent.plugins.channel_generation_host import (
+            get_current_channel_turn_binding,
+        )
 
         source_lease = source_lease or get_current_runtime_lease()
         snapshot_lease = source_lease.fork() if source_lease is not None else None
+        channel_binding = get_current_channel_turn_binding()
         caller_task = asyncio.current_task()
         caller_cancelling = (
             caller_task.cancelling() if caller_task is not None else 0
         )
         handler_task = asyncio.create_task(
-            self._invoke_observer(handler, event, snapshot_lease),
+            self._invoke_observer(
+                handler,
+                event,
+                snapshot_lease,
+                channel_binding,
+            ),
             name=f"event_observer:{_handler_name(handler)}",
         )
         try:
@@ -340,20 +350,39 @@ class EventBus:
         handler: Handler[object],
         event: object,
         snapshot_lease: RuntimeSnapshotLease | None,
+        channel_binding: object | None,
     ) -> None:
-        if snapshot_lease is not None:
-            from agent.plugins.snapshot import bind_runtime_snapshot, reset_runtime_snapshot
+        channel_token = None
+        if channel_binding is not None:
+            from agent.plugins.channel_generation_host import (
+                bind_channel_turn_binding,
+            )
 
-            async with snapshot_lease:
-                token = bind_runtime_snapshot(snapshot_lease)
-                try:
-                    await self._invoke_observer(handler, event, None)
-                finally:
-                    reset_runtime_snapshot(token)
-            return
-        result = handler(event)
-        if inspect.isawaitable(result):
-            await result
+            channel_token = bind_channel_turn_binding(channel_binding)
+        try:
+            if snapshot_lease is not None:
+                from agent.plugins.snapshot import (
+                    bind_runtime_snapshot,
+                    reset_runtime_snapshot,
+                )
+
+                async with snapshot_lease:
+                    token = bind_runtime_snapshot(snapshot_lease)
+                    try:
+                        await self._invoke_observer(handler, event, None, None)
+                    finally:
+                        reset_runtime_snapshot(token)
+                return
+            result = handler(event)
+            if inspect.isawaitable(result):
+                await result
+        finally:
+            if channel_token is not None:
+                from agent.plugins.channel_generation_host import (
+                    reset_channel_turn_binding,
+                )
+
+                reset_channel_turn_binding(channel_token)
 
     def _ensure_observe_queue(
         self,
@@ -506,6 +535,10 @@ def _handler_name(handler: Handler[object]) -> str:
             getattr(handler, "__name__", repr(handler)),
         )
     )
+
+
+def _event_type(value: object) -> type[object]:
+    return cast(type[object], value)
 
 
 def _raise_event_bus_errors(message: str, errors: list[BaseException]) -> None:

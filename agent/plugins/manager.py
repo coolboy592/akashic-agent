@@ -391,7 +391,7 @@ class PluginManager:
             on_before_start=self._reserve_channel_binding,
             config_revision_checker=self._check_channel_config_revision,
             on_failure=self._on_channel_cleanup_failure,
-            snapshot_lease_acquirer=self._snapshot_store.acquire,
+            snapshot_lease_acquirer=self._snapshot_store.lease,
             identity_resolver=self._resolve_channel_identity,
             identity_rememberer=self._remember_channel_identity,
             attachment_import=channel_attachment_store,

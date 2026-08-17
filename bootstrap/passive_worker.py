@@ -222,6 +222,7 @@ class PassiveMessageWorker:
                     "inputTimestamp": message.timestamp.isoformat(),
                     "inboundMetadata": {
                         **dict(message.metadata),
+                        "client_message_id": envelope.message_id,
                         **(
                             {
                                 "attachment_ids": [
@@ -248,6 +249,7 @@ class PassiveMessageWorker:
                             Any,
                             envelope.lease.snapshot_lease,
                         ),
+                        channel_binding_lease=cast(Any, envelope.lease),
                         live_media=tuple(
                             lease.model_path for lease in attachment_leases
                         ),

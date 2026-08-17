@@ -5,12 +5,12 @@ import hashlib
 import json
 import math
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import date, datetime, time
 from enum import StrEnum
 from types import MappingProxyType
-from typing import Protocol, TypeAlias
+from typing import Literal, Protocol, TypeAlias
 
 from agent.plugin_composition.context import Context, FiberHandle, HealthHandle
 from agent.plugin_composition.model import CompositionError, IncidentView, ServiceKey
@@ -443,6 +443,193 @@ class ChannelDeliveryReceipt:
 
 
 @dataclass(frozen=True, slots=True)
+class ControlReceipt:
+    """Report one deduplicated interrupt and its independent response delivery."""
+
+    accepted: bool
+    reason: Literal["interrupted", "idle", "duplicate", "binding_closed"]
+    response: ChannelDeliveryReceipt | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.accepted, bool):
+            raise TypeError("accepted 必须是 bool")
+        if self.reason not in {"interrupted", "idle", "duplicate", "binding_closed"}:
+            raise ValueError(f"control reason 无效: {self.reason}")
+        if self.reason == "interrupted" and not self.accepted:
+            raise ValueError("interrupted control 必须 accepted=True")
+        if self.reason != "interrupted" and self.accepted:
+            raise ValueError("非 interrupted control 不得 accepted=True")
+        if self.reason in {"duplicate", "binding_closed"} and self.response is not None:
+            raise ValueError("duplicate/binding_closed control 不得携带 response")
+        if self.response is not None and not isinstance(
+            self.response, ChannelDeliveryReceipt
+        ):
+            raise TypeError("response 必须是 ChannelDeliveryReceipt 或 None")
+
+
+@dataclass(frozen=True, slots=True)
+class ControlResponseBodies:
+    """Carry provider-localized response bodies for accepted and idle control."""
+
+    interrupted: str
+    idle: str
+
+    def __post_init__(self) -> None:
+        _string(self.interrupted, "interrupted")
+        _string(self.idle, "idle")
+
+
+class ChannelControlPort(Protocol):
+    async def interrupt(
+        self,
+        raw: RawInbound,
+        *,
+        response_bodies: ControlResponseBodies,
+    ) -> ControlReceipt: ...
+
+
+class TurnStreamEventKind(StrEnum):
+    TURN_STARTED = "turn.started"
+    STREAM_DELTA = "stream.delta"
+    TOOL_STARTED = "tool.started"
+    TOOL_COMPLETED = "tool.completed"
+    TURN_OUTPUT_COMPLETED = "turn.output.completed"
+
+
+@dataclass(frozen=True, slots=True)
+class TurnStartedPresentation:
+    turn_id: str
+    client_message_id: str
+
+    def __post_init__(self) -> None:
+        _text(self.turn_id, "turn_id")
+        _message_id(self.client_message_id)
+
+
+@dataclass(frozen=True, slots=True)
+class StreamDeltaPresentation:
+    turn_id: str
+    sequence: int
+    text_delta: str
+    reasoning_delta: str
+
+    def __post_init__(self) -> None:
+        _text(self.turn_id, "turn_id")
+        _positive_sequence(self.sequence)
+        _string(self.text_delta, "text_delta")
+        _string(self.reasoning_delta, "reasoning_delta")
+
+
+@dataclass(frozen=True, slots=True)
+class ToolPresentation:
+    turn_id: str
+    sequence: int
+    tool_call_id: str
+    tool_name: str
+
+    def __post_init__(self) -> None:
+        _text(self.turn_id, "turn_id")
+        _positive_sequence(self.sequence)
+        _text(self.tool_call_id, "tool_call_id")
+        _text(self.tool_name, "tool_name")
+
+
+@dataclass(frozen=True, slots=True)
+class TurnOutputCompletedPresentation:
+    turn_id: str
+    sequence: int
+
+    def __post_init__(self) -> None:
+        _text(self.turn_id, "turn_id")
+        _positive_sequence(self.sequence)
+
+
+TurnStreamPayload: TypeAlias = (
+    TurnStartedPresentation
+    | StreamDeltaPresentation
+    | ToolPresentation
+    | TurnOutputCompletedPresentation
+)
+
+
+@dataclass(frozen=True, slots=True)
+class TurnStreamEvent:
+    """Freeze one typed turn presentation event before provider callbacks."""
+
+    presentation_id: str
+    kind: TurnStreamEventKind
+    payload: TurnStreamPayload
+
+    def __post_init__(self) -> None:
+        _text(self.presentation_id, "presentation_id")
+        if not isinstance(self.kind, TurnStreamEventKind):
+            raise TypeError("kind 必须是 TurnStreamEventKind")
+        expected: type[object]
+        if self.kind is TurnStreamEventKind.TURN_STARTED:
+            expected = TurnStartedPresentation
+        elif self.kind is TurnStreamEventKind.STREAM_DELTA:
+            expected = StreamDeltaPresentation
+        elif self.kind in {
+            TurnStreamEventKind.TOOL_STARTED,
+            TurnStreamEventKind.TOOL_COMPLETED,
+        }:
+            expected = ToolPresentation
+        else:
+            expected = TurnOutputCompletedPresentation
+        if not isinstance(self.payload, expected):
+            raise TypeError(
+                f"{self.kind.value} payload 必须是 {expected.__name__}"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class PresentationReceipt:
+    """Report one settled remote preview callback."""
+
+    presentation_id: str
+    status: DeliveryStatus
+    provider_ids: tuple[str, ...] = ()
+    error: str | None = None
+
+    def __post_init__(self) -> None:
+        _text(self.presentation_id, "presentation_id")
+        if not isinstance(self.status, DeliveryStatus):
+            raise TypeError("status 必须是 DeliveryStatus")
+        object.__setattr__(
+            self,
+            "provider_ids",
+            _text_tuple(self.provider_ids, "provider_ids"),
+        )
+        if self.error is not None:
+            _text(self.error, "error")
+
+
+TurnStreamCallback: TypeAlias = Callable[
+    [TurnStreamEvent], Awaitable[PresentationReceipt]
+]
+
+
+class StreamSubscription(Protocol):
+    def close_admission(self) -> None: ...
+
+    async def await_quiescence(self) -> None: ...
+
+    async def close(self) -> None: ...
+
+
+class TurnStreamPort(Protocol):
+    def subscribe(self, callback: TurnStreamCallback) -> StreamSubscription: ...
+
+
+@dataclass(frozen=True, slots=True)
+class ChannelPresentationPorts:
+    """Expose only the presentation capabilities declared by one binding."""
+
+    control: ChannelControlPort | None
+    turn_stream: TurnStreamPort | None
+
+
+@dataclass(frozen=True, slots=True)
 class QueuedReceipt:
     """Represent queue admission separately from a settled delivery receipt."""
 
@@ -526,6 +713,8 @@ class ChannelFactoryContext:
     identity: ChannelIdentityPort | None
     attachment_import: ChannelAttachmentImportPort | None = None
     attachment_read: ChannelAttachmentReadPort | None = None
+    control: ChannelControlPort | None = None
+    turn_stream: TurnStreamPort | None = None
 
     def __post_init__(self) -> None:
         _text(self.snapshot_id, "snapshot_id")
@@ -555,6 +744,14 @@ class ChannelFactoryContext:
             raise TypeError(
                 "channel factory attachment_read 必须提供 acquire(ref)"
             )
+        if self.control is not None and not callable(
+            getattr(self.control, "interrupt", None)
+        ):
+            raise TypeError("channel factory control 必须提供 interrupt(raw, ...)")
+        if self.turn_stream is not None and not callable(
+            getattr(self.turn_stream, "subscribe", None)
+        ):
+            raise TypeError("channel factory turn_stream 必须提供 subscribe(callback)")
         object.__setattr__(self, "config", config)
         object.__setattr__(self, "credentials", credentials)
 
@@ -1305,6 +1502,12 @@ def _message_id(value: object) -> str:
     return result
 
 
+def _positive_sequence(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError("sequence 必须是正整数")
+    return value
+
+
 def _string(value: object, field_name: str) -> str:
     if not isinstance(value, str):
         raise TypeError(f"{field_name} 必须是 str")
@@ -1320,17 +1523,21 @@ __all__ = [
     "ChannelAttachmentImportPort",
     "ChannelAttachmentReadPort",
     "ChannelCleanupFailure",
+    "ChannelControlPort",
     "ChannelDeliveryReceipt",
     "ChannelFactoryContext",
     "ChannelIngressPort",
     "ChannelIdentityPort",
     "ChannelReady",
+    "ChannelPresentationPorts",
     "ChannelInboundMessage",
     "AttachmentKind",
     "AttachmentReadLease",
     "AttachmentRef",
     "CredentialRef",
     "DeliveryStatus",
+    "ControlReceipt",
+    "ControlResponseBodies",
     "ChannelDefinition",
     "ChannelDescriptor",
     "ChannelFactoryFreezeInput",
@@ -1350,6 +1557,17 @@ __all__ = [
     "PushToolRequest",
     "QueuedReceipt",
     "RawInbound",
+    "PresentationReceipt",
+    "StreamDeltaPresentation",
+    "StreamSubscription",
     "StopReceipt",
+    "ToolPresentation",
+    "TurnOutputCompletedPresentation",
+    "TurnStartedPresentation",
+    "TurnStreamCallback",
+    "TurnStreamEvent",
+    "TurnStreamEventKind",
+    "TurnStreamPayload",
+    "TurnStreamPort",
     "_freeze_plugin_channels",
 ]

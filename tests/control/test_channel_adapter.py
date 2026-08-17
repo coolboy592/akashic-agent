@@ -537,9 +537,9 @@ async def test_capacity_bytes_includes_request_waits_without_busy_polling(
     attempts = {"count": 0}
     original_start = runtime.start_turn
 
-    async def counting_start(request: TurnRequest) -> Any:
+    async def counting_start(request: TurnRequest, **kwargs: Any) -> Any:
         attempts["count"] += 1
-        return await original_start(request)
+        return await original_start(request, **kwargs)
 
     runtime.start_turn = counting_start  # type: ignore[method-assign]
     await bus.publish_inbound(_mobile_item("small", "y" * 200, "client:small"))
