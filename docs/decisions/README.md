@@ -13,7 +13,7 @@
 | [0005](0005-git-cursor-drives-one-shot-migrations.md) | superseded | Git cursor 驱动一次性兼容迁移 | MIG-001、MIG-002、WSP-003、BAK-001 |
 | [0006](0006-akasha-v2-is-the-canonical-explicit-memory-engine.md) | accepted | Akasha V2 是显式记忆的唯一算法实现 | MEM-009、SES-003、GOV-005、TST-002、TST-005 |
 | [0007](0007-mobile-plugin-control-and-data-planes-are-explicit.md) | accepted | 移动插件控制面与查询数据面显式分离 | MOB-001、MOB-003、MOB-006、PLG-003、PLG-011、TST-006～TST-008 |
-| [0008](0008-plugin-runtime-publishes-only-committed-snapshots.md) | accepted | 插件运行时只发布已提交快照 | PLG-001～PLG-008、GOV-005、TST-006～TST-008 |
+| [0008](0008-plugin-runtime-publishes-only-committed-snapshots.md) | superseded | 插件运行时只发布已提交快照 | PLG-001～PLG-008、GOV-005、TST-006～TST-008 |
 | [0009](0009-akasha-mobile-recall-preserves-semantic-lanes.md) | accepted | Akasha 移动卡片完整保留有界召回 lane | MOB-006、PLG-011、TST-006～TST-008 |
 | [0010](0010-provider-default-output-and-benchmark-diagnostics.md) | accepted | Provider 默认输出边界与 Benchmark 诊断边界 | RUN-006、TST-009 |
 | [0011](0011-benchmark-concurrency-six.md) | accepted | Benchmark 隔离实例并发上限提高到六 | TST-009、WSP-004、SH-001 |
@@ -42,6 +42,7 @@
 | [0034](0034-turn-is-the-logical-work-unit.md) | accepted | Turn 是逻辑工作单元 | CTX-003、SES-007、SES-008、MEM-011、OUT-001、OUT-004、SCH-003 |
 | [0035](0035-mobile-protocol-delivery-is-phased.md) | accepted | 移动协议交付按变更性质分阶段 | MOB-008、MOB-006、TST-007、GOV-002 |
 | [0036](0036-plugin-composition-keeps-promotion-owner.md) | accepted | 插件组合内核保留现有晋升 owner | PLG-001～PLG-013、WSP-001～WSP-005、ERR-001、TST-001～TST-007 |
+| [0037](0037-plugin-runtime-is-pure-v3.md) | accepted / implementing | 插件运行时收敛为 pure v3 | PLG-001～PLG-014、WSP-001～WSP-005、ERR-001、TST-001～TST-008 |
 
 ## 新增规则
 
