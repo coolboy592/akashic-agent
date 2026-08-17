@@ -124,36 +124,19 @@ class RuntimeSnapshot:
     _store_token: object | None = field(default=None, repr=False)
 
     def active_generations(self) -> tuple[PluginGeneration, ...]:
-        # V2_REMOVAL(static-active)：v2 删除后全部 generation 只读冻结的 Root active 集合。
+        if self.generations and self.composition_active_plugin_ids is None:
+            raise RuntimeError("RuntimeSnapshot 缺少 Root active plugin projection")
+        active_plugin_ids = self.composition_active_plugin_ids or frozenset()
         return tuple(
             generation
             for generation in self.generations.values()
-            if (
-                generation.plugin_id in self.composition_active_plugin_ids
-                if self.composition_active_plugin_ids is not None
-                and getattr(generation.instance, "api_version", None) == 3
-                else plugin_is_active(
-                    generation.instance,
-                    plugin_id=generation.plugin_id,
-                )
-            )
+            if generation.plugin_id in active_plugin_ids
         )
 
     def claim(self, store_token: object) -> None:
         if self.state != "compiled" or self.lease_count or self._store_token is not None:
             raise RuntimeError("RuntimeSnapshot 不是可发布的全新 compiled 快照")
         self._store_token = store_token
-
-
-def plugin_is_active(instance: object, *, plugin_id: str) -> bool:
-    # V2_REMOVAL(static-active)：v2 删除后仅保留 ComposablePlugin 的绑定期校验。
-    checker = getattr(instance, "is_active", None)
-    if not callable(checker):
-        return True
-    try:
-        return bool(checker())
-    except Exception as error:
-        raise RuntimeError(f"插件 active 状态检查失败: {plugin_id}") from error
 
 
 @dataclass(frozen=True)

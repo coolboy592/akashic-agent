@@ -40,7 +40,6 @@ from agent.plugins.snapshot import (
     RuntimeSnapshotCompiler,
     RuntimeSnapshotStore,
     bind_runtime_snapshot,
-    plugin_is_active,
     reset_runtime_snapshot,
 )
 from agent.tools.message_push import MessagePushTool

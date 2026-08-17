@@ -170,7 +170,6 @@ from agent.plugins.snapshot import (
     RuntimeSnapshotStore,
     SnapshotTransaction,
     get_current_runtime_snapshot,
-    plugin_is_active,
 )
 from bus.event_bus import EventBus
 from infra.channels.contract import Channel
@@ -5781,9 +5780,7 @@ class PluginManager:
         return [
             generation
             for generation in generations
-            if plugin_is_active(
-                generation.instance, plugin_id=generation.plugin_id
-            )
+            if cast(ComposablePlugin, generation.instance).static_active
         ]
 
     async def _mount_generation_composition(
