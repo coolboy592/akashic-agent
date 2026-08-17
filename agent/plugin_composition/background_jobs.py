@@ -8,7 +8,7 @@ from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from types import MappingProxyType
-from typing import TypeAlias, cast
+from typing import Protocol, TypeAlias, cast
 
 from agent.plugin_composition.context import Context, FiberHandle, HealthHandle
 from agent.plugin_composition.model import CompositionError, FiberState, ServiceKey
@@ -121,6 +121,26 @@ BackgroundJobRetryPolicy = RetryPolicy
 
 
 @dataclass(frozen=True, slots=True)
+class ProgrammaticTurnReceipt:
+    """Identify a Turn admitted through one invocation-scoped port."""
+
+    session_id: str
+    turn_id: str
+
+
+class ProgrammaticTurnPort(Protocol):
+    """Expose only Core-owned programmatic Turn admission to one job."""
+
+    async def create_session(self, *, metadata: Mapping[str, object]) -> str: ...
+
+    async def submit(
+        self,
+        session_id: str,
+        content: str,
+    ) -> ProgrammaticTurnReceipt: ...
+
+
+@dataclass(frozen=True, slots=True)
 class BackgroundJobDefinition:
     """Describe one interval/Core-event job without retaining a handler callable."""
 
@@ -134,6 +154,7 @@ class BackgroundJobDefinition:
     domain_effect: str | None = None
     domain_effect_lookup_export: str | None = None
     model_role: str | None = None
+    programmatic_turns: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or _NAME.fullmatch(self.name) is None:
@@ -178,6 +199,8 @@ class BackgroundJobDefinition:
             )
         if self.model_role is not None:
             _identifier(self.model_role, "model_role")
+        if not isinstance(self.programmatic_turns, bool):
+            raise TypeError("programmatic_turns 必须是 bool")
 
 
 @dataclass(frozen=True, slots=True)
@@ -195,6 +218,7 @@ class BackgroundJobDescriptor:
     domain_effect: str | None = None
     domain_effect_lookup_export: str | None = None
     model_role: str | None = None
+    programmatic_turns: bool = False
 
     def __post_init__(self) -> None:
         _text(self.owner, "owner")
@@ -209,6 +233,7 @@ class BackgroundJobDescriptor:
             domain_effect=self.domain_effect,
             domain_effect_lookup_export=self.domain_effect_lookup_export,
             model_role=self.model_role,
+            programmatic_turns=self.programmatic_turns,
         )
         object.__setattr__(self, "triggers", definition.triggers)
         object.__setattr__(self, "documents_scope", definition.documents_scope)
@@ -407,6 +432,7 @@ class _BackgroundJobDeclarations:
             domain_effect=definition.domain_effect,
             domain_effect_lookup_export=definition.domain_effect_lookup_export,
             model_role=definition.model_role,
+            programmatic_turns=definition.programmatic_turns,
         )
         registration = _Registration(
             token=token,
@@ -525,6 +551,7 @@ def _normalize_definition(definition: BackgroundJobDefinition) -> BackgroundJobD
         domain_effect=definition.domain_effect,
         domain_effect_lookup_export=definition.domain_effect_lookup_export,
         model_role=definition.model_role,
+        programmatic_turns=definition.programmatic_turns,
     )
 
 
@@ -558,6 +585,7 @@ def _descriptor_identity(descriptor: BackgroundJobDescriptor) -> dict[str, objec
         "domain_effect": descriptor.domain_effect,
         "domain_effect_lookup_export": descriptor.domain_effect_lookup_export,
         "model_role": descriptor.model_role,
+        "programmatic_turns": descriptor.programmatic_turns,
     }
 
 
@@ -584,6 +612,8 @@ __all__ = [
     "CoreEventTrigger",
     "IntervalTrigger",
     "PluginBackgroundJobs",
+    "ProgrammaticTurnPort",
+    "ProgrammaticTurnReceipt",
     "RetryPolicy",
     "_freeze_plugin_background_jobs",
 ]

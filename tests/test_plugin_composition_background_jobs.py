@@ -30,7 +30,11 @@ def _runtime(tmp_path: Path, plugin_id: str = "drift") -> PluginRuntime:
     )
 
 
-def _definition(name: str = "merge_proactive_pending") -> BackgroundJobDefinition:
+def _definition(
+    name: str = "merge_proactive_pending",
+    *,
+    programmatic_turns: bool = False,
+) -> BackgroundJobDefinition:
     return BackgroundJobDefinition(
         name=name,
         triggers=(CoreEventTrigger(CoreEvent.DRIFT_FINISHED), IntervalTrigger(60)),
@@ -46,6 +50,7 @@ def _definition(name: str = "merge_proactive_pending") -> BackgroundJobDefinitio
         domain_effect="emotion.state",
         domain_effect_lookup_export="lookup_emotion_effect",
         model_role="proactive.merge",
+        programmatic_turns=programmatic_turns,
     )
 
 
@@ -134,6 +139,34 @@ async def test_background_job_candidate_freeze_has_no_execution_surface(
         CoreEventTrigger(CoreEvent.DRIFT_FINISHED),
         IntervalTrigger(60),
     )
+    await root.dispose()
+
+
+@pytest.mark.asyncio
+async def test_background_job_preserves_explicit_programmatic_turn_declaration(
+    tmp_path: Path,
+) -> None:
+    root = CompositionRoot("jobs-programmatic")
+    service = PluginBackgroundJobs(root.instance_token)
+    _ = await root.context.provide(BACKGROUND_JOBS, service)
+
+    async def apply(ctx) -> None:
+        await ctx.require(BACKGROUND_JOBS).register(
+            ctx,
+            _definition(programmatic_turns=True),
+        )
+
+    _ = await root.mount(
+        apply,
+        name="drift",
+        inject=(BACKGROUND_JOBS,),
+        runtime=_runtime(tmp_path),
+    )
+    catalog = _freeze_plugin_background_jobs(service, root.instance_token)
+    binding = catalog.job("drift:merge_proactive_pending")
+    assert binding is not None
+    assert binding.definition.programmatic_turns is True
+    assert catalog.descriptors[0].programmatic_turns is True
     await root.dispose()
 
 
@@ -256,6 +289,12 @@ async def test_background_job_name_is_unique_per_owner(
         ),
         lambda: BackgroundJobDefinition(
             "bad", (IntervalTrigger(1),), "bad export"
+        ),
+        lambda: BackgroundJobDefinition(
+            "bad",
+            (IntervalTrigger(1),),
+            "run",
+            programmatic_turns=1,
         ),
         lambda: RetryPolicy(max_attempts=0),
         lambda: RetryPolicy(base_delay_seconds=float("nan")),

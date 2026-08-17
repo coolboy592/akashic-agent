@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import inspect
+import math
 import secrets
 from contextvars import ContextVar, Token
 from collections.abc import Awaitable, Callable, Coroutine, Mapping
@@ -20,6 +21,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, TYPE_CHECKING, cast
 
+from agent.control.models import TurnRequest
 from agent.model_runtime.registry import (
     RoleBoundProvider,
     current_model_binding,
@@ -31,6 +33,8 @@ from agent.plugin_composition.background_jobs import (
     CoreEvent,
     CoreEventTrigger,
     IntervalTrigger,
+    ProgrammaticTurnPort,
+    ProgrammaticTurnReceipt,
 )
 from agent.plugins.composable import ComposablePlugin
 from agent.plugins.job_outcome_ledger import (
@@ -70,6 +74,19 @@ _DOCUMENTS_ALLOWLIST = frozenset(
     {
         ("emotion", "merge_pending"),
         ("emotion", "merge_proactive_pending"),
+    }
+)
+_PROGRAMMATIC_SESSION_RESERVED_FIELDS = frozenset(
+    {
+        "event_id",
+        "generation_id",
+        "invocation_id",
+        "job_name",
+        "plugin_id",
+        "programmatic",
+        "runtime",
+        "skip_post_memory",
+        "snapshot_id",
     }
 )
 
@@ -405,6 +422,7 @@ class BackgroundJobContext:
     activation_token: object
     domain_effects: ProactiveDomainEffects | None = None
     documents: "_InvocationDocuments | None" = None
+    turns: ProgrammaticTurnPort | None = None
     _children: set[asyncio.Future[None]] = field(default_factory=set, init=False, repr=False)
     _closed: bool = field(default=False, init=False, repr=False)
 
@@ -504,6 +522,151 @@ class _JobRequest:
         """Return the stable semantic trigger key shared by effect and documents."""
 
         return f"{self.outcome.semantic_job_id}:{self.outcome.trigger_identity}"
+
+
+class _ProgrammaticTurnPort:
+    """Admit programmatic Turns through one exact job invocation lease."""
+
+    def __init__(
+        self,
+        runtime: object,
+        request: _JobRequest,
+        session_creator: Callable[..., object],
+    ) -> None:
+        self._runtime = runtime
+        self._request = request
+        self._session_creator = session_creator
+        self._invocation_token: object | None = None
+        self._sessions: dict[str, dict[str, object]] = {}
+        self._turn_tasks: set[asyncio.Task[None]] = set()
+        self._closed = False
+
+    def _bind_invocation_token(self, token: object) -> None:
+        """Bind the non-forgeable Context token before exposing the port."""
+
+        if self._invocation_token is not None:
+            raise RuntimeError("programmatic Turn invocation token 已绑定")
+        self._invocation_token = token
+
+    async def create_session(self, *, metadata: Mapping[str, object]) -> str:
+        """Persist one Core-named programmatic session with immutable provenance."""
+
+        self._require_live()
+        payload = _programmatic_session_metadata(self._request, metadata)
+        key = "programmatic:" + secrets.token_hex(16)
+        result = self._session_creator(key=key, metadata=payload)
+        if inspect.isawaitable(result):
+            await result
+        self._sessions[key] = payload
+        return key
+
+    async def submit(
+        self,
+        session_id: str,
+        content: str,
+    ) -> ProgrammaticTurnReceipt:
+        """Admit one Turn on a port-created session and release its lease at terminal."""
+
+        self._require_live()
+        if not isinstance(session_id, str) or not session_id:
+            raise ValueError("programmatic session_id 必须是非空字符串")
+        if session_id not in self._sessions:
+            raise RuntimeError("programmatic Turn session 不属于当前 job port")
+        if not isinstance(content, str):
+            raise TypeError("programmatic Turn content 必须是字符串")
+        start_turn = getattr(self._runtime, "start_turn", None)
+        if not callable(start_turn):
+            raise RuntimeError("ConversationRuntime 缺少 start_turn")
+        lease = self._request.snapshot_lease.fork()
+        metadata = dict(self._sessions[session_id])
+        task = asyncio.create_task(
+            self._admit(start_turn, session_id, content, metadata, lease),
+            name=f"programmatic_turn_admission:{session_id}",
+        )
+        try:
+            handle = await asyncio.shield(task)
+        except asyncio.CancelledError:
+            # Admission is a Core critical section: finish it before restoring cancellation.
+            try:
+                handle = await task
+            except BaseException:
+                await lease.release()
+                raise
+            self._retain_turn_lease(handle, lease, session_id)
+            raise
+        except BaseException:
+            await lease.release()
+            raise
+        self._retain_turn_lease(handle, lease, session_id)
+        turn_id = _turn_handle_id(handle)
+        return ProgrammaticTurnReceipt(session_id=session_id, turn_id=turn_id)
+
+    async def _admit(
+        self,
+        start_turn: Callable[..., object],
+        session_id: str,
+        content: str,
+        metadata: Mapping[str, object],
+        lease: RuntimeSnapshotLease,
+    ) -> object:
+        request = TurnRequest(session_id, content, dict(metadata))
+        result = start_turn(request, runtime_snapshot_lease=lease)
+        if not inspect.isawaitable(result):
+            raise TypeError("ConversationRuntime.start_turn 必须返回 awaitable")
+        return await result
+
+    def _close(self) -> None:
+        """Close this invocation port without cancelling already admitted Turns."""
+
+        self._closed = True
+
+    def _retain_turn_lease(
+        self,
+        handle: object,
+        lease: RuntimeSnapshotLease,
+        session_id: str,
+    ) -> None:
+        task = asyncio.create_task(
+            self._release_turn_lease(handle, lease),
+            name=f"programmatic_turn_lease:{session_id}",
+        )
+        self._turn_tasks.add(task)
+
+        def finish(completed: asyncio.Task[None]) -> None:
+            self._turn_tasks.discard(completed)
+            # Retrieve the exception so a failed child Turn does not become an orphan task.
+            _ = completed.exception() if not completed.cancelled() else None
+
+        task.add_done_callback(finish)
+
+    async def _release_turn_lease(
+        self,
+        handle: object,
+        lease: RuntimeSnapshotLease,
+    ) -> None:
+        try:
+            result = getattr(handle, "result", None)
+            if not callable(result):
+                raise RuntimeError("ConversationRuntime TurnHandle 缺少 result")
+            terminal = result()
+            if not inspect.isawaitable(terminal):
+                raise TypeError("ConversationRuntime TurnHandle.result 必须返回 awaitable")
+            await terminal
+        finally:
+            await lease.release()
+
+    def _require_live(self) -> None:
+        if self._closed:
+            raise RuntimeError("ProgrammaticTurnPort 已结算")
+        if self._invocation_token is None:
+            raise RuntimeError("ProgrammaticTurnPort invocation token 未绑定")
+        if _CURRENT_INVOCATION_TOKEN.get() is not self._invocation_token:
+            raise RuntimeError("ProgrammaticTurnPort invocation token 不匹配")
+        lease = self._request.snapshot_lease
+        if not lease.active:
+            raise RuntimeError("ProgrammaticTurnPort 的 RuntimeSnapshot lease 已释放")
+        if lease.snapshot.snapshot_id != self._request.binding.snapshot_id:
+            raise RuntimeError("ProgrammaticTurnPort snapshot identity 不匹配")
 
 
 class _InvocationDocuments:
@@ -615,12 +778,15 @@ class _InvocationDocuments:
 class _InvocationResources:
     effects: ProactiveDomainEffects | None
     documents: _InvocationDocuments | None
+    turns: _ProgrammaticTurnPort | None
 
     @property
     def effect_committed(self) -> bool:
         return self.effects is not None and self.effects.issued_receipt is not None
 
     async def finalize(self) -> None:
+        if self.turns is not None:
+            self.turns._close()
         if self.documents is not None:
             if (
                 self.documents.effect_receipt is None
@@ -683,6 +849,8 @@ class BackgroundJobActivityAdapter:
         clock: Callable[[], datetime] | None = None,
         invocation_id_factory: Callable[[], str] | None = None,
         interval_poll_seconds: float = 0.05,
+        conversation_runtime: object | None = None,
+        programmatic_session_creator: Callable[..., object] | None = None,
     ) -> None:
         if ledger is not None and ledger_path is not None:
             raise TypeError("ledger 不能与 ledger_path 同时提供")
@@ -701,6 +869,8 @@ class BackgroundJobActivityAdapter:
         else:
             self._ledger = None
         self._workspace = None if workspace is None else Path(workspace).resolve()
+        self._conversation_runtime: object | None = None
+        self._programmatic_session_creator: Callable[..., object] | None = None
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._invocation_id_factory = invocation_id_factory or (
             lambda: "invocation-" + secrets.token_hex(16)
@@ -711,6 +881,12 @@ class BackgroundJobActivityAdapter:
         self._handler_resolution_count = 0
         self._active: BackgroundJobRuntimeBinding | None = None
 
+        if conversation_runtime is not None:
+            self.bind_conversation_runtime(
+                conversation_runtime,
+                programmatic_session_creator=programmatic_session_creator,
+            )
+
     @property
     def ledger(self) -> JobOutcomeLedger | None:
         return self._ledger
@@ -718,6 +894,43 @@ class BackgroundJobActivityAdapter:
     @property
     def active_binding(self) -> BackgroundJobRuntimeBinding | None:
         return self._active
+
+    @property
+    def conversation_runtime(self) -> object | None:
+        return self._conversation_runtime
+
+    def bind_conversation_runtime(
+        self,
+        runtime: object,
+        *,
+        programmatic_session_creator: Callable[..., object] | None = None,
+    ) -> None:
+        """Bind the unique Core ConversationRuntime before job admission opens."""
+
+        if self._conversation_runtime is not None:
+            if (
+                self._conversation_runtime is runtime
+                and (
+                    programmatic_session_creator is None
+                    or programmatic_session_creator
+                    is self._programmatic_session_creator
+                )
+            ):
+                if (
+                    self._programmatic_session_creator is None
+                    and programmatic_session_creator is not None
+                ):
+                    self._programmatic_session_creator = programmatic_session_creator
+                return
+            raise RuntimeError("BackgroundJob ConversationRuntime owner 已绑定")
+        if not callable(getattr(runtime, "start_turn", None)):
+            raise TypeError("BackgroundJob ConversationRuntime 缺少 start_turn")
+        if programmatic_session_creator is not None and not callable(
+            programmatic_session_creator
+        ):
+            raise TypeError("BackgroundJob programmatic session creator 必须可调用")
+        self._conversation_runtime = runtime
+        self._programmatic_session_creator = programmatic_session_creator
 
     @property
     def handler_resolution_count(self) -> int:
@@ -766,6 +979,21 @@ class BackgroundJobActivityAdapter:
         if store is None:
             raise RuntimeError("BackgroundJob 需要 RuntimeSnapshotStore")
         bindings = () if catalog is None else tuple(catalog.values())
+        candidate_plugin_ids = target_lease.validation_candidate_plugin_ids
+        if (
+            any(
+                binding.definition.programmatic_turns
+                and binding.plugin_id not in candidate_plugin_ids
+                for binding in bindings
+            )
+            and (
+                self._conversation_runtime is None
+                or self._programmatic_session_creator is None
+            )
+        ):
+            raise RuntimeError(
+                "BackgroundJob programmatic_turns 需要在 PluginManager.load_all 前绑定 ConversationRuntime 与 SessionStore creator"
+            )
         for binding in bindings:
             generation = snapshot.generations.get(binding.plugin_id)
             if generation is None:
@@ -799,6 +1027,18 @@ class BackgroundJobActivityAdapter:
         jobs: dict[str, _MaterializedJob] = {}
         snapshot = plan.target_lease.snapshot
         try:
+            if any(
+                binding.definition.programmatic_turns
+                and binding.plugin_id
+                not in plan.target_lease.validation_candidate_plugin_ids
+                for binding in plan.bindings
+            ) and (
+                self._conversation_runtime is None
+                or self._programmatic_session_creator is None
+            ):
+                raise RuntimeError(
+                    "BackgroundJob programmatic_turns 缺少 ConversationRuntime owner 或 SessionStore creator"
+                )
             for binding in plan.bindings:
                 generation = snapshot.generations[binding.plugin_id]
                 handler = self._resolve_handler(generation.instance, binding.handler_export)
@@ -1414,10 +1654,27 @@ class BackgroundJobActivityAdapter:
         """Bind the optional Emotion effect and document ports to one invocation."""
 
         job = request.job
+        turns = None
+        is_candidate = (
+            job.binding.plugin_id in request.snapshot_lease.validation_candidate_plugin_ids
+        )
+        if job.binding.definition.programmatic_turns and not is_candidate:
+            if (
+                self._conversation_runtime is None
+                or self._programmatic_session_creator is None
+            ):
+                raise RuntimeError(
+                    "BackgroundJob programmatic_turns 缺少 ConversationRuntime owner 或 SessionStore creator"
+                )
+            turns = _ProgrammaticTurnPort(
+                self._conversation_runtime,
+                request,
+                self._programmatic_session_creator,
+            )
         effect_id = job.binding.definition.domain_effect
         lookup = job.domain_effect_lookup
         if effect_id is None:
-            return _InvocationResources(None, None)
+            return _InvocationResources(None, None, turns)
         if lookup is None or not _documents_binding_allowed(job.binding):
             raise RuntimeError("BackgroundJob domain effect binding 不完整")
         if self._workspace is None:
@@ -1461,7 +1718,7 @@ class BackgroundJobActivityAdapter:
 
         documents = _InvocationDocuments(inner, commit)
         effects._bind_prepared_guard(lambda: documents.intent is not None)
-        return _InvocationResources(effects, documents)
+        return _InvocationResources(effects, documents, turns)
 
     async def _finish_invocation_resources(
         self,
@@ -1514,6 +1771,8 @@ class BackgroundJobActivityAdapter:
                         invocation_token=object(),
                         model_binding=model_binding,
                     )
+                    if resources.turns is not None:
+                        resources.turns._bind_invocation_token(llm.invocation_token)
                     ctx = BackgroundJobContext(
                         plugin_id=request.job.binding.plugin_id,
                         event=request.event,
@@ -1527,6 +1786,7 @@ class BackgroundJobActivityAdapter:
                         activation_token=request.job.binding.activation_token,
                         domain_effects=resources.effects,
                         documents=resources.documents,
+                        turns=resources.turns,
                     )
                     invocation_token = _CURRENT_INVOCATION_TOKEN.set(
                         llm.invocation_token
@@ -2113,6 +2373,66 @@ def _event_id_for(event: object | None) -> str | None:
     return event_id
 
 
+def _programmatic_session_metadata(
+    request: _JobRequest,
+    metadata: Mapping[str, object],
+) -> dict[str, object]:
+    """Validate plugin metadata and append immutable Core provenance."""
+
+    if not isinstance(metadata, Mapping):
+        raise TypeError("programmatic session metadata 必须是 JSON object")
+    payload = dict(metadata)
+    if any(not isinstance(key, str) for key in payload):
+        raise TypeError("programmatic session metadata key 必须是字符串")
+    reserved = sorted(_PROGRAMMATIC_SESSION_RESERVED_FIELDS.intersection(payload))
+    if reserved:
+        raise ValueError(
+            "programmatic session metadata 不能覆盖 Core 字段: "
+            + ", ".join(reserved)
+        )
+    _validate_json_value(payload, "metadata")
+    payload.update(
+        {
+            "event_id": request.event_id,
+            "generation_id": request.job.binding.generation_id,
+            "invocation_id": request.invocation_id,
+            "job_name": request.job.binding.name,
+            "plugin_id": request.job.binding.plugin_id,
+            "programmatic": True,
+            "skip_post_memory": True,
+            "snapshot_id": request.binding.snapshot_id,
+        }
+    )
+    return payload
+
+
+def _validate_json_value(value: object, path: str) -> None:
+    if value is None or isinstance(value, (str, bool, int)):
+        return
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError(f"{path} 必须是有限 JSON number")
+        return
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise TypeError(f"{path} 的 object key 必须是字符串")
+            _validate_json_value(item, f"{path}.{key}")
+        return
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            _validate_json_value(item, f"{path}[{index}]")
+        return
+    raise TypeError(f"{path} 包含不可 JSON 序列化的值")
+
+
+def _turn_handle_id(handle: object) -> str:
+    turn_id = getattr(handle, "id", None)
+    if not isinstance(turn_id, str) or not turn_id:
+        raise RuntimeError("ConversationRuntime TurnHandle 缺少已持久化 turn id")
+    return turn_id
+
+
 def _event_payload_for(event: object | None) -> Mapping[str, object] | None:
     """Freeze the supported Core event into its durable recovery payload."""
 
@@ -2279,5 +2599,7 @@ __all__ = [
     "GenerationJobHost",
     "GenerationLlmLease",
     "GenerationLlmResult",
+    "ProgrammaticTurnPort",
+    "ProgrammaticTurnReceipt",
     "PluginLlmResult",
 ]

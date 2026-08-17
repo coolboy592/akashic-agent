@@ -8,6 +8,7 @@ from typing import Any, cast
 
 import pytest
 
+from agent.control.runtime import ConversationRuntime
 from agent.plugin_composition.background_jobs import (
     BackgroundJobBinding,
     BackgroundJobCatalog,
@@ -44,18 +45,29 @@ from agent.plugins.snapshot import (
 )
 from bus.events_lifecycle import DriftFinished
 from bus.event_bus import EventBus
+from bootstrap.tools import CoreRuntime
+from session.store import SessionStore
 
 
 class _Store:
-    def __init__(self, snapshot: Any) -> None:
+    def __init__(
+        self,
+        snapshot: Any,
+        candidate_plugin_ids: frozenset[str] = frozenset(),
+    ) -> None:
         self.snapshot = snapshot
+        self.candidate_plugin_ids = candidate_plugin_ids
         self.leases = 0
 
     async def acquire(self, snapshot_id: str) -> RuntimeSnapshotLease:
         assert snapshot_id == self.snapshot.snapshot_id
         self.snapshot.lease_count += 1
         self.leases += 1
-        return RuntimeSnapshotLease(self, self.snapshot)
+        return RuntimeSnapshotLease(
+            self,
+            self.snapshot,
+            self.candidate_plugin_ids,
+        )
 
     async def release_lease(self, snapshot: Any) -> None:
         snapshot.lease_count -= 1
@@ -66,7 +78,11 @@ class _Store:
         assert source.snapshot is self.snapshot
         self.snapshot.lease_count += 1
         self.leases += 1
-        return RuntimeSnapshotLease(self, self.snapshot)
+        return RuntimeSnapshotLease(
+            self,
+            self.snapshot,
+            source.validation_candidate_plugin_ids,
+        )
 
 
 @dataclass
@@ -114,6 +130,11 @@ def _fixture(
     ledger_path: Any | None = None,
     documents: bool = False,
     domain_lookup: Any | None = None,
+    programmatic_turns: bool = False,
+    conversation_runtime: object | None = None,
+    programmatic_session_creator: Any | None = None,
+    conversation_runtime_binder: Any | None = None,
+    validation_candidate_plugin_ids: frozenset[str] = frozenset(),
 ):
     plugin_id = "emotion" if documents else "drift"
     plugin = _module(handler, name=plugin_id, domain_lookup=domain_lookup)
@@ -130,6 +151,7 @@ def _fixture(
         domain_effect_lookup_export=(
             "lookup_emotion_effect" if documents else None
         ),
+        programmatic_turns=programmatic_turns,
     )
     descriptor = BackgroundJobDescriptor(
         owner=plugin_id,
@@ -143,6 +165,7 @@ def _fixture(
         domain_effect=definition.domain_effect,
         domain_effect_lookup_export=definition.domain_effect_lookup_export,
         model_role=definition.model_role,
+        programmatic_turns=definition.programmatic_turns,
     )
     fiber = _Fiber(object())
     binding = BackgroundJobBinding(
@@ -170,10 +193,14 @@ def _fixture(
         generations={plugin_id: generation},
         lease_count=0,
     )
-    store = _Store(snapshot)
+    store = _Store(snapshot, validation_candidate_plugin_ids)
     snapshot.lease_count += 1
     store.leases += 1
-    target_lease = RuntimeSnapshotLease(store, snapshot)
+    target_lease = RuntimeSnapshotLease(
+        store,
+        snapshot,
+        validation_candidate_plugin_ids,
+    )
     ledger = JobOutcomeLedger(ledger_path or tmp_path / "outcomes.sqlite")
     adapter = BackgroundJobActivityAdapter(
         EventBus(),
@@ -183,6 +210,14 @@ def _fixture(
         clock=clock,
         workspace=(str(tmp_path / "workspace") if documents else None),
     )
+    if conversation_runtime is not None:
+        if conversation_runtime_binder is None:
+            adapter.bind_conversation_runtime(
+                conversation_runtime,
+                programmatic_session_creator=programmatic_session_creator,
+            )
+        else:
+            conversation_runtime_binder(adapter, conversation_runtime)
     plan = adapter.prepare_components("tx-1", target_lease, catalog)
     return adapter, plan, target_lease, store, ledger
 
@@ -209,6 +244,58 @@ def _event_payload(event: DriftFinished) -> dict[str, str]:
         "message_result": event.message_result,
         "timestamp": event.timestamp.isoformat(),
     }
+
+
+class _ProgrammaticSessionStore:
+    def __init__(self) -> None:
+        self.sessions: dict[str, dict[str, object]] = {}
+
+    def create_session(
+        self,
+        *,
+        key: str,
+        metadata: dict[str, object],
+    ) -> None:
+        if key in self.sessions:
+            raise RuntimeError(f"duplicate session: {key}")
+        self.sessions[key] = dict(metadata)
+
+
+class _ProgrammaticTurnHandle:
+    def __init__(self, turn_id: str) -> None:
+        self.id = turn_id
+        self._terminal: asyncio.Future[object] = asyncio.get_running_loop().create_future()
+
+    async def result(self) -> object:
+        return await self._terminal
+
+    def complete(self) -> None:
+        if not self._terminal.done():
+            self._terminal.set_result(object())
+
+
+class _ProgrammaticConversationRuntime:
+    def __init__(self) -> None:
+        self._store = _ProgrammaticSessionStore()
+        self.requests: list[tuple[Any, RuntimeSnapshotLease, _ProgrammaticTurnHandle]] = []
+
+    def create_session(
+        self,
+        *,
+        key: str,
+        metadata: dict[str, object],
+    ) -> None:
+        self._store.create_session(key=key, metadata=metadata)
+
+    async def start_turn(
+        self,
+        request: Any,
+        *,
+        runtime_snapshot_lease: RuntimeSnapshotLease,
+    ) -> _ProgrammaticTurnHandle:
+        handle = _ProgrammaticTurnHandle(f"turn:{len(self.requests) + 1}")
+        self.requests.append((request, runtime_snapshot_lease, handle))
+        return handle
 
 
 def _domain_record(ctx: Any) -> dict[str, object]:
@@ -719,6 +806,250 @@ async def test_llm_lease_is_invocation_scoped_and_invalid_after_handler(tmp_path
         event_id="llm-event",
     )
     assert outcome is not None and outcome.state is JobOutcomeState.SUCCEEDED
+    await adapter.close_components("tx-1", runtime)
+    await target_lease.release()
+
+
+@pytest.mark.asyncio
+async def test_programmatic_turn_port_is_only_exposed_to_declared_job_and_releases_child_lease(
+    tmp_path,
+) -> None:
+    conversation = _ProgrammaticConversationRuntime()
+    captured: list[Any] = []
+
+    async def handler(ctx) -> None:
+        assert ctx.turns is not None
+        captured.append(ctx.turns)
+        session_id = await ctx.turns.create_session(metadata={"label": "watch"})
+        receipt = await ctx.turns.submit(session_id, "inspect this event")
+        assert receipt.session_id == session_id
+        assert receipt.turn_id == "turn:1"
+
+    adapter, plan, target_lease, store, ledger = _fixture(
+        tmp_path,
+        handler,
+        programmatic_turns=True,
+        conversation_runtime=conversation,
+        programmatic_session_creator=conversation.create_session,
+    )
+    runtime = await adapter.materialize_closed("tx-1", plan)
+    adapter.finalize_components("tx-1", runtime)
+    await adapter.enqueue_event(runtime, _event("programmatic-event"))
+    await adapter.drain(runtime)
+
+    assert len(conversation.requests) == 1
+    request, child_lease, handle = conversation.requests[0]
+    assert request.thread_id.startswith("programmatic:")
+    assert request.metadata["plugin_id"] == "drift"
+    assert request.metadata["job_name"] == "merge_pending"
+    assert request.metadata["generation_id"] == "generation-1"
+    assert request.metadata["snapshot_id"] == "snapshot-1"
+    assert request.metadata["event_id"] == "programmatic-event"
+    assert request.metadata["skip_post_memory"] is True
+    assert conversation._store.sessions[request.thread_id]["label"] == "watch"
+    assert store.leases == 2
+
+    handle.complete()
+    for _ in range(100):
+        if store.leases == 1:
+            break
+        await asyncio.sleep(0)
+    assert store.leases == 1
+    with pytest.raises(RuntimeError, match="已结算"):
+        await captured[0].create_session(metadata={})
+    assert ledger.find_by_event(
+        plugin_id="drift",
+        job_name="merge_pending",
+        event_id="programmatic-event",
+    ).state is JobOutcomeState.SUCCEEDED
+    await adapter.close_components("tx-1", runtime)
+    await target_lease.release()
+    assert not child_lease.active
+
+
+@pytest.mark.asyncio
+async def test_programmatic_turn_uses_bootstrap_bound_real_conversation_runtime(
+    tmp_path,
+) -> None:
+    session_store = SessionStore(tmp_path / "real-sessions.db")
+
+    async def execute(request) -> str:
+        return f"reply:{request.input}"
+
+    conversation = ConversationRuntime(session_store, execute)
+    receipts: list[Any] = []
+
+    async def handler(ctx) -> None:
+        assert ctx.turns is not None
+        session_id = await ctx.turns.create_session(metadata={"source": "real"})
+        receipts.append(await ctx.turns.submit(session_id, "real runtime"))
+
+    def bind_from_core(host: Any, owner: object) -> None:
+        core = cast(Any, object.__new__(CoreRuntime))
+        core.background_job_host = host
+        core.session_manager = SimpleNamespace(control_store=session_store)
+        core.bind_conversation_runtime(owner)
+
+    adapter, plan, target_lease, snapshot_store, _ledger = _fixture(
+        tmp_path,
+        handler,
+        programmatic_turns=True,
+        conversation_runtime=conversation,
+        conversation_runtime_binder=bind_from_core,
+    )
+    runtime = await adapter.materialize_closed("tx-1", plan)
+    adapter.finalize_components("tx-1", runtime)
+    try:
+        await adapter.enqueue_event(runtime, _event("real-programmatic"))
+        await adapter.drain(runtime)
+        assert len(receipts) == 1
+        receipt = receipts[0]
+        result = await conversation.wait_result(receipt.session_id, receipt.turn_id)
+        assert result.final_response == "reply:real runtime"
+        metadata = session_store.get_session_meta(receipt.session_id)
+        assert metadata is not None
+        assert metadata["metadata"]["programmatic"] is True
+        assert metadata["metadata"]["plugin_id"] == "drift"
+        record = session_store.read_turn(receipt.turn_id)
+        assert record is not None
+        assert record.thread_id == receipt.session_id
+        for _ in range(100):
+            if snapshot_store.leases == 1:
+                break
+            await asyncio.sleep(0)
+        assert snapshot_store.leases == 1
+    finally:
+        await adapter.close_components("tx-1", runtime)
+        await target_lease.release()
+        await conversation.shutdown()
+        session_store.close()
+
+
+@pytest.mark.asyncio
+async def test_programmatic_turn_port_rejects_reserved_metadata_and_foreign_session(
+    tmp_path,
+) -> None:
+    conversation = _ProgrammaticConversationRuntime()
+    saved: list[Any] = []
+
+    async def handler(ctx) -> None:
+        assert ctx.turns is not None
+        saved.append(ctx.turns)
+        with pytest.raises(ValueError, match="不能覆盖 Core 字段"):
+            await ctx.turns.create_session(metadata={"plugin_id": "forged"})
+        session_id = await ctx.turns.create_session(metadata={})
+        with pytest.raises(RuntimeError, match="不属于当前 job port"):
+            await ctx.turns.submit("programmatic:foreign", "no")
+        handle = conversation.requests
+        assert session_id.startswith("programmatic:")
+        assert handle == []
+
+    adapter, plan, target_lease, store, _ledger = _fixture(
+        tmp_path,
+        handler,
+        programmatic_turns=True,
+        conversation_runtime=conversation,
+        programmatic_session_creator=conversation.create_session,
+    )
+    runtime = await adapter.materialize_closed("tx-1", plan)
+    adapter.finalize_components("tx-1", runtime)
+    await adapter.enqueue_event(runtime, _event("programmatic-validation"))
+    await adapter.drain(runtime)
+    assert store.leases == 1
+    await adapter.close_components("tx-1", runtime)
+    await target_lease.release()
+
+
+@pytest.mark.asyncio
+async def test_programmatic_turn_port_is_none_for_ordinary_job(tmp_path) -> None:
+    captured: list[Any] = []
+
+    async def handler(ctx) -> None:
+        captured.append(ctx.turns)
+
+    adapter, plan, target_lease, store, _ledger = _fixture(tmp_path, handler)
+    conversation = _ProgrammaticConversationRuntime()
+    adapter.bind_conversation_runtime(conversation)
+    runtime = await adapter.materialize_closed("tx-1", plan)
+    adapter.finalize_components("tx-1", runtime)
+    await adapter.enqueue_event(runtime, _event("ordinary-job"))
+    await adapter.drain(runtime)
+    assert captured == [None]
+    assert conversation.requests == []
+    assert store.leases == 1
+    await adapter.close_components("tx-1", runtime)
+    await target_lease.release()
+
+
+@pytest.mark.asyncio
+async def test_programmatic_turn_port_is_not_exposed_to_candidate_job(tmp_path) -> None:
+    captured: list[Any] = []
+
+    async def handler(ctx) -> None:
+        captured.append(ctx.turns)
+
+    adapter, plan, target_lease, store, _ledger = _fixture(
+        tmp_path,
+        handler,
+        programmatic_turns=True,
+        validation_candidate_plugin_ids=frozenset({"drift"}),
+    )
+    runtime = await adapter.materialize_closed("tx-1", plan)
+    adapter.finalize_components("tx-1", runtime)
+    await adapter.enqueue_event(runtime, _event("candidate-job"))
+    await adapter.drain(runtime)
+    assert captured == [None]
+    assert store.leases == 1
+    await adapter.close_components("tx-1", runtime)
+    await target_lease.release()
+
+
+@pytest.mark.asyncio
+async def test_programmatic_turn_owner_is_required_before_formal_materialization(
+    tmp_path,
+) -> None:
+    async def handler(_ctx) -> None:
+        return None
+
+    with pytest.raises(RuntimeError, match="ConversationRuntime"):
+        _fixture(
+            tmp_path,
+            handler,
+            programmatic_turns=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_programmatic_turn_port_failure_closes_without_lease_residue(tmp_path) -> None:
+    conversation = _ProgrammaticConversationRuntime()
+    captured: list[Any] = []
+
+    async def handler(ctx) -> None:
+        assert ctx.turns is not None
+        captured.append(ctx.turns)
+        await ctx.turns.create_session(metadata={})
+        raise RuntimeError("programmatic handler failed")
+
+    adapter, plan, target_lease, store, ledger = _fixture(
+        tmp_path,
+        handler,
+        programmatic_turns=True,
+        conversation_runtime=conversation,
+        programmatic_session_creator=conversation.create_session,
+    )
+    runtime = await adapter.materialize_closed("tx-1", plan)
+    adapter.finalize_components("tx-1", runtime)
+    await adapter.enqueue_event(runtime, _event("programmatic-failure"))
+    await adapter.drain(runtime)
+    assert store.leases == 1
+    with pytest.raises(RuntimeError, match="已结算"):
+        await captured[0].create_session(metadata={})
+    outcome = ledger.find_by_event(
+        plugin_id="drift",
+        job_name="merge_pending",
+        event_id="programmatic-failure",
+    )
+    assert outcome is not None and outcome.state is JobOutcomeState.FAILED
     await adapter.close_components("tx-1", runtime)
     await target_lease.release()
 

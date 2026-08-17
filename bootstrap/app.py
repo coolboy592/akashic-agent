@@ -291,10 +291,6 @@ class AppRuntime:
             self.light_provider = self.core.light_provider
             self.memory_runtime = self.core.memory_runtime
             self.presence = self.core.presence
-            await self.core.start()
-            if self.readiness is not None:
-                self.readiness.mark_stage("core.ready")
-            self.workspace_mcp_watcher_task = self.core.workspace_mcp_watcher_task
 
             async def _execute_control_request(request: TurnRequest):
                 assert self.agent_loop is not None
@@ -306,6 +302,7 @@ class AppRuntime:
 
             manager = getattr(self.core, "plugin_manager", None)
             if manager is None:
+                await self.core.start()
                 raise RuntimeError("插件 Runtime 不可用")
             self.plugin_turn_rollout = TurnPluginRollout(
                 manager,
@@ -327,6 +324,11 @@ class AppRuntime:
                     quiesce=self.conversation_runtime.quiesce_for_restart,
                     resume=self.conversation_runtime.resume_after_restart_cancel,
                 )
+            self.core.bind_conversation_runtime(self.conversation_runtime)
+            await self.core.start()
+            if self.readiness is not None:
+                self.readiness.mark_stage("core.ready")
+            self.workspace_mcp_watcher_task = self.core.workspace_mcp_watcher_task
             app_server_endpoint: str | None = None
             workspace_token: str | None = None
             if self.config.app_server.enabled:

@@ -102,6 +102,8 @@ from agent.plugin_composition.background_jobs import (
     CoreEventTrigger,
     IntervalTrigger,
     PluginBackgroundJobs,
+    ProgrammaticTurnPort,
+    ProgrammaticTurnReceipt,
     RetryPolicy,
 )
 from agent.plugin_composition.tool_catalog import (
@@ -239,6 +241,8 @@ __all__ = [
     "PluginCommands",
     "PluginProactiveComponents",
     "PluginBackgroundJobs",
+    "ProgrammaticTurnPort",
+    "ProgrammaticTurnReceipt",
     "PluginToolBinding",
     "PluginToolCatalog",
     "PluginToolDefinition",
