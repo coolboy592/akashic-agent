@@ -277,6 +277,39 @@ async def test_installed_plugin_shadows_builtin_with_same_name(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_installed_legacy_tool_uses_full_plugin_id_as_source(tmp_path: Path):
+    installed_root = tmp_path / "cache" / "github" / "watcher" / "0.1.0"
+    installed_root.mkdir(parents=True)
+    (installed_root / "plugin.py").write_text(
+        "from agent.plugins import Plugin, tool\n"
+        "class WatcherPlugin(Plugin):\n"
+        "    name = 'watcher'\n"
+        "    @tool(name='watcher_status')\n"
+        "    async def status(self, event):\n"
+        "        \"\"\"Return watcher status.\"\"\"\n"
+        "        return 'ok'\n",
+        encoding="utf-8",
+    )
+    tools = ToolRegistry()
+    manager = PluginManager(
+        plugin_dirs=[],
+        installed_cache_root=tmp_path / "cache",
+        event_bus=EventBus(),
+        tool_registry=tools,
+        workspace=tmp_path / "workspace",
+    )
+
+    try:
+        await manager.load_all()
+        assert tools.get_tool_names_by_source("plugin", "watcher@github") == {
+            "watcher_status"
+        }
+        assert tools.get_tool_names_by_source("plugin", "watcher") == set()
+    finally:
+        await manager.terminate_all()
+
+
+@pytest.mark.asyncio
 async def test_plugin_job_runtime_runs_event_job():
     bus = EventBus()
     llm = _FakePluginLlm()

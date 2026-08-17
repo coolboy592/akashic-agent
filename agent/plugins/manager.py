@@ -1857,7 +1857,12 @@ class PluginManager:
         for generation in staged:
             instance = cast(Any, generation.instance)
             try:
-                self._register_tools(instance, generation.module_path, [])
+                self._register_tools(
+                    instance,
+                    generation.module_path,
+                    generation.plugin_id,
+                    [],
+                )
                 self._bind_tool_hooks(instance, generation.module_path)
                 self._publish_contributions(generation.contributions)
                 self._channels.extend(generation.contributions.channels)
@@ -5925,7 +5930,7 @@ class PluginManager:
                 if isinstance(instance.context.kv_store, PreparedPluginKVStore):
                     instance.context.kv_store.commit()
             load_phase = "publish"
-            self._register_tools(instance, mp, tool_names)
+            self._register_tools(instance, mp, generation.plugin_id, tool_names)
             self._bind_tool_hooks(instance, mp)
             self._publish_contributions(contributions)
             self._channels.extend(contributions.channels)
@@ -7564,6 +7569,7 @@ class PluginManager:
         self,
         instance: Any,
         module_path: str,
+        plugin_id: str,
         tool_names: list[str],
     ) -> None:
         if self._tool_registry is None:
@@ -7575,7 +7581,6 @@ class PluginManager:
             tool = _build_plugin_tool(instance, md)
             tool_name = tool.name
             # 3. 注册到 ToolRegistry，标记来源为 plugin
-            plugin_name = getattr(instance, "name", None) or module_path
             if self._tool_registry.has_tool(tool_name):
                 raise RuntimeError(f"插件工具名称重复: {tool_name}")
             tool_names.append(tool_name)
@@ -7585,9 +7590,9 @@ class PluginManager:
                 always_on=bool(md.tool_always_on),
                 search_hint=md.tool_search_hint,
                 source_type="plugin",
-                source_name=plugin_name,
+                source_name=plugin_id,
             )
-            logger.info("插件工具已注册: %s (来自 %s)", tool_name, plugin_name)
+            logger.info("插件工具已注册: %s (来自 %s)", tool_name, plugin_id)
 
     def _bind_tool_hooks(self, instance: Any, module_path: str) -> None:
         # V2_REMOVAL(tool-hooks)：legacy 非 generation load path，随 v2 Manager 删除。
