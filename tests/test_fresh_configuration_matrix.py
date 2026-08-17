@@ -153,7 +153,7 @@ async def test_fresh_init_core_configuration_matrix(
         manager = runtime.plugin_manager
         activity_host = manager.activity_host
         assert activity_host is not None
-        assert manager.proactive_lifecycles == []
+        assert not hasattr(manager, "proactive_lifecycles")
         snapshot = manager.current_snapshot
         assert snapshot is not None
         if proactive_name == "off":

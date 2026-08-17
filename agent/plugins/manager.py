@@ -491,36 +491,6 @@ class PluginManager:
         return list(self._after_turn_modules)
 
     @property
-    def proactive_modules(self) -> list[object]:
-        if self.current_snapshot is not None:
-            return list(self.current_snapshot.proactive_modules)
-        return list(self._proactive_modules)
-
-    @property
-    def proactive_lifecycles(self) -> list[object]:
-        if self.current_snapshot is not None:
-            return list(self.current_snapshot.proactive_lifecycles)
-        return list(self._proactive_lifecycles)
-
-    @property
-    def proactive_module_factories(self) -> list[object]:
-        if self.current_snapshot is not None:
-            return list(self.current_snapshot.proactive_module_factories)
-        return list(self._proactive_module_factories)
-
-    @property
-    def proactive_runtime_factories(self) -> list[object]:
-        if self.current_snapshot is not None:
-            return list(self.current_snapshot.proactive_runtime_factories)
-        return list(self._proactive_runtime_factories)
-
-    @property
-    def proactive_sources(self) -> list[RegisteredProactiveSource]:
-        if self.current_snapshot is not None:
-            return list(self.current_snapshot.proactive_sources.values())
-        return list(self._proactive_sources)
-
-    @property
     def jobs(self) -> list[RegisteredPluginJob]:
         if self.current_snapshot is not None:
             return list(self.current_snapshot.jobs.values())

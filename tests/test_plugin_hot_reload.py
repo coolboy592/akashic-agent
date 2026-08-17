@@ -1171,7 +1171,7 @@ async def test_candidate_mcp_catalog_uses_stable_public_names_and_closes(
     active = manager.generation("mcp_ready")
     assert active is not None and active.job_catalog is not None
     active_job = manager.jobs[0]
-    active_source = manager.proactive_sources[0]
+    active_source = active.proactive_catalog.sources["mcp_ready:feed"]
     assert isinstance(active_job.spec.triggers, tuple)
     assert len(active_job.spec.triggers) == 1
     assert active_source.spec.channels == ("content",)

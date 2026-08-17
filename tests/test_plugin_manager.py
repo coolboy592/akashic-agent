@@ -227,7 +227,7 @@ async def test_builtin_package_completes_proactive_lifecycle(
     try:
         await mgr.load_all()
 
-        assert mgr.proactive_lifecycles == []
+        assert not hasattr(mgr, "proactive_lifecycles")
         binding = _private_binding(mgr)
         assert binding.lifecycle is not None
         assert binding.lifecycle.id == lifecycle_id
