@@ -54,7 +54,6 @@ from bootstrap.wiring import (
     resolve_toolset_provider,
 )
 from agent.lifecycle.facade import TurnLifecycle
-from agent.plugins.jobs import ProviderPluginLlmService
 from bootstrap.providers import build_model_registry, build_providers, build_vl_provider
 from bootstrap.cleanup import run_cleanup_steps
 from bus.event_bus import EventBus
@@ -648,11 +647,6 @@ def build_core_runtime(
         workspace=workspace,
         session_manager=session_manager,
         memory_engine=memory_runtime.engine,
-        llm=ProviderPluginLlmService(
-            provider=provider,
-            model=config.model,
-            max_tokens=0,
-        ),
         installed_cache_root=plugins_root() / "cache",
         channel_attachment_store=channel_attachment_store,
     )

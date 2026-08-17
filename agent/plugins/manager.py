@@ -97,7 +97,6 @@ from agent.plugins.specs import (
     ManagedServiceSpec,
     McpServerSpec,
     MobileUiContribution,
-    RegisteredProactiveSource,
 )
 from infra.channels.base import SessionIdentityIndex
 from infra.channels.artifacts import ChannelAttachmentArtifactStore
@@ -114,11 +113,6 @@ from agent.plugins.artifacts import (
     write_pointers,
 )
 from agent.plugins.source_resolver import resolve_plugin_sources
-from agent.plugins.jobs import (
-    IntervalTrigger,
-    PluginLlmService,
-    RegisteredPluginJob,
-)
 from agent.plugins.scope import CleanupFailure, PluginScope
 from agent.plugins.generation import (
     GateCheckResult,
@@ -126,7 +120,6 @@ from agent.plugins.generation import (
     MobileUiAsset,
     PluginContributions,
     PluginGeneration,
-    PluginReadinessContext,
     PluginSemanticCheck,
 )
 from agent.plugins.importer import FreshPluginImporter
@@ -148,12 +141,6 @@ from agent.plugins.reload_journal import (
 from agent.plugins.skill_host import PluginSkillHost, PreparedSkillCatalog
 from agent.mcp.generation import WorkspaceMcpGeneration
 from agent.mcp.host import McpGenerationHost, PreparedMcpCatalog
-from agent.plugins.activity_host import (
-    PluginJobHost,
-    PluginProactiveHost,
-    PreparedJobCatalog,
-    PreparedProactiveCatalog,
-)
 from agent.plugins.generation_activity_host import (
     ActivityCatalog,
     ActivityHost,
@@ -265,7 +252,6 @@ class PluginManager:
         tool_registry: Any = None,
         session_manager: Any = None,
         memory_engine: Any = None,
-        llm: PluginLlmService | None = None,
         installed_cache_root: Path | None = None,
         channel_attachment_store: ChannelAttachmentArtifactStore | None = None,
     ) -> None:
@@ -283,7 +269,6 @@ class PluginManager:
         self._composition_memory_runtime: MemoryRuntimeInfo | None | object = (
             _UNRESOLVED_MEMORY_RUNTIME if memory_engine is not None else None
         )
-        self._llm = llm
         self._installed_cache_root = installed_cache_root
         self._channel_switcher: (
             Callable[
@@ -329,12 +314,6 @@ class PluginManager:
         ) = None
         self._loaded: set[str] = set()
         self._channels: list[Channel] = []
-        self._proactive_modules: list[object] = []
-        self._proactive_lifecycles: list[object] = []
-        self._proactive_module_factories: list[object] = []
-        self._proactive_runtime_factories: list[object] = []
-        self._proactive_sources: list[RegisteredProactiveSource] = []
-        self._jobs: list[RegisteredPluginJob] = []
         self._active_plugins: dict[str, ActivePluginInfo] = {}
         self._scopes: dict[str, PluginScope] = {}
         self._cleanup_failures: list[CleanupFailure] = []
@@ -357,8 +336,6 @@ class PluginManager:
         )
         self._active_workspace_mcp: WorkspaceMcpGeneration | None = None
         self._prepared_workspace_mcp: WorkspaceMcpGeneration | None = None
-        self._job_host = PluginJobHost()
-        self._proactive_host = PluginProactiveHost()
         self._snapshot_compiler = RuntimeSnapshotCompiler()
         self._snapshot_store = RuntimeSnapshotStore(self._on_snapshot_drained)
         self._snapshot_skill_catalogs: dict[str, str] = {}
@@ -401,16 +378,6 @@ class PluginManager:
         if self.current_snapshot is not None:
             return list(self.current_snapshot.channels.values())
         return list(self._channels)
-
-    @property
-    def jobs(self) -> list[RegisteredPluginJob]:
-        if self.current_snapshot is not None:
-            return list(self.current_snapshot.jobs.values())
-        return list(self._jobs)
-
-    @property
-    def llm(self) -> PluginLlmService | None:
-        return self._llm
 
     @property
     def plugin_dirs(self) -> list[Path]:
@@ -1193,15 +1160,6 @@ class PluginManager:
             "channel binding 缺少 exact generation owner: "
             f"{plugin_id}/{generation_id}"
         )
-
-    def job_catalog(self, generation_id: str) -> PreparedJobCatalog | None:
-        return self._job_host.get(generation_id)
-
-    def proactive_catalog(
-        self,
-        generation_id: str,
-    ) -> PreparedProactiveCatalog | None:
-        return self._proactive_host.get(generation_id)
 
     @property
     def current_snapshot(self) -> RuntimeSnapshot | None:
@@ -3558,29 +3516,13 @@ class PluginManager:
             if self._candidate_service_health_check is None:
                 raise RuntimeError("候选 managed service 健康检查未绑定")
             await self._candidate_service_health_check(generation.generation_id)
-        if generation.mcp_catalog is not None:
-            self._mcp_host.assert_healthy(generation.generation_id)
         if generation.validation_managed_services:
             assert self._candidate_service_stopper is not None
             await self._candidate_service_stopper(generation.generation_id)
 
-        # 3. Reconnect MCP with formal endpoint env, then refresh snapshot payload.
-        if generation.mcp_catalog is not None:
-            await self._mcp_host.close(generation.generation_id)
-            generation.mcp_catalog = None
+        # 3. Restore the formal data projection, then refresh the exact Root payload.
         generation.contributions = production
         generation.data_dir = production_data_dir
-        if production.mcp_servers or production.proactive_sources:
-            generation.mcp_catalog = await self._mcp_host.prepare(
-                generation.generation_id,
-                server_specs=production.mcp_servers,
-                required_tools=_required_mcp_tools(production.proactive_sources),
-                scope=generation.scope,
-            )
-            generation.scope.defer(
-                "production_mcp_catalog",
-                lambda: self._mcp_host.close(generation.generation_id),
-            )
         replacement = await self._compile_generation_snapshot(
             generation,
             allow_unready_stable_composition=True,
@@ -4492,17 +4434,6 @@ class PluginManager:
                 raise RuntimeError("RuntimeSnapshot 插件作用域已关闭")
             if item.scope.resource_count < item.minimum_resource_count:
                 raise RuntimeError("RuntimeSnapshot 插件资源数量不足")
-            if (
-                item.job_catalog is not None
-                and self._job_host.get(item.generation_id) is not item.job_catalog
-            ):
-                raise RuntimeError("RuntimeSnapshot Job catalog 不可用")
-            if (
-                item.proactive_catalog is not None
-                and self._proactive_host.get(item.generation_id)
-                is not item.proactive_catalog
-            ):
-                raise RuntimeError("RuntimeSnapshot proactive catalog 不可用")
 
     def _advance_reload(
         self,
@@ -4746,14 +4677,6 @@ class PluginManager:
                         drift=True,
                     ),
                     "mcp_tools": _mcp_tool_names(active),
-                    "readiness_checks": _gate_check_evidence(
-                        active,
-                        "readiness_semantic_checks",
-                    ),
-                    "jobs": _job_keys(active),
-                    "proactive_sources": _proactive_source_keys(active),
-                    "job_specs": _job_spec_evidence(active),
-                    "proactive_source_specs": _proactive_source_spec_evidence(active),
                     "snapshot_id": (
                         self.current_snapshot.snapshot_id
                         if self.current_snapshot is not None
@@ -4806,23 +4729,6 @@ class PluginManager:
                     else {}
                 ),
                 "mcp_tools": _mcp_tool_names(prepared) if prepared is not None else [],
-                "readiness_checks": (
-                    _gate_check_evidence(prepared, "readiness_semantic_checks")
-                    if prepared is not None
-                    else []
-                ),
-                "jobs": _job_keys(prepared) if prepared is not None else [],
-                "proactive_sources": (
-                    _proactive_source_keys(prepared) if prepared is not None else []
-                ),
-                "job_specs": (
-                    _job_spec_evidence(prepared) if prepared is not None else {}
-                ),
-                "proactive_source_specs": (
-                    _proactive_source_spec_evidence(prepared)
-                    if prepared is not None
-                    else {}
-                ),
                 "snapshot_id": (
                     self.current_snapshot.snapshot_id
                     if self.current_snapshot is not None
@@ -5221,51 +5127,6 @@ class PluginManager:
                 "skill_catalog",
                 lambda: self._skill_host.close(generation_id),
             )
-            try:
-                job_catalog = self._job_host.prepare(
-                    generation_id,
-                    contributions.jobs,
-                )
-                scope.defer(
-                    "job_catalog",
-                    lambda: self._job_host.close(generation_id),
-                )
-                proactive_catalog = self._proactive_host.prepare(
-                    generation_id,
-                    contributions.proactive_sources,
-                )
-                scope.defer(
-                    "proactive_catalog",
-                    lambda: self._proactive_host.close(generation_id),
-                )
-            except Exception as error:
-                gate_result = _with_gate_check(
-                    gate_result,
-                    check_id="activity_catalogs",
-                    passed=False,
-                    evidence=str(error),
-                )
-                self._gate_results[plugin_id] = gate_result
-                raise _CandidateRejected(gate_result) from error
-            generation.job_catalog = job_catalog
-            generation.proactive_catalog = proactive_catalog
-            contributions = replace(
-                contributions,
-                jobs=tuple(job_catalog.jobs.values()),
-                proactive_sources=tuple(proactive_catalog.sources.values()),
-            )
-            generation.contributions = contributions
-            gate_result = _with_gate_check(
-                gate_result,
-                check_id="activity_catalogs",
-                passed=True,
-                evidence={
-                    "jobs": sorted(job_catalog.jobs),
-                    "proactive_sources": sorted(proactive_catalog.sources),
-                },
-            )
-            self._gate_results[plugin_id] = gate_result
-            generation.gate_result = gate_result
             if not activate:
                 validation_root = (
                     self._workspace
@@ -5307,109 +5168,19 @@ class PluginManager:
                     validation_workspace=generation.validation_workspace,
                 )
                 contributions = generation.contributions
-            if (
-                not activate
-                or contributions.mcp_servers
-                or contributions.proactive_sources
-            ):
-                try:
-                    mcp_catalog = await self._mcp_host.prepare(
-                        generation_id,
-                        server_specs=contributions.mcp_servers,
-                        required_tools=_required_mcp_tools(
-                            contributions.proactive_sources
-                        ),
-                        scope=scope,
-                    )
-                except Exception as error:
-                    gate_result = _with_gate_check(
-                        gate_result,
-                        check_id="mcp_readiness",
-                        passed=False,
-                        evidence=str(error),
-                        gate_id="G1/G2/G3-readiness",
-                    )
-                    self._gate_results[plugin_id] = gate_result
-                    raise _CandidateRejected(gate_result) from error
-                generation.mcp_catalog = mcp_catalog
-                scope.defer(
-                    "mcp_catalog",
-                    lambda: self._mcp_host.close(generation_id),
+            if not activate:
+                generation.runtime_snapshot = await self._compile_generation_snapshot(
+                    generation,
+                    candidate_owner=generation,
                 )
-                try:
-                    raw_readiness_checks: object = (
-                        await instance.readiness_semantic_checks(
-                            PluginReadinessContext(
-                                generation_id=generation_id,
-                                mcp_catalog=mcp_catalog,
-                                job_catalog=job_catalog,
-                                proactive_catalog=proactive_catalog,
-                            )
-                        )
-                    )
-                    if not isinstance(raw_readiness_checks, list):
-                        raise RuntimeError("readiness_semantic_checks 返回值不是 list")
-                    readiness_checks = cast(list[object], raw_readiness_checks)
-                except Exception as error:
-                    readiness_passed = False
-                    readiness_evidence: object = str(error)
-                else:
-                    invalid_readiness = [
-                        check
-                        for check in readiness_checks
-                        if not isinstance(check, PluginSemanticCheck)
-                        or not check.passed
-                    ]
-                    readiness_passed = not invalid_readiness
-                    normalized_readiness: list[dict[str, object]] = []
-                    for check in readiness_checks:
-                        if isinstance(check, PluginSemanticCheck):
-                            normalized_readiness.append(
-                                {
-                                    "check_id": check.check_id,
-                                    "passed": check.passed,
-                                    "evidence": check.evidence,
-                                }
-                            )
-                        else:
-                            normalized_readiness.append(
-                                {
-                                    "check_id": "invalid",
-                                    "passed": False,
-                                    "evidence": repr(check),
-                                }
-                            )
-                    readiness_evidence = normalized_readiness
-                gate_result = _with_gate_check(
-                    gate_result,
-                    check_id="mcp_readiness",
-                    passed=True,
-                    evidence=list(mcp_catalog.tool_names),
-                    gate_id="G1/G2/G3-readiness",
+                self._advance_reload(
+                    generation,
+                    "prepared",
+                    candidate_snapshot_id=generation.runtime_snapshot.snapshot_id,
                 )
-                gate_result = _with_gate_check(
-                    gate_result,
-                    check_id="readiness_semantic_checks",
-                    passed=readiness_passed,
-                    evidence=readiness_evidence,
-                )
-                self._gate_results[plugin_id] = gate_result
-                generation.gate_result = gate_result
-                if gate_result.status == "failed":
-                    raise _CandidateRejected(gate_result)
-                if not activate:
-                    generation.runtime_snapshot = await self._compile_generation_snapshot(
-                        generation,
-                        candidate_owner=generation,
-                    )
-                    self._advance_reload(
-                        generation,
-                        "prepared",
-                        candidate_snapshot_id=generation.runtime_snapshot.snapshot_id,
-                    )
-                    generation.minimum_resource_count = scope.resource_count
-                    self._prepared_generations[plugin_id] = generation
-                    return generation
+                generation.minimum_resource_count = scope.resource_count
+                self._prepared_generations[plugin_id] = generation
+                return generation
             if stage_stable:
                 return generation
             generation.runtime_snapshot = await self._compile_generation_snapshot(
@@ -6730,12 +6501,6 @@ class PluginManager:
             _ = self._active_plugins.pop(mp, None)
         self._loaded.clear()
         self._active_plugins.clear()
-        self._proactive_modules.clear()
-        self._proactive_lifecycles.clear()
-        self._proactive_module_factories.clear()
-        self._proactive_runtime_factories.clear()
-        self._proactive_sources.clear()
-        self._jobs.clear()
         self._channels.clear()
         self._scopes.clear()
         self._active_generations.clear()
@@ -7473,12 +7238,6 @@ def _replace_snapshot_payload(
         raise RuntimeError("只能刷新无 lease 的 candidate snapshot")
     for name in (
         "generations",
-        "jobs",
-        "proactive_sources",
-        "proactive_modules",
-        "proactive_lifecycles",
-        "proactive_module_factories",
-        "proactive_runtime_factories",
         "channels",
         "skill_catalog_generation_id",
         "mcp_catalog_generation_ids",
@@ -7957,24 +7716,10 @@ def _mcp_tool_names(generation: PluginGeneration) -> list[str]:
     return list(catalog.tool_names) if catalog is not None else []
 
 
-def _required_mcp_tools(
-    sources: tuple[RegisteredProactiveSource, ...],
-) -> dict[str, tuple[str, ...]]:
-    required: dict[str, list[str]] = {}
-    for source in sources:
-        names = required.setdefault(source.spec.server, [])
-        names.append(source.spec.fetch_tool)
-        if source.spec.ack_tool:
-            names.append(source.spec.ack_tool)
-    return {
-        server_name: tuple(tool_names) for server_name, tool_names in required.items()
-    }
-
-
 def _log_candidate_status(result: dict[str, object]) -> None:
     logger.info(
         "plugin_candidate_status plugin=%s gate=%s active=%s prepared=%s "
-        "revision=%s counts=skills:%d,drift_skills:%d,mcp:%d,jobs:%d,sources:%d",
+        "revision=%s counts=skills:%d,drift_skills:%d,mcp:%d",
         result["plugin_id"],
         result["gate_status"],
         result["active_generation"],
@@ -7983,60 +7728,11 @@ def _log_candidate_status(result: dict[str, object]) -> None:
         len(cast(list[object], result["skills"])),
         len(cast(dict[object, object], result["drift_skill_descriptions"])),
         len(cast(list[object], result["mcp_tools"])),
-        len(cast(list[object], result["jobs"])),
-        len(cast(list[object], result["proactive_sources"])),
     )
     logger.debug(
         "plugin_candidate_status_detail %s",
         json.dumps(result, ensure_ascii=False, sort_keys=True),
     )
-
-
-def _job_keys(generation: PluginGeneration) -> list[str]:
-    catalog = generation.job_catalog
-    return sorted(catalog.jobs) if catalog is not None else []
-
-
-def _proactive_source_keys(generation: PluginGeneration) -> list[str]:
-    catalog = generation.proactive_catalog
-    return sorted(catalog.sources) if catalog is not None else []
-
-
-def _job_spec_evidence(generation: PluginGeneration) -> dict[str, object]:
-    catalog = generation.job_catalog
-    if catalog is None:
-        return {}
-    return {
-        key: [
-            (
-                {"type": "interval", "seconds": trigger.seconds}
-                if isinstance(trigger, IntervalTrigger)
-                else {
-                    "type": "event",
-                    "event": trigger.event_type.__name__,
-                }
-            )
-            for trigger in job.spec.triggers
-        ]
-        for key, job in sorted(catalog.jobs.items())
-    }
-
-
-def _proactive_source_spec_evidence(
-    generation: PluginGeneration,
-) -> dict[str, object]:
-    catalog = generation.proactive_catalog
-    if catalog is None:
-        return {}
-    return {
-        key: {
-            "server": source.spec.server,
-            "fetch_tool": source.spec.fetch_tool,
-            "ack_tool": source.spec.ack_tool,
-            "fetch_page_size": source.spec.fetch_page_size,
-        }
-        for key, source in sorted(catalog.sources.items())
-    }
 
 
 def _gate_check_evidence(

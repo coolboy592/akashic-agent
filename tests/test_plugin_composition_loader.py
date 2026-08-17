@@ -299,6 +299,17 @@ def _channel_static_manifest(version: str) -> str:
     )
 
 
+def _write_static_v3_manifest(root: Path, name: str, version: str) -> None:
+    (root / "akashic.plugin.toml").write_text(
+        "schema_version = 1\n"
+        f"name = {name!r}\n"
+        f"version = {version!r}\n"
+        "api_version = 3\n"
+        "entrypoint = 'plugin.py'\n",
+        encoding="utf-8",
+    )
+
+
 @pytest.mark.asyncio
 async def test_v3_channel_registry_redacts_candidate_credentials_before_import(
     tmp_path: Path,
@@ -2056,17 +2067,19 @@ async def test_v3_loader_fails_loud_when_required_service_never_appears(
 
 
 @pytest.mark.asyncio
-async def test_mixed_stable_boot_publishes_one_complete_snapshot(
+async def test_v3_stable_boot_publishes_one_complete_snapshot(
     tmp_path: Path,
 ) -> None:
     _write_plugin(
         tmp_path / "plugins",
-        "legacy",
-        "from agent.plugins import Plugin\n"
-        "class LegacyPlugin(Plugin):\n"
-        "    name = 'legacy'\n"
-        "    def activate(self):\n"
-        "        self.activated = True\n",
+        "independent",
+        "api_version = 3\n"
+        "name = 'independent'\n"
+        "version = '1.0.0'\n"
+        "activated = False\n"
+        "def apply(ctx, config):\n"
+        "    global activated\n"
+        "    activated = True\n",
     )
     _write_plugin(
         tmp_path / "plugins",
@@ -2104,17 +2117,17 @@ async def test_mixed_stable_boot_publishes_one_complete_snapshot(
     await manager.load_all()
 
     snapshot = manager.current_snapshot
-    legacy = manager.generation("legacy")
-    assert snapshot is not None and legacy is not None
+    independent = manager.generation("independent")
+    assert snapshot is not None and independent is not None
     assert len(installed) == 1
-    assert set(snapshot.generations) == {"consumer", "legacy", "provider"}
+    assert set(snapshot.generations) == {"consumer", "independent", "provider"}
     assert snapshot.composition_root is not None
     assert snapshot.composition_topology is not None
     assert snapshot.composition_topology.services == (
         "core.commands",
         "fixture.batch",
     )
-    assert getattr(legacy.instance, "activated") is True
+    assert independent.instance.module.activated is True
     catalog_id = snapshot.skill_catalog_generation_id
     assert catalog_id is not None
     assert manager._skill_host.get(catalog_id) is not None
@@ -2122,46 +2135,6 @@ async def test_mixed_stable_boot_publishes_one_complete_snapshot(
     await manager.terminate_all()
 
     assert manager._skill_host.get(catalog_id) is None
-
-
-@pytest.mark.asyncio
-async def test_failed_snapshot_install_restores_legacy_plugin_kv(
-    tmp_path: Path,
-) -> None:
-    _write_plugin(
-        tmp_path / "plugins",
-        "legacy_kv",
-        "from agent.plugins import Plugin\n"
-        "class LegacyKvPlugin(Plugin):\n"
-        "    name = 'legacy_kv'\n"
-        "    async def prepare(self):\n"
-        "        self.context.kv_store.set('value', 'changed')\n",
-    )
-    kv_path = (
-        tmp_path
-        / "workspace"
-        / "plugin-data"
-        / "legacy_kv-builtin"
-        / ".kv.json"
-    )
-    kv_path.parent.mkdir(parents=True)
-    original = '{"value":"original"}\n'
-    kv_path.write_text(original, encoding="utf-8")
-    manager = _manager(tmp_path)
-
-    def reject_install(snapshot: object) -> None:
-        del snapshot
-        raise RuntimeError("install failed")
-
-    manager._snapshot_store.install = reject_install  # type: ignore[method-assign]
-
-    with pytest.raises(RuntimeError, match="install failed"):
-        await manager.load_all()
-
-    assert kv_path.read_text(encoding="utf-8") == original
-    assert manager.current_snapshot is None
-    assert manager._active_generations == {}
-    assert manager._scopes == {}
 
 
 @pytest.mark.asyncio
@@ -2227,63 +2200,6 @@ async def test_cancelled_stable_batch_finishes_all_cleanup(tmp_path: Path) -> No
     assert manager._snapshot_store.retained_snapshot_ids == ()
     assert manager._active_generations == {}
     assert manager._scopes == {}
-
-
-@pytest.mark.asyncio
-async def test_failed_legacy_participant_rebuilds_remaining_instances(
-    tmp_path: Path,
-) -> None:
-    _write_plugin(
-        tmp_path / "plugins",
-        "a_good",
-        "from agent.plugins import Plugin\n"
-        "class GoodPlugin(Plugin):\n"
-        "    name = 'a_good'\n",
-    )
-    _write_plugin(
-        tmp_path / "plugins",
-        "z_failed",
-        "from agent.plugins import Plugin\n"
-        "class FailedPlugin(Plugin):\n"
-        "    name = 'z_failed'\n"
-        "    async def prepare(self):\n"
-        "        raise RuntimeError('rejected')\n",
-    )
-    manager = _manager(tmp_path)
-    original_load_one = manager._load_one
-    observed: list[object] = []
-    module_paths: list[str] = []
-
-    async def record_load(
-        mod: dict[str, str],
-        *,
-        activate: bool = True,
-        stage_stable: bool = False,
-    ) -> PluginGeneration | None:
-        generation = await original_load_one(
-            mod,
-            activate=activate,
-            stage_stable=stage_stable,
-        )
-        if generation is not None and generation.plugin_id == "a_good":
-            observed.append(generation.instance)
-            module_paths.append(generation.module_path)
-        return generation
-
-    manager._load_one = record_load  # type: ignore[method-assign]
-
-    await manager.load_all()
-
-    active = manager.generation("a_good")
-    assert active is not None
-    assert len(observed) == 2
-    assert observed[0] is not observed[1]
-    assert active.instance is observed[1]
-    assert module_paths[0] not in sys.modules
-    assert module_paths[1] in sys.modules
-    assert manager.generation("z_failed") is None
-
-    await manager.terminate_all()
 
 
 @pytest.mark.asyncio
@@ -2617,6 +2533,8 @@ async def test_installed_v3_candidate_rebuilds_runtime_then_promotes(
         source.replace("version = '1.0.0'", "version = '2.0.0'"),
         encoding="utf-8",
     )
+    _write_static_v3_manifest(stable_root, "installed_v3", "1.0.0")
+    _write_static_v3_manifest(latest_root, "installed_v3", "2.0.0")
     for root, version in ((stable_root, "v1"), (latest_root, "v2")):
         skill_dir = root / "skills" / "installed-skill"
         skill_dir.mkdir(parents=True)
@@ -2778,6 +2696,8 @@ async def test_installed_v3_dashboard_uses_composition_runtime_until_promotion(
         source.replace("version = '1.0.0'", "version = '2.0.0'"),
         encoding="utf-8",
     )
+    _write_static_v3_manifest(stable_root, "dashboard_v3", "1.0.0")
+    _write_static_v3_manifest(latest_root, "dashboard_v3", "2.0.0")
     (stable_root / "dashboard.py").write_text(
         "def register(app, context):\n"
         "    assert context.workspace_root('memes').is_dir()\n",
@@ -3083,6 +3003,8 @@ async def test_installed_v3_candidate_health_blocks_promotion_until_recovered(
         source.replace("version = '1.0.0'", "version = '2.0.0'"),
         encoding="utf-8",
     )
+    _write_static_v3_manifest(stable_artifact, "installed_v3", "1.0.0")
+    _write_static_v3_manifest(latest_artifact, "installed_v3", "2.0.0")
     stable_pointer = ArtifactPointer(".artifacts/1.0.0-aaaa")
     latest_pointer = ArtifactPointer(".artifacts/2.0.0-bbbb")
     write_pointers(plugin_base, stable=stable_pointer, latest=stable_pointer)
@@ -3148,6 +3070,8 @@ async def test_installed_v3_candidate_incident_overflow_blocks_promotion(
         source.replace("version = '1.0.0'", "version = '2.0.0'"),
         encoding="utf-8",
     )
+    _write_static_v3_manifest(stable_artifact, "installed_v3", "1.0.0")
+    _write_static_v3_manifest(latest_artifact, "installed_v3", "2.0.0")
     stable_pointer = ArtifactPointer(".artifacts/1.0.0-aaaa")
     latest_pointer = ArtifactPointer(".artifacts/2.0.0-bbbb")
     write_pointers(plugin_base, stable=stable_pointer, latest=stable_pointer)
@@ -3209,6 +3133,8 @@ async def test_installed_v3_owner_commit_failure_discards_production_root(
         source.replace("version = '1.0.0'", "version = '2.0.0'"),
         encoding="utf-8",
     )
+    _write_static_v3_manifest(stable_artifact, "installed_v3", "1.0.0")
+    _write_static_v3_manifest(latest_artifact, "installed_v3", "2.0.0")
     stable_pointer = ArtifactPointer(".artifacts/1.0.0-aaaa")
     latest_pointer = ArtifactPointer(".artifacts/2.0.0-bbbb")
     write_pointers(plugin_base, stable=stable_pointer, latest=stable_pointer)

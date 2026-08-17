@@ -594,7 +594,6 @@ async def test_initial_stable_activity_prepare_failure_discards_pending_candidat
         [generation],
         snapshot=snapshot,
         catalog_id=None,
-        published_count=manager._legacy_publication_counts(),
     )
 
     assert manager.snapshot_store.pending_transaction is None

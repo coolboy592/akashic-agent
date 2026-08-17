@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, cast
 from agent.plugin_composition import Context, ServiceKey, ServiceView
 
 if TYPE_CHECKING:
-    from agent.plugins.generation import PluginReadinessContext, PluginSemanticCheck
+    from agent.plugins.generation import PluginSemanticCheck
 
 _CORE_RESERVED_WORKSPACE_ROOTS = frozenset({"plugin-data", "runtime"})
 
@@ -70,10 +70,9 @@ class ComposablePlugin:
         )
         if len(set(inject)) != len(inject):
             raise ValueError(f"v3 插件依赖重复: {name}")
-        for export_name in ("static_semantic_checks", "readiness_semantic_checks"):
-            export = getattr(module, export_name, None)
-            if export is not None and not callable(export):
-                raise ValueError(f"v3 插件 {export_name} 必须可调用")
+        static_checks = getattr(module, "static_semantic_checks", None)
+        if static_checks is not None and not callable(static_checks):
+            raise ValueError("v3 插件 static_semantic_checks 必须可调用")
         active = getattr(module, "is_active", None)
         if active is not None and not callable(active):
             raise ValueError("v3 插件 is_active 必须是可调用对象")
@@ -151,19 +150,6 @@ class ComposablePlugin:
         if provider is None:
             return []
         return cast(list[PluginSemanticCheck], provider())
-
-    async def readiness_semantic_checks(
-        self,
-        context: PluginReadinessContext,
-    ) -> list[PluginSemanticCheck]:
-        provider = getattr(self.module, "readiness_semantic_checks", None)
-        if provider is None:
-            return []
-        result = provider(context)
-        if inspect.isawaitable(result):
-            result = await result
-        return cast(list[PluginSemanticCheck], result)
-
 
 def _validate_apply_signature(apply: Callable[..., object]) -> None:
     """Reject v3 apply callables that Core cannot invoke as apply(ctx, config)."""

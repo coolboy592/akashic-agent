@@ -10,9 +10,7 @@ from typing import Literal, cast
 
 from agent.mcp.generation import WorkspaceMcpGeneration
 from agent.plugins.generation import PluginGeneration
-from agent.plugins.jobs import RegisteredPluginJob, plugin_job_key
 from agent.plugins.private_proactive import PrivateProactiveCatalog
-from agent.plugins.specs import RegisteredProactiveSource, proactive_source_key
 from agent.tools.registry import ToolRegistry
 from agent.skills import SkillIndex
 from agent.plugin_composition import (
@@ -72,12 +70,6 @@ RuntimeSelector = Literal["stable", "latest"]
 class RuntimeSnapshot:
     snapshot_id: str
     generations: Mapping[str, PluginGeneration]
-    jobs: Mapping[str, RegisteredPluginJob]
-    proactive_sources: Mapping[str, RegisteredProactiveSource]
-    proactive_modules: tuple[object, ...]
-    proactive_lifecycles: tuple[object, ...]
-    proactive_module_factories: tuple[object, ...]
-    proactive_runtime_factories: tuple[object, ...]
     channels: Mapping[str, Channel]
     skill_catalog_generation_id: str | None
     mcp_catalog_generation_ids: Mapping[str, str]
@@ -160,28 +152,6 @@ class RuntimeSnapshotCompiler:
         ordered = [generations[key] for key in sorted(generations)]
         if any(generation.plugin_id != key for key, generation in generations.items()):
             raise RuntimeError("RuntimeSnapshot generation key 与 plugin_id 不一致")
-        jobs = self._compile_jobs(ordered)
-        sources = self._compile_sources(ordered)
-        proactive_modules = tuple(
-            module
-            for generation in ordered
-            for module in generation.contributions.proactive_modules
-        )
-        proactive_lifecycles = tuple(
-            lifecycle
-            for generation in ordered
-            for lifecycle in generation.contributions.proactive_lifecycles
-        )
-        proactive_module_factories = tuple(
-            factory
-            for generation in ordered
-            for factory in generation.contributions.proactive_module_factories
-        )
-        proactive_runtime_factories = tuple(
-            factory
-            for generation in ordered
-            for factory in generation.contributions.proactive_runtime_factories
-        )
         channels: dict[str, Channel] = {}
         for generation in ordered:
             for channel in generation.contributions.channels:
@@ -454,8 +424,6 @@ class RuntimeSnapshotCompiler:
                     proactive_component_catalog,
                     generations,
                     mcp_server_registry,
-                    sources,
-                    proactive_modules,
                 )
                 identity += (
                     f"|proactive-components-v3:{proactive_component_catalog.identity}"
@@ -473,7 +441,6 @@ class RuntimeSnapshotCompiler:
                 self._validate_background_job_catalog(
                     background_job_catalog,
                     generations,
-                    jobs,
                 )
                 identity += f"|background-jobs-v3:{background_job_catalog.identity}"
             plugin_tools = composition_root.context.get(TOOL_CATALOG)
@@ -495,12 +462,6 @@ class RuntimeSnapshotCompiler:
         return RuntimeSnapshot(
             snapshot_id=snapshot_id,
             generations=MappingProxyType(dict(generations)),
-            jobs=MappingProxyType(jobs),
-            proactive_sources=MappingProxyType(sources),
-            proactive_modules=proactive_modules,
-            proactive_lifecycles=proactive_lifecycles,
-            proactive_module_factories=proactive_module_factories,
-            proactive_runtime_factories=proactive_runtime_factories,
             channels=MappingProxyType(channels),
             skill_catalog_generation_id=(
                 catalog_owner.skill_catalog.generation_id
@@ -568,8 +529,6 @@ class RuntimeSnapshotCompiler:
         catalog: ProactiveCatalog,
         generations: Mapping[str, PluginGeneration],
         mcp_registry: McpServerRegistry | None,
-        legacy_sources: Mapping[str, RegisteredProactiveSource],
-        legacy_modules: tuple[object, ...],
     ) -> None:
         """Validate exact generation routes without executing a source or module."""
 
@@ -614,38 +573,7 @@ class RuntimeSnapshotCompiler:
                         f"{descriptor.owner}:{descriptor.ack_tool}"
                     )
 
-        # 3. The bridge namespace and lifecycle slots remain exclusive across v2/v3.
-        for source in legacy_sources.values():
-            if source.spec.server.startswith("__v3_proactive__:"):
-                raise RuntimeError(
-                    "legacy proactive source 使用 Core 保留 server namespace: "
-                    f"{source.plugin_id}:{source.spec.id}"
-                )
-        legacy_slots = {
-            str(slot)
-            for slot in (getattr(module, "slot", None) for module in legacy_modules)
-            if isinstance(slot, str) and slot
-        }
-        legacy_produced = {
-            str(capability)
-            for module in legacy_modules
-            for capability in getattr(module, "produces", ())
-            if isinstance(capability, str) and capability
-        }
-        for binding in catalog.modules.values():
-            descriptor = binding.descriptor
-            if descriptor.slot in legacy_slots:
-                raise RuntimeError(
-                    f"v2/v3 proactive module slot 冲突: {descriptor.slot}"
-                )
-            conflict = legacy_produced.intersection(descriptor.produces)
-            if conflict:
-                raise RuntimeError(
-                    "v2/v3 proactive capability producer 冲突: "
-                    + ", ".join(sorted(conflict))
-                )
-
-        # 4. Frame lifecycle is Core-owned and produced capabilities are unique.
+        # 3. Frame lifecycle is Core-owned and produced capabilities are unique.
         produced: dict[str, str] = {}
         for binding in catalog.modules.values():
             descriptor = binding.descriptor
@@ -666,9 +594,8 @@ class RuntimeSnapshotCompiler:
     def _validate_background_job_catalog(
         catalog: BackgroundJobCatalog,
         generations: Mapping[str, PluginGeneration],
-        legacy_jobs: Mapping[str, RegisteredPluginJob],
     ) -> None:
-        """Validate exact job generations and reject v2/v3 semantic collisions."""
+        """Validate every background job against its exact generation."""
 
         for binding in catalog.values():
             generation = generations.get(binding.plugin_id)
@@ -680,18 +607,6 @@ class RuntimeSnapshotCompiler:
                     "RuntimeSnapshot background job 不属于 exact generation: "
                     f"{binding.plugin_id}:{binding.generation_id}"
                 )
-        legacy_names = set(legacy_jobs)
-        collisions = {
-            f"{descriptor.owner}:{descriptor.name}"
-            for descriptor in catalog.descriptors
-            if f"{descriptor.owner}:{descriptor.name}" in legacy_names
-        }
-        if collisions:
-            raise RuntimeError(
-                "RuntimeSnapshot v2/v3 background job 名称冲突: "
-                + ", ".join(sorted(collisions))
-            )
-
     @staticmethod
     def _validate_plugin_tool_catalog(
         catalog: PluginToolCatalog,
@@ -709,37 +624,6 @@ class RuntimeSnapshotCompiler:
                     "RuntimeSnapshot plugin Tool 不属于 exact generation: "
                     f"{binding.plugin_id}:{binding.generation_id}"
                 )
-
-    @staticmethod
-    def _compile_jobs(
-        generations: list[PluginGeneration],
-    ) -> dict[str, RegisteredPluginJob]:
-        jobs: dict[str, RegisteredPluginJob] = {}
-        for generation in generations:
-            catalog = generation.job_catalog
-            if catalog is None:
-                continue
-            for key, job in catalog.jobs.items():
-                if key in jobs or key != plugin_job_key(job):
-                    raise RuntimeError(f"RuntimeSnapshot Job 稳定键冲突: {key}")
-                jobs[key] = job
-        return jobs
-
-    @staticmethod
-    def _compile_sources(
-        generations: list[PluginGeneration],
-    ) -> dict[str, RegisteredProactiveSource]:
-        sources: dict[str, RegisteredProactiveSource] = {}
-        for generation in generations:
-            catalog = generation.proactive_catalog
-            if catalog is None:
-                continue
-            for key, source in catalog.sources.items():
-                if key in sources or key != proactive_source_key(source):
-                    raise RuntimeError(f"RuntimeSnapshot proactive 稳定键冲突: {key}")
-                sources[key] = source
-        return sources
-
 
 # 插件生命周期边界：一个 turn、job、event 或 proactive tick 必须始终使用同一
 # snapshot；旧 generation 只有在全部 lease 释放后才能 retire 和清理。

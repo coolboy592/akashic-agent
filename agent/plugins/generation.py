@@ -8,13 +8,10 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from agent.plugin_composition.ui_slots import MobileUiQueryHandler
-    from agent.plugins.jobs import RegisteredPluginJob
     from agent.plugins.scope import PluginScope, ScopedEventBus
-    from agent.plugins.specs import RegisteredProactiveSource
     from infra.channels.contract import Channel
     from agent.plugins.skill_host import PreparedSkillCatalog
     from agent.mcp.host import PreparedMcpCatalog
-    from agent.plugins.activity_host import PreparedJobCatalog, PreparedProactiveCatalog
     from agent.plugins.static_manifest import StaticPluginManifest
     from agent.plugins.snapshot import RuntimeSnapshot
 
@@ -43,14 +40,6 @@ class PluginSemanticCheck:
 
 
 @dataclass(frozen=True)
-class PluginReadinessContext:
-    generation_id: str
-    mcp_catalog: PreparedMcpCatalog
-    job_catalog: PreparedJobCatalog
-    proactive_catalog: PreparedProactiveCatalog
-
-
-@dataclass(frozen=True)
 class GateCheckResult:
     check_id: str
     status: GateStatus
@@ -74,12 +63,6 @@ class PluginContributions:
     drift_skill_roots: tuple[Path, ...] = ()
     mcp_servers: dict[str, dict[str, Any]] = field(default_factory=dict)
     managed_services: dict[str, dict[str, Any]] = field(default_factory=dict)
-    proactive_modules: tuple[object, ...] = ()
-    proactive_lifecycles: tuple[object, ...] = ()
-    proactive_module_factories: tuple[object, ...] = ()
-    proactive_runtime_factories: tuple[object, ...] = ()
-    proactive_sources: tuple[RegisteredProactiveSource, ...] = ()
-    jobs: tuple[RegisteredPluginJob, ...] = ()
     channels: tuple[Channel, ...] = ()
     dashboard_module: Path | None = None
     mobile_ui_asset: MobileUiAsset | None = None
@@ -112,8 +95,6 @@ class PluginGeneration:
     entrypoint: str = "plugin.py"
     skill_catalog: PreparedSkillCatalog | None = None
     mcp_catalog: PreparedMcpCatalog | None = None
-    job_catalog: PreparedJobCatalog | None = None
-    proactive_catalog: PreparedProactiveCatalog | None = None
     runtime_snapshot: RuntimeSnapshot | None = None
     staged_event_bus: ScopedEventBus | None = None
     prepare_started: bool = False
