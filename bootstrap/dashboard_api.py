@@ -75,8 +75,7 @@ def _dashboard_plugin_dirs(project_root: Path) -> dict[str, Path]:
 
     cache_root = resolve_plugins_root() / "cache"
     for source in resolve_plugin_sources([], installed_cache_root=cache_root):
-        plugin_name = source.plugin_root.parent.name
-        plugin_id = f"{plugin_name}@{source.marketplace}"
+        plugin_id = f"{source.plugin_name}@{source.marketplace}"
         if manifest.get(plugin_id, True) is False:
             continue
         plugin_root = source.plugin_root.resolve(strict=False)

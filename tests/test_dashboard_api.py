@@ -17,6 +17,7 @@ import pytest
 from fastapi.testclient import TestClient as _RawTestClient
 
 import bootstrap.dashboard_api as dashboard_api
+from agent.plugins.artifacts import ArtifactPointer, write_pointers
 from bootstrap.dashboard_api import (
     _dashboard_plugin_dirs,
     create_dashboard_app as _create_dashboard_app,
@@ -53,10 +54,13 @@ TestClient = _TrackedTestClient
 
 
 @pytest.fixture(autouse=True)
-def _isolate_dashboard_plugin_home(monkeypatch: pytest.MonkeyPatch) -> None:
+def _isolate_dashboard_plugin_home(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """让 Dashboard 测试只观察各自声明的 HOME/manifest。"""
 
-    monkeypatch.delenv("AKASHIC_PLUGIN_HOME", raising=False)
+    monkeypatch.setenv("AKASHIC_PLUGIN_HOME", str(tmp_path / "plugin-home"))
 
 
 def _use_writable_dashboard_plugins(
@@ -1328,13 +1332,14 @@ def test_wake_package_owns_dashboard_visibility(tmp_path, monkeypatch) -> None:
 def test_dashboard_lists_installed_plugin_panels(tmp_path, monkeypatch) -> None:
     _seed_workspace(tmp_path)
     home = tmp_path / "home"
-    plugin_dir = (
-        home / ".akashic-plugin" / "cache" / "github" / "status_commands" / "1.0.0"
+    plugin_base = (
+        home / ".akashic-plugin" / "cache" / "github" / "status_commands"
     )
+    plugin_dir = plugin_base / ".artifacts" / "1.0.0-test"
     plugin_dir.mkdir(parents=True, exist_ok=True)
     (plugin_dir / "dashboard.py").write_text(
         "from fastapi import FastAPI\n"
-        "def register(app: FastAPI, plugin_dir, workspace):\n"
+        "def register(app: FastAPI, context):\n"
         "    return None\n",
         encoding="utf-8",
     )
@@ -1342,15 +1347,29 @@ def test_dashboard_lists_installed_plugin_panels(tmp_path, monkeypatch) -> None:
         "export default {};\n", encoding="utf-8"
     )
     (plugin_dir / "plugin.py").write_text(
-        "from agent.plugins import Plugin\nclass StatusPlugin(Plugin):\n    name='status_commands'\n    version='1.0.0'\n",
+        "api_version = 3\n"
+        "name = 'status_commands'\n"
+        "version = '1.0.0'\n"
+        "dashboard_module = 'dashboard.py'\n"
+        "async def apply(ctx, config): pass\n",
         encoding="utf-8",
     )
+    (plugin_dir / "akashic.plugin.toml").write_text(
+        "schema_version = 1\n"
+        "name = 'status_commands'\n"
+        "version = '1.0.0'\n"
+        "api_version = 3\n"
+        "entrypoint = 'plugin.py'\n",
+        encoding="utf-8",
+    )
+    pointer = ArtifactPointer(".artifacts/1.0.0-test")
+    _ = write_pointers(plugin_base, stable=pointer, latest=pointer)
     manifest_path = home / ".akashic-plugin" / "manifest.toml"
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     manifest_path.write_text(
         '[plugins."status_commands@github"]\nenabled = true\n', encoding="utf-8"
     )
-    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("AKASHIC_PLUGIN_HOME", str(home / ".akashic-plugin"))
 
     with TestClient(create_dashboard_app(tmp_path)) as client:
         plugins = client.get("/api/dashboard/plugins").json()
@@ -1375,15 +1394,33 @@ def test_installed_typescript_panel_uses_runtime_cache_without_source_write(
 ) -> None:
     _seed_workspace(tmp_path)
     home = tmp_path / "home"
-    plugin_dir = home / ".akashic-plugin/cache/github/read_only_panel/1.0.0"
+    plugin_base = home / ".akashic-plugin/cache/github/read_only_panel"
+    plugin_dir = plugin_base / ".artifacts/1.0.0-test"
     plugin_dir.mkdir(parents=True)
-    (plugin_dir / "plugin.py").write_text("# installed source\n", encoding="utf-8")
+    (plugin_dir / "plugin.py").write_text(
+        "api_version = 3\n"
+        "name = 'read_only_panel'\n"
+        "version = '1.0.0'\n"
+        "dashboard_module = 'dashboard.py'\n"
+        "async def apply(ctx, config): pass\n",
+        encoding="utf-8",
+    )
+    (plugin_dir / "akashic.plugin.toml").write_text(
+        "schema_version = 1\n"
+        "name = 'read_only_panel'\n"
+        "version = '1.0.0'\n"
+        "api_version = 3\n"
+        "entrypoint = 'plugin.py'\n",
+        encoding="utf-8",
+    )
+    pointer = ArtifactPointer(".artifacts/1.0.0-test")
+    _ = write_pointers(plugin_base, stable=pointer, latest=pointer)
     (plugin_dir / "db.py").write_text(
         "def ping(): return 'ok'\n",
         encoding="utf-8",
     )
     (plugin_dir / "dashboard.py").write_text(
-        "def register(app, plugin_dir, workspace):\n"
+        "def register(app, context):\n"
         "    from .db import ping\n"
         "    assert ping() == 'ok'\n",
         encoding="utf-8",
@@ -1398,7 +1435,7 @@ def test_installed_typescript_panel_uses_runtime_cache_without_source_write(
         '[plugins."read_only_panel@github"]\nenabled = true\n',
         encoding="utf-8",
     )
-    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("AKASHIC_PLUGIN_HOME", str(home / ".akashic-plugin"))
     compiled_outputs: list[Path] = []
     monkeypatch.setattr(
         dashboard_api,
@@ -1447,11 +1484,29 @@ def test_installed_fresh_javascript_panel_stays_in_artifact(
 ) -> None:
     _seed_workspace(tmp_path)
     home = tmp_path / "home"
-    plugin_dir = home / ".akashic-plugin/cache/github/published_panel/1.0.0"
+    plugin_base = home / ".akashic-plugin/cache/github/published_panel"
+    plugin_dir = plugin_base / ".artifacts/1.0.0-test"
     plugin_dir.mkdir(parents=True)
-    (plugin_dir / "plugin.py").write_text("# installed source\n", encoding="utf-8")
+    (plugin_dir / "plugin.py").write_text(
+        "api_version = 3\n"
+        "name = 'published_panel'\n"
+        "version = '1.0.0'\n"
+        "dashboard_module = 'dashboard.py'\n"
+        "async def apply(ctx, config): pass\n",
+        encoding="utf-8",
+    )
+    (plugin_dir / "akashic.plugin.toml").write_text(
+        "schema_version = 1\n"
+        "name = 'published_panel'\n"
+        "version = '1.0.0'\n"
+        "api_version = 3\n"
+        "entrypoint = 'plugin.py'\n",
+        encoding="utf-8",
+    )
+    pointer = ArtifactPointer(".artifacts/1.0.0-test")
+    _ = write_pointers(plugin_base, stable=pointer, latest=pointer)
     (plugin_dir / "dashboard.py").write_text(
-        "def register(app, plugin_dir, workspace): return None\n",
+        "def register(app, context): return None\n",
         encoding="utf-8",
     )
     source = plugin_dir / "dashboard_panel.ts"
@@ -1465,7 +1520,7 @@ def test_installed_fresh_javascript_panel_stays_in_artifact(
         '[plugins."published_panel@github"]\nenabled = true\n',
         encoding="utf-8",
     )
-    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("AKASHIC_PLUGIN_HOME", str(home / ".akashic-plugin"))
     monkeypatch.setattr(
         dashboard_api,
         "_dashboard_plugin_dirs",
@@ -1678,7 +1733,7 @@ def test_standalone_dashboard_honors_builtin_plugin_manifest(
         "[plugins.akasha]\nenabled = false\n",
         encoding="utf-8",
     )
-    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("AKASHIC_PLUGIN_HOME", str(home / ".akashic-plugin"))
 
     plugins = _dashboard_plugin_dirs(Path.cwd())
 
@@ -1691,7 +1746,7 @@ def test_standalone_dashboard_rejects_invalid_manifest(tmp_path, monkeypatch) ->
     manifest_path = home / ".akashic-plugin" / "manifest.toml"
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     manifest_path.write_text("invalid = [\n", encoding="utf-8")
-    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("AKASHIC_PLUGIN_HOME", str(home / ".akashic-plugin"))
 
     with pytest.raises(tomllib.TOMLDecodeError):
         _dashboard_plugin_dirs(Path.cwd())
@@ -1702,7 +1757,8 @@ def test_standalone_dashboard_does_not_import_plugin_backend(
 ) -> None:
     _seed_workspace(tmp_path)
     home = tmp_path / "home"
-    plugin_dir = home / ".akashic-plugin" / "cache" / "github" / "observe" / "1.0.0"
+    plugin_base = home / ".akashic-plugin" / "cache" / "github" / "observe"
+    plugin_dir = plugin_base / ".artifacts" / "1.0.0-test"
     plugin_dir.mkdir(parents=True, exist_ok=True)
     (plugin_dir / "db.py").write_text(
         "def ping():\n" "    return 'ok'\n",
@@ -1719,15 +1775,29 @@ def test_standalone_dashboard_does_not_import_plugin_backend(
         encoding="utf-8",
     )
     (plugin_dir / "plugin.py").write_text(
-        "from agent.plugins import Plugin\nclass ObservePlugin(Plugin):\n    name='observe'\n    version='1.0.0'\n",
+        "api_version = 3\n"
+        "name = 'observe'\n"
+        "version = '1.0.0'\n"
+        "dashboard_module = 'dashboard.py'\n"
+        "async def apply(ctx, config): pass\n",
         encoding="utf-8",
     )
+    (plugin_dir / "akashic.plugin.toml").write_text(
+        "schema_version = 1\n"
+        "name = 'observe'\n"
+        "version = '1.0.0'\n"
+        "api_version = 3\n"
+        "entrypoint = 'plugin.py'\n",
+        encoding="utf-8",
+    )
+    pointer = ArtifactPointer(".artifacts/1.0.0-test")
+    _ = write_pointers(plugin_base, stable=pointer, latest=pointer)
     manifest_path = home / ".akashic-plugin" / "manifest.toml"
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     manifest_path.write_text(
         '[plugins."observe@github"]\nenabled = true\n', encoding="utf-8"
     )
-    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("AKASHIC_PLUGIN_HOME", str(home / ".akashic-plugin"))
     source_before = _test_tree_digest(plugin_dir)
 
     with TestClient(create_dashboard_app(tmp_path)) as client:
