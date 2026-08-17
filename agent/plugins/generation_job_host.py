@@ -22,6 +22,7 @@ from types import MappingProxyType
 from typing import Any, TYPE_CHECKING, cast
 
 from agent.control.models import TurnRequest
+from agent.control.errors import TurnAdmissionUncertainError
 from agent.model_runtime.registry import (
     RoleBoundProvider,
     current_model_binding,
@@ -519,6 +520,7 @@ class _JobRequest:
     cancelled: bool = False
     lease_released: bool = False
     resources: "_InvocationResources | None" = None
+    programmatic_turn_uncertain: bool = False
 
     @property
     def idempotency_key(self) -> str:
@@ -602,8 +604,15 @@ class _ProgrammaticTurnPort:
                 name=f"programmatic_turn_admission:{session_id}",
             )
         except BaseException as error:
-            self._ledger.reset_programmatic_turn(self._request.invocation_id)
-            await lease.release()
+            try:
+                self._ledger.reset_programmatic_turn(self._request.invocation_id)
+            except BaseException as reset_error:
+                self._request.programmatic_turn_uncertain = True
+                raise ProgrammaticTurnUncertainError(
+                    "programmatic Turn admission task 失败且 receipt 无法重置"
+                ) from reset_error
+            finally:
+                await lease.release()
             raise ProgrammaticTurnPreAdmissionError(
                 "programmatic Turn admission task 未创建"
             ) from error
@@ -613,11 +622,28 @@ class _ProgrammaticTurnPort:
                 await asyncio.shield(task)
             except asyncio.CancelledError:
                 cancelled = True
+            except BaseException:
+                break
         try:
             handle = task.result()
         except BaseException as error:
-            self._ledger.reset_programmatic_turn(self._request.invocation_id)
-            await lease.release()
+            if isinstance(error, TurnAdmissionUncertainError):
+                self._request.programmatic_turn_uncertain = True
+                await lease.release()
+                raise ProgrammaticTurnUncertainError(
+                    "programmatic Turn 已持久化，但未取得 handle"
+                ) from error
+            try:
+                self._ledger.reset_programmatic_turn(self._request.invocation_id)
+            except BaseException as reset_error:
+                self._request.programmatic_turn_uncertain = True
+                raise ProgrammaticTurnUncertainError(
+                    "programmatic Turn pre-admission receipt 无法重置"
+                ) from reset_error
+            finally:
+                await lease.release()
+            if cancelled:
+                raise asyncio.CancelledError
             raise ProgrammaticTurnPreAdmissionError(
                 "programmatic Turn 在取得 receipt 前失败"
             ) from error
@@ -629,6 +655,7 @@ class _ProgrammaticTurnPort:
                 turn_id,
             )
         except BaseException as error:
+            self._request.programmatic_turn_uncertain = True
             raise ProgrammaticTurnUncertainError(
                 "programmatic Turn 已取得 handle，但 durable receipt 未确认"
             ) from error
@@ -637,27 +664,33 @@ class _ProgrammaticTurnPort:
         return ProgrammaticTurnReceipt(session_id=session_id, turn_id=turn_id)
 
     async def _require_owned_session(self, session_id: str) -> dict[str, object]:
-        """Accept a local session or verify one durable session owned by this plugin job."""
+        """Verify Session ownership and rebuild provenance for the current Turn."""
 
         if session_id in self._sessions:
-            return dict(self._sessions[session_id])
-        try:
-            result = self._session_reader(session_id)
-            if inspect.isawaitable(result):
-                result = await result
-        except BaseException as error:
-            raise ProgrammaticTurnPreAdmissionError(
-                "programmatic Turn session provenance 无法读取"
-            ) from error
-        if not isinstance(result, Mapping):
-            raise ProgrammaticTurnPreAdmissionError(
-                "programmatic Turn session 不存在或不属于当前插件"
-            )
-        metadata = result.get("metadata")
-        if not isinstance(metadata, Mapping):
-            raise ProgrammaticTurnPreAdmissionError(
-                "programmatic Turn session 缺少 Core provenance"
-            )
+            metadata: Mapping[str, object] = self._sessions[session_id]
+        else:
+            try:
+                result = self._session_reader(session_id)
+                if inspect.isawaitable(result):
+                    result = await result
+            except BaseException as error:
+                raise ProgrammaticTurnPreAdmissionError(
+                    "programmatic Turn session provenance 无法读取"
+                ) from error
+            if not isinstance(result, Mapping):
+                raise ProgrammaticTurnPreAdmissionError(
+                    "programmatic Turn session 不存在或不属于当前插件"
+                )
+            stored_metadata = result.get("metadata")
+            if not isinstance(stored_metadata, Mapping):
+                raise ProgrammaticTurnPreAdmissionError(
+                    "programmatic Turn session 缺少 Core provenance"
+                )
+            if any(not isinstance(key, str) for key in stored_metadata):
+                raise ProgrammaticTurnPreAdmissionError(
+                    "programmatic Turn session provenance key 无效"
+                )
+            metadata = cast(Mapping[str, object], stored_metadata)
         if (
             metadata.get("programmatic") is not True
             or metadata.get("plugin_id") != self._request.job.binding.plugin_id
@@ -666,7 +699,13 @@ class _ProgrammaticTurnPort:
             raise ProgrammaticTurnPreAdmissionError(
                 "programmatic Turn session provenance 不匹配"
             )
-        return dict(metadata)
+        plugin_metadata = {
+            str(key): value
+            for key, value in metadata.items()
+            if isinstance(key, str)
+            and key not in _PROGRAMMATIC_SESSION_RESERVED_FIELDS
+        }
+        return _programmatic_session_metadata(self._request, plugin_metadata)
 
     async def _admit(
         self,
@@ -1546,6 +1585,15 @@ class BackgroundJobActivityAdapter:
         try:
             # 1. Scan durable pending outcomes without consulting the current catalog.
             for record in ledger.list_pending():
+                if record.programmatic_turn_state is not None:
+                    detail = _programmatic_turn_reconcile_error(record)
+                    self._transition_outcome(
+                        record.invocation_id,
+                        JobOutcomeState.FAILED,
+                        error=detail,
+                    )
+                    _report_recovery(runtime, record, detail)
+                    continue
                 job = jobs.get(record.semantic_job_id)
                 if job is None:
                     _report_recovery(runtime, record, "exact job binding unavailable")
@@ -1557,15 +1605,6 @@ class BackgroundJobActivityAdapter:
                         record,
                         "exact identity mismatch: " + ", ".join(mismatches),
                     )
-                    continue
-                if record.programmatic_turn_state is not None:
-                    detail = _programmatic_turn_reconcile_error(record)
-                    self._transition_outcome(
-                        record.invocation_id,
-                        JobOutcomeState.FAILED,
-                        error=detail,
-                    )
-                    _report_recovery(runtime, record, detail)
                     continue
                 if await self._recover_document_record(job, record):
                     continue
@@ -1997,10 +2036,15 @@ class BackgroundJobActivityAdapter:
                         _CURRENT_INVOCATION_TOKEN.reset(invocation_token)
                     current = ledger.get(request.invocation_id)
                     if (
-                        current is not None
-                        and current.programmatic_turn_state
-                        is ProgrammaticTurnState.SUBMITTING
+                        request.programmatic_turn_uncertain
+                        or (
+                            current is not None
+                            and current.programmatic_turn_state
+                            is ProgrammaticTurnState.SUBMITTING
+                        )
                     ):
+                        if current is None:
+                            raise RuntimeError("programmatic Turn outcome 丢失")
                         self._transition_outcome(
                             request.invocation_id,
                             JobOutcomeState.FAILED,

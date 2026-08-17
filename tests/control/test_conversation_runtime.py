@@ -9,7 +9,7 @@ from typing import Any, cast
 
 import pytest
 
-from agent.control.errors import ThreadBusyError
+from agent.control.errors import ThreadBusyError, TurnAdmissionUncertainError
 from agent.control.events import TurnEvent
 from agent.control.models import (
     TurnItem,
@@ -326,6 +326,33 @@ async def test_invalid_initial_input_releases_admission_capacity(
 
     assert runtime.admission_snapshot()["turns"] == 0
     assert runtime.admission_snapshot()["bytes"] == 0
+    await runtime.shutdown()
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_post_persist_start_failure_terminalizes_turn_and_releases_owner(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+
+    async def execute(_request: TurnRequest) -> str:
+        return "unused"
+
+    runtime = ConversationRuntime(store, execute)
+
+    def fail_publish_user(_thread_id: str, _turn_id: str, _item: TurnItem) -> None:
+        raise RuntimeError("publish failed after durable admission")
+
+    monkeypatch.setattr(runtime, "_publish_user_item", fail_publish_user)
+    with pytest.raises(TurnAdmissionUncertainError) as captured:
+        await runtime.start_turn(TurnRequest("programmatic:post-persist", "hello"))
+
+    record = store.read_turn(captured.value.turn_id)
+    assert record is not None and record.status is TurnStatus.FAILED
+    assert runtime.admission_snapshot()["turns"] == 0
+    assert "programmatic:post-persist" not in runtime._active_by_thread
     await runtime.shutdown()
     store.close()
 

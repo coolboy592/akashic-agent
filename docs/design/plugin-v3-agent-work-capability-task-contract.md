@@ -75,7 +75,10 @@ class ProgrammaticTurnReceipt:
 Core 的 `JobOutcomeLedger` 在调用 `ConversationRuntime` 前写 `submitting`，取得 handle 后写
 `admitted + turn_id`。同进程 handler 后续失败或取消、以及进程崩溃后发现任一 admission 状态时，
 都不得重跑 handler；记录转为带 `manual reconcile` 原因的失败事实。只有明确未取得 Turn handle
-的异常才能清除 `submitting` 并沿既有 retry policy 重试。
+且由 `ConversationRuntime` 证明尚未持久化 Turn 的异常，才能清除 `submitting` 并沿既有 retry
+policy 重试。若 Runtime 已写入 Turn、却在发布 handle 前失败，Runtime 先把该 Turn 收束为 durable
+failed 并释放 active owner，再向 job port 抛 typed uncertain；ledger 保留 `submitting`，禁止重放。
+重启扫描必须先收束所有带 admission state 的记录，再判断旧 generation/job 是否仍存在。
 
 Session 与 Turn 的权威 owner 仍是现有 Control/Session runtime。该 port 不新增第二份消息、
 Session 或 Turn 模型，也不允许删除、编辑或任意查询 Session。

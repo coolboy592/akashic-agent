@@ -15,6 +15,7 @@ from agent.control.errors import (
     RuntimeClosedError,
     SlowConsumerError,
     ThreadBusyError,
+    TurnAdmissionUncertainError,
     TurnNotFoundError,
 )
 from agent.control.events import TurnEvent
@@ -350,34 +351,83 @@ class ConversationRuntime:
             self._next_event_sequence[turn_id] = 0
             self._subscribers[turn_id] = set()
             handle = TurnHandle(self, request.thread_id, turn_id)
-        self._publish(
-            TurnEvent.create(
-                "turn/queued", request.thread_id, turn_id, turn=record.to_dict()
+        try:
+            self._publish(
+                TurnEvent.create(
+                    "turn/queued", request.thread_id, turn_id, turn=record.to_dict()
+                )
             )
-        )
-        self._publish_user_item(request.thread_id, turn_id, user_item)
-        execution_request = (
-            TurnRequest(
-                effective_request.thread_id,
-                effective_request.input,
-                {**effective_request.metadata, "media": list(live_media)},
+            self._publish_user_item(request.thread_id, turn_id, user_item)
+            execution_request = (
+                TurnRequest(
+                    effective_request.thread_id,
+                    effective_request.input,
+                    {**effective_request.metadata, "media": list(live_media)},
+                )
+                if live_media
+                else effective_request
             )
-            if live_media
-            else effective_request
-        )
-        task = asyncio.create_task(
-            self._run(
-                execution_request,
+            task = asyncio.create_task(
+                self._run(
+                    execution_request,
+                    turn_id,
+                    attempt_replay=attempt_replay,
+                    prior_tool_chain=prior_tool_chain,
+                    runtime_snapshot_lease=runtime_snapshot_lease,
+                    channel_binding_lease=channel_binding_lease,
+                ),
+                name=f"conversation-turn:{turn_id}",
+            )
+        except BaseException as error:
+            try:
+                self._fail_queued_start(request.thread_id, turn_id, error)
+            except BaseException as cleanup_error:
+                raise TurnAdmissionUncertainError(
+                    turn_id,
+                    "turn 已持久化，且 start_turn cleanup 未完成",
+                ) from cleanup_error
+            raise TurnAdmissionUncertainError(
                 turn_id,
-                attempt_replay=attempt_replay,
-                prior_tool_chain=prior_tool_chain,
-                runtime_snapshot_lease=runtime_snapshot_lease,
-                channel_binding_lease=channel_binding_lease,
-            ),
-            name=f"conversation-turn:{turn_id}",
-        )
+                "turn 已持久化，但 start_turn 未返回 handle",
+            ) from error
         self._tasks[turn_id] = task
         return handle
+
+    def _fail_queued_start(
+        self,
+        thread_id: str,
+        turn_id: str,
+        error: BaseException,
+    ) -> None:
+        """Terminalize a persisted Turn whose execution task was not published."""
+
+        terminal: TurnRecord | None = None
+        try:
+            current = self._store.read_turn(turn_id)
+            if current is not None and current.status is TurnStatus.QUEUED:
+                current = self._store.transition_turn(
+                    turn_id,
+                    expected_status=TurnStatus.QUEUED,
+                    status=TurnStatus.IN_PROGRESS,
+                    thread_id=thread_id,
+                )
+                terminal = self._store.transition_turn(
+                    turn_id,
+                    expected_status=current.status,
+                    status=TurnStatus.FAILED,
+                    thread_id=thread_id,
+                    error=TurnError(
+                        type=type(error).__name__,
+                        message=str(error),
+                        retryable=False,
+                    ),
+                )
+            future = self._results.get(turn_id)
+            if terminal is not None and future is not None and not future.done():
+                future.set_result(TurnResult.from_record(terminal))
+                self._finish_streams(turn_id)
+        finally:
+            self._release_turn_ownership(thread_id, turn_id)
 
     async def reject_never_fit_turn(self, request: TurnRequest) -> TurnHandle:
         """把永久超过单请求容量的输入持久化为可观察 failed turn。"""
