@@ -100,20 +100,9 @@ from agent.plugins.specs import (
     ProactiveSourceSpec,
     RegisteredProactiveSource,
 )
-from agent.lifecycle.types import (
-    AfterReasoningCtx,
-    AfterStepCtx,
-    AfterToolResultCtx,
-    AfterTurnCtx,
-    BeforeReasoningCtx,
-    BeforeStepCtx,
-    BeforeToolCallCtx,
-    BeforeTurnCtx,
-    PromptRenderCtx,
-)
 from infra.channels.base import SessionIdentityIndex
 from infra.channels.artifacts import ChannelAttachmentArtifactStore
-from agent.plugins.registry import MetadataKind, PluginEventType, plugin_registry
+from agent.plugins.registry import MetadataKind, plugin_registry
 from agent.plugins.artifacts import (
     ArtifactPointer,
     ArtifactSelector,
@@ -231,19 +220,6 @@ async def _complete_critical(awaitable: Awaitable[U]) -> tuple[U, bool]:
     # 3. 读取操作结果，保留其真实异常
     result = await task
     return result, cancelled
-
-
-_EVENT_TYPE_MAP: dict[PluginEventType, type] = {
-    PluginEventType.BEFORE_TURN: BeforeTurnCtx,
-    PluginEventType.BEFORE_REASONING: BeforeReasoningCtx,
-    PluginEventType.PROMPT_RENDER: PromptRenderCtx,
-    PluginEventType.BEFORE_STEP: BeforeStepCtx,
-    PluginEventType.AFTER_STEP: AfterStepCtx,
-    PluginEventType.AFTER_REASONING: AfterReasoningCtx,
-    PluginEventType.AFTER_TURN: AfterTurnCtx,
-    PluginEventType.BEFORE_TOOL_CALL: BeforeToolCallCtx,
-    PluginEventType.AFTER_TOOL_RESULT: AfterToolResultCtx,
-}
 
 
 @dataclass(frozen=True)
@@ -1834,7 +1810,6 @@ class PluginManager:
                 self._activate_published_generation(generation, None)
             except Exception as error:
                 raise _StablePluginFailed(generation, "publish", error) from error
-        self._compile_snapshot_event_handlers(snapshot)
         self._commit_stable_kv(staged)
         self._snapshot_skill_catalogs[snapshot.snapshot_id] = catalog_id
         await self._publish_committed_snapshot(snapshot)
@@ -2674,7 +2649,6 @@ class PluginManager:
         }
         snapshot, catalog_id = await self._compile_topology_snapshot(generations)
         try:
-            self._compile_snapshot_event_handlers(snapshot)
             if self._dashboard_preparer is not None:
                 self._dashboard_preparer(snapshot)
         except BaseException:
@@ -3892,7 +3866,6 @@ class PluginManager:
         if validation_workspace is not None:
             _remove_validation_data_dir(validation_workspace.parent)
         generation.validation_data_inventory = ()
-        self._compile_snapshot_event_handlers(ready.snapshot)
         if self._dashboard_preparer is not None:
             self._dashboard_preparer(ready.snapshot)
         if not isinstance(generation.instance, ComposablePlugin):
@@ -4254,7 +4227,6 @@ class PluginManager:
                     ),
                 },
             )
-        self._compile_snapshot_event_handlers(snapshot)
         if self._dashboard_preparer is not None:
             try:
                 self._dashboard_preparer(snapshot)
@@ -4688,9 +4660,7 @@ class PluginManager:
                 _remove_validation_data_dir(generation.data_dir)
             raise
         generation.publication_created_data_dir = created_data_dir
-        validation_event_handlers = validation_snapshot.event_handlers
         _replace_snapshot_payload(validation_snapshot, production_snapshot)
-        validation_snapshot.event_handlers = validation_event_handlers
         validation_workspace = generation.validation_workspace
         generation.validation_workspace = None
         if self._dashboard_preparer is not None:
@@ -4789,32 +4759,6 @@ class PluginManager:
         generation.prepare_started = True
         await instance.prepare()
         generation.minimum_resource_count = generation.scope.resource_count
-
-    def _compile_snapshot_event_handlers(self, snapshot: RuntimeSnapshot) -> None:
-        handlers: dict[type[object], list[Any]] = {}
-        for generation in snapshot.generations.values():
-            for metadata in plugin_registry.get_handlers_by_module_path(
-                generation.module_path
-            ):
-                if metadata.kind != MetadataKind.LIFECYCLE:
-                    continue
-                event_type = _EVENT_TYPE_MAP.get(metadata.event_type)  # type: ignore[arg-type]
-                if event_type is None:
-                    continue
-                handlers.setdefault(event_type, []).append(
-                    functools.partial(metadata.handler, generation.instance)
-                )
-            staged = generation.staged_event_bus
-            if staged is None:
-                continue
-            for event_type, handler in staged.staged_handlers():
-                handlers.setdefault(event_type, []).append(handler)
-        snapshot.event_handlers = MappingProxyType(
-            {
-                event_type: tuple(event_handlers)
-                for event_type, event_handlers in handlers.items()
-            }
-        )
 
     async def _post_publish_invariants(
         self,
@@ -5919,7 +5863,6 @@ class PluginManager:
         plugin_registry.register_instance(stable_module_path, instance)
         sys.modules[stable_module_path] = sys.modules[mp]
         assert generation.runtime_snapshot is not None
-        self._compile_snapshot_event_handlers(generation.runtime_snapshot)
         await self._publish_committed_snapshot(generation.runtime_snapshot)
         if generation.mcp_catalog is not None:
             self._mcp_host.mark_active(generation.generation_id)
@@ -6949,7 +6892,6 @@ class PluginManager:
             generation,
             snapshot.plugin_tool_catalog,
         )
-        self._compile_snapshot_event_handlers(snapshot)
         return snapshot
 
     @staticmethod
@@ -8620,7 +8562,6 @@ def _replace_snapshot_payload(
         "tool_registry",
         "plugin_skill_index",
         "command_registry",
-        "event_handlers",
         "proactive_component_catalog",
         "proactive_component_catalog_identity",
         "private_proactive_catalog",

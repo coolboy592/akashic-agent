@@ -57,7 +57,6 @@ from agent.plugin_composition.tool_catalog import (
     PluginToolCatalog,
     _freeze_plugin_tools,
 )
-from bus.event_bus import Handler
 from infra.channels.contract import Channel
 
 SnapshotState = Literal[
@@ -117,9 +116,6 @@ class RuntimeSnapshot:
     tool_registry: ToolRegistry | None = None
     plugin_skill_index: SkillIndex | None = None
     command_registry: CommandRegistry | None = None
-    event_handlers: Mapping[type[object], tuple[Handler[object], ...]] = field(
-        default_factory=lambda: MappingProxyType({})
-    )
     composition_root: CompositionRoot | None = None
     composition_topology: TopologyView | None = None
     composition_active_plugin_ids: frozenset[str] | None = None

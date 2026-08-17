@@ -10,26 +10,12 @@ from typing import Callable, Any
 # 先迁移该 consumer。
 
 class MetadataKind(Enum):
-    LIFECYCLE = auto()
     TOOL = auto()
-
-
-class PluginEventType(Enum):
-    BEFORE_TURN = "before_turn"
-    BEFORE_REASONING = "before_reasoning"
-    PROMPT_RENDER = "prompt_render"
-    BEFORE_STEP = "before_step"
-    AFTER_STEP = "after_step"
-    AFTER_REASONING = "after_reasoning"
-    AFTER_TURN = "after_turn"
-    BEFORE_TOOL_CALL = "before_tool_call"
-    AFTER_TOOL_RESULT = "after_tool_result"
 
 
 @dataclass
 class PluginHandlerMetadata:
     kind: MetadataKind
-    event_type: PluginEventType | None
     handler: Callable[..., Any]
     handler_name: str
     plugin_module_path: str

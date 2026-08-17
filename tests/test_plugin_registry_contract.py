@@ -29,6 +29,8 @@ def test_registry_drops_tool_hook_metadata_and_dead_lookups() -> None:
 
     for removed_name in (
         "HandlerType",
+        "PluginEventType",
+        "LIFECYCLE",
         "TOOL_HOOK",
         "PRE_TOOL",
         "hook_tool_name",
