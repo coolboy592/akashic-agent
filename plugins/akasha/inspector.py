@@ -15,9 +15,11 @@ from zoneinfo import ZoneInfo
 
 import numpy as np
 
-from agent.plugins.manifest import builtin_plugin_data_dir
-
-from .config import load_akasha_config, resolve_workspace_path
+from .config import AkashaConfig, resolve_workspace_path
+from .infrastructure.sparse_index.schema import (
+    INDEX_VERSION,
+    TOOL_CHAIN_PROJECTION_VERSION,
+)
 
 _LOCAL_TZ = ZoneInfo("Asia/Shanghai")
 
@@ -42,39 +44,36 @@ class _DenseSnapshot:
     assistant_present: np.ndarray
 
 
-def resolve_inspector_paths(workspace: Path) -> InspectorPaths:
-    """Resolve current V2 sidecars from the active workspace config."""
+def resolve_inspector_paths(
+    *,
+    memory_root: Path,
+    config: AkashaConfig,
+) -> InspectorPaths:
+    """Resolve immutable Akasha sidecars from explicit roots and config."""
 
-    config_path = (
-        builtin_plugin_data_dir("akasha", workspace)
-        / "config.local.toml"
-    )
-    config = load_akasha_config(config_path)
+    config.validate()
     return InspectorPaths(
-        memory=resolve_workspace_path(workspace, config.db_path),
-        index=resolve_workspace_path(workspace, config.index_path),
+        memory=resolve_workspace_path(memory_root, config.db_path),
+        index=resolve_workspace_path(memory_root, config.index_path),
     )
 
 
 class AkashaInspectorReader:
     """Expose historical cue, activation, completion, and prompt evidence."""
 
-    def __init__(self, workspace: Path) -> None:
-        self.workspace = workspace
-        config_path = (
-            builtin_plugin_data_dir("akasha", workspace)
-            / "config.local.toml"
-        )
-        self.config = load_akasha_config(config_path)
-        self.paths = InspectorPaths(
-            memory=resolve_workspace_path(
-                workspace,
-                self.config.db_path,
-            ),
-            index=resolve_workspace_path(
-                workspace,
-                self.config.index_path,
-            ),
+    def __init__(
+        self,
+        *,
+        memory_root: Path,
+        data_root: Path,
+        config: AkashaConfig,
+    ) -> None:
+        self.memory_root = memory_root.resolve(strict=False)
+        self.data_root = data_root.resolve(strict=False)
+        self.config = config
+        self.paths = resolve_inspector_paths(
+            memory_root=self.memory_root,
+            config=config,
         )
         self._dense_lock = threading.RLock()
         self._dense_snapshot: _DenseSnapshot | None = None
@@ -316,12 +315,43 @@ class AkashaInspectorReader:
             "ATTACH DATABASE ? AS sparse",
             (f"file:{self.paths.index}?mode=ro",),
         )
-        _ = connection.execute(
-            "ATTACH DATABASE ? AS sessions",
-            (f"file:{self.workspace / 'sessions.db'}?mode=ro",),
-        )
+        self._validate_sidecar_schema(connection)
         _ = connection.execute("PRAGMA query_only = ON")
         return connection
+
+    @staticmethod
+    def _validate_sidecar_schema(connection: sqlite3.Connection) -> None:
+        """Reject sidecars that cannot reproduce the Inspector tool lane."""
+
+        row = connection.execute(
+            "SELECT value FROM sparse.metadata WHERE key='index_version'"
+        ).fetchone()
+        actual_version = None if row is None else str(row[0])
+        if actual_version != INDEX_VERSION:
+            raise ValueError(
+                f"unsupported sparse index version: {actual_version}"
+            )
+        columns = {
+            str(item[1])
+            for item in connection.execute(
+                "PRAGMA sparse.table_info(sparse_turns)"
+            )
+        }
+        if "assistant_tool_chain_json" not in columns:
+            raise ValueError(
+                "sparse index lacks assistant tool-chain projection; "
+                "explicit rebuild is required"
+            )
+        projection = connection.execute(
+            "SELECT value FROM sparse.metadata "
+            "WHERE key='tool_chain_projection_version'"
+        ).fetchone()
+        actual_projection = None if projection is None else str(projection[0])
+        if actual_projection != TOOL_CHAIN_PROJECTION_VERSION:
+            raise ValueError(
+                "unsupported assistant tool-chain projection version: "
+                f"{actual_projection}; explicit rebuild is required"
+            )
 
     @staticmethod
     def _load_run(
@@ -340,7 +370,7 @@ class AkashaInspectorReader:
                 turn.started_at AS ts,
                 sparse_turn.user_text AS query_text,
                 sparse_turn.assistant_text,
-                assistant.tool_chain AS tool_chain_json,
+                sparse_turn.assistant_tool_chain_json AS tool_chain_json,
                 event.time_prior,
                 event.continuation,
                 COALESCE(activation.pushes, event.pushes) AS pushes,
@@ -394,8 +424,6 @@ class AkashaInspectorReader:
               ON turn.node_id = event.current_turn_node_id
             JOIN sparse.sparse_turns AS sparse_turn
               ON sparse_turn.turn_id = turn.turn_id
-            LEFT JOIN sessions.messages AS assistant
-              ON assistant.id = turn.assistant_message_id
             LEFT JOIN activation_runs AS activation
               ON activation.query_turn_node_id = turn.node_id
             LEFT JOIN recall_runs AS recall
