@@ -197,3 +197,21 @@ def test_engine_and_inspector_share_declared_memory_path_contract(
                 index_path="akasha-v2-index.db",
             ),
         )
+
+
+def test_inspector_rejects_symlinked_memory_root(
+    tmp_path: Path,
+) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    memory_root = tmp_path / "workspace" / "memory"
+    memory_root.parent.mkdir()
+    memory_root.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="memory root 不能是符号链接"):
+        AkashaInspectorReader(
+            memory_root=memory_root,
+            config=AkashaConfig(),
+        )
+
+    assert list(outside.iterdir()) == []

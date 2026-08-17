@@ -98,19 +98,23 @@ def resolve_memory_path(
 ) -> Path:
     """Resolve historical storage syntax inside the declared memory root."""
 
-    # 1. Accept the historical ``memory/file`` form and a direct filename.
+    # 1. The declared capability root itself must remain a real workspace directory.
+    if memory_root.is_symlink():
+        raise ValueError(f"Akasha memory root 不能是符号链接: {memory_root}")
+
+    # 2. Accept exactly the historical ``memory/file`` form or a direct filename.
     raw = PurePosixPath(configured)
     parts = raw.parts
     if not parts or raw.is_absolute():
         raise ValueError(f"Akasha sidecar path 无效: {configured}")
     if parts[0] == memory_root.name:
+        if len(parts) != 2:
+            raise ValueError(f"Akasha sidecar 必须位于 memory root: {configured}")
         parts = parts[1:]
     elif len(parts) != 1:
         raise ValueError(f"Akasha sidecar 必须位于 memory root: {configured}")
-    if not parts:
-        raise ValueError(f"Akasha sidecar path 无效: {configured}")
 
-    # 2. Resolve traversal and symlinks against the one capability root.
+    # 3. Resolve traversal and child symlinks against the one capability root.
     root = memory_root.resolve(strict=False)
     path = root.joinpath(*parts).resolve(strict=False)
     if not path.is_relative_to(root):

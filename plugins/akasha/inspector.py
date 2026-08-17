@@ -67,12 +67,12 @@ class AkashaInspectorReader:
         memory_root: Path,
         config: AkashaConfig,
     ) -> None:
-        self.memory_root = memory_root.resolve(strict=False)
         self.config = config
         self.paths = resolve_inspector_paths(
-            memory_root=self.memory_root,
+            memory_root=memory_root,
             config=config,
         )
+        self.memory_root = memory_root.resolve(strict=False)
         self._dense_lock = threading.RLock()
         self._dense_snapshot: _DenseSnapshot | None = None
 
