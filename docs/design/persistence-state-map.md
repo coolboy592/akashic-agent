@@ -529,7 +529,7 @@ listener 与 Dashboard 读写同一副本，discard 不改正式素材，promoti
 ### 13.2 已确认缺口
 
 1. 仓库只有通用 `rolling_backup.example.toml`，没有 Akashic workspace 的正式 source manifest。
-2. 通用脚本只接受单个 `file` 和 `sqlite`，不能直接一致性快照 `uploads/` 和 `plugin-data/`，也没有把插件 manifest/source 作为 companion 安装状态恢复。
+2. 通用脚本现在支持普通文件、SQLite online backup 和拒绝 symlink 的目录树快照，并以 relative path、mode、size、SHA-256 manifest 支持隔离恢复；但仍没有 Akashic workspace 的正式 source manifest，也没有把插件 manifest/source 作为 companion 安装状态恢复。
 3. 当前快照 manifest 不记录 workspace 选择、应用 commit、schema/插件版本、主配置位置或全局状态位置。
 4. 没有一条仓库内工作流证明同一份快照能在隔离 workspace 恢复并通过应用级只读 smoke。
 5. SQLite 分别 backup 时，每个文件内部一致，但多个数据库与普通文件之间没有全局事务时点。
