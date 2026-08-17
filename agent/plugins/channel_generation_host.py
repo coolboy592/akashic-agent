@@ -352,6 +352,7 @@ class ChannelBindingLease:
                 recipient=envelope.recipient,
                 body=envelope.body,
             ),
+            retained_binding=True,
         )
         return ChannelDeliveryReceipt(
             delivery_id=receipt.delivery_id,
@@ -1846,13 +1847,19 @@ class ChannelGenerationHost:
         self,
         key: tuple[str, str],
         request: ProviderDeliveryRequest,
+        *,
+        retained_binding: bool = False,
     ) -> ProviderDeliveryReceipt:
+        """Deliver through a live binding or an exact lease admitted before close."""
+
         state = self._binding(key)
         if not isinstance(request, ProviderDeliveryRequest):
             raise TypeError("channel deliver 只接受 ProviderDeliveryRequest")
         if request.binding_token != state.binding_token:
             raise RuntimeError("channel delivery binding token 不匹配")
-        if not state.admission_open or state.stopping or state.stopped:
+        if state.stopping or state.stopped:
+            raise RuntimeError("channel admission 已关闭")
+        if not retained_binding and not state.admission_open:
             raise RuntimeError("channel admission 已关闭")
         state.in_flight += 1
         state.drain_event.clear()
