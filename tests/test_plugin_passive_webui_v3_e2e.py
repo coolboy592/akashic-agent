@@ -162,8 +162,22 @@ def test_final_immutability_rejects_shutdown_publication_or_asset_changes(
     second = plugin_base / ".artifacts/second"
     first.mkdir(parents=True)
     second.mkdir(parents=True)
-    (first / "plugin.py").write_text("FIRST = True\n", encoding="utf-8")
-    (second / "plugin.py").write_text("SECOND = True\n", encoding="utf-8")
+    for artifact, version in ((first, "1.0.0"), (second, "2.0.0")):
+        (artifact / "plugin.py").write_text(
+            "api_version = 3\n"
+            "name = 'citation'\n"
+            f"version = {version!r}\n"
+            "async def apply(ctx, config): pass\n",
+            encoding="utf-8",
+        )
+        (artifact / "akashic.plugin.toml").write_text(
+            "schema_version = 1\n"
+            "name = 'citation'\n"
+            f"version = {version!r}\n"
+            "api_version = 3\n"
+            "entrypoint = 'plugin.py'\n",
+            encoding="utf-8",
+        )
     memes = sandbox / "workspace/memes"
     memes.mkdir(parents=True)
     (memes / "manifest.json").write_text("{}\n", encoding="utf-8")
