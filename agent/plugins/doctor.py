@@ -88,7 +88,10 @@ def _inspect_plugin(
             )
         )
         try:
-            declaration = _load_plugin_declaration(stable_root)
+            declaration = _load_plugin_declaration(
+                stable_root,
+                require_static="@" in plugin_id,
+            )
             checks.extend(
                 _check_capabilities(
                     declaration,
@@ -111,7 +114,10 @@ def _inspect_plugin(
             )
         )
         try:
-            declaration = _load_plugin_declaration(latest_root)
+            declaration = _load_plugin_declaration(
+                latest_root,
+                require_static="@" in plugin_id,
+            )
             checks.extend(_check_candidate_declaration(declaration, latest_root))
             checks.extend(
                 _check_empty_projection(
@@ -161,14 +167,8 @@ def _find_plugin_roots(
             base,
         )
 
-    # 3. 没有 pointer state 时兼容单个 legacy 可见版本目录。
-    versions = (
-        sorted(path for path in base.iterdir() if path.is_dir())
-        if base.is_dir()
-        else []
-    )
-    root = versions[-1] if versions and _plugin_root_has_entrypoint(versions[-1]) else None
-    return root, root, base
+    # 3. 外部插件只认原子 pointer，不扫描旧版可见目录。
+    return None, None, base
 
 
 def _plugin_root_has_entrypoint(root: Path) -> bool:
@@ -188,10 +188,16 @@ def _entrypoint_label(root: Path) -> str:
     return "plugin.py"
 
 
-def _load_plugin_declaration(plugin_root: Path) -> ComposablePlugin:
+def _load_plugin_declaration(
+    plugin_root: Path,
+    *,
+    require_static: bool,
+) -> ComposablePlugin:
     """读取并校验一个 v3 namespace。"""
 
     static_manifest = _load_optional_static_manifest(plugin_root)
+    if require_static and static_manifest is None:
+        raise ValueError(f"installed v3 插件缺少静态 manifest: {plugin_root}")
     module_name = f"akasic_plugin_doctor_{uuid.uuid4().hex}"
     path = plugin_root / (
         static_manifest.entrypoint if static_manifest is not None else "plugin.py"
