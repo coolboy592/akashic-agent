@@ -522,6 +522,59 @@ async def test_c14d_control_uses_exact_binding_and_bounded_dedupe() -> None:
 
 
 @pytest.mark.asyncio
+async def test_c14d_control_cancelled_during_source_release_closes_binding() -> None:
+    snapshot, factories, adapters = await _make_snapshot(
+        adapter_cls=PresentationAdapter,
+        capabilities=frozenset(ChannelCapability),
+    )
+    release_gate = asyncio.Event()
+    sources: list[_FakeSnapshotLease] = []
+
+    def acquire(snapshot_id: str) -> _FakeSnapshotLease:
+        assert snapshot_id == snapshot.snapshot_id
+        source = _FakeSnapshotLease(snapshot, release_gate=release_gate)
+        sources.append(source)
+        return source
+
+    host = _host(snapshot_lease_acquirer=acquire)
+    generation = await host.start(snapshot, factories)
+    generation.open_admission()
+    control = tuple(adapters.values())[0].presentation_ports.control
+    assert control is not None
+    task = asyncio.create_task(
+        control.interrupt(
+            RawInbound(
+                message_id="cancel-source-release",
+                message=ChannelInboundMessage(
+                    channel="feishu",
+                    sender="sender",
+                    chat_id="chat",
+                    content="/stop",
+                    timestamp=datetime.now(timezone.utc),
+                    metadata={},
+                ),
+            ),
+            response_bodies=ControlResponseBodies("stopped", "idle"),
+        )
+    )
+    while not sources or not sources[0].forks:
+        await asyncio.sleep(0)
+
+    task.cancel()
+    await asyncio.sleep(0)
+    assert not task.done()
+    release_gate.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert not sources[0].active
+    assert not sources[0].forks[0].active
+    assert generation.channel("feishu").in_flight == 0
+    assert not host._binding_leases
+    await generation.stop()
+
+
+@pytest.mark.asyncio
 async def test_c14d_existing_turn_lease_can_finish_stream_after_close_admission() -> None:
     snapshot, factories, adapters = await _make_snapshot(
         adapter_cls=PresentationAdapter,

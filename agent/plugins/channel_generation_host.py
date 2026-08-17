@@ -1377,20 +1377,34 @@ class ChannelGenerationHost:
             raise RuntimeError("Channel control exact snapshot lease owner 未绑定")
         state = self._binding(key)
         source = acquirer(state.snapshot_id)
+        binding: ChannelBindingLease | None = None
         try:
-            if source.snapshot.snapshot_id != state.snapshot_id:
-                raise RuntimeError("Channel control 与当前 stable snapshot 不一致")
-            return self.acquire_binding(
-                source,
-                state.channel_name,
-                _allow_claimed_after_close=True,
-            )
-        finally:
-            release = asyncio.create_task(
-                source.release(),
-                name=f"channel-control-source-release:{state.channel_name}",
-            )
-            await _await_task_after_cancellation(release)
+            try:
+                if source.snapshot.snapshot_id != state.snapshot_id:
+                    raise RuntimeError("Channel control 与当前 stable snapshot 不一致")
+                binding = self.acquire_binding(
+                    source,
+                    state.channel_name,
+                    _allow_claimed_after_close=True,
+                )
+            finally:
+                release = asyncio.create_task(
+                    source.release(),
+                    name=f"channel-control-source-release:{state.channel_name}",
+                )
+                await _await_task_after_cancellation(release)
+        except BaseException as error:
+            if binding is not None:
+                cleanup = asyncio.create_task(
+                    binding.aclose(),
+                    name=f"channel-control-binding-rollback:{state.channel_name}",
+                )
+                try:
+                    await _await_task_after_cancellation(cleanup)
+                except BaseException as cleanup_error:
+                    raise error from cleanup_error
+            raise
+        return cast(ChannelBindingLease, binding)
 
     async def emit_turn_event(
         self,
