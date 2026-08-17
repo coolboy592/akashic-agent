@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
@@ -198,8 +197,7 @@ def test_items_from_block_parses_each_summary_once(
     ]
 
 
-@pytest.mark.asyncio
-async def test_recall_inspector_hard_links_legacy_data_without_rewriting(
+def test_recall_inspector_uses_generation_root_without_legacy_fallback(
     tmp_path: Path,
 ) -> None:
     workspace = tmp_path / "workspace"
@@ -207,15 +205,14 @@ async def test_recall_inspector_hard_links_legacy_data_without_rewriting(
     legacy = workspace / "observe" / "recall_inspector.jsonl"
     data_root.mkdir(parents=True)
     legacy.parent.mkdir(parents=True)
-    original = b'{"kind":"context_prepare","engine":"default","turn_id":"old"}\n'
+    original = b'{"kind":"context_prepare","engine":"default","turn_id":"legacy"}\n'
     legacy.write_bytes(original)
 
     target = default_memory_plugin._resolve_recall_data_path(
         data_root=data_root,
-        workspace=workspace,
     )
-    assert target.read_bytes() == original
-    assert os.path.samefile(target, legacy)
+    assert target == data_root / "recall_inspector.jsonl"
+    assert not target.exists()
 
     plugin = DefaultMemoryInspector(target)
     plugin.record_context_prepare(
@@ -232,60 +229,8 @@ async def test_recall_inspector_hard_links_legacy_data_without_rewriting(
         )
     )
 
-    reader = RecallInspectorDashboardReader(data_root)
-    _, total = reader.list_turns()
-
-    assert total == 2
-    with legacy.open("a", encoding="utf-8") as stream:
-        _ = stream.write(
-            '{"kind":"context_prepare","engine":"default","turn_id":"rollback"}\n'
-        )
-    assert b'"turn_id":"rollback"' in target.read_bytes()
-
-
-def test_recall_inspector_rejects_divergent_new_and_legacy_files(
-    tmp_path: Path,
-) -> None:
-    workspace = tmp_path / "workspace"
-    data_root = workspace / "plugin-data" / "default_memory-builtin"
-    legacy = workspace / "observe" / "recall_inspector.jsonl"
-    data_root.mkdir(parents=True)
-    legacy.parent.mkdir(parents=True)
-    legacy.write_text("legacy\n", encoding="utf-8")
-    (data_root / "recall_inspector.jsonl").write_text(
-        "new\n",
-        encoding="utf-8",
-    )
-
-    with pytest.raises(RuntimeError, match="新旧路径指向不同文件"):
-        default_memory_plugin._resolve_recall_data_path(
-            data_root=data_root,
-            workspace=workspace,
-        )
-
-
-def test_recall_inspector_does_not_fallback_when_hard_link_fails(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    workspace = tmp_path / "workspace"
-    data_root = workspace / "plugin-data" / "default_memory-builtin"
-    legacy = workspace / "observe" / "recall_inspector.jsonl"
-    data_root.mkdir(parents=True)
-    legacy.parent.mkdir(parents=True)
-    legacy.write_text("legacy\n", encoding="utf-8")
-
-    def fail_link(_: Path, __: Path) -> None:
-        raise OSError("cross-device link")
-
-    monkeypatch.setattr(default_memory_plugin.os, "link", fail_link)
-
-    with pytest.raises(RuntimeError, match="无法以 hard link 接续旧数据"):
-        default_memory_plugin._resolve_recall_data_path(
-            data_root=data_root,
-            workspace=workspace,
-        )
-    assert not (data_root / "recall_inspector.jsonl").exists()
+    assert target.read_bytes() != original
+    assert legacy.read_bytes() == original
 
 
 @pytest.mark.asyncio
@@ -293,12 +238,6 @@ async def test_recall_inspector_v3_runs_from_formal_snapshot(
     tmp_path: Path,
 ) -> None:
     workspace = tmp_path / "workspace"
-    legacy = workspace / "observe" / "recall_inspector.jsonl"
-    legacy.parent.mkdir(parents=True)
-    legacy.write_text(
-        '{"kind":"context_prepare","engine":"default","turn_id":"legacy"}\n',
-        encoding="utf-8",
-    )
     manager = _default_memory_manager(tmp_path, memory_name="default")
     await manager.load_all()
 
@@ -310,7 +249,7 @@ async def test_recall_inspector_v3_runs_from_formal_snapshot(
     assert snapshot.composition_topology is not None
     assert len(snapshot.composition_topology.listeners) == 2
     data_path = generation.data_dir / "recall_inspector.jsonl"
-    assert os.path.samefile(data_path, legacy)
+    assert data_path.parent == generation.data_dir
 
     lease = manager.snapshot_store.lease()
     token = bind_runtime_snapshot(lease)
@@ -364,7 +303,7 @@ async def test_recall_inspector_v3_runs_from_formal_snapshot(
     assert result.status == "success"
     reader = RecallInspectorDashboardReader(generation.data_dir)
     items, total = reader.list_turns()
-    assert total == 2
+    assert total == 1
     current = next(item for item in items if item["session_key"] == "web:1")
     assert current["context_prepare_count"] == 1
     assert current["recall_memory_count"] == 1

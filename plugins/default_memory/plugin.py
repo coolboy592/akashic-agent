@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
 import threading
 from datetime import datetime, timezone
@@ -112,11 +111,8 @@ async def apply(ctx: Context, config: object) -> None:
 
     # 1. Core 已用 static service view 决定当前 generation 是否挂载。
     _ = config
-    # 2. 正式 runtime 非破坏地接续旧诊断路径，candidate 只看到隔离 workspace。
-    data_path = _resolve_recall_data_path(
-        data_root=ctx.data_root,
-        workspace=ctx.runtime.workspace,
-    )
+    # 2. 当前 generation 独占自己的诊断数据根。
+    data_path = _resolve_recall_data_path(data_root=ctx.data_root)
     inspector = DefaultMemoryInspector(data_path)
 
     # 3. 两个 listener 都由当前 Fiber Effect 持有并逆序清理。
@@ -129,30 +125,10 @@ def is_active(services: ServiceView) -> bool:
     return runtime is not None and runtime.name == "default"
 
 
-def _resolve_recall_data_path(*, data_root: Path, workspace: Path) -> Path:
-    """接续旧 JSONL 名字，并拒绝形成两份可写历史。"""
+def _resolve_recall_data_path(*, data_root: Path) -> Path:
+    """返回当前 generation 独占的 inspector JSONL 路径。"""
 
-    target = data_root / _RECALL_FILENAME
-    # V2_REMOVAL(default-memory-recall-path)：确认全部 runtime 只读写 data_root
-    # 且旧 v2 不再可能回滚后，删除 legacy 名字接续分支。
-    legacy = workspace / "observe" / _RECALL_FILENAME
-    if target.exists():
-        if legacy.exists() and not os.path.samefile(target, legacy):
-            raise RuntimeError(
-                "default_memory recall inspector 新旧路径指向不同文件: "
-                f"legacy={legacy} target={target}"
-            )
-        return target
-    if not legacy.exists():
-        return target
-    try:
-        os.link(legacy, target)
-    except OSError as error:
-        raise RuntimeError(
-            "default_memory recall inspector 无法以 hard link 接续旧数据: "
-            f"legacy={legacy} target={target}"
-        ) from error
-    return target
+    return data_root / _RECALL_FILENAME
 
 
 def _turn_id(session_key: str, timestamp: str, content: str) -> str:
