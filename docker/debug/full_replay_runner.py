@@ -276,6 +276,12 @@ def prepare_profile(
         memory_md=memory_md,
         proactive_context=proactive_context,
     )
+    replay_plugin_data = workspace / "plugin-data" / "replay_debug-builtin"
+    _ = replay_plugin_data.mkdir(parents=True, exist_ok=True)
+    _ = (replay_plugin_data / "config.local.toml").write_text(
+        'replay_token = "isolated-replay-fixture"\n',
+        encoding="utf-8",
+    )
 
     source_plugins_home = template / "home" / ".akashic-plugin"
     entries = load_plugin_manifest(source_plugins_home)
