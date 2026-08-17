@@ -126,6 +126,7 @@ Gate 报告。分支名、PR 号和浮动 ref 不能代替 commit。
 | C22 | static v3 artifact manifest / install staging | `CANDIDATE` | 集成 head `3e1f5c10`（独立复审 head `b6967d13`）已在 import 前校验 identity/runtime/validation、custom entrypoint 与 C12/C13 descriptor，不成功 staging 不创建正式 data/artifact/pointer；Calendar `654d078d` 已由真实 Host 消费 exact staged `.venv/bin/python`，manifest/apply/runtime identity 一致且候选排除 credential/receipt；待全部 external v3 与最终 artifact Gate | Calendar MCP / 全部 external v3 |
 | C23 | Core-owned Channel attachment artifact / Session binding | `CANDIDATE` | `0bd2d928` 已完成 immutable opaque artifact、fixed-ID resumable Mobile import、SessionDB 原子 message binding、exact fd read lease、无自动 GC 与目录/SQLite 可恢复备份；Mobile 114、Bus/lifecycle/Host 124、最终 ownership 聚焦 201 tests、Basedpyright 0，独立 review 无 P0/P1；待 Feishu/QQ 与复制 workspace E3/E4 进入 `READY` | Feishu / QQBot / Core channels |
 | C24 | read-only existing Session projection | `CANDIDATE` | Core `cb2011b4` formal 只经 `get_existing` 返回 detached snapshot，candidate 同名 Service 调用即 fail-loud；Status Commands `eb245ad` 的真实 active compaction ledger 同时驱动 committed command 与 Mobile query，查询前后 `sessions.db*` 摘要不变。Core 38、插件 6、面板 7 tests、Pyright/contract/compileall/diff-check 通过；待 E3 复制 workspace | Status Commands |
+| C25 | explicit interaction undo coordinator | `IN_PROGRESS` | latest interaction 事务 fence、SQLite backup、Default Memory durable receipt、Akasha source gate、进程内取消与 Core 重启重放 | Plugin Undo |
 
 实现原则：C11～C17、C21～C22 只由表中的首个真实 consumer 拉动，不提前复制
 `commands()/mcp_servers()/managed_services()/channels()/jobs()/proactive_*()/mobile_ui()` 旧方法。
@@ -167,7 +168,7 @@ Gate 报告。分支名、PR 号和浮动 ref 不能代替 commit。
 |---|---|---|---|---|
 | Daynight Gate | proactive module / prompt gate | C15 | `CANDIDATE` | plugin `e5adbd2`；真实 Manager/ActivityHost exact lease、配置行为、dispose、contract 与 Pyright 已通过，待 E3 |
 | Emotion | Dashboard、mobile、Drift Skill、proactive module、job/LLM | C09/C15/C17/C21 | `OPEN` | E1/E3 |
-| Plugin Undo | command、before-turn、显式 interaction 撤销 | C02/C11 | `OPEN` | E1/E3 |
+| Plugin Undo | command、显式 interaction 撤销 | C11/C25 | `OPEN` | E1/E3 |
 | Observe | Dashboard、mobile、committed event observers | C02/C17 | `OPEN` | E1 |
 | Setup Helper | command | C11 | `CANDIDATE` | Core `78e50d4d` + plugin `65770db`；`/chatid` 与 `/myid` 走 committed registry，在 Session/模型 admission 前短路，installed candidate→formal 晋升与 Root/validation cleanup 已通过，待 E3 |
 | Status Commands | mobile、command、只读 Session projection | C11/C17/C24 | `CANDIDATE` | Core `cb2011b4` + plugin `eb245ad`；真实 Manager command/Mobile/ledger oracle 通过，待 E3 复制 workspace |

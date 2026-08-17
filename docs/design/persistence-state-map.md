@@ -287,6 +287,7 @@ workspace 之外还有两组明确的全局状态：
 | `channel_identities` | `SessionStore` 原子事务，由 `SessionManager`/Core Channel Host 协调 | v3 channel inbound 与 proactive recipient resolve | `(channel, identity)` 唯一 durable recipient；legacy Session metadata 只作一次性迁移输入，显式 Session 删除由同一审计事务级联并可从整库 backup 恢复 |
 | `channel_identity_migrations` | `SessionStore` | v3 channel identity rebuild | 每个 channel 的一次性 migration marker；identity 表删除到空也禁止重新扫描 legacy metadata |
 | `session_compactions` | `session.store.SessionStore`，由 Core checkpoint owner 请求 | prompt replay、Markdown reconciliation、删除恢复 | append-only generation lineage、source provenance、retained tail、summary、usage 和失效状态 |
+| `interaction_memory_reconciliations` | `SessionStore.delete_interaction` 与 Core `InteractionUndoCoordinator` | Plugin Undo / Default Memory 启动恢复 | source 删除事务内新增 pending receipt；幂等 memory undo 成功后原位完成；失败只增加 attempt/error，不自动删除历史 receipt |
 | `messages` | `SessionStore` | prompt 历史、dashboard、Akasha、检索工具 | 原始 user/assistant/tool 消息和单调 `seq` |
 | `attachments` / `attachment_imports` | `SessionStore` + Core `ChannelAttachmentArtifactStore` | v3 Channel、Mobile adapter、Session read projection | immutable ready artifact metadata 与 crash-resumable import phase；不提供普通 delete/GC |
 | `message_attachments` | `SessionStore` message append transaction | prompt/read adapter、Channel history | ordered message→artifact binding，与 `extra.attachment_ids` 同事务一致 |

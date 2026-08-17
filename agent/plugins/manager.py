@@ -30,6 +30,7 @@ from agent.plugin_composition import (
     MCP_SERVERS,
     MEMORY_RUNTIME,
     MEMORY_TURN_RUNTIME,
+    INTERACTION_UNDO,
     PROACTIVE_COMPONENTS,
     SESSION_READ,
     BACKGROUND_JOBS,
@@ -40,6 +41,7 @@ from agent.plugin_composition import (
     FiberState,
     MemoryRuntimeInfo,
     MemoryTurnRuntime,
+    InteractionUndoService,
     PluginChannels,
     PluginUiSlots,
     PluginCommands,
@@ -59,6 +61,7 @@ from agent.plugin_composition.mcp_slots import PluginMcpServers
 from agent.plugin_composition.process_slots import PluginManagedProcesses
 from agent.plugin_composition.model import resolve_declared_workspace_root
 from agent.plugins.composable import ComposablePlugin
+from agent.plugins.interaction_undo import InteractionUndoCoordinator
 from agent.plugins.composition_generation_host import (
     CompositionGenerationHost,
     CompositionRuntimeFailure,
@@ -310,6 +313,11 @@ class PluginManager:
         self._workspace = workspace
         self._session_manager = session_manager
         self._memory_engine = memory_engine
+        self._interaction_undo = (
+            InteractionUndoCoordinator(session_manager, memory_engine)
+            if session_manager is not None and memory_engine is not None
+            else None
+        )
         self._composition_memory_runtime: MemoryRuntimeInfo | None | object = (
             _UNRESOLVED_MEMORY_RUNTIME if memory_engine is not None else None
         )
@@ -1529,7 +1537,11 @@ class PluginManager:
     async def load_all(self) -> None:
         """Load stable plugins and reconstruct any durable latest candidate."""
 
-        # 1. 先处理尚未进入 latest_ready 的残留事务，恢复磁盘 pointer。
+        # 1. 先收敛已提交的 interaction 删除，再开放任何插件命令。
+        if self._interaction_undo is not None:
+            await self._interaction_undo.recover_pending()
+
+        # 2. 处理尚未进入 latest_ready 的残留事务，恢复磁盘 pointer。
         recovery = self._reload_journal.pending_recovery()
         self._require_unique_recovery_plugins(recovery)
         stable_by_id = self._discovered_by_id(installed_selector="stable")
@@ -1563,7 +1575,7 @@ class PluginManager:
             self._reload_journal.finish_recovery(action)
             self._write_startup_recovery_fact(action, committed=False)
 
-        # 2. 根据 durable pointer 判定 promoting 崩溃发生在切换前还是切换后。
+        # 3. 根据 durable pointer 判定 promoting 崩溃发生在切换前还是切换后。
         stable_by_id = self._discovered_by_id(installed_selector="stable")
         latest_by_id = self._discovered_by_id(installed_selector="latest")
         restore_candidates, restore_committed, restore_discarded = (
@@ -1577,7 +1589,7 @@ class PluginManager:
             self._reload_journal.finish_recovery(action)
             self._write_startup_recovery_fact(action, committed=False)
 
-        # 3. stable 在未发布事务中完整装配；latest 随后以新事务恢复。
+        # 4. stable 在未发布事务中完整装配；latest 随后以新事务恢复。
         if self._active_generations:
             for mod in stable_by_id.values():
                 _ = await self._load_one(mod)
@@ -6194,6 +6206,16 @@ class PluginManager:
                     else SessionReadService.candidate_validation()
                 )
                 _ = await root.context.provide(SESSION_READ, session_read)
+            if self._interaction_undo is not None and any(
+                INTERACTION_UNDO in cast(ComposablePlugin, item.instance).inject
+                for item in ordered
+            ):
+                interaction_undo = (
+                    InteractionUndoService(self._interaction_undo.undo_latest)
+                    if candidate_owner is None
+                    else InteractionUndoService.candidate_validation()
+                )
+                _ = await root.context.provide(INTERACTION_UNDO, interaction_undo)
             memory_runtime = self._get_composition_memory_runtime()
             if memory_runtime is not None:
                 _ = await root.context.provide(

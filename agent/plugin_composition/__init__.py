@@ -60,6 +60,11 @@ from agent.plugin_composition.session_read import (
     SessionReadService,
     SessionReadSnapshot,
 )
+from agent.plugin_composition.interaction_undo import (
+    INTERACTION_UNDO,
+    InteractionUndoResult,
+    InteractionUndoService,
+)
 from agent.plugin_composition.mcp_slots import (
     MCP_SERVERS,
     EndpointEnv,
@@ -196,6 +201,9 @@ __all__ = [
     "InboundIdentity",
     "InboundOwner",
     "InboundState",
+    "INTERACTION_UNDO",
+    "InteractionUndoResult",
+    "InteractionUndoService",
     "JsonValue",
     "MEMORY_RUNTIME",
     "MEMORY_TURN_RUNTIME",
