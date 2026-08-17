@@ -8,11 +8,8 @@ from typing import Any, cast
 
 from agent.config import Config
 from agent.plugins.artifacts import read_pointers, resolve_pointer
-from agent.plugins.base import Plugin
 from agent.plugins.composable import ComposablePlugin
 from agent.plugins.manifest import load_plugin_manifest, plugins_root
-from agent.plugins.registry import plugin_registry
-from agent.plugins.specs import McpServerSpec
 from agent.plugins.static_manifest import (
     StaticPluginManifest,
     load_static_plugin_manifest,
@@ -191,11 +188,8 @@ def _entrypoint_label(root: Path) -> str:
     return "plugin.py"
 
 
-PluginDeclaration = type[Plugin] | ComposablePlugin
-
-
-def _load_plugin_declaration(plugin_root: Path) -> PluginDeclaration:
-    """读取一个 v3 namespace，或暂时兼容 v2 Plugin class。"""
+def _load_plugin_declaration(plugin_root: Path) -> ComposablePlugin:
+    """读取并校验一个 v3 namespace。"""
 
     static_manifest = _load_optional_static_manifest(plugin_root)
     module_name = f"akasic_plugin_doctor_{uuid.uuid4().hex}"
@@ -215,31 +209,23 @@ def _load_plugin_declaration(plugin_root: Path) -> PluginDeclaration:
         spec.loader.exec_module(module)
         if static_manifest is not None and getattr(module, "api_version", None) != 3:
             raise ValueError("静态 v3 manifest 与 module api_version 不一致")
-        if getattr(module, "api_version", None) == 3:
-            if static_manifest is not None:
-                validate_module_exports(
-                    static_manifest,
-                    module,
-                    plugin_root=plugin_root,
-                )
-            return ComposablePlugin.from_module(module)
-        # V2_REMOVAL(plugin-doctor-declaration)：最后一个 v2 插件迁移后删除
-        # registry class 发现与 Plugin 子类校验。
-        plugin_class = plugin_registry.get_class(module_name)
-        if plugin_class is None:
-            raise ValueError("plugin.py 未声明 Plugin 子类")
-        if not issubclass(plugin_class, Plugin):
-            raise TypeError("plugin.py 注册的类型不是 Plugin 子类")
-        return cast(type[Plugin], plugin_class)
+        if getattr(module, "api_version", None) != 3:
+            raise ValueError("plugin.py 必须声明 api_version = 3")
+        if static_manifest is not None:
+            validate_module_exports(
+                static_manifest,
+                module,
+                plugin_root=plugin_root,
+            )
+        return ComposablePlugin.from_module(module)
     finally:
-        plugin_registry.remove_plugin(module_name)
         _ = sys.modules.pop(module_name, None)
 
 
 def _load_optional_static_manifest(
     plugin_root: Path,
 ) -> StaticPluginManifest | None:
-    """读取外部 v3 static manifest；无 manifest 时保留 v2 迁移期路径。"""
+    """读取可选的 v3 static manifest；内建源码插件可以没有 manifest。"""
 
     path = plugin_root / "akashic.plugin.toml"
     if not path.exists() and not path.is_symlink():
@@ -248,7 +234,7 @@ def _load_optional_static_manifest(
 
 
 def _check_capabilities(
-    declaration: PluginDeclaration,
+    declaration: ComposablePlugin,
     plugin_root: Path,
     workspace: Path,
     *,
@@ -293,15 +279,12 @@ def _check_capabilities(
             )
         )
     servers = _declared_mcp_servers(declaration)
-    invalid = [item for item in servers if not isinstance(item, McpServerSpec)]
-    checks.append(
-        _check("mcp", "error" if invalid else "ok", f"servers={len(servers)}")
-    )
+    checks.append(_check("mcp", "ok", f"servers={len(servers)}"))
     return checks
 
 
 def _check_candidate_declaration(
-    declaration: PluginDeclaration,
+    declaration: ComposablePlugin,
     plugin_root: Path,
 ) -> list[dict[str, str]]:
     checks: list[dict[str, str]] = []
@@ -318,11 +301,10 @@ def _check_candidate_declaration(
             )
         )
     servers = _declared_mcp_servers(declaration)
-    invalid = [item for item in servers if not isinstance(item, McpServerSpec)]
     checks.append(
         _check(
             "candidate_mcp",
-            "error" if invalid else "ok",
+            "ok",
             f"servers={len(servers)}",
         )
     )
@@ -330,21 +312,18 @@ def _check_candidate_declaration(
 
 
 def _declared_skill_roots(
-    declaration: PluginDeclaration,
+    declaration: ComposablePlugin,
     *,
     drift: bool,
 ) -> tuple[str, ...]:
-    if isinstance(declaration, ComposablePlugin):
-        return declaration.drift_skill_roots if drift else declaration.skill_roots
-    return declaration.drift_skill_roots() if drift else declaration.skill_roots()
+    return declaration.drift_skill_roots if drift else declaration.skill_roots
 
 
 def _declared_mcp_servers(
-    declaration: PluginDeclaration,
-) -> tuple[McpServerSpec, ...] | list[McpServerSpec]:
-    if isinstance(declaration, ComposablePlugin):
-        return ()
-    return declaration.mcp_servers()
+    declaration: ComposablePlugin,
+) -> tuple[()]:
+    del declaration
+    return ()
 
 
 def _check_empty_projection(

@@ -23,12 +23,11 @@ def _write_artifact_plugin(
     plugin_root = plugin_base / ".artifacts" / artifact_id
     plugin_root.mkdir(parents=True)
     (plugin_root / "plugin.py").write_text(
-        "from agent.plugins import Plugin\n"
-        "class DemoPlugin(Plugin):\n"
-        "    name = 'demo'\n"
-        "    version = '1.0.0'\n"
-        "    @classmethod\n"
-        "    def skill_roots(cls): return ('skills',)\n",
+        "api_version = 3\n"
+        "name = 'demo'\n"
+        "version = '1.0.0'\n"
+        "skill_roots = ('skills',)\n"
+        "def apply(ctx, config): pass\n",
         encoding="utf-8",
     )
     for name, body in skills.items():
@@ -54,12 +53,11 @@ def test_plugin_doctor_reads_programmatic_capabilities(tmp_path: Path) -> None:
     skill_dir.mkdir(parents=True)
     (skill_dir / "SKILL.md").write_text("skill", encoding="utf-8")
     (plugin_root / "plugin.py").write_text(
-        "from agent.plugins import Plugin\n"
-        "class DemoPlugin(Plugin):\n"
-        "    name = 'demo'\n"
-        "    version = '1.0.0'\n"
-        "    @classmethod\n"
-        "    def skill_roots(cls): return ('skills',)\n",
+        "api_version = 3\n"
+        "name = 'demo'\n"
+        "version = '1.0.0'\n"
+        "skill_roots = ('skills',)\n"
+        "def apply(ctx, config): pass\n",
         encoding="utf-8",
     )
     (workspace / "skills").mkdir(parents=True)
@@ -191,10 +189,10 @@ def test_plugin_doctor_reads_latest_artifact_candidate(tmp_path: Path) -> None:
     plugin_root = plugin_base / ".artifacts" / "1.0.0-aaaa"
     plugin_root.mkdir(parents=True)
     (plugin_root / "plugin.py").write_text(
-        "from agent.plugins import Plugin\n"
-        "class DemoPlugin(Plugin):\n"
-        "    name = 'demo'\n"
-        "    version = '1.0.0'\n",
+        "api_version = 3\n"
+        "name = 'demo'\n"
+        "version = '1.0.0'\n"
+        "def apply(ctx, config): pass\n",
         encoding="utf-8",
     )
     _ = write_pointers(
