@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 from datetime import datetime, timezone
@@ -30,8 +31,11 @@ from bus.events_lifecycle import (
     ToolCallStarted,
     TurnOutputCompleted,
     TurnStarted,
+    TurnCommitted,
 )
+from bus.queue import MessageBus
 from infra.channels.base import AttachmentStore
+from infra.channels.artifacts import ChannelAttachmentArtifactStore
 from infra.mobile_realtime.channel import MobileRealtimeChannel
 from infra.mobile_realtime.gateway import MobileGatewayRuntime
 from infra.mobile_realtime.protocol import (
@@ -700,6 +704,7 @@ def _message_frame(
     text: str = "你好",
     model_runtime_id: str | None = None,
     model_reasoning_effort: str | None = None,
+    media_refs: list[str] | None = None,
 ) -> MessageSendCommand:
     frame = parse_frame(
         json.dumps(
@@ -714,7 +719,7 @@ def _message_frame(
                     "client_message_id": frame_id,
                     "session_id": session_id,
                     "text": text,
-                    "media_refs": [],
+                    "media_refs": media_refs or [],
                     "client_created_at": datetime.now(timezone.utc).isoformat(),
                     **({"reply_to": reply_to} if reply_to is not None else {}),
                     **(
@@ -832,6 +837,142 @@ async def test_message_send_is_idempotent_and_session_is_shared_between_devices(
     assert manager.delete_session(session_id)
     with pytest.raises(KeyError, match="session 不存在"):
         manager.get_existing(session_id)
+    await channel.stop()
+    manager.close()
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_mobile_message_adopts_finalized_upload_before_bus_admission(
+    tmp_path: Path,
+) -> None:
+    storage = MobileRealtimeStorage(tmp_path / "mobile.db")
+    device_id = uuid4().hex
+    _register_device(storage, device_id)
+    runtime = _Runtime(storage)
+    channel = MobileRealtimeChannel(cast(MobileGatewayRuntime, runtime))
+    bus = _Bus()
+    workspace = tmp_path / "workspace"
+    manager = SessionManager(workspace)
+    legacy_store = AttachmentStore(tmp_path / "uploads")
+    legacy_store.root.mkdir(parents=True)
+    content = b"mobile-c23"
+    source = legacy_store.root / "upload.png"
+    source.write_bytes(content)
+    session_id = f"mobile:{uuid4()}"
+    storage.create_attachment(
+        AttachmentRecord(
+            attachment_id="upload-c23",
+            device_id=device_id,
+            session_id=session_id,
+            direction="upload",
+            filename="upload.png",
+            content_type="image/png",
+            size_bytes=len(content),
+            sha256=hashlib.sha256(content).hexdigest(),
+            local_path=str(source),
+            transferred_bytes=len(content),
+            state="ready",
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+        )
+    )
+    artifact_store = ChannelAttachmentArtifactStore(
+        workspace=workspace,
+        session_store=manager.control_store,
+    )
+    channel.bind_channel_attachment_store(artifact_store)
+    await channel.start(
+        cast(
+            Any,
+            SimpleNamespace(
+                bus=bus,
+                session_manager=manager,
+                event_bus=_EventBus(),
+                push_tool=_PushTool(),
+                interrupt_controller=None,
+                attachment_store=legacy_store,
+            ),
+        )
+    )
+
+    reply = await channel.handle_command(
+        device_id=device_id,
+        frame=_message_frame(
+            frame_id="01ARZ3NDEKTSV4RRFFQ69G5FAX",
+            session_id=session_id,
+            media_refs=["upload-c23"],
+        ),
+    )
+
+    assert reply.type == "message.send.ok"
+    assert len(bus.inbound) == 1
+    inbound = bus.inbound[0]
+    assert inbound.media == []
+    artifact_ids = cast(list[str], inbound.metadata["attachment_ids"])
+    assert len(artifact_ids) == 1
+    imported = storage.list_attachment_imports(
+        session_id=session_id,
+        client_message_id="01ARZ3NDEKTSV4RRFFQ69G5FAX",
+    )
+    assert imported[0].phase == "artifact_committed"
+    assert imported[0].artifact_id == artifact_ids[0]
+
+    # 1. Mobile handoff 只持久化 opaque artifact ID，不复制旧上传路径。
+    durable_bus = MessageBus()
+    durable_bus.bind_durable_inbound_store(manager.control_store)
+    await durable_bus.publish_inbound(inbound)
+    handoff = manager.control_store.list_inbound_handoffs()[0]
+    assert json.loads(cast(str, handoff["media_json"])) == []
+    assert json.loads(cast(str, handoff["metadata_json"]))["attachment_ids"] == (
+        artifact_ids
+    )
+    assert str(source) not in cast(str, handoff["metadata_json"])
+    consumed = await durable_bus.consume_inbound()
+    assert consumed is inbound
+    await durable_bus.complete_inbound(consumed)
+    await durable_bus.aclose()
+
+    # 2. artifact read lease 可读，且只暴露进程内 fd 路径。
+    ref = artifact_store.resolve_refs(tuple(artifact_ids))[0]
+    lease = await artifact_store.acquire(ref)
+    try:
+        assert await lease.read_bytes(max_bytes=1024) == content
+    finally:
+        await lease.aclose()
+
+    # 3. Session commit 与 Mobile import phase 最终收束到同一 artifact ID。
+    session = manager.get_existing(session_id)
+    pending: dict[str, object] = {
+        "role": "user",
+        "content": "with attachment",
+        "client_message_id": "01ARZ3NDEKTSV4RRFFQ69G5FAX",
+        "attachment_ids": artifact_ids,
+    }
+    await manager.append_messages(session, [pending])
+    await channel.stop()
+    restarted = MobileRealtimeChannel(cast(MobileGatewayRuntime, runtime))
+    restarted.bind_channel_attachment_store(artifact_store)
+    await restarted.start(
+        cast(
+            Any,
+            SimpleNamespace(
+                bus=bus,
+                session_manager=manager,
+                event_bus=_EventBus(),
+                push_tool=_PushTool(),
+                interrupt_controller=None,
+                attachment_store=legacy_store,
+            ),
+        )
+    )
+    assert storage.list_attachment_imports(
+        session_id=session_id,
+        client_message_id="01ARZ3NDEKTSV4RRFFQ69G5FAX",
+    )[0].phase == "message_bound"
+
+    manager.release_admission(inbound.session_admission_id)
+    await restarted.stop()
     manager.close()
     storage.close()
 

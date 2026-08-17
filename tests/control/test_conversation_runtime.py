@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
@@ -52,6 +53,44 @@ async def test_runtime_persists_events_and_terminal_result(tmp_path: Path) -> No
     assert result.final_response == "reply:hello"
     assert store.read_turn(handle.id) is not None
     _assert_single_terminal(runtime, handle.id)
+    await runtime.shutdown()
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_runtime_keeps_live_attachment_paths_out_of_durable_turn(
+    tmp_path: Path,
+) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    seen_media: list[str] = []
+
+    async def execute(request: TurnRequest) -> str:
+        seen_media.extend(cast(list[str], request.metadata["media"]))
+        return "ok"
+
+    runtime = ConversationRuntime(store, execute)
+    handle = await runtime.start_turn(
+        TurnRequest(
+            "mobile:attachment",
+            "hello",
+            {
+                "media": [],
+                "inboundMetadata": {"attachment_ids": ["artifact-1"]},
+            },
+        ),
+        live_media=("/proc/self/fd/999",),
+    )
+    _ = await handle.result()
+
+    record = store.read_turn(handle.id)
+    assert record is not None
+    assert seen_media == ["/proc/self/fd/999"]
+    assert record.metadata["media"] == []
+    assert record.metadata["inboundMetadata"] == {
+        "attachment_ids": ["artifact-1"]
+    }
+    assert record.items[0].data["media"] == []
+    assert "/proc/" not in json.dumps(record.to_dict(), ensure_ascii=False)
     await runtime.shutdown()
     store.close()
 

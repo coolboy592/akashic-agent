@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import sqlite3
 from contextlib import contextmanager
@@ -13,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, Mock
 import pytest
 
 from agent.context import ContextBuilder
+from agent.plugin_composition.channels import AttachmentKind
 from agent.control.context import running_turn_id
 from agent.core.passive_support import build_context_hint_message
 from agent.core.passive_turn import (
@@ -36,6 +38,7 @@ from bus.events import (
 )
 from bus.events_lifecycle import TurnCommitted
 from core.error_context import current_client_message_id, current_session_key
+from infra.channels.artifacts import ChannelAttachmentArtifactStore
 from agent.lifecycle.types import (
     AfterReasoningCtx,
     AfterReasoningInput,
@@ -1923,13 +1926,27 @@ async def test_after_reasoning_persists_mobile_canonical_ids(tmp_path: Path):
             return frame
 
     manager = SessionManager(tmp_path / "workspace")
+    artifact_store = ChannelAttachmentArtifactStore(
+        workspace=tmp_path / "workspace",
+        session_store=manager.control_store,
+    )
+    attachment = await artifact_store.import_bytes(
+        b"mobile-user-attachment",
+        kind=AttachmentKind.FILE,
+        filename="note.txt",
+        media_type="text/plain",
+    )
     session = manager.get_or_create("mobile:00000000-0000-0000-0000-000000000001")
     msg = InboundMessage(
         channel="mobile",
         sender="device:test",
         chat_id="00000000-0000-0000-0000-000000000001",
         content="hello",
-        metadata={"client_message_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV"},
+        media=["/proc/self/fd/999"],
+        metadata={
+            "client_message_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "attachment_ids": [attachment.artifact_id],
+        },
     )
     state = TurnState(msg=msg, session_key=session.key, dispatch_outbound=True)
     state.session = session
@@ -1959,6 +1976,12 @@ async def test_after_reasoning_persists_mobile_canonical_ids(tmp_path: Path):
         == messages[0]["client_message_id"]
     )
     assert result.outbound.session_message_id == messages[1]["id"]
+    assert messages[0]["attachment_ids"] == [attachment.artifact_id]
+    assert messages[0].get("media") in (None, [])
+    assert "/proc/" not in json.dumps(messages[0], ensure_ascii=False)
+    assert reloaded.control_store.message_attachment_ids(messages[0]["id"]) == (
+        attachment.artifact_id,
+    )
     reloaded.close()
 
 

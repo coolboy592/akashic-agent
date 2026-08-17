@@ -13,6 +13,7 @@ from uuid import uuid4
 if TYPE_CHECKING:
     from agent.plugins.manager import PluginManager
     from agent.restart import RestartCoordinator
+    from infra.channels.artifacts import ChannelAttachmentArtifactStore
 
 logger = logging.getLogger(__name__)
 
@@ -153,6 +154,7 @@ class CoreRuntime:
     workspace_mcp_watcher_task: asyncio.Task[None] | None
     memory_runtime: MemoryRuntime
     presence: PresenceStore
+    channel_attachment_store: "ChannelAttachmentArtifactStore | None" = None
     model_registry: ModelRegistry | None = None
     agent_provider: LLMProvider | None = None
     plugin_manager: "PluginManager | None" = None
@@ -627,6 +629,10 @@ def build_core_runtime(
     from infra.channels.artifacts import ChannelAttachmentArtifactStore
 
     # 3. 创建插件 manager，并把 snapshot store 绑定到 loop。
+    channel_attachment_store = ChannelAttachmentArtifactStore(
+        workspace=workspace,
+        session_store=session_manager.control_store,
+    )
     plugin_manager = _PluginManager(
         plugin_dirs=_resolve_plugin_dirs(workspace),
         event_bus=event_bus,
@@ -640,10 +646,7 @@ def build_core_runtime(
             max_tokens=0,
         ),
         installed_cache_root=plugins_root() / "cache",
-        channel_attachment_store=ChannelAttachmentArtifactStore(
-            workspace=workspace,
-            session_store=session_manager.control_store,
-        ),
+        channel_attachment_store=channel_attachment_store,
     )
     bus.bind_channel_outbound_dispatcher(
         plugin_manager.channel_generation_host.dispatch_outbound
@@ -715,6 +718,7 @@ def build_core_runtime(
         workspace_mcp_watcher_task=None,
         memory_runtime=memory_runtime,
         presence=presence,
+        channel_attachment_store=channel_attachment_store,
         model_registry=model_registry,
         plugin_manager=plugin_manager,
     )

@@ -3,7 +3,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Any, cast
+from collections.abc import Awaitable
+from typing import TYPE_CHECKING, Any, Protocol, TypeVar, cast
 
 from agent.control.errors import (
     ControlAdmissionError,
@@ -21,15 +22,43 @@ from agent.control.runtime import ConversationRuntime, TurnHandle
 from agent.looping.core import AgentLoop
 from agent.plugin_composition.channels import (
     DeliveryStatus as ChannelDeliveryStatus,
+    AttachmentRef,
     InboundEnvelope,
     InboundOwner,
     OutboundEnvelope,
+    AttachmentReadLease,
 )
 from bus.events import InboundMessage, OutboundMessage, TurnTerminalStatus
 from bus.queue import MessageBus
 from core.common.diagnostic_log import turn_milestone
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from infra.channels.artifacts import ChannelAttachmentArtifactStore
+
+T = TypeVar("T")
+
+
+class _ModelAttachmentLease(AttachmentReadLease, Protocol):
+    @property
+    def model_path(self) -> str: ...
+
+
+async def _complete_critical(awaitable: Awaitable[T]) -> T:
+    """Finish attachment ownership cleanup before restoring caller cancellation."""
+
+    task = asyncio.ensure_future(awaitable)
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+    result = task.result()
+    if cancelled:
+        raise asyncio.CancelledError
+    return result
 
 _TERMINAL_DELIVERY_RETRY_DELAYS = (0.05, 0.1)
 _TERMINAL_LANE_RETRY_DELAY = 1.0
@@ -43,11 +72,17 @@ class PassiveMessageWorker:
     """把渠道入站消息转换为 ConversationRuntime turn。"""
 
     def __init__(
-        self, bus: MessageBus, runtime: ConversationRuntime, legacy_loop: AgentLoop
+        self,
+        bus: MessageBus,
+        runtime: ConversationRuntime,
+        legacy_loop: AgentLoop,
+        *,
+        attachment_store: ChannelAttachmentArtifactStore | None = None,
     ) -> None:
         self._bus = bus
         self._runtime = runtime
         self._legacy_loop = legacy_loop
+        self._attachment_store = attachment_store
         self._running = False
         self._lane_queues: dict[
             str,
@@ -170,8 +205,12 @@ class PassiveMessageWorker:
         # 1. Lane owns the accepted envelope until the runtime handle exists.
         envelope.handoff(InboundOwner.LANE, InboundOwner.LOOP)
         transferred = False
+        attachment_leases: tuple[_ModelAttachmentLease, ...] = ()
         try:
             message = envelope.message
+            attachment_leases = await self._acquire_attachment_refs(
+                message.attachments
+            )
             request = TurnRequest(
                 envelope.session_key,
                 message.content,
@@ -181,7 +220,18 @@ class PassiveMessageWorker:
                     "sender": message.sender,
                     "media": [],
                     "inputTimestamp": message.timestamp.isoformat(),
-                    "inboundMetadata": dict(message.metadata),
+                    "inboundMetadata": {
+                        **dict(message.metadata),
+                        **(
+                            {
+                                "attachment_ids": [
+                                    ref.artifact_id for ref in message.attachments
+                                ]
+                            }
+                            if message.attachments
+                            else {}
+                        ),
+                    },
                     "channelMessageId": envelope.message_id,
                     "channelSnapshotId": envelope.snapshot_id,
                     "channelGenerationId": envelope.generation_id,
@@ -198,6 +248,9 @@ class PassiveMessageWorker:
                             Any,
                             envelope.lease.snapshot_lease,
                         ),
+                        live_media=tuple(
+                            lease.model_path for lease in attachment_leases
+                        ),
                     )
                     break
                 except ThreadBusyError:
@@ -212,7 +265,11 @@ class PassiveMessageWorker:
 
             # 3. The result task owns delivery and terminal lease release.
             task = asyncio.create_task(
-                self._finish_channel_envelope(envelope, handle),
+                self._finish_channel_envelope(
+                    envelope,
+                    handle,
+                    attachment_leases,
+                ),
                 name=f"channel-passive-result:{handle.id}",
             )
             self._result_tasks.add(task)
@@ -227,12 +284,18 @@ class PassiveMessageWorker:
             return task
         finally:
             if not transferred:
-                await self._bus.release_channel_inbound(envelope, InboundOwner.LOOP)
+                try:
+                    await self._close_attachment_leases(attachment_leases)
+                finally:
+                    await self._bus.release_channel_inbound(
+                        envelope, InboundOwner.LOOP
+                    )
 
     async def _finish_channel_envelope(
         self,
         envelope: InboundEnvelope,
         handle: TurnHandle,
+        attachment_leases: tuple[_ModelAttachmentLease, ...],
     ) -> None:
         """Await the turn and settle one exact non-retryable provider delivery."""
 
@@ -272,7 +335,10 @@ class PassiveMessageWorker:
                     receipt.error,
                 )
         finally:
-            await self._bus.complete_inbound(envelope)
+            try:
+                await self._close_attachment_leases(attachment_leases)
+            finally:
+                await self._bus.complete_inbound(envelope)
 
     async def _drain_channel_lane_queues(self) -> None:
         """Close every v3 envelope still owned by a stopped lane."""
@@ -341,7 +407,11 @@ class PassiveMessageWorker:
                 self._legacy_loop.session_manager.admit_existing(item.session_key)
             )
         transferred = False
+        attachment_leases: tuple[_ModelAttachmentLease, ...] = ()
         try:
+            attachment_leases = await self._acquire_mobile_attachment_ids(
+                item.metadata
+            )
             # 阶段3：渠道信息只作为 executor 所需的受控 metadata，不改变 thread identity。
             request = TurnRequest(
                 item.session_key,
@@ -350,14 +420,19 @@ class PassiveMessageWorker:
                     "channel": item.channel,
                     "chatId": item.chat_id,
                     "sender": item.sender,
-                    "media": list(item.media),
+                    "media": [] if attachment_leases else list(item.media),
                     "inputTimestamp": item.timestamp.isoformat(),
                     "inboundMetadata": dict(item.metadata),
                 },
             )
             while True:
                 try:
-                    handle = await self._runtime.start_turn(request)
+                    handle = await self._runtime.start_turn(
+                        request,
+                        live_media=tuple(
+                            lease.model_path for lease in attachment_leases
+                        ),
+                    )
                     break
                 except ThreadBusyError:
                     await self._runtime.wait_thread_available(item.session_key)
@@ -389,7 +464,7 @@ class PassiveMessageWorker:
                         )
                     continue
             task = asyncio.create_task(
-                self._finish_message(item, handle),
+                self._finish_message(item, handle, attachment_leases),
                 name=f"passive-result:{handle.id}",
             )
             self._result_tasks.add(task)
@@ -399,9 +474,17 @@ class PassiveMessageWorker:
         finally:
             # 阶段4：turn owner 建立前只释放 admission，durable handoff 保留供恢复。
             if not transferred:
-                self._release_admission_once(item)
+                try:
+                    await self._close_attachment_leases(attachment_leases)
+                finally:
+                    self._release_admission_once(item)
 
-    async def _finish_message(self, item: InboundMessage, handle: TurnHandle) -> None:
+    async def _finish_message(
+        self,
+        item: InboundMessage,
+        handle: TurnHandle,
+        attachment_leases: tuple[_ModelAttachmentLease, ...] = (),
+    ) -> None:
         """等待新 turn 的唯一终态；mobile 只在 durable delivered 后完成 inbound。
 
         finally 兜底本轮 session admission：取消、receipt False 与异常路径都
@@ -426,7 +509,64 @@ class PassiveMessageWorker:
                 await self._bus.publish_outbound(outbound)
                 await self._complete_message(item)
         finally:
-            self._release_admission_once(item)
+            try:
+                await self._close_attachment_leases(attachment_leases)
+            finally:
+                self._release_admission_once(item)
+
+    async def _acquire_mobile_attachment_ids(
+        self,
+        metadata: dict[str, object],
+    ) -> tuple[_ModelAttachmentLease, ...]:
+        raw = metadata.get("attachment_ids")
+        if raw is None:
+            return ()
+        if not isinstance(raw, list) or not all(
+            isinstance(item, str) and item for item in raw
+        ):
+            raise ValueError("mobile attachment_ids 必须是非空字符串数组")
+        store = self._attachment_store
+        if store is None:
+            raise RuntimeError("PassiveWorker attachment store 未绑定")
+        refs = store.resolve_refs(tuple(cast(list[str], raw)))
+        return await self._acquire_attachment_refs(refs)
+
+    async def _acquire_attachment_refs(
+        self,
+        refs: tuple[AttachmentRef, ...],
+    ) -> tuple[_ModelAttachmentLease, ...]:
+        if not refs:
+            return ()
+        store = self._attachment_store
+        if store is None:
+            raise RuntimeError("PassiveWorker attachment store 未绑定")
+        leases: list[_ModelAttachmentLease] = []
+        try:
+            for ref in refs:
+                lease = await store.acquire(ref)
+                leases.append(cast(_ModelAttachmentLease, lease))
+        except BaseException:
+            await self._close_attachment_leases(tuple(leases))
+            raise
+        return tuple(leases)
+
+    async def _close_attachment_leases(
+        self,
+        leases: tuple[_ModelAttachmentLease, ...],
+    ) -> None:
+        if not leases:
+            return
+
+        async def close_all() -> None:
+            results = await asyncio.gather(
+                *(lease.aclose() for lease in reversed(leases)),
+                return_exceptions=True,
+            )
+            failures = [result for result in results if isinstance(result, Exception)]
+            if failures:
+                raise ExceptionGroup("attachment read lease cleanup 失败", failures)
+
+        await _complete_critical(close_all())
 
     async def _commit_mobile_terminal(
         self,

@@ -14,6 +14,8 @@ import infra.mobile_realtime.storage as storage_module
 from infra.mobile_realtime.storage import (
     AckOverflowError,
     AckRollbackError,
+    AttachmentRecord,
+    AttachmentStateError,
     CommandConflictError,
     CommandReceiptCapacityError,
     DeviceRecord,
@@ -51,6 +53,26 @@ def _event_json(event_id: str) -> str:
             "payload": {"text": event_id},
         },
         separators=(",", ":"),
+    )
+
+
+def _ready_upload(
+    *, attachment_id: str, session_id: str = "mobile:chat-1"
+) -> AttachmentRecord:
+    return AttachmentRecord(
+        attachment_id=attachment_id,
+        device_id="device-1",
+        session_id=session_id,
+        direction="upload",
+        filename=f"{attachment_id}.png",
+        content_type="image/png",
+        size_bytes=3,
+        sha256="a" * 64,
+        local_path=f"/tmp/{attachment_id}.png",
+        transferred_bytes=3,
+        state="ready",
+        created_at=NOW,
+        updated_at=NOW,
     )
 
 
@@ -95,6 +117,66 @@ def test_database_uses_wal_and_keeps_server_identity_stable(
                 keyset_manifest_path="keys/keyset-v3/manifest.json",
                 public_key_fingerprint="sha256:server-2",
             )
+        )
+
+
+def test_attachment_import_mapping_is_exact_and_resumable(
+    storage: MobileRealtimeStorage,
+) -> None:
+    storage.register_device(_device())
+    storage.create_attachment(_ready_upload(attachment_id="upload-1"))
+    storage.create_attachment(_ready_upload(attachment_id="upload-2"))
+
+    prepared = storage.prepare_attachment_imports(
+        device_id="device-1",
+        session_id="mobile:chat-1",
+        client_message_id="client-1",
+        attachment_ids=("upload-1", "upload-2"),
+    )
+    replay = storage.prepare_attachment_imports(
+        device_id="device-1",
+        session_id="mobile:chat-1",
+        client_message_id="client-1",
+        attachment_ids=("upload-1", "upload-2"),
+    )
+
+    assert replay == prepared
+    assert tuple(item.ordinal for item in prepared) == (0, 1)
+    assert len({item.artifact_id for item in prepared}) == 2
+    committed = storage.advance_attachment_import(
+        device_id="device-1",
+        session_id="mobile:chat-1",
+        client_message_id="client-1",
+        ordinal=0,
+        expected_phase="prepared",
+        phase="artifact_committed",
+    )
+    assert committed.phase == "artifact_committed"
+    assert storage.list_attachment_imports(
+        session_id="mobile:chat-1",
+        client_message_id="client-1",
+    )[0] == committed
+
+
+def test_attachment_import_mapping_rejects_message_drift(
+    storage: MobileRealtimeStorage,
+) -> None:
+    storage.register_device(_device())
+    storage.create_attachment(_ready_upload(attachment_id="upload-1"))
+    storage.create_attachment(_ready_upload(attachment_id="upload-2"))
+    _ = storage.prepare_attachment_imports(
+        device_id="device-1",
+        session_id="mobile:chat-1",
+        client_message_id="client-1",
+        attachment_ids=("upload-1",),
+    )
+
+    with pytest.raises(AttachmentStateError, match="drift|漂移|数量"):
+        storage.prepare_attachment_imports(
+            device_id="device-1",
+            session_id="mobile:chat-1",
+            client_message_id="client-1",
+            attachment_ids=("upload-2",),
         )
 
 

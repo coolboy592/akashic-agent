@@ -282,8 +282,9 @@ class ConversationRuntime:
         request: TurnRequest,
         *,
         runtime_snapshot_lease: RuntimeSnapshotLease | None = None,
+        live_media: tuple[str, ...] = (),
     ) -> TurnHandle:
-        """拒绝 active thread，否则恢复未完成 interaction 并创建新 attempt。"""
+        """拒绝 active thread，并仅把本次进程可用的 media 交给 executor。"""
 
         # 1. 在唯一 owner 处检查 thread 与控制面容量；拒绝不写 SessionStore。
         _validate_turn_request_metadata(request)
@@ -353,9 +354,18 @@ class ConversationRuntime:
             )
         )
         self._publish_user_item(request.thread_id, turn_id, user_item)
+        execution_request = (
+            TurnRequest(
+                effective_request.thread_id,
+                effective_request.input,
+                {**effective_request.metadata, "media": list(live_media)},
+            )
+            if live_media
+            else effective_request
+        )
         task = asyncio.create_task(
             self._run(
-                effective_request,
+                execution_request,
                 turn_id,
                 attempt_replay=attempt_replay,
                 prior_tool_chain=prior_tool_chain,

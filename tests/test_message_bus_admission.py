@@ -14,6 +14,8 @@ import pytest
 from agent.control.models import TurnRequest, TurnStatus
 from agent.control.runtime import ConversationRuntime
 from agent.plugin_composition.channels import (
+    AttachmentKind,
+    AttachmentRef,
     ChannelInboundMessage,
     ChannelDeliveryReceipt,
     DeliveryStatus,
@@ -83,6 +85,8 @@ def _v3_inbound(
     close_gate: asyncio.Event | None = None,
     *,
     message_id: str = "message-1",
+    attachments: tuple[AttachmentRef, ...] = (),
+    metadata: dict[str, object] | None = None,
 ) -> tuple[InboundEnvelope, _InboundLease]:
     lease = _InboundLease(close_gate)
     envelope = InboundEnvelope(
@@ -96,7 +100,8 @@ def _v3_inbound(
             chat_id="chat-1",
             content="hello",
             timestamp=datetime.now(timezone.utc),
-            metadata={},
+            metadata=metadata or {},
+            attachments=attachments,
         ),
         lease=lease,
     )
@@ -173,6 +178,62 @@ async def test_worker_error_before_turn_owner_keeps_handoff_and_releases_admissi
     await bus.aclose()
     assert len(store.list_inbound_handoffs()) == 1
     assert owner_key in bus._inbound_accepted
+    manager.close()
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_mobile_attachment_acquire_failure_releases_session_admission(
+    tmp_path: Path,
+) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    manager = SessionManager(tmp_path / "workspace")
+    session_key = "mobile:missing-attachment"
+    manager.save(manager.get_or_create(session_key))
+    _, admission_id = manager.admit_existing(session_key)
+    bus = MessageBus()
+    bus.bind_durable_inbound_store(store)
+    item = InboundMessage(
+        "mobile",
+        "device:1",
+        "missing-attachment",
+        "hello",
+        metadata={
+            "session_key_override": session_key,
+            "client_message_id": "client-missing-attachment",
+            "attachment_ids": ["artifact-missing"],
+        },
+        session_admission_id=admission_id,
+    )
+    await bus.publish_inbound(item)
+    consumed = await bus.consume_inbound()
+
+    class _Runtime:
+        async def start_turn(self, _request: object) -> object:
+            raise AssertionError("attachment acquisition failure must precede turn start")
+
+    from bootstrap.passive_worker import PassiveMessageWorker
+
+    worker = PassiveMessageWorker(
+        bus,
+        _Runtime(),  # type: ignore[arg-type]
+        SimpleNamespace(session_manager=manager),  # type: ignore[arg-type]
+    )
+    lane = asyncio.Queue()
+    lane.put_nowait(consumed)
+    worker._lane_queues[session_key] = lane
+    await worker._run_lane(session_key, lane)
+
+    assert len(store.list_inbound_handoffs()) == 1
+    assert (
+        store._conn.execute(
+            "SELECT 1 FROM session_admissions WHERE admission_id = ?",
+            (admission_id,),
+        ).fetchone()
+        is None
+    )
+    assert item.session_admission_id is None
+    await bus.aclose()
     manager.close()
     store.close()
 
@@ -1005,6 +1066,72 @@ async def test_v3_channel_worker_preserves_exact_binding_through_terminal_delive
     assert binding is lease
     assert envelope.state is InboundState.TERMINAL
     assert lease.closed == 1
+
+    worker.stop()
+    bus.stop()
+    await worker_task
+    await dispatch_task
+    await runtime.shutdown()
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_v3_channel_worker_projects_and_closes_attachment_lease(
+    tmp_path: Path,
+) -> None:
+    from bootstrap.passive_worker import PassiveMessageWorker
+    from infra.channels.artifacts import ChannelAttachmentArtifactStore
+
+    store = SessionStore(tmp_path / "sessions.db")
+    attachment_store = ChannelAttachmentArtifactStore(
+        workspace=tmp_path,
+        session_store=store,
+    )
+    ref = await attachment_store.import_bytes(
+        b"attachment-body",
+        kind=AttachmentKind.FILE,
+        filename="note.txt",
+        media_type="text/plain",
+    )
+    seen_paths: list[str] = []
+
+    async def execute(request: TurnRequest) -> str:
+        media = cast(list[str], request.metadata["media"])
+        assert len(media) == 1
+        assert Path(media[0]).read_bytes() == b"attachment-body"
+        seen_paths.extend(media)
+        return "ok"
+
+    runtime = ConversationRuntime(store, execute)
+    bus = MessageBus()
+
+    async def dispatch(
+        envelope: OutboundEnvelope,
+        _binding: object,
+    ) -> ChannelDeliveryReceipt:
+        return ChannelDeliveryReceipt(
+            envelope.delivery_id,
+            DeliveryStatus.DELIVERED,
+        )
+
+    bus.bind_channel_outbound_dispatcher(dispatch)
+    worker = PassiveMessageWorker(
+        bus,
+        runtime,
+        cast(Any, object()),
+        attachment_store=attachment_store,
+    )
+    worker_task = asyncio.create_task(worker.run())
+    dispatch_task = asyncio.create_task(bus.dispatch_outbound())
+    envelope, lease = _v3_inbound(
+        attachments=(ref,),
+        metadata={"client_message_id": "client-attachment-1"},
+    )
+
+    await bus.publish_channel_inbound(envelope)
+    await asyncio.wait_for(lease.closed_event.wait(), timeout=2)
+
+    assert seen_paths and not Path(seen_paths[0]).exists()
 
     worker.stop()
     bus.stop()

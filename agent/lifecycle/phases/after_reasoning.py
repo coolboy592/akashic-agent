@@ -246,6 +246,13 @@ class _PersistUserMessageModule:
                 value = turn_input.metadata.get(field)
                 if isinstance(value, str) and value:
                     input_kwargs[field] = value
+            attachment_ids = turn_input.metadata.get("attachment_ids")
+            if attachment_ids is not None:
+                if not isinstance(attachment_ids, list) or not all(
+                    isinstance(item, str) and item for item in attachment_ids
+                ):
+                    raise ValueError("turn input attachment_ids 必须是非空字符串数组")
+                input_kwargs["attachment_ids"] = list(attachment_ids)
             display_content = turn_input.metadata.get("display_content")
             persisted_users.append(
                 _pending_message(
@@ -255,7 +262,11 @@ class _PersistUserMessageModule:
                         if isinstance(display_content, str)
                         else turn_input.content
                     ),
-                    media=list(turn_input.media) if turn_input.media else None,
+                    media=(
+                        None
+                        if attachment_ids is not None
+                        else (list(turn_input.media) if turn_input.media else None)
+                    ),
                     **input_kwargs,
                 )
             )

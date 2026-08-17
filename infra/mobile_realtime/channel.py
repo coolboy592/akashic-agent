@@ -11,9 +11,12 @@ from collections.abc import AsyncGenerator, Iterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+from pathlib import Path
 from time import monotonic
 from typing import TYPE_CHECKING, cast
 from uuid import UUID, uuid4
+
+from agent.plugin_composition.channels import AttachmentKind, AttachmentRef
 
 from bus.events import (
     ChannelMessage,
@@ -30,6 +33,7 @@ from bus.events_lifecycle import (
     ToolCallStarted,
     TurnOutputCompleted,
     TurnStarted,
+    TurnCommitted,
 )
 from agent.plugins.mobile_ui import (
     MobileUiPluginUnavailable,
@@ -83,6 +87,7 @@ from infra.mobile_realtime.storage import (
 if TYPE_CHECKING:
     from agent.model_runtime.registry import ModelRegistry
     from agent.plugins.mobile_ui import MobileUiProvider
+    from infra.channels.artifacts import ChannelAttachmentArtifactStore
     from infra.mobile_realtime.gateway import MobileGatewayRuntime
 
 
@@ -227,6 +232,17 @@ class MobileRealtimeChannel:
         self._mobile_ui_hot_connections: dict[str, int] = {}
         self._runtime_inspection: RuntimeInspectionService | None = None
         self._model_registry: ModelRegistry | None = None
+        self._channel_attachment_store: ChannelAttachmentArtifactStore | None = None
+
+    def bind_channel_attachment_store(
+        self,
+        store: ChannelAttachmentArtifactStore,
+    ) -> None:
+        """绑定 Mobile finalized upload 到 Core artifact 的唯一导入 owner。"""
+
+        if self._channel_attachment_store is not None:
+            raise RuntimeError("Mobile channel attachment store 已绑定")
+        self._channel_attachment_store = store
 
     def bind_runtime_inspection(self, service: RuntimeInspectionService) -> None:
         """绑定只读运行时检查服务。"""
@@ -289,12 +305,14 @@ class MobileRealtimeChannel:
             ctx.attachment_store,
             max_attachment_bytes=self._runtime.config.max_attachment_mb * 1024 * 1024,
         )
+        self._reconcile_committed_attachment_imports()
         _ = ctx.bus.subscribe_outbound(self.name, self._on_response)
         _ = ctx.event_bus.on(TurnStarted, self._on_turn_started)
         _ = ctx.event_bus.on(StreamDeltaReady, self._on_stream_delta)
         _ = ctx.event_bus.on(ToolCallStarted, self._on_tool_call_started)
         _ = ctx.event_bus.on(ToolCallCompleted, self._on_tool_call_completed)
         _ = ctx.event_bus.on(TurnOutputCompleted, self._on_output_completed)
+        _ = ctx.event_bus.on(TurnCommitted, self._on_turn_committed)
         _ = ctx.push_tool.register_channel(
             self.name,
             deliver=self._deliver_message,
@@ -636,6 +654,12 @@ class MobileRealtimeChannel:
             raise RuntimeError(
                 f"client_message_id 绑定了非用户消息: {frame.payload.client_message_id}"
             )
+
+        self._mark_attachment_imports_bound(
+            session_id=session_id,
+            client_message_id=frame.payload.client_message_id,
+            message_id=cast(str, message["id"]),
+        )
 
         # 3. 原子补写成功收据，后续重放继续得到相同 ACK
         completed = self._runtime.storage.complete_command(
@@ -1609,6 +1633,15 @@ class MobileRealtimeChannel:
             "device_id": device_id,
             "require_existing_session": True,
         }
+        if frame.payload.media_refs:
+            refs = await self._import_message_attachments(
+                device_id=device_id,
+                session_id=session_id,
+                client_message_id=frame.payload.client_message_id,
+                attachment_ids=tuple(frame.payload.media_refs),
+            )
+            metadata["attachment_ids"] = [ref.artifact_id for ref in refs]
+            media = []
         if frame.payload.model_runtime_id is not None:
             metadata["model_runtime_id"] = frame.payload.model_runtime_id
             metadata["model_reasoning_effort"] = (
@@ -1677,6 +1710,58 @@ class MobileRealtimeChannel:
                 "client_message_id": frame.payload.client_message_id,
             },
         )
+
+    async def _import_message_attachments(
+        self,
+        *,
+        device_id: str,
+        session_id: str,
+        client_message_id: str,
+        attachment_ids: tuple[str, ...],
+    ) -> tuple[AttachmentRef, ...]:
+        """Resume MobileDB mappings and publish every finalized file to Core."""
+
+        store = self._channel_attachment_store
+        if store is None:
+            raise RuntimeError("Mobile channel attachment store 未绑定")
+        mappings = self._runtime.storage.prepare_attachment_imports(
+            device_id=device_id,
+            session_id=session_id,
+            client_message_id=client_message_id,
+            attachment_ids=attachment_ids,
+        )
+        refs: list[AttachmentRef] = []
+        for mapping in mappings:
+            record = self._runtime.storage.read_attachment(
+                mapping.mobile_attachment_id
+            )
+            if record is None:
+                raise AttachmentStateError(
+                    f"Mobile finalized attachment 丢失: {mapping.mobile_attachment_id}"
+                )
+            ref = await store.adopt_file_with_artifact_id(
+                Path(record.local_path),
+                allowed_root=self._require_ctx().attachment_store.root,
+                artifact_id=mapping.artifact_id,
+                kind=(
+                    AttachmentKind.IMAGE
+                    if record.content_type.startswith("image/")
+                    else AttachmentKind.FILE
+                ),
+                filename=record.filename,
+                media_type=record.content_type,
+            )
+            if mapping.phase == "prepared":
+                _ = self._runtime.storage.advance_attachment_import(
+                    device_id=device_id,
+                    session_id=session_id,
+                    client_message_id=client_message_id,
+                    ordinal=mapping.ordinal,
+                    expected_phase="prepared",
+                    phase="artifact_committed",
+                )
+            refs.append(ref)
+        return tuple(refs)
 
     def _resolve_reply(
         self,
@@ -2122,6 +2207,82 @@ class MobileRealtimeChannel:
                 turn_id=turn_id,
                 payload={"client_message_id": event.client_message_id},
                 required_capability=TURN_OUTPUT_COMPLETED_CAPABILITY,
+            )
+
+    async def _on_turn_committed(self, event: TurnCommitted) -> None:
+        """Close MobileDB cross-database mappings after SessionDB binding commits."""
+
+        if event.channel != self.name or not event.client_message_id:
+            return
+        message_id = event.persisted_user_message_id
+        if not message_id:
+            return
+        try:
+            self._mark_attachment_imports_bound(
+                session_id=event.session_key,
+                client_message_id=event.client_message_id,
+                message_id=message_id,
+            )
+        except (OSError, sqlite3.Error) as error:
+            logger.error(
+                "mobile attachment mapping remains recoverable after Session commit "
+                "session=%s client_message_id=%s error=%s",
+                event.session_key,
+                event.client_message_id,
+                error,
+            )
+
+    def _mark_attachment_imports_bound(
+        self,
+        *,
+        session_id: str,
+        client_message_id: str,
+        message_id: str,
+    ) -> None:
+        """Verify SessionDB binding and close the matching MobileDB mappings."""
+
+        mappings = self._runtime.storage.list_attachment_imports(
+            session_id=session_id,
+            client_message_id=client_message_id,
+        )
+        if not mappings:
+            return
+        durable_ids = self._require_ctx().session_manager.control_store.message_attachment_ids(
+            message_id
+        )
+        if durable_ids != tuple(item.artifact_id for item in mappings):
+            raise RuntimeError("Mobile attachment mapping 与 Session binding 不一致")
+        for item in mappings:
+            if item.phase == "message_bound":
+                continue
+            if item.phase != "artifact_committed":
+                raise RuntimeError("Mobile attachment mapping 尚未完成 artifact commit")
+            _ = self._runtime.storage.advance_attachment_import(
+                device_id=item.device_id,
+                session_id=item.session_id,
+                client_message_id=item.client_message_id,
+                ordinal=item.ordinal,
+                expected_phase="artifact_committed",
+                phase="message_bound",
+            )
+
+    def _reconcile_committed_attachment_imports(self) -> None:
+        """Close mappings whose Session message committed before the prior process died."""
+
+        store = self._require_ctx().session_manager.control_store
+        groups = {
+            (item.session_id, item.client_message_id)
+            for item in self._runtime.storage.list_incomplete_attachment_imports()
+            if item.phase == "artifact_committed"
+        }
+        for session_id, client_message_id in sorted(groups):
+            message = store.get_message_by_client_id(session_id, client_message_id)
+            if message is None:
+                continue
+            self._mark_attachment_imports_bound(
+                session_id=session_id,
+                client_message_id=client_message_id,
+                message_id=cast(str, message["id"]),
             )
 
     async def _on_response(self, message: OutboundMessage) -> None:

@@ -359,10 +359,14 @@ class AppRuntime:
                 boot_id=self.readiness.boot_id if self.readiness else None,
                 ready=(lambda: self.readiness.ready) if self.readiness else None,
             )
+            channel_attachment_store = self.core.channel_attachment_store
+            if channel_attachment_store is None:
+                raise RuntimeError("Core channel attachment store 未初始化")
             self.passive_worker = PassiveMessageWorker(
                 self.bus,
                 self.conversation_runtime,
                 self.agent_loop,
+                attachment_store=channel_attachment_store,
             )
             if self.restart_coordinator is not None:
                 coordinator = self.restart_coordinator
@@ -451,6 +455,9 @@ class AppRuntime:
                 self.bus.bind_durable_inbound_store(self.session_manager.control_store)
                 self.mobile_gateway_runtime.channel.bind_runtime_inspection(
                     runtime_inspection
+                )
+                self.mobile_gateway_runtime.channel.bind_channel_attachment_store(
+                    channel_attachment_store
                 )
                 if self.core.model_registry is None:
                     raise RuntimeError("Mobile Gateway 启动需要模型注册表")

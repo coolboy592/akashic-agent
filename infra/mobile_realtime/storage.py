@@ -9,11 +9,13 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Literal, cast
+from uuid import uuid4
 
 
 PairingStatus = Literal["pending", "confirmed", "consumed", "expired"]
 AttachmentDirection = Literal["upload", "outbound"]
 AttachmentState = Literal["transferring", "ready", "failed"]
+AttachmentImportPhase = Literal["prepared", "artifact_committed", "message_bound"]
 _MAX_REBASE_ACK = 1 << 62
 
 
@@ -166,6 +168,20 @@ class AttachmentRecord:
     state: AttachmentState
     created_at: datetime
     updated_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class MobileAttachmentImportRecord:
+    device_id: str
+    session_id: str
+    client_message_id: str
+    ordinal: int
+    mobile_attachment_id: str
+    artifact_id: str
+    phase: AttachmentImportPhase
+    created_at: datetime
+    updated_at: datetime
+    error: str | None
 
 
 class MobileRealtimeStorage:
@@ -962,6 +978,181 @@ class MobileRealtimeStorage:
                 ),
             )
         return record
+
+    def prepare_attachment_imports(
+        self,
+        *,
+        device_id: str,
+        session_id: str,
+        client_message_id: str,
+        attachment_ids: tuple[str, ...],
+    ) -> tuple[MobileAttachmentImportRecord, ...]:
+        """固定一次 Mobile 消息导入的 ordinal 与 Core artifact identity。"""
+
+        device_key = _require_text(device_id, "device_id")
+        session_key = _require_text(session_id, "session_id")
+        message_key = _require_text(client_message_id, "client_message_id")
+        if len(set(attachment_ids)) != len(attachment_ids):
+            raise AttachmentStateError("同一消息不能重复引用 Mobile 附件")
+
+        # 1. 在同一 MobileDB transaction 中核对 finalized owner 并固定映射。
+        now = _serialize_datetime(datetime.now(timezone.utc), "updated_at")
+        with self._lock, self._db:
+            _ = self._read_device_row(device_key)
+            for ordinal, attachment_id in enumerate(attachment_ids):
+                attachment_key = _require_text(attachment_id, "attachment_id")
+                attachment = self._db.execute(
+                    "SELECT * FROM mobile_attachments WHERE attachment_id = ?",
+                    (attachment_key,),
+                ).fetchone()
+                if attachment is None:
+                    raise AttachmentStateError(f"附件不存在: {attachment_key}")
+                record = _attachment_from_row(attachment)
+                if (
+                    record.device_id != device_key
+                    or record.session_id != session_key
+                    or record.direction != "upload"
+                    or record.state != "ready"
+                ):
+                    raise AttachmentStateError(
+                        f"附件未就绪或不属于当前消息: {attachment_key}"
+                    )
+                existing = self._db.execute(
+                    """
+                    SELECT * FROM mobile_attachment_imports
+                    WHERE device_id = ? AND session_id = ?
+                      AND client_message_id = ? AND ordinal = ?
+                    """,
+                    (device_key, session_key, message_key, ordinal),
+                ).fetchone()
+                if existing is not None:
+                    imported = _attachment_import_from_row(existing)
+                    if imported.mobile_attachment_id != attachment_key:
+                        raise AttachmentStateError(
+                            "同一消息 ordinal 的 Mobile 附件发生漂移"
+                        )
+                    continue
+                _ = self._db.execute(
+                    """
+                    INSERT INTO mobile_attachment_imports(
+                        device_id, session_id, client_message_id, ordinal,
+                        mobile_attachment_id, artifact_id, phase,
+                        created_at, updated_at, error
+                    ) VALUES(?, ?, ?, ?, ?, ?, 'prepared', ?, ?, NULL)
+                    """,
+                    (
+                        device_key,
+                        session_key,
+                        message_key,
+                        ordinal,
+                        attachment_key,
+                        uuid4().hex,
+                        now,
+                        now,
+                    ),
+                )
+
+            # 2. 重放必须解析为同一完整 ordinal 集合，不能接受缩短或扩展。
+            rows = self._db.execute(
+                """
+                SELECT * FROM mobile_attachment_imports
+                WHERE device_id = ? AND session_id = ? AND client_message_id = ?
+                ORDER BY ordinal
+                """,
+                (device_key, session_key, message_key),
+            ).fetchall()
+            if len(rows) != len(attachment_ids):
+                raise AttachmentStateError("同一 Mobile 消息的附件数量发生漂移")
+            return tuple(_attachment_import_from_row(row) for row in rows)
+
+    def advance_attachment_import(
+        self,
+        *,
+        device_id: str,
+        session_id: str,
+        client_message_id: str,
+        ordinal: int,
+        expected_phase: AttachmentImportPhase,
+        phase: AttachmentImportPhase,
+        error: str | None = None,
+    ) -> MobileAttachmentImportRecord:
+        """按精确前态推进一个跨库导入记录。"""
+
+        allowed = {
+            ("prepared", "artifact_committed"),
+            ("artifact_committed", "message_bound"),
+        }
+        if (expected_phase, phase) not in allowed:
+            raise ValueError(f"非法 attachment import phase: {expected_phase}->{phase}")
+        now = _serialize_datetime(datetime.now(timezone.utc), "updated_at")
+        with self._lock, self._db:
+            cursor = self._db.execute(
+                """
+                UPDATE mobile_attachment_imports
+                SET phase = ?, updated_at = ?, error = ?
+                WHERE device_id = ? AND session_id = ? AND client_message_id = ?
+                  AND ordinal = ? AND phase = ?
+                """,
+                (
+                    phase,
+                    now,
+                    error,
+                    _require_text(device_id, "device_id"),
+                    _require_text(session_id, "session_id"),
+                    _require_text(client_message_id, "client_message_id"),
+                    ordinal,
+                    expected_phase,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise AttachmentStateError("attachment import phase 推进冲突")
+            row = self._db.execute(
+                """
+                SELECT * FROM mobile_attachment_imports
+                WHERE device_id = ? AND session_id = ? AND client_message_id = ?
+                  AND ordinal = ?
+                """,
+                (device_id, session_id, client_message_id, ordinal),
+            ).fetchone()
+        assert row is not None
+        return _attachment_import_from_row(row)
+
+    def list_attachment_imports(
+        self,
+        *,
+        session_id: str,
+        client_message_id: str,
+    ) -> tuple[MobileAttachmentImportRecord, ...]:
+        """读取一条 Mobile 消息的 durable attachment import 映射。"""
+
+        with self._lock:
+            rows = self._db.execute(
+                """
+                SELECT * FROM mobile_attachment_imports
+                WHERE session_id = ? AND client_message_id = ?
+                ORDER BY ordinal
+                """,
+                (
+                    _require_text(session_id, "session_id"),
+                    _require_text(client_message_id, "client_message_id"),
+                ),
+            ).fetchall()
+        return tuple(_attachment_import_from_row(row) for row in rows)
+
+    def list_incomplete_attachment_imports(
+        self,
+    ) -> tuple[MobileAttachmentImportRecord, ...]:
+        """读取仍需 Core/Session 对账的跨库导入记录。"""
+
+        with self._lock:
+            rows = self._db.execute(
+                """
+                SELECT * FROM mobile_attachment_imports
+                WHERE phase != 'message_bound'
+                ORDER BY created_at, device_id, session_id, client_message_id, ordinal
+                """
+            ).fetchall()
+        return tuple(_attachment_import_from_row(row) for row in rows)
 
     def create_or_read_outbound_attachment(
         self,
@@ -1956,6 +2147,28 @@ class MobileRealtimeStorage:
                 FOREIGN KEY(attachment_id) REFERENCES mobile_attachments(attachment_id)
                     ON DELETE CASCADE
             );
+
+            CREATE TABLE IF NOT EXISTS mobile_attachment_imports (
+                device_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                client_message_id TEXT NOT NULL,
+                ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+                mobile_attachment_id TEXT NOT NULL,
+                artifact_id TEXT NOT NULL UNIQUE,
+                phase TEXT NOT NULL CHECK(
+                    phase IN ('prepared', 'artifact_committed', 'message_bound')
+                ),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                error TEXT,
+                PRIMARY KEY(device_id, session_id, client_message_id, ordinal),
+                UNIQUE(session_id, client_message_id, ordinal),
+                UNIQUE(device_id, session_id, client_message_id, mobile_attachment_id),
+                FOREIGN KEY(device_id) REFERENCES mobile_devices(device_id)
+                    ON DELETE CASCADE,
+                FOREIGN KEY(mobile_attachment_id)
+                    REFERENCES mobile_attachments(attachment_id)
+            );
             """
         )
         self._db.commit()
@@ -2256,6 +2469,30 @@ def _attachment_from_row(row: sqlite3.Row) -> AttachmentRecord:
     if record.transferred_bytes > record.size_bytes:
         raise ValueError("mobile_attachments.transferred_bytes 超过 size_bytes")
     return record
+
+
+def _attachment_import_from_row(row: sqlite3.Row) -> MobileAttachmentImportRecord:
+    phase = _row_text(row, "phase")
+    if phase not in {"prepared", "artifact_committed", "message_bound"}:
+        raise ValueError(f"mobile_attachment_imports.phase 非法: {phase}")
+    ordinal = int(row["ordinal"])
+    if ordinal < 0:
+        raise ValueError("mobile_attachment_imports.ordinal 非法")
+    error = row["error"]
+    if error is not None and not isinstance(error, str):
+        raise TypeError("mobile_attachment_imports.error 必须为文本或 NULL")
+    return MobileAttachmentImportRecord(
+        device_id=_row_text(row, "device_id"),
+        session_id=_row_text(row, "session_id"),
+        client_message_id=_row_text(row, "client_message_id"),
+        ordinal=ordinal,
+        mobile_attachment_id=_row_text(row, "mobile_attachment_id"),
+        artifact_id=_row_text(row, "artifact_id"),
+        phase=cast(AttachmentImportPhase, phase),
+        created_at=_parse_datetime(_row_text(row, "created_at"), "created_at"),
+        updated_at=_parse_datetime(_row_text(row, "updated_at"), "updated_at"),
+        error=error,
+    )
 
 
 def _cursor_from_row(row: sqlite3.Row) -> DeviceCursor:

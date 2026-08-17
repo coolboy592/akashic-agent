@@ -63,6 +63,14 @@ class _ArtifactReadLease:
     def ref(self) -> AttachmentRef:
         return self._ref
 
+    @property
+    def model_path(self) -> str:
+        """Expose a process-local path while this exact read lease remains open."""
+
+        if self._fd < 0:
+            raise RuntimeError("AttachmentReadLease 已关闭")
+        return f"/proc/self/fd/{self._fd}"
+
     async def read_bytes(self, *, max_bytes: int) -> bytes:
         if isinstance(max_bytes, bool) or not isinstance(max_bytes, int):
             raise TypeError("max_bytes 必须是 int")
@@ -214,6 +222,17 @@ class ChannelAttachmentArtifactStore:
                 ) from close_error
             raise asyncio.CancelledError
         return _ArtifactReadLease(canonical, fd)
+
+    def resolve_refs(self, artifact_ids: tuple[str, ...]) -> tuple[AttachmentRef, ...]:
+        """Resolve ordered opaque identities to immutable ready metadata."""
+
+        refs: list[AttachmentRef] = []
+        for artifact_id in artifact_ids:
+            record = self._session_store.get_attachment(artifact_id)
+            if record is None or record.state != "ready":
+                raise ValueError(f"attachment 尚未发布: {artifact_id}")
+            refs.append(self._ref_from_record(record))
+        return tuple(refs)
 
     def audit_orphan_artifact_ids(self) -> tuple[str, ...]:
         """报告物理已发布但没有 ready row 的 artifact，不执行删除或恢复。"""
