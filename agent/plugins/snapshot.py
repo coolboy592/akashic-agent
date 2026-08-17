@@ -19,6 +19,7 @@ from agent.skills import SkillIndex
 from agent.plugin_composition import (
     CHANNELS,
     COMMANDS,
+    BACKGROUND_JOBS,
     MANAGED_PROCESSES,
     MCP_SERVERS,
     PROACTIVE_COMPONENTS,
@@ -46,6 +47,10 @@ from agent.plugin_composition.process_slots import (
 from agent.plugin_composition.proactive import (
     ProactiveCatalog,
     _freeze_plugin_proactive_components,
+)
+from agent.plugin_composition.background_jobs import (
+    BackgroundJobCatalog,
+    _freeze_plugin_background_jobs,
 )
 from bus.event_bus import Handler
 from infra.channels.contract import Channel
@@ -100,6 +105,8 @@ class RuntimeSnapshot:
     managed_process_registry_identity: str | None = None
     proactive_component_catalog: ProactiveCatalog | None = None
     proactive_component_catalog_identity: str | None = None
+    background_job_catalog: BackgroundJobCatalog | None = None
+    background_job_catalog_identity: str | None = None
     tool_registry: ToolRegistry | None = None
     plugin_skill_index: SkillIndex | None = None
     command_registry: CommandRegistry | None = None
@@ -277,6 +284,7 @@ class RuntimeSnapshotCompiler:
         mcp_server_registry: McpServerRegistry | None = None
         managed_process_registry: ManagedProcessRegistry | None = None
         proactive_component_catalog: ProactiveCatalog | None = None
+        background_job_catalog: BackgroundJobCatalog | None = None
         if composition_root is not None:
             receipt = composition_root.receipt()
             if require_composition_ready and not receipt.ready:
@@ -485,6 +493,22 @@ class RuntimeSnapshotCompiler:
                 identity += (
                     f"|proactive-components-v3:{proactive_component_catalog.identity}"
                 )
+            background_jobs = composition_root.context.get(BACKGROUND_JOBS)
+            if background_jobs is not None:
+                background_job_catalog = _freeze_plugin_background_jobs(
+                    background_jobs,
+                    composition_root.instance_token,
+                    {
+                        generation.plugin_id: generation.generation_id
+                        for generation in ordered
+                    },
+                )
+                self._validate_background_job_catalog(
+                    background_job_catalog,
+                    generations,
+                    jobs,
+                )
+                identity += f"|background-jobs-v3:{background_job_catalog.identity}"
         snapshot_id = hashlib.sha256(identity.encode()).hexdigest()[:16]
         return RuntimeSnapshot(
             snapshot_id=snapshot_id,
@@ -530,6 +554,12 @@ class RuntimeSnapshotCompiler:
                 None
                 if proactive_component_catalog is None
                 else proactive_component_catalog.identity
+            ),
+            background_job_catalog=background_job_catalog,
+            background_job_catalog_identity=(
+                None
+                if background_job_catalog is None
+                else background_job_catalog.identity
             ),
             plugin_skill_index=(
                 catalog_owner.skill_catalog.normal_plugins
@@ -635,6 +665,36 @@ class RuntimeSnapshotCompiler:
                         "RuntimeSnapshot proactive capability producer 冲突: "
                         f"{capability} ({previous}, {descriptor.slot})"
                     )
+
+    @staticmethod
+    def _validate_background_job_catalog(
+        catalog: BackgroundJobCatalog,
+        generations: Mapping[str, PluginGeneration],
+        legacy_jobs: Mapping[str, RegisteredPluginJob],
+    ) -> None:
+        """Validate exact job generations and reject v2/v3 semantic collisions."""
+
+        for binding in catalog.values():
+            generation = generations.get(binding.plugin_id)
+            if (
+                generation is None
+                or generation.generation_id != binding.generation_id
+            ):
+                raise RuntimeError(
+                    "RuntimeSnapshot background job 不属于 exact generation: "
+                    f"{binding.plugin_id}:{binding.generation_id}"
+                )
+        legacy_names = set(legacy_jobs)
+        collisions = {
+            f"{descriptor.owner}:{descriptor.name}"
+            for descriptor in catalog.descriptors
+            if f"{descriptor.owner}:{descriptor.name}" in legacy_names
+        }
+        if collisions:
+            raise RuntimeError(
+                "RuntimeSnapshot v2/v3 background job 名称冲突: "
+                + ", ".join(sorted(collisions))
+            )
 
     @staticmethod
     def _compile_jobs(
@@ -1450,6 +1510,8 @@ class RuntimeSnapshotStore:
                 or snapshot.managed_process_registry_identity is not None
                 or snapshot.proactive_component_catalog is not None
                 or snapshot.proactive_component_catalog_identity is not None
+                or snapshot.background_job_catalog is not None
+                or snapshot.background_job_catalog_identity is not None
             ):
                 raise RuntimeError(
                     "RuntimeSnapshot composition identity 缺少 Root Context"
@@ -1531,6 +1593,25 @@ class RuntimeSnapshotStore:
         ):
             raise RuntimeError(
                 "RuntimeSnapshot proactive catalog 不属于 exact Root"
+            )
+        if (
+            snapshot.background_job_catalog_identity
+            != (
+                None
+                if snapshot.background_job_catalog is None
+                else snapshot.background_job_catalog.identity
+            )
+        ):
+            raise RuntimeError(
+                "RuntimeSnapshot background job catalog 在编译后发生变化"
+            )
+        if (
+            snapshot.background_job_catalog is not None
+            and snapshot.background_job_catalog.root_instance_token
+            is not root.instance_token
+        ):
+            raise RuntimeError(
+                "RuntimeSnapshot background job catalog 不属于 exact Root"
             )
         topology = snapshot.composition_topology
         if topology is None:

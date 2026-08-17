@@ -30,6 +30,7 @@ from agent.plugin_composition import (
     MCP_SERVERS,
     MEMORY_RUNTIME,
     PROACTIVE_COMPONENTS,
+    BACKGROUND_JOBS,
     UI_SLOTS,
     CommandRegistry,
     CompositionRoot,
@@ -40,6 +41,7 @@ from agent.plugin_composition import (
     PluginUiSlots,
     PluginCommands,
     PluginProactiveComponents,
+    PluginBackgroundJobs,
     PluginRuntime,
     resolve_mobile_ui_asset,
     ServiceView,
@@ -5943,6 +5945,14 @@ class PluginManager:
                 _ = await root.context.provide(
                     PROACTIVE_COMPONENTS,
                     PluginProactiveComponents(root.instance_token),
+                )
+            if any(
+                BACKGROUND_JOBS in cast(ComposablePlugin, item.instance).inject
+                for item in ordered
+            ):
+                _ = await root.context.provide(
+                    BACKGROUND_JOBS,
+                    PluginBackgroundJobs(root.instance_token),
                 )
             if any(
                 UI_SLOTS in cast(ComposablePlugin, item.instance).inject
