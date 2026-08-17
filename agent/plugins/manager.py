@@ -5269,6 +5269,10 @@ class PluginManager:
                 raise RuntimeError(
                     f"插件 {initial_plugin_id} 静态 manifest admission 失败: {error}"
                 ) from error
+        elif mod.get("source_type") == "installed":
+            raise RuntimeError(
+                f"installed 插件缺少静态 v3 manifest: {initial_plugin_id}"
+            )
         try:
             source_revision = _source_revision(plugin_dir)
         except Exception as error:
@@ -5383,6 +5387,21 @@ class PluginManager:
             loaded_module is not None
             and getattr(loaded_module, "api_version", None) == 3
         )
+        if not is_v3:
+            self._remove_module_tree(mp)
+            self._record_failed_gate(
+                plugin_id=initial_plugin_id,
+                revision=source_revision,
+                check_id="plugin_api",
+                reason="plugin.py 必须声明 api_version = 3",
+            )
+            self._abort_reload_attempt(
+                reload_tx_id,
+                error="plugin_api: plugin.py 必须声明 api_version = 3",
+            )
+            raise RuntimeError(
+                f"插件只接受 api_version = 3: {initial_plugin_id}"
+            )
         private_members = {item.member for item in PRIVATE_PROACTIVE_DEFINITIONS}
         if (
             isinstance(loaded_module, ModuleType)
@@ -5406,31 +5425,11 @@ class PluginManager:
                 raise RuntimeError(
                     f"private proactive admission 失败: {initial_plugin_id}: {error_text}"
                 ) from error
-        cls = plugin_registry.get_class(mp)
-        if not is_v3 and cls is None:
-            logger.warning("插件 %s 未注册类", mod["name"])
-            self._remove_module_tree(mp)
-            self._record_failed_gate(
-                plugin_id=initial_plugin_id,
-                revision=source_revision,
-                check_id="plugin_class",
-                reason="plugin.py 未注册 Plugin 子类",
-            )
-            self._abort_reload_attempt(
-                reload_tx_id,
-                error="plugin_class: plugin.py 未注册 Plugin 子类",
-            )
-            return None
         try:
-            if is_v3:
-                if not isinstance(loaded_module, ModuleType):
-                    raise RuntimeError("v3 插件模块未保留在 import registry")
-                instance: Any = ComposablePlugin.from_module(loaded_module)
-                config_model = instance.ConfigModel
-            else:
-                assert cls is not None
-                instance = cls()
-                config_model = getattr(cls, "ConfigModel", None)
+            if not isinstance(loaded_module, ModuleType):
+                raise RuntimeError("v3 插件模块未保留在 import registry")
+            instance: Any = ComposablePlugin.from_module(loaded_module)
+            config_model = instance.ConfigModel
             name = str(instance.name or mod["name"]).strip()
             if not name:
                 raise RuntimeError("插件缺少 name")
@@ -5441,7 +5440,7 @@ class PluginManager:
                 )
             credential_paths = (
                 _static_channel_credential_paths(static_manifest)
-                if is_v3 and static_manifest is not None
+                if static_manifest is not None
                 else ()
             )
             credential_alias_groups = (
@@ -5449,7 +5448,7 @@ class PluginManager:
                     config_model,
                     credential_paths=credential_paths,
                 )
-                if is_v3
+                if static_manifest is not None
                 else ()
             )
             config_projection = _read_plugin_config_projection(
@@ -5480,24 +5479,6 @@ class PluginManager:
             created_activation_data_dir = not data_dir.exists()
             ensure_workspace_plugin_data_dir(data_dir, self._workspace)
         scope = PluginScope(plugin_id)
-        if not isinstance(instance, ComposablePlugin):
-            from agent.plugins.context import PluginContext, PluginKVStore
-
-            instance.context = PluginContext(
-                event_bus=None,  # type: ignore[arg-type]
-                tool_registry=None,
-                plugin_id=plugin_id,
-                plugin_dir=plugin_dir,
-                data_dir=None,
-                kv_store=PluginKVStore(data_dir / ".kv.json", writable=False),
-                config=plugin_config,
-                workspace=self._workspace,
-                session_manager=None,
-                memory_engine=None,
-                llm=None,
-                scope=None,
-                generation_id=generation_id,
-            )
         plugin_registry.register_instance(mp, instance)
         prepare_started = False
         generation: PluginGeneration | None = None

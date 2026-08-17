@@ -85,6 +85,82 @@ def _manager(
 
 
 @pytest.mark.asyncio
+async def test_installed_plugin_without_static_manifest_fails_before_import(
+    tmp_path: Path,
+) -> None:
+    """在任何插件代码或正式数据写入前拒绝无 manifest 的 installed artifact。"""
+
+    # 1. 构造仍可被 source resolver 发现的旧 installed artifact。
+    plugin_dir = (
+        tmp_path
+        / "home"
+        / "cache"
+        / "lab"
+        / "missing_manifest"
+        / "1.0.0"
+    )
+    plugin_dir.mkdir(parents=True)
+    import_marker = plugin_dir / "imported"
+    (plugin_dir / "plugin.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(import_marker)!r}).write_text('imported')\n"
+        "api_version = 3\n"
+        "name = 'missing_manifest'\n"
+        "version = '1.0.0'\n"
+        "async def apply(ctx, config): pass\n",
+        encoding="utf-8",
+    )
+    manager = _manager(tmp_path)
+
+    # 2. Admission 必须在 import、generation 和正式 data root 之前失败。
+    with pytest.raises(RuntimeError, match="缺少静态 v3 manifest"):
+        await manager.load_all()
+    assert not import_marker.exists()
+    assert manager.current_snapshot is None
+    assert manager.generation("missing_manifest@lab") is None
+    assert not (
+        tmp_path
+        / "workspace"
+        / "plugin-data"
+        / "missing_manifest-lab"
+    ).exists()
+
+
+@pytest.mark.asyncio
+async def test_builtin_v2_plugin_fails_without_generation_or_data(
+    tmp_path: Path,
+) -> None:
+    """拒绝 builtin v2 class 入口并清除 import registry。"""
+
+    # 1. Builtin 可在无静态 manifest 时进入 import，但不能进入 generation。
+    plugin_dir = _write_plugin(
+        tmp_path / "plugins",
+        "legacy_probe",
+        "from agent.plugins import Plugin\n"
+        "class LegacyProbe(Plugin):\n"
+        "    name = 'legacy_probe'\n",
+    )
+    manager = _manager(tmp_path)
+
+    # 2. v2 namespace 必须 fail-loud，且不留下正式 data 或 registry owner。
+    with pytest.raises(RuntimeError, match="只接受 api_version = 3"):
+        await manager.load_all()
+    assert manager.current_snapshot is None
+    assert manager.generation("legacy_probe") is None
+    assert not (
+        tmp_path
+        / "workspace"
+        / "plugin-data"
+        / "legacy_probe-builtin"
+    ).exists()
+    assert not any(
+        module_path.startswith("akasic_plugin_")
+        for module_path in plugin_registry._classes
+    )
+    assert plugin_dir.exists()
+
+
+@pytest.mark.asyncio
 async def test_replace_snapshot_payload_rebinds_all_exact_root_activity_catalogs(
 ) -> None:
     """让全部 activity catalog 随载荷一起切换到正式 Root。"""
