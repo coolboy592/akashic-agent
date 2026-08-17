@@ -138,25 +138,30 @@ class EventBus:
                     reset_runtime_snapshot(token)
         # 1. 并发执行观察者；每个观察者自己记录异常，fanout 只汇总失败数量。
         handlers = self._handlers_for(type(event))
-        if not handlers:
-            return
-        from agent.plugins.snapshot import get_current_runtime_lease
+        if handlers:
+            from agent.plugins.snapshot import get_current_runtime_lease
 
-        source_lease = get_current_runtime_lease()
-        results = await asyncio.gather(
-            *(
-                self._run_observer(event, handler, source_lease)
-                for handler in handlers
+            source_lease = get_current_runtime_lease()
+            results = await asyncio.gather(
+                *(
+                    self._run_observer(event, handler, source_lease)
+                    for handler in handlers
+                )
             )
-        )
-        failed_count = results.count(False)
-        if failed_count:
-            logger.warning(
-                "fanout completed with observer errors: event=%s failed=%d total=%d",
-                type(event).__name__,
-                failed_count,
-                len(handlers),
-            )
+            failed_count = results.count(False)
+            if failed_count:
+                logger.warning(
+                    "fanout completed with observer errors: event=%s failed=%d total=%d",
+                    type(event).__name__,
+                    failed_count,
+                    len(handlers),
+                )
+
+        # 2. Legacy EventBus handlers settle first; composition observers then
+        #    consume the same object under the request's exact RuntimeSnapshot.
+        from agent.lifecycle.composition import observe_composition_domain_event
+
+        await observe_composition_domain_event(event)
 
     def enqueue(
         self,
@@ -166,9 +171,13 @@ class EventBus:
         if self._closed:
             logger.warning("event enqueue ignored after close: %s", type(event).__name__)
             return
-        queue = self._ensure_observe_queue()
-        from agent.plugins.snapshot import lease_current_runtime_snapshot
+        from agent.plugins.snapshot import (
+            get_lifecycle_runtime_snapshot,
+            lease_current_runtime_snapshot,
+        )
 
+        _ = get_lifecycle_runtime_snapshot()
+        queue = self._ensure_observe_queue()
         snapshot_lease = lease_current_runtime_snapshot()
         if snapshot_lease is None and self._runtime_snapshot_store is not None:
             snapshot = self._runtime_snapshot_store.current
@@ -210,11 +219,11 @@ class EventBus:
             )
 
     async def _runtime_lease(self) -> RuntimeSnapshotLease | None:
-        if self._runtime_snapshot_store is None:
-            return None
-        from agent.plugins.snapshot import get_current_runtime_snapshot
+        from agent.plugins.snapshot import get_lifecycle_runtime_snapshot
 
-        if get_current_runtime_snapshot() is not None:
+        if get_lifecycle_runtime_snapshot() is not None:
+            return None
+        if self._runtime_snapshot_store is None:
             return None
         if self._runtime_snapshot_store.current is None:
             return None

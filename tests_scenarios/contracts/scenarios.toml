@@ -32,6 +32,12 @@ companion_receipt_deletes_valid_result = "tests/semantic/test_companion_contract
 companion_shell_cleanup_rewrites_turn = "tests/semantic/test_companion_contract.py::test_shell_cleanup_rejects_turn_rewrite_mutant"
 companion_control_replay_drops_live_event = "tests/semantic/test_companion_contract.py::test_control_replay_rejects_live_drop_mutant"
 companion_dashboard_uses_html_sink = "tests/semantic/test_companion_contract.py::test_dashboard_rejects_html_sink_mutant"
+domain_event_legacy_order = "tests/test_plugin_composition_lifecycle.py::test_domain_observe_event_runs_after_legacy_fanout"
+domain_event_no_handler_early_return = "tests/test_plugin_composition_lifecycle.py::test_domain_observe_event_is_not_skipped_without_legacy_handlers"
+domain_event_candidate_binding = "tests/test_plugin_composition_lifecycle.py::test_domain_observe_event_uses_bound_candidate_root"
+domain_event_wrong_task_fallback = "tests/test_plugin_composition_lifecycle.py::test_event_bus_rejects_inherited_wrong_task_binding"
+retrieval_event_payload = "tests/test_plugin_composition_lifecycle.py::test_retrieval_pipeline_emits_completed_event"
+retrieval_event_error_propagation = "tests/test_plugin_composition_lifecycle.py::test_retrieval_failure_publishes_error_then_propagates"
 
 [scenarios.contract_catalog]
 requirements = ["GOV-001", "GOV-003", "TST-001", "TST-006"]
@@ -285,6 +291,44 @@ command = [
 ]
 observes = ["candidate_generation", "active_generation", "turn_committed_event_position", "rollback"]
 mutants = ["candidate_visible_before_activation", "plugin_uninstall_deletes_data"]
+
+[scenarios.plugin_domain_observe_events]
+requirements = ["RUN-001", "OUT-001", "PLG-001", "MEM-001", "TST-001", "TST-003"]
+groups = ["plugin", "lifecycle", "events", "memory"]
+environment = "public_clean_workspace"
+timeout_seconds = 60
+command = [
+  "python",
+  "-m",
+  "pytest",
+  "-q",
+  "tests/test_plugin_composition_lifecycle.py::test_domain_observe_event_runs_after_legacy_fanout",
+  "tests/test_plugin_composition_lifecycle.py::test_domain_observe_event_is_not_skipped_without_legacy_handlers",
+  "tests/test_plugin_composition_lifecycle.py::test_domain_observe_event_uses_bound_candidate_root",
+  "tests/test_plugin_composition_lifecycle.py::test_domain_observe_event_rejects_inherited_wrong_task_binding",
+  "tests/test_plugin_composition_lifecycle.py::test_event_bus_rejects_inherited_wrong_task_binding",
+  "tests/test_plugin_composition_lifecycle.py::test_retrieval_pipeline_emits_completed_event",
+  "tests/test_plugin_composition_lifecycle.py::test_retrieval_failure_publishes_error_then_propagates",
+  "tests/test_plugin_composition_lifecycle.py::test_domain_event_contract_imports_without_phase_runtime",
+]
+observes = [
+  "domain_event_identity",
+  "legacy_before_composition",
+  "candidate_root_binding",
+  "wrong_task_failure",
+  "event_bus_wrong_task_failure",
+  "retrieval_completed_payload",
+  "retrieval_error_propagation",
+  "leaf_contract_import",
+]
+mutants = [
+  "domain_event_legacy_order",
+  "domain_event_no_handler_early_return",
+  "domain_event_candidate_binding",
+  "domain_event_wrong_task_fallback",
+  "retrieval_event_payload",
+  "retrieval_event_error_propagation",
+]
 
 [scenarios.plugin_uninstall_drain_finality]
 requirements = ["PLG-003", "PLG-005", "PLG-006", "PLG-010", "PLG-012", "ERR-001"]

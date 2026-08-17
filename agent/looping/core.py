@@ -412,6 +412,7 @@ class AgentLoop:
         # 3. 最后串 passive prepare / execute / commit 主链。
         retrieval_pipeline = deps.retrieval_pipeline or DefaultMemoryRetrievalPipeline(
             memory=memory_svc,
+            event_publisher=self._event_bus,
         )
         self._retrieval_pipeline = retrieval_pipeline
         passive_context_store = DefaultContextStore(

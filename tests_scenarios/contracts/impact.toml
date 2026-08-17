@@ -143,7 +143,7 @@ paths = [
   "tests/test_plugin_*.py",
 ]
 depends_on = ["lifecycle"]
-scenarios = ["plugin_generation_contract", "plugin_uninstall_drain_finality", "mcp_process_lifecycle"]
+scenarios = ["plugin_generation_contract", "plugin_uninstall_drain_finality", "mcp_process_lifecycle", "plugin_domain_observe_events"]
 
 [groups.recursive_plugin_validation]
 priority = "p0"
@@ -178,14 +178,14 @@ priority = "p1"
 requirements = ["RUN-001", "RUN-002", "PLG-001"]
 paths = ["agent/lifecycle/**", "agent/turn_events/**", "bootstrap/runtime_readiness.py"]
 depends_on = ["events"]
-scenarios = ["contract_catalog", "plugin_generation_contract"]
+scenarios = ["contract_catalog", "plugin_generation_contract", "plugin_domain_observe_events"]
 
 [groups.events]
 priority = "p1"
 requirements = ["RUN-001", "OUT-001"]
 paths = ["bus/**", "agent/tool_hooks/**"]
 depends_on = []
-scenarios = ["contract_catalog"]
+scenarios = ["contract_catalog", "plugin_domain_observe_events"]
 
 [groups.channel]
 priority = "p1"
@@ -221,7 +221,7 @@ paths = [
   "bootstrap/toolsets/memory.py",
 ]
 depends_on = ["session_persistence"]
-scenarios = ["memory_persistence_contract"]
+scenarios = ["memory_persistence_contract", "plugin_domain_observe_events"]
 
 [groups.jobs]
 priority = "p1"

@@ -523,6 +523,7 @@ def _build_loop_deps(
     )
     retrieval_pipeline = DefaultMemoryRetrievalPipeline(
         memory=memory_services,
+        event_publisher=event_bus,
     )
 
     return AgentLoopDeps(

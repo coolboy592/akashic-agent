@@ -3,7 +3,12 @@ from __future__ import annotations
 from typing import TypeVar
 
 from agent.lifecycle.types import AfterReasoningCtx, BeforeTurnCtx, PromptRenderCtx
-from agent.plugin_composition import CompositionError, EmitEventKey, SerialEventKey
+from agent.plugin_composition import (
+    CompositionError,
+    EmitEventKey,
+    ObserveEventKey,
+    SerialEventKey,
+)
 from agent.plugins.snapshot import get_lifecycle_runtime_snapshot
 
 P = TypeVar("P")
@@ -53,3 +58,41 @@ async def run_composition_lifecycle(
             "LIFECYCLE_BAIL_NOT_ALLOWED",
             f"lifecycle 接入点不接受 Bail: {key.name}",
         )
+
+
+async def observe_composition_event(
+    key: ObserveEventKey[P],
+    payload: P,
+) -> None:
+    """Observe one settled fact from the request's frozen composition Root."""
+
+    # 1. Bootstrap and legacy snapshots without a composition Root stay unchanged.
+    snapshot = get_lifecycle_runtime_snapshot()
+    if snapshot is None or snapshot.composition_root is None:
+        return
+
+    # 2. Observe owns failure isolation for ordinary plugin listeners; binding
+    #    and caller cancellation failures remain fail-loud at this boundary.
+    await snapshot.composition_root.context.observe(key, payload)
+
+
+async def observe_composition_domain_event(event: object) -> None:
+    """Bridge one legacy domain event to its request-bound ObserveEventKey."""
+
+    # 1. Resolve only the three domain facts that have a stable v3 Observe seam.
+    from agent.turn_events.observe import (
+        MEMORY_WRITTEN_EVENT,
+        PROACTIVE_FINISHED_EVENT,
+        RETRIEVAL_COMPLETED_EVENT,
+    )
+    from bus.events_lifecycle import ProactiveFinished
+    from core.memory.events import MemoryWritten, RetrievalCompleted
+
+    if isinstance(event, ProactiveFinished):
+        await observe_composition_event(PROACTIVE_FINISHED_EVENT, event)
+        return
+    if isinstance(event, RetrievalCompleted):
+        await observe_composition_event(RETRIEVAL_COMPLETED_EVENT, event)
+        return
+    if isinstance(event, MemoryWritten):
+        await observe_composition_event(MEMORY_WRITTEN_EVENT, event)
