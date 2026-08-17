@@ -583,6 +583,31 @@ def test_v3_static_install_accepts_custom_entrypoint(
     assert not (result.installed_path / "plugin.py").exists()
 
 
+def test_install_rejects_missing_static_manifest_before_plugin_import(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "legacy-source"
+    repo.mkdir()
+    imported = tmp_path / "imported"
+    (repo / "plugin.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(imported)!r}).write_text('imported', encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    _commit(repo)
+
+    with pytest.raises(ValueError, match="akashic.plugin.toml"):
+        install_git_plugin(
+            workspace=tmp_path / "workspace",
+            source=str(repo),
+            marketplace="lab",
+            plugins_home=tmp_path / "plugins-home",
+        )
+
+    assert not imported.exists()
+    assert not (tmp_path / "workspace" / "plugin-data").exists()
+
+
 @pytest.mark.parametrize("preexisting", (False, True))
 def test_v3_static_staging_failure_preserves_formal_data_state(
     tmp_path: Path,

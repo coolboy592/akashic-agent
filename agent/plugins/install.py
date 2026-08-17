@@ -1,17 +1,14 @@
 from __future__ import annotations
 
-import importlib.util
 import os
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
-import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
 
 from agent.plugins.artifacts import (
     ArtifactPointer,
@@ -32,9 +29,6 @@ from agent.plugins.manifest import (
     plugins_root,
     workspace_plugin_data_dir,
 )
-from agent.plugins.registry import plugin_registry
-from agent.plugins.composable import ComposablePlugin
-from agent.plugins.specs import McpServerSpec
 from agent.plugins.static_manifest import (
     StaticPluginManifest,
     load_static_plugin_manifest,
@@ -199,31 +193,15 @@ def install_git_plugin(
         source_revision = _run_git(["rev-parse", "HEAD"], cwd=clone_root)
         if re.fullmatch(r"[0-9a-f]{40}", source_revision) is None:
             raise RuntimeError(f"插件 Git HEAD 无效: {source_revision}")
-        static_manifest = _load_optional_static_manifest(clone_root)
-        if static_manifest is not None:
-            # 1. Static v3 identity is available before any plugin import.
-            plugin_name = _validate_path_segment(static_manifest.name, "插件 name")
-            plugin_version = _validate_path_segment(
-                static_manifest.version,
-                "插件 version",
-            )
-            mcp_servers: list[McpServerSpec] = []
-        else:
-            # 2. The v2 transition path retains its class import and declarations.
-            plugin_class = _load_plugin_entry(clone_root)
-            plugin_name = _validate_path_segment(
-                getattr(plugin_class, "name", None),
-                "插件 name",
-            )
-            plugin_version = _validate_path_segment(
-                getattr(plugin_class, "version", None),
-                "插件 version",
-            )
-            mcp_servers = _load_mcp_specs(plugin_class)
+        static_manifest = load_static_plugin_manifest(clone_root)
+        plugin_name = _validate_path_segment(static_manifest.name, "插件 name")
+        plugin_version = _validate_path_segment(
+            static_manifest.version,
+            "插件 version",
+        )
         activation = _activate_plugin_version(
             plugin_name=plugin_name,
             plugin_version=plugin_version,
-            mcp_servers=mcp_servers,
             static_manifest=static_manifest,
             marketplace=marketplace,
             clone_root=clone_root,
@@ -314,8 +292,7 @@ def _activate_plugin_version(
     *,
     plugin_name: str,
     plugin_version: str,
-    mcp_servers: list[McpServerSpec],
-    static_manifest: StaticPluginManifest | None,
+    static_manifest: StaticPluginManifest,
     marketplace: str,
     clone_root: Path,
     cache_root: Path,
@@ -365,10 +342,7 @@ def _activate_plugin_version(
     try:
         # 2. 在不可发现的 staging 目录复制代码并准备依赖，旧版本保持可见
         _ = shutil.copytree(clone_root, staging_root, dirs_exist_ok=True)
-        if static_manifest is not None:
-            _prepare_static_python_runtimes(staging_root, static_manifest)
-        else:
-            _prepare_plugin_mcp_runtimes(staging_root, mcp_servers)
+        _prepare_static_python_runtimes(staging_root, static_manifest)
 
         # 3. Artifact 只创建一次；一次原子写发布完整 stable/latest pair。
         if target_root.exists():
@@ -524,14 +498,6 @@ def _validate_source_tree(root: Path) -> None:
                 raise ValueError(f"插件 source 符号链接形成循环: {path} -> {resolved}")
 
 
-def _prepare_plugin_mcp_runtimes(
-    plugin_root: Path,
-    servers: list[McpServerSpec],
-) -> None:
-    for server in servers:
-        _prepare_single_mcp_server(plugin_root=plugin_root, server=server)
-
-
 def _prepare_static_python_runtimes(
     plugin_root: Path,
     manifest: StaticPluginManifest,
@@ -547,173 +513,6 @@ def _prepare_static_python_runtimes(
             requirements,
             f"{manifest.name} python[{index}]",
         )
-
-
-def _load_optional_static_manifest(
-    plugin_root: Path,
-) -> StaticPluginManifest | None:
-    """Load a v3 static manifest when present, without importing plugin.py."""
-
-    path = plugin_root / "akashic.plugin.toml"
-    if not path.exists() and not path.is_symlink():
-        return None
-    return load_static_plugin_manifest(plugin_root)
-
-
-def _prepare_single_mcp_server(
-    *,
-    plugin_root: Path,
-    server: McpServerSpec,
-) -> None:
-    command_items = list(server.command)
-    if not _is_python_command(command_items[0]):
-        return
-    runtime_root = _resolve_mcp_runtime_root(plugin_root, server.cwd, command_items)
-    if runtime_root is None:
-        return
-    requirements = runtime_root / "requirements.txt"
-    if not requirements.exists() or requirements.is_symlink():
-        return
-    _ = _ensure_python_runtime(runtime_root, requirements, server.name)
-
-
-def _resolve_mcp_runtime_root(
-    plugin_root: Path,
-    cwd_raw: str,
-    command_items: list[str],
-) -> Path | None:
-    candidates: list[Path] = []
-    if len(command_items) >= 2:
-        script_path = Path(command_items[1])
-        if _looks_like_plugin_path(command_items[1]):
-            script_candidate = (
-                script_path if script_path.is_absolute() else plugin_root / script_path
-            )
-            resolved_script = script_candidate.resolve(strict=False)
-            _require_plugin_path(plugin_root, resolved_script, "MCP command")
-            candidates.append(script_candidate.parent)
-    if cwd_raw:
-        cwd_path = Path(cwd_raw)
-        cwd_candidate = cwd_path if cwd_path.is_absolute() else plugin_root / cwd_path
-        _require_plugin_path(
-            plugin_root,
-            cwd_candidate.resolve(strict=False),
-            "MCP cwd",
-        )
-        candidates.append(cwd_candidate)
-    candidates.append(plugin_root)
-    for candidate in candidates:
-        if (candidate / "requirements.txt").exists():
-            return candidate
-    return None
-
-
-def _looks_like_plugin_path(value: str) -> bool:
-    return (
-        Path(value).is_absolute()
-        or "/" in value
-        or "\\" in value
-        or value.startswith(".")
-    )
-
-
-def _require_plugin_path(plugin_root: Path, path: Path, label: str) -> None:
-    plugin_root = plugin_root.resolve(strict=False)
-    path = path.resolve(strict=False)
-    try:
-        _ = path.relative_to(plugin_root)
-    except ValueError as error:
-        raise ValueError(f"插件 {label} 越界: {path}") from error
-
-
-def _load_plugin_entry(plugin_root: Path) -> type | ComposablePlugin:
-    """Load one legacy class or v3 namespace declaration for install validation."""
-
-    plugin_path = plugin_root / "plugin.py"
-    if not plugin_path.exists():
-        raise ValueError("插件缺少 plugin.py")
-    module_name = f"akasic_plugin_install_{uuid.uuid4().hex}"
-    spec = importlib.util.spec_from_file_location(
-        module_name,
-        plugin_path,
-        submodule_search_locations=[str(plugin_root)],
-    )
-    if spec is None or spec.loader is None:
-        raise ImportError(f"无法加载插件文件: {plugin_path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    try:
-        spec.loader.exec_module(module)
-        # V2_REMOVAL(static-manifest-admission)：这是无静态 manifest 的过渡入口；
-        # 最后一个 v2 artifact 迁走后连同 install import fallback 一并删除。
-        if getattr(module, "api_version", None) == 3:
-            return ComposablePlugin.from_module(module)
-        # V2_REMOVAL(plugin-install-v2)：full-fleet 只剩 v3 namespace 后删除 class registry
-        # fallback，unknown/legacy declaration 在这一边界直接 fail-loud。
-        plugin_class = plugin_registry.get_class(module_name)
-        if plugin_class is None:
-            raise ValueError("plugin.py 未声明 Plugin 子类或 v3 apply 模块")
-        return plugin_class
-    finally:
-        plugin_registry.remove_module_tree(module_name)
-        for imported_name in tuple(sys.modules):
-            if imported_name == module_name or imported_name.startswith(
-                f"{module_name}."
-            ):
-                _ = sys.modules.pop(imported_name, None)
-
-
-def _load_plugin_class(plugin_root: Path) -> type:
-    """Load the legacy class contract retained for v2 install callers."""
-
-    entry = _load_plugin_entry(plugin_root)
-    if isinstance(entry, ComposablePlugin):
-        raise ValueError("v3 插件没有 legacy Plugin 子类")
-    return entry
-
-
-def _load_mcp_specs(
-    plugin_class: type | ComposablePlugin,
-) -> list[McpServerSpec]:
-    if isinstance(plugin_class, ComposablePlugin):
-        return []
-    provider = getattr(plugin_class, "mcp_servers", None)
-    if not callable(provider):
-        raise ValueError("插件缺少 mcp_servers() 声明")
-    raw = cast(Callable[[], object], provider)()
-    if not isinstance(raw, list):
-        raise ValueError("mcp_servers() 必须返回 list")
-    raw_items = cast(list[object], raw)
-    result: list[McpServerSpec] = []
-    names: set[str] = set()
-    for item in raw_items:
-        if (
-            not isinstance(item, McpServerSpec)
-            or not isinstance(item.name, str)
-            or not item.name
-            or not item.command
-            or not isinstance(item.command, tuple)
-            or not isinstance(item.cwd, str)
-            or not isinstance(item.env, dict)
-            or not isinstance(item.candidate_read_only_tools, tuple)
-            or not all(isinstance(value, str) and value for value in item.command)
-            or not all(
-                isinstance(key, str) and isinstance(value, str)
-                for key, value in item.env.items()
-            )
-            or not all(
-                isinstance(value, str) and value
-                for value in item.candidate_read_only_tools
-            )
-            or len(set(item.candidate_read_only_tools))
-            != len(item.candidate_read_only_tools)
-        ):
-            raise ValueError(f"MCP server 声明无效: {item!r}")
-        if item.name in names:
-            raise ValueError(f"MCP server 名称重复: {item.name}")
-        names.add(item.name)
-        result.append(item)
-    return result
 
 
 def _ensure_python_runtime(
@@ -743,11 +542,6 @@ def _venv_python_path(venv_dir: Path) -> Path:
         if os.name == "nt"
         else venv_dir / "bin" / "python"
     )
-
-
-def _is_python_command(value: str) -> bool:
-    name = Path(value).name.lower()
-    return name in {"python", "python3", "python.exe"}
 
 
 def _run_git(args: list[str], cwd: Path | None = None) -> str:
