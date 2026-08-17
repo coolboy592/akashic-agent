@@ -28,8 +28,14 @@ from agent.config_models import (
 from agent.control.context import running_turn_id
 from agent.looping.ports import MemoryServices
 from agent.migrations.akasha_sidecar import rebuild_akasha_sidecars
-from agent.plugins import Plugin
-from agent.plugins.context import PluginContext, PluginKVStore
+from agent.plugin_composition import (
+    MEMORY_RUNTIME,
+    DashboardContext,
+    MemoryRuntimeInfo,
+    MemoryTurnRuntime,
+    ServiceView,
+)
+from agent.plugins.composable import ComposablePlugin
 from agent.plugins.manifest import (
     builtin_plugin_data_dir,
     ensure_workspace_plugin_data_dir,
@@ -45,13 +51,12 @@ from core.memory.engine import MemoryQuery, MemoryQueryResult, MemoryScope
 from core.memory.plugin import MemoryPlugin as MemoryPluginProtocol
 from plugins.akasha.application.cycle import MemoryCycle
 from plugins.akasha.application.rebuild import rebuild_memory
-from plugins.akasha.config import AkashaConfig, render_akasha_config
+from plugins.akasha.config import AkashaConfig, load_akasha_config, render_akasha_config
 from plugins.akasha.dashboard import register as register_dashboard
 from plugins.akasha.domain.features import BurstAwareFeaturePool
 from plugins.akasha.domain.model import MemoryConfig
 from plugins.akasha.engine import (
     ActiveRecallSnapshot,
-    AkashaFeedbackPersistModule,
     AkashaMemoryEngine,
     PendingRetrieval,
     RetrievalRecords,
@@ -67,8 +72,9 @@ from plugins.akasha.infrastructure.sparse_index import (
     build_sparse_index,
 )
 from plugins.akasha.memory_plugin import MemoryPlugin
+from plugins.akasha import plugin as akasha_plugin
 from plugins.akasha.plugin import (
-    AkashaPlugin,
+    _AkashaMobileQuery,
     _empty_mobile_recall,
     _mobile_recall_lane,
 )
@@ -92,91 +98,21 @@ class _Embedder:
         return None
 
 
-def test_akasha_v2_registers_both_host_protocols(tmp_path: Path) -> None:
-    plugin = AkashaPlugin()
-    plugin.context = PluginContext(
-        event_bus=cast(Any, None),
-        tool_registry=None,
-        plugin_id="akasha",
-        plugin_dir=Path("plugins/akasha"),
-        data_dir=builtin_plugin_data_dir("akasha", tmp_path),
-        kv_store=PluginKVStore(tmp_path / ".kv.json"),
-        workspace=tmp_path,
-        memory_engine=SimpleNamespace(describe=lambda: SimpleNamespace(name="akasha")),
-    )
-    assert isinstance(plugin, Plugin)
+def test_akasha_registers_v3_namespace_and_memory_factory() -> None:
+    plugin = ComposablePlugin.from_module(akasha_plugin)
+
+    assert plugin.api_version == 3
+    assert plugin.name == "akasha"
+    assert plugin.dashboard_module == "dashboard.py"
+    assert plugin.workspace_roots == ("memory",)
     assert isinstance(MemoryPlugin(), MemoryPluginProtocol)
     assert MemoryPlugin.plugin_id == "akasha"
-    assert len(plugin.after_reasoning_modules()) == 1
-    assert plugin.dashboard_module() == "dashboard.py"
-    mobile = plugin.mobile_ui()
-    assert mobile.module == "mobile_ui.js"
-    assert mobile.stylesheet == "mobile_ui.css"
-    assert mobile.slots == ("turn.before_reasoning",)
-    assert mobile.navigation is not None
-    assert mobile.navigation.label == "Akasha Inspector"
 
 
-def test_mobile_recall_is_empty_when_akasha_is_not_the_memory_owner(
-    tmp_path: Path,
-) -> None:
-    plugin = AkashaPlugin()
-    plugin.context = PluginContext(
-        event_bus=cast(Any, None),
-        tool_registry=None,
-        plugin_id="akasha",
-        plugin_dir=Path("plugins/akasha"),
-        data_dir=builtin_plugin_data_dir("akasha", tmp_path),
-        kv_store=PluginKVStore(tmp_path / ".kv.json"),
-        workspace=tmp_path,
-        memory_engine=SimpleNamespace(describe=lambda: SimpleNamespace(name="default")),
+def test_akasha_is_inactive_when_default_memory_owns_runtime() -> None:
+    assert not akasha_plugin.is_active(
+        ServiceView.freeze({MEMORY_RUNTIME: MemoryRuntimeInfo(name="default")})
     )
-
-    assert plugin.mobile_ui_available() is False
-    active = plugin.mobile_ui_query(
-        "recall.current",
-        {"message_id": "assistant:turn-one"},
-        session_id="web:one",
-        turn_id="turn-one",
-    )
-    persisted = plugin.mobile_ui_query(
-        "recall.current",
-        {"message_id": "message:one"},
-        session_id="web:one",
-        turn_id=None,
-    )
-
-    assert active == _empty_mobile_recall()
-    assert persisted == _empty_mobile_recall()
-    assert not (tmp_path / "memory" / "akasha.db").exists()
-
-
-def test_feedback_marker_is_exported_before_user_message_persistence() -> None:
-    # Import after passive-turn modules settle their lifecycle import cycle.
-    from agent.lifecycle.phases import default_after_reasoning_modules
-
-    plugin = AkashaPlugin()
-    modules = default_after_reasoning_modules(
-        EventBus(),
-        cast(Any, SimpleNamespace()),
-        cast(Any, plugin.after_reasoning_modules()),
-    )
-    slots = [module.slot for module in modules]
-
-    assert slots.index("akasha.feedback.persist") < slots.index(
-        "after_reasoning.persist_user"
-    )
-
-
-@pytest.mark.asyncio
-async def test_feedback_persistence_is_inert_when_akasha_is_not_active() -> None:
-    frame = SimpleNamespace(slots={"existing": "value"})
-    owner = SimpleNamespace(context=SimpleNamespace(memory_engine=None))
-
-    result = await AkashaFeedbackPersistModule(owner).run(frame)
-
-    assert result is frame
-    assert frame.slots == {"existing": "value"}
 
 
 @pytest.mark.asyncio
@@ -248,12 +184,10 @@ async def test_feedback_tools_compose_correction_from_two_markers(
             "applies_after": "current_turn_commit",
         }
 
-        # 3. Export both independent markers onto the current user Message.
-        frame = SimpleNamespace(slots={})
-        owner = SimpleNamespace(context=SimpleNamespace(memory_engine=engine))
-        await AkashaFeedbackPersistModule(owner).run(frame)
-        forgotten_marker = frame.slots["persist:user:akasha_forget"]
-        remembered_marker = frame.slots["persist:user:akasha_reinforce"]
+        # 3. Export both independent markers through the narrow Memory port.
+        metadata = engine.take_turn_user_metadata("turn:feedback")
+        forgotten_marker = cast(dict[str, object], metadata["akasha_forget"])
+        remembered_marker = cast(dict[str, object], metadata["akasha_reinforce"])
         assert forgotten_marker["action"] == "forget"
         assert forgotten_marker["target_message_ids"] == ["message:1"]
         assert forgotten_marker["target_turn_ids"] == ["message:0::message:1"]
@@ -264,6 +198,39 @@ async def test_feedback_tools_compose_correction_from_two_markers(
     finally:
         running_turn_id.reset(token)
         _close_engine(engine)
+
+
+@pytest.mark.asyncio
+async def test_uncommitted_feedback_does_not_survive_engine_restart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _create_sessions(tmp_path / "sessions.db")
+    monkeypatch.setattr("plugins.akasha.engine.Embedder", _Embedder)
+    engine = _engine(tmp_path)
+    spec = next(
+        item for item in engine.tool_profile().tools if item.name == "remember_memory"
+    )
+    assert spec.tool_class is not None
+    tool = spec.tool_class(engine, spec)
+    token = running_turn_id.set("turn:crashed")
+    try:
+        result = json.loads(
+            await tool.execute(
+                message_ids=["current_user_message"],
+                reason="staged but not committed",
+            )
+        )
+    finally:
+        running_turn_id.reset(token)
+    assert result["status"] == "staged"
+    _close_engine(engine)
+
+    restarted = _engine(tmp_path)
+    try:
+        assert restarted.take_turn_user_metadata("turn:crashed") == {}
+    finally:
+        _close_engine(restarted)
 
 
 @pytest.mark.asyncio
@@ -357,17 +324,12 @@ async def test_feedback_markers_change_future_recall_and_replay_identically(
             ]
             == "staged"
         )
-        frame = SimpleNamespace(slots={})
-        owner = SimpleNamespace(context=SimpleNamespace(memory_engine=engine))
-        await AkashaFeedbackPersistModule(owner).run(frame)
+        user_extra = engine.take_turn_user_metadata("turn:correction")
     finally:
         running_turn_id.reset(token)
 
     # 2. Persist those marker fields on the next canonical user Message.
     correction_time = started + timedelta(minutes=5)
-    user_extra = {
-        key.removeprefix("persist:user:"): value for key, value in frame.slots.items()
-    }
     _append_turn(
         sessions,
         sequence=2,
@@ -632,16 +594,10 @@ async def test_online_turn_recall_and_replay_share_one_state(
     # 3. Explicit recall is read-only and cannot replace context learning.
     next_time = started + timedelta(minutes=5)
     active_turn_id = "turn:alpha-follow"
-    plugin = AkashaPlugin()
-    plugin.context = PluginContext(
-        event_bus=cast(Any, None),
-        tool_registry=None,
-        plugin_id="akasha",
-        plugin_dir=Path("plugins/akasha"),
-        data_dir=builtin_plugin_data_dir("akasha", tmp_path),
-        kv_store=PluginKVStore(tmp_path / ".kv.json"),
-        workspace=tmp_path,
-        memory_engine=engine,
+    mobile_query = _AkashaMobileQuery(
+        MemoryTurnRuntime(engine),
+        memory_root=tmp_path / "memory",
+        data_root=builtin_plugin_data_dir("akasha", tmp_path),
     )
     wait_started = threading.Event()
     wait_for_active_recall = engine.wait_for_active_recall
@@ -666,7 +622,7 @@ async def test_online_turn_recall_and_replay_share_one_state(
     )
     active_query = asyncio.create_task(
         asyncio.to_thread(
-            plugin.mobile_ui_query,
+            mobile_query,
             "recall.current",
             {"message_id": f"assistant:{active_turn_id}"},
             session_id="test:one",
@@ -798,7 +754,12 @@ async def test_online_turn_recall_and_replay_share_one_state(
     # 5. Inspector reconstructs the exact prior-only lanes without writes.
     _write_inspector_config(tmp_path)
     before_memory = logical_state_sha256(tmp_path / "memory" / "akasha.db")
-    reader = AkashaInspectorReader(tmp_path)
+    reader = AkashaInspectorReader(
+        memory_root=tmp_path / "memory",
+        config=load_akasha_config(
+            builtin_plugin_data_dir("akasha", tmp_path) / "config.local.toml"
+        ),
+    )
     overview = reader.get_overview()
     rows, total = reader.list_turns(q="alpha follow")
     detail = reader.get_turn(str(rows[0]["query_id"]))
@@ -819,8 +780,16 @@ async def test_online_turn_recall_and_replay_share_one_state(
 
     # 6. The desktop API exposes the same state through read-only routes.
     app = FastAPI()
-    app.state.memory_admin = engine
-    register_dashboard(app, Path("plugins/akasha"), tmp_path)
+    register_dashboard(
+        app,
+        DashboardContext(
+            plugin_id="akasha",
+            plugin_dir=Path("plugins/akasha"),
+            data_root=builtin_plugin_data_dir("akasha", tmp_path),
+            validation=False,
+            _workspace_roots=(("memory", tmp_path / "memory"),),
+        ),
+    )
     with TestClient(app) as client:
         response = client.get(
             "/api/dashboard/akasha-inspector/turns",
@@ -835,19 +804,19 @@ async def test_online_turn_recall_and_replay_share_one_state(
         assert api_detail.json()["left_count"] == 1
 
     # 7. Mobile projections resolve the same committed assistant message.
-    mobile = plugin.mobile_ui_query(
+    mobile = mobile_query(
         "recall.current",
         {"message_id": "message:3"},
         session_id="test:one",
         turn_id=None,
     )
-    recent = plugin.mobile_ui_query(
+    recent = mobile_query(
         "inspector.recent",
         {},
         session_id=None,
         turn_id=None,
     )
-    mobile_detail = plugin.mobile_ui_query(
+    mobile_detail = mobile_query(
         "inspector.detail",
         {"query_id": str(rows[0]["query_id"])},
         session_id=None,
@@ -2907,7 +2876,12 @@ def _write_inspector_config(workspace: Path) -> None:
 def test_inspector_overview_is_empty_before_first_akasha_commit(tmp_path: Path) -> None:
     _write_inspector_config(tmp_path)
 
-    assert AkashaInspectorReader(tmp_path).get_overview() == {
+    assert AkashaInspectorReader(
+        memory_root=tmp_path / "memory",
+        config=load_akasha_config(
+            builtin_plugin_data_dir("akasha", tmp_path) / "config.local.toml"
+        ),
+    ).get_overview() == {
         "available": True,
         "total": 0,
         "latest_at": None,

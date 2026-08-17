@@ -9,13 +9,13 @@ import threading
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import cast
 from zoneinfo import ZoneInfo
 
 import numpy as np
 
-from .config import AkashaConfig, resolve_workspace_path
+from .config import AkashaConfig
 from .infrastructure.sparse_index.schema import (
     INDEX_VERSION,
     TOOL_CHAIN_PROJECTION_VERSION,
@@ -53,9 +53,31 @@ def resolve_inspector_paths(
 
     config.validate()
     return InspectorPaths(
-        memory=resolve_workspace_path(memory_root, config.db_path),
-        index=resolve_workspace_path(memory_root, config.index_path),
+        memory=_resolve_declared_memory_path(memory_root, config.db_path),
+        index=_resolve_declared_memory_path(memory_root, config.index_path),
     )
+
+
+def _resolve_declared_memory_path(memory_root: Path, configured: str) -> Path:
+    """Resolve legacy config syntax without escaping the declared memory root."""
+
+    # 1. Accept the historical ``memory/file`` form and direct root filenames.
+    parts = PurePosixPath(configured).parts
+    if not parts or PurePosixPath(configured).is_absolute():
+        raise ValueError(f"Akasha sidecar path 无效: {configured}")
+    if parts[0] == memory_root.name:
+        parts = parts[1:]
+    elif len(parts) != 1:
+        raise ValueError(f"Akasha sidecar 必须位于 memory root: {configured}")
+    if not parts:
+        raise ValueError(f"Akasha sidecar path 无效: {configured}")
+
+    # 2. Resolve symlinks and traversal against the capability root.
+    root = memory_root.resolve(strict=False)
+    path = root.joinpath(*parts).resolve(strict=False)
+    if not path.is_relative_to(root):
+        raise ValueError(f"Akasha sidecar 必须位于 memory root: {configured}")
+    return path
 
 
 class AkashaInspectorReader:
@@ -65,11 +87,9 @@ class AkashaInspectorReader:
         self,
         *,
         memory_root: Path,
-        data_root: Path,
         config: AkashaConfig,
     ) -> None:
         self.memory_root = memory_root.resolve(strict=False)
-        self.data_root = data_root.resolve(strict=False)
         self.config = config
         self.paths = resolve_inspector_paths(
             memory_root=self.memory_root,
@@ -89,8 +109,7 @@ class AkashaInspectorReader:
                 "earliest_at": None,
             }
         with closing(self._connect()) as connection:
-            row = connection.execute(
-                """
+            row = connection.execute("""
                 SELECT
                     COUNT(*) AS total,
                     MAX(turn.started_at) AS latest_at,
@@ -98,8 +117,7 @@ class AkashaInspectorReader:
                 FROM memory_events AS event
                 JOIN turn_nodes AS turn
                   ON turn.node_id = event.current_turn_node_id
-                """
-            ).fetchone()
+                """).fetchone()
         return {
             "available": True,
             "total": int(row["total"]),
@@ -203,9 +221,7 @@ class AkashaInspectorReader:
             ).fetchall()
         items = [dict(row) for row in rows]
         for item in items:
-            item["recall_capture_available"] = bool(
-                item["recall_capture_available"]
-            )
+            item["recall_capture_available"] = bool(item["recall_capture_available"])
         return items, total
 
     def get_turn(self, query_id: str) -> dict[str, object] | None:
@@ -220,17 +236,13 @@ class AkashaInspectorReader:
             seeds = self._load_seeds(connection, node_id)
             activations = self._load_activations(connection, node_id)
             completions = self._load_completions(connection, node_id)
-        tool_left, tool_right = _tool_recall_lanes(
-            run.pop("tool_chain_json")
-        )
+        tool_left, tool_right = _tool_recall_lanes(run.pop("tool_chain_json"))
 
         # 2. Reconstruct the host-visible lanes from frozen prior turns.
         dense = self._dense_items(node_id)
         dense_ids = {str(item["query_id"]) for item in dense}
         right = [
-            item
-            for item in completions
-            if str(item["query_id"]) not in dense_ids
+            item for item in completions if str(item["query_id"]) not in dense_ids
         ][: self.config.context_recall_limit]
         dense = _sort_by_time(dense)
         right = _sort_by_time(right)
@@ -306,17 +318,23 @@ class AkashaInspectorReader:
     def _connect(self) -> sqlite3.Connection:
         """Open both sidecars read-only for one coherent inspection query."""
 
+        # 1. Open the learned-state sidecar before attaching the sparse projection.
         connection = sqlite3.connect(
             f"file:{self.paths.memory}?mode=ro",
             uri=True,
         )
-        connection.row_factory = sqlite3.Row
-        _ = connection.execute(
-            "ATTACH DATABASE ? AS sparse",
-            (f"file:{self.paths.index}?mode=ro",),
-        )
-        self._validate_sidecar_schema(connection)
-        _ = connection.execute("PRAGMA query_only = ON")
+        try:
+            # 2. Validate the exact projection before returning an owned handle.
+            connection.row_factory = sqlite3.Row
+            _ = connection.execute(
+                "ATTACH DATABASE ? AS sparse",
+                (f"file:{self.paths.index}?mode=ro",),
+            )
+            self._validate_sidecar_schema(connection)
+            _ = connection.execute("PRAGMA query_only = ON")
+        except BaseException:
+            connection.close()
+            raise
         return connection
 
     @staticmethod
@@ -328,14 +346,10 @@ class AkashaInspectorReader:
         ).fetchone()
         actual_version = None if row is None else str(row[0])
         if actual_version != INDEX_VERSION:
-            raise ValueError(
-                f"unsupported sparse index version: {actual_version}"
-            )
+            raise ValueError(f"unsupported sparse index version: {actual_version}")
         columns = {
             str(item[1])
-            for item in connection.execute(
-                "PRAGMA sparse.table_info(sparse_turns)"
-            )
+            for item in connection.execute("PRAGMA sparse.table_info(sparse_turns)")
         }
         if "assistant_tool_chain_json" not in columns:
             raise ValueError(
@@ -438,9 +452,7 @@ class AkashaInspectorReader:
         item["activation_capture_available"] = bool(
             item["activation_capture_available"]
         )
-        item["recall_capture_available"] = bool(
-            item["recall_capture_available"]
-        )
+        item["recall_capture_available"] = bool(item["recall_capture_available"])
         return item
 
     @staticmethod
@@ -473,9 +485,7 @@ class AkashaInspectorReader:
         return [
             {
                 **dict(row),
-                "assistant_preview": _assistant_preview(
-                    str(row["assistant_text"])
-                ),
+                "assistant_preview": _assistant_preview(str(row["assistant_text"])),
                 "channels": _json_list(
                     row["channels_json"],
                     "event_seeds.channels_json",
@@ -519,9 +529,7 @@ class AkashaInspectorReader:
         return [
             {
                 **dict(row),
-                "assistant_preview": _assistant_preview(
-                    str(row["assistant_text"])
-                ),
+                "assistant_preview": _assistant_preview(str(row["assistant_text"])),
                 "graph_only": bool(row["is_graph_only"]),
                 "dominant_path": _json_list(
                     row["dominant_path_json"],
@@ -568,9 +576,7 @@ class AkashaInspectorReader:
         return [
             {
                 **dict(row),
-                "assistant_preview": _assistant_preview(
-                    str(row["assistant_text"])
-                ),
+                "assistant_preview": _assistant_preview(str(row["assistant_text"])),
                 "sources": _json_list(
                     row["sources_json"],
                     "recall_items.sources_json",
@@ -598,19 +604,15 @@ class AkashaInspectorReader:
         user_scores = snapshot.user[:query_node_id] @ query
         assistant_scores = snapshot.assistant[:query_node_id] @ query
         user_scores[~snapshot.user_present[:query_node_id]] = -np.inf
-        assistant_scores[
-            ~snapshot.assistant_present[:query_node_id]
-        ] = -np.inf
+        assistant_scores[~snapshot.assistant_present[:query_node_id]] = -np.inf
         scores = np.maximum(user_scores, assistant_scores)
 
         # 2. Apply the engine's score-desc, node-id-asc tie break.
         nodes = np.arange(query_node_id)
         ranked = np.lexsort((nodes, -scores))
-        selected = [
-            int(node)
-            for node in ranked
-            if math.isfinite(float(scores[node]))
-        ][:5]
+        selected = [int(node) for node in ranked if math.isfinite(float(scores[node]))][
+            :5
+        ]
         return [
             {
                 **snapshot.turns[node],
@@ -641,8 +643,7 @@ class AkashaInspectorReader:
 
         # 1. Read stable graph order and both indexed message vectors.
         with closing(self._connect()) as connection:
-            rows = connection.execute(
-                """
+            rows = connection.execute("""
                 SELECT
                     turn.node_id,
                     turn.turn_id AS query_id,
@@ -666,8 +667,7 @@ class AkashaInspectorReader:
                   ON assistant_dense.turn_id = turn.turn_id
                  AND assistant_dense.field = 'assistant'
                 ORDER BY turn.node_id
-                """
-            ).fetchall()
+                """).fetchall()
         _require_contiguous_nodes(rows)
         dimension = _dense_dimension(rows)
 
@@ -693,9 +693,7 @@ class AkashaInspectorReader:
                 "ts": row["ts"],
                 "user_text": row["user_text"],
                 "assistant_text": row["assistant_text"],
-                "assistant_preview": _assistant_preview(
-                    str(row["assistant_text"])
-                ),
+                "assistant_preview": _assistant_preview(str(row["assistant_text"])),
             }
             for row in rows
         )
@@ -718,12 +716,8 @@ def mobile_summary(item: dict[str, object]) -> dict[str, object]:
         "query_preview": _clip(str(item["query_text"]), 180),
         "ts": item["ts"],
         "seed_count": item["seed_count"],
-        "activation_capture_available": item[
-            "activation_capture_available"
-        ],
-        "recall_capture_available": item[
-            "recall_capture_available"
-        ],
+        "activation_capture_available": item["activation_capture_available"],
+        "recall_capture_available": item["recall_capture_available"],
         "activation_count": item["activation_count"],
         "left_count": item["left_count"],
         "right_count": item["right_count"],
@@ -947,8 +941,4 @@ def _render_lane(
 
 def _parse_time(value: str) -> datetime:
     parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    return (
-        parsed.replace(tzinfo=_LOCAL_TZ)
-        if parsed.tzinfo is None
-        else parsed
-    )
+    return parsed.replace(tzinfo=_LOCAL_TZ) if parsed.tzinfo is None else parsed

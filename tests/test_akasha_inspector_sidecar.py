@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 
 import pytest
@@ -18,8 +19,7 @@ from plugins.akasha.inspector import AkashaInspectorReader
 
 def _create_source(path: Path, tool_chain: str | None) -> None:
     connection = sqlite3.connect(path)
-    connection.executescript(
-        """
+    connection.executescript("""
         CREATE TABLE sessions (
             key TEXT PRIMARY KEY,
             created_at TEXT NOT NULL,
@@ -48,8 +48,7 @@ def _create_source(path: Path, tool_chain: str | None) -> None:
             updated_at TEXT NOT NULL,
             PRIMARY KEY(message_id, model)
         );
-        """
-    )
+        """)
     connection.execute(
         "INSERT INTO sessions VALUES (?, ?, ?, 0, NULL)",
         (
@@ -100,7 +99,6 @@ def _reader(tmp_path: Path, index: Path) -> AkashaInspectorReader:
     sqlite3.connect(memory).close()
     return AkashaInspectorReader(
         memory_root=tmp_path,
-        data_root=tmp_path / "plugin-data",
         config=AkashaConfig(db_path="akasha.db", index_path=index.name),
     )
 
@@ -108,18 +106,13 @@ def _reader(tmp_path: Path, index: Path) -> AkashaInspectorReader:
 def test_sparse_projection_preserves_tool_chain_without_sessions_attach(
     tmp_path: Path,
 ) -> None:
-    chain = json.dumps(
-        [{"calls": [{"name": "recall_memory", "status": "success"}]}]
-    )
+    chain = json.dumps([{"calls": [{"name": "recall_memory", "status": "success"}]}])
     index = _build_source_sidecar(tmp_path, chain)
     (tmp_path / "sessions.db").unlink()
     reader = _reader(tmp_path, index)
 
-    with reader._connect() as connection:  # noqa: SLF001
-        databases = {
-            str(row[1])
-            for row in connection.execute("PRAGMA database_list")
-        }
+    with closing(reader._connect()) as connection:  # noqa: SLF001
+        databases = {str(row[1]) for row in connection.execute("PRAGMA database_list")}
         projected = connection.execute(
             "SELECT assistant_tool_chain_json FROM sparse.sparse_turns"
         ).fetchone()[0]
@@ -150,14 +143,27 @@ def test_old_sparse_schema_fails_loud_with_rebuild_instruction(
 ) -> None:
     index = tmp_path / "index.db"
     connection = sqlite3.connect(index)
-    connection.executescript(SCHEMA.replace("    assistant_tool_chain_json TEXT,\n", ""))
-    connection.execute(
-        "INSERT INTO metadata(key, value) VALUES ('index_version', '9')"
+    connection.executescript(
+        SCHEMA.replace("    assistant_tool_chain_json TEXT,\n", "")
     )
+    connection.execute("INSERT INTO metadata(key, value) VALUES ('index_version', '9')")
     connection.commit()
     connection.close()
     reader = _reader(tmp_path, index)
 
     with pytest.raises(ValueError, match="explicit rebuild is required"):
-        with reader._connect():  # noqa: SLF001
+        with closing(reader._connect()):  # noqa: SLF001
             pass
+
+
+def test_inspector_rejects_sidecars_outside_declared_memory_root(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="必须位于 memory root"):
+        AkashaInspectorReader(
+            memory_root=tmp_path / "memory",
+            config=AkashaConfig(
+                db_path="../sessions.db",
+                index_path="memory/akasha-v2-index.db",
+            ),
+        )

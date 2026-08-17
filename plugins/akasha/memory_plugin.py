@@ -1,4 +1,4 @@
-"""Akasic Agent MemoryPlugin factory for Akasha V2."""
+"""Akashic Agent memory engine factory for Akasha."""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ from .engine import AkashaMemoryEngine
 
 
 class MemoryPlugin:
-    """Build the Akasha V2 runtime with host-owned infrastructure."""
+    """Build the Akasha runtime with host-owned infrastructure."""
 
     plugin_id = "akasha"
 

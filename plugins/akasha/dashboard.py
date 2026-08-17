@@ -1,34 +1,26 @@
-"""Expose the read-only Akasha V2 Inspector to the desktop dashboard."""
+"""Expose the read-only Akasha Inspector to the v3 dashboard."""
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query
+from agent.plugin_composition import DashboardContext
 
+from .config import load_akasha_config
 from .inspector import AkashaInspectorReader
-
-
-def plugin_enabled(app: FastAPI) -> bool:
-    """Mount the Inspector only while Akasha owns the memory runtime."""
-
-    memory_admin = getattr(app.state, "memory_admin", None)
-    describe = getattr(memory_admin, "describe", None)
-    return bool(
-        callable(describe)
-        and str(getattr(describe(), "name", "")) == "akasha"
-    )
 
 
 def register(
     app: FastAPI,
-    _plugin_dir: Path,
-    workspace: Path,
+    context: DashboardContext,
 ) -> None:
     """Register read-only retrieval-inspection routes."""
 
-    reader = AkashaInspectorReader(workspace)
+    reader = AkashaInspectorReader(
+        memory_root=context.workspace_root("memory"),
+        config=load_akasha_config(context.data_root / "config.local.toml"),
+    )
 
     @app.get("/api/dashboard/akasha-inspector/overview")
     def get_overview() -> dict[str, object]:

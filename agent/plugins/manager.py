@@ -29,6 +29,7 @@ from agent.plugin_composition import (
     MANAGED_PROCESSES,
     MCP_SERVERS,
     MEMORY_RUNTIME,
+    MEMORY_TURN_RUNTIME,
     PROACTIVE_COMPONENTS,
     SESSION_READ,
     BACKGROUND_JOBS,
@@ -38,6 +39,7 @@ from agent.plugin_composition import (
     CredentialRef,
     FiberState,
     MemoryRuntimeInfo,
+    MemoryTurnRuntime,
     PluginChannels,
     PluginUiSlots,
     PluginCommands,
@@ -48,6 +50,7 @@ from agent.plugin_composition import (
     resolve_mobile_ui_asset,
     ServiceView,
 )
+from core.memory.plugin import MemoryTurnRuntimeApi
 from agent.plugin_composition.channels import (
     ChannelRegistrySnapshot,
     ProviderClientFactory,
@@ -6196,6 +6199,24 @@ class PluginManager:
                 _ = await root.context.provide(
                     MEMORY_RUNTIME,
                     memory_runtime,
+                )
+            if (
+                self._memory_engine is not None
+                and isinstance(self._memory_engine, MemoryTurnRuntimeApi)
+                and any(
+                    MEMORY_TURN_RUNTIME
+                    in cast(ComposablePlugin, item.instance).inject
+                    for item in ordered
+                )
+            ):
+                memory_turn_runtime = (
+                    MemoryTurnRuntime(self._memory_engine)
+                    if candidate_owner is None
+                    else MemoryTurnRuntime.candidate_validation()
+                )
+                _ = await root.context.provide(
+                    MEMORY_TURN_RUNTIME,
+                    memory_turn_runtime,
                 )
             if candidate_owner is None:
                 for item in ordered:

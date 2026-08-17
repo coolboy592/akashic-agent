@@ -51,7 +51,9 @@ from agent.plugin_composition.model import (
 )
 from agent.plugin_composition.runtime_services import (
     MEMORY_RUNTIME,
+    MEMORY_TURN_RUNTIME,
     MemoryRuntimeInfo,
+    MemoryTurnRuntime,
 )
 from agent.plugin_composition.session_read import (
     SESSION_READ,
@@ -196,11 +198,13 @@ __all__ = [
     "InboundState",
     "JsonValue",
     "MEMORY_RUNTIME",
+    "MEMORY_TURN_RUNTIME",
     "MANAGED_PROCESSES",
     "MCP_SERVERS",
     "PROACTIVE_COMPONENTS",
     "BACKGROUND_JOBS",
     "MemoryRuntimeInfo",
+    "MemoryTurnRuntime",
     "EndpointEnv",
     "McpServerDefinition",
     "ManagedProcessDefinition",
