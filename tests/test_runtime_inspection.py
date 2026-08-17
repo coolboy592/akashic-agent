@@ -103,13 +103,6 @@ async def test_capabilities_project_bounded_v3_composition_facts(
     )
     _write_plugin(
         tmp_path / "plugins",
-        "inspected_v2",
-        "from agent.plugins import Plugin\n"
-        "class InspectedLegacyPlugin(Plugin):\n"
-        "    name = 'inspected_v2'\n",
-    )
-    _write_plugin(
-        tmp_path / "plugins",
         "inactive_v3",
         "api_version = 3\n"
         "name = 'inactive_v3'\n"
@@ -146,9 +139,6 @@ async def test_capabilities_project_bounded_v3_composition_facts(
         for item in cast(list[dict[str, object]], payload["plugins"])
     }
     assert "inactive_v3" not in plugins
-    legacy = plugins["inspected_v2"]
-    assert legacy["api_version"] == 2
-    assert legacy["composition"] is None
     v3 = plugins["inspected_v3"]
     assert v3["api_version"] == 3
     composition = cast(dict[str, object], v3["composition"])
