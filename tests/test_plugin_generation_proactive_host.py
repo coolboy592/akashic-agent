@@ -164,6 +164,7 @@ def _fixture(handler: object):
         },
         proactive_component_catalog=catalog,
         background_job_catalog=None,
+        private_proactive_catalog=None,
     )
     store = _Store()
     target_lease = RuntimeSnapshotLease(store, snapshot)
