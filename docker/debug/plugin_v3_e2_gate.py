@@ -15,6 +15,7 @@ import json
 import os
 import re
 import shlex
+import signal
 import shutil
 import subprocess
 import sys
@@ -31,8 +32,19 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from agent.plugins.artifacts import ArtifactPointer, read_pointers, write_pointers  # noqa: E402
+from agent.plugins.artifacts import (  # noqa: E402
+    ArtifactPointer,
+    read_pointers,
+    resolve_pointer,
+    write_pointers,
+)
 from agent.plugins.manager import PluginManager  # noqa: E402
+from agent.plugins.generation_activity_host import ActivityHost  # noqa: E402
+from agent.plugins.generation_job_host import BackgroundJobActivityAdapter  # noqa: E402
+from agent.plugins.generation_private_proactive_host import (  # noqa: E402
+    PrivateProactiveHost,
+)
+from agent.plugins.generation_proactive_host import ProactiveActivityAdapter  # noqa: E402
 from agent.plugins.manifest import write_plugin_manifest  # noqa: E402
 from agent.plugins.snapshot import (  # noqa: E402
     bind_runtime_snapshot,
@@ -86,7 +98,6 @@ FORMAL_PORTS = {"calendar-mcp": 18000, "fitbit-mcp": 18765}
 REQUIRED_IMPORTS = {
     "calendar-mcp": (
         "mcp",
-        "email_validator",
         "fastapi",
         "uvicorn",
         "dotenv",
@@ -159,6 +170,8 @@ class RuntimeEvidence:
     formal_data_before: str
     formal_data_after: str
     cleanup: dict[str, object]
+    stable_pointer: str
+    latest_pointer: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -333,12 +346,10 @@ def _scenario_catalog_sha256() -> str:
 def _runtime_interpreter(path: Path) -> Path:
     """Validate one supplied interpreter without mutating its environment."""
 
-    candidate = path.expanduser()
-    if not candidate.is_absolute():
-        candidate = Path.cwd() / candidate
-    if not candidate.is_file() or not os.access(candidate, os.X_OK):
-        raise GateBlocked(f"runtime Python 不可执行: {candidate}")
-    return candidate
+    resolved = path.expanduser().resolve(strict=True)
+    if not resolved.is_file() or not os.access(resolved, os.X_OK):
+        raise GateBlocked(f"runtime Python 不可执行: {resolved}")
+    return resolved
 
 
 def _check_imports(runtime_python: Path, plugin_ids: tuple[str, ...]) -> None:
@@ -515,6 +526,112 @@ def _prepare_external_candidates(
     entries = {f"{INSTALLED_NAMES[item]}@github": True for item in MCP_PLUGIN_IDS}
     _ = write_plugin_manifest(entries, plugins_home=cache_root.parent)
     return bases
+
+
+def _assert_exact_pointer_pair(
+    source: Path,
+    plugin_base: Path,
+    *,
+    context: str,
+    require_converged: bool = False,
+) -> tuple[str, str]:
+    """Verify both durable pointers resolve to artifacts of the locked source."""
+
+    # 1. Read the Manager-owned pointer state; never infer a candidate from a directory name.
+    source_manifest = load_static_plugin_manifest(source)
+    pointers = read_pointers(plugin_base)
+    if pointers is None:
+        raise RuntimeError(f"{context} 缺少 artifact pointer: {plugin_base}")
+    if pointers.stable.path is None or pointers.latest.path is None:
+        raise RuntimeError(f"{context} stable/latest pointer 不能为空: {plugin_base}")
+    if require_converged and pointers.stable != pointers.latest:
+        raise RuntimeError(
+            f"{context} stable/latest pointer 未收敛: "
+            f"stable={pointers.stable.path} latest={pointers.latest.path}"
+        )
+
+    # 2. Resolve through the canonical artifact validator and compare static identity.
+    for selector, pointer in (
+        ("stable", pointers.stable),
+        ("latest", pointers.latest),
+    ):
+        artifact = resolve_pointer(plugin_base, pointer)
+        if artifact is None:
+            raise RuntimeError(f"{context} {selector} pointer 解析为空")
+        artifact_manifest = load_static_plugin_manifest(artifact)
+        if artifact_manifest.identity_digest != source_manifest.identity_digest:
+            raise RuntimeError(
+                f"{context} {selector} artifact manifest identity 漂移: "
+                f"expected={source_manifest.identity_digest} "
+                f"actual={artifact_manifest.identity_digest}"
+            )
+    return pointers.stable.path, pointers.latest.path
+
+
+def _rebuild_exact_latest_candidate(
+    source: Path,
+    plugin_base: Path,
+    runtime_stage: Path,
+) -> tuple[str, str]:
+    """Rebuild Steam's disposable latest artifact after a discarded probe."""
+
+    # 1. Preserve the exact stable artifact and reject a missing or drifted base.
+    manifest = load_static_plugin_manifest(source)
+    pointers = read_pointers(plugin_base)
+    if pointers is None or pointers.stable.path is None:
+        raise RuntimeError(f"重建 latest 前缺少 stable pointer: {plugin_base}")
+    stable = resolve_pointer(plugin_base, pointers.stable)
+    if stable is None:
+        raise RuntimeError(f"重建 latest 前 stable pointer 解析为空: {plugin_base}")
+    stable_manifest = load_static_plugin_manifest(stable)
+    if stable_manifest.identity_digest != manifest.identity_digest:
+        raise RuntimeError(f"重建 latest 前 stable artifact identity 漂移: {plugin_base}")
+
+    # 2. Materialize a fresh exact candidate and bind every declared runtime.
+    candidate_pointer = ".artifacts/latest-e2-retry"
+    candidate = plugin_base / candidate_pointer
+    if candidate.exists() or candidate.is_symlink():
+        raise RuntimeError(f"重建 latest 目标已存在: {candidate}")
+    _copy_source_to_artifact(source, candidate)
+    for runtime in manifest.python:
+        runtime_root = (candidate / runtime.runtime_root).resolve(strict=False)
+        runtime_root.mkdir(parents=True, exist_ok=True)
+        link = runtime_root / ".venv"
+        if link.exists() or link.is_symlink():
+            raise RuntimeError(f"重建 latest runtime staging target 已存在: {link}")
+        link.symlink_to(runtime_stage, target_is_directory=True)
+    _ = write_pointers(
+        plugin_base,
+        stable=pointers.stable,
+        latest=ArtifactPointer(candidate_pointer),
+    )
+    stable_path, latest_path = _assert_exact_pointer_pair(
+        source,
+        plugin_base,
+        context="Steam in-process failure candidate 重建后",
+    )
+    if stable_path == latest_path:
+        raise RuntimeError("Steam in-process failure candidate 未形成独立 latest pointer")
+    return stable_path, latest_path
+
+
+def _write_formal_steam_config(workspace: Path) -> Path:
+    """Seed disposable formal Steam data before stable runtime admission."""
+
+    data_root = workspace / "plugin-data" / "steam-github"
+    data_root.mkdir(parents=True, exist_ok=True)
+    config = data_root / "steam_mcp_config.json"
+    config.write_text(
+        json.dumps(
+            {
+                "steam_api_key": "test-only",
+                "steam_id": "76561198000000000",
+                "snapshot_interval_seconds": 3600,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return config
 
 
 def _make_fake_sudo(bin_dir: Path) -> None:
@@ -705,10 +822,16 @@ async def _probe_candidate(
     manager: PluginManager,
     plugin_id: str,
     bases: Mapping[str, Path],
+    sources: Mapping[str, Path],
 ) -> RuntimeEvidence:
     """Publish one latest candidate, exercise recording routes, then discard it."""
 
     installed_id = f"{INSTALLED_NAMES[plugin_id]}@github"
+    _assert_exact_pointer_pair(
+        sources[plugin_id],
+        bases[plugin_id],
+        context=f"{plugin_id} normal probe 前",
+    )
     formal_data = manager._workspace / "plugin-data" / f"{INSTALLED_NAMES[plugin_id]}-github"
     before = _sha256_tree(formal_data)
     prepared = await manager.prepare_candidate(installed_id)
@@ -733,6 +856,8 @@ async def _probe_candidate(
         raise RuntimeError(
             f"{plugin_id} candidate tool allowlist 漂移: {server.tool_names} != {expected_tools}"
         )
+    candidate_state = runtime.mcp.state
+    candidate_tools = tuple(server.tool_names)
     route = server.route()
     probes: list[dict[str, object]] = []
     for tool_name in expected_tools:
@@ -773,9 +898,12 @@ async def _probe_candidate(
         raise RuntimeError(f"{plugin_id} candidate recording 改写 formal plugin-data")
 
     cleanup = await manager.drop_candidate(installed_id)
-    pointers = read_pointers(bases[plugin_id])
-    if pointers is None or pointers.stable != pointers.latest:
-        raise RuntimeError(f"{plugin_id} discard 后 stable/latest pointer 未收敛")
+    stable_pointer, latest_pointer = _assert_exact_pointer_pair(
+        sources[plugin_id],
+        bases[plugin_id],
+        context=f"{plugin_id} normal probe 后",
+        require_converged=True,
+    )
     retained_runtime = manager.composition_generation_host.get(generation_id)
     retained_failure = manager.composition_generation_host.failure(generation_id)
     if retained_runtime is not None or retained_failure is not None:
@@ -787,14 +915,16 @@ async def _probe_candidate(
         plugin_id=installed_id,
         generation_id=generation_id,
         mode=runtime.mode,
-        state=runtime.mcp.state,
-        mcp_tools=tuple(server.tool_names),
+        state=candidate_state,
+        mcp_tools=candidate_tools,
         probes=tuple(probes),
         process_endpoints=tuple(process_endpoints),
         candidate_workspace=str(candidate_workspace),
         formal_data_before=before,
         formal_data_after=after_probe,
         cleanup=cast(dict[str, object], cleanup),
+        stable_pointer=stable_pointer,
+        latest_pointer=latest_pointer,
     )
 
 
@@ -817,11 +947,23 @@ def _sha256_tree(path: Path) -> str:
 async def _run_in_process_failure(
     manager: PluginManager,
     bases: Mapping[str, Path],
+    sources: Mapping[str, Path],
+    runtime_stage: Path,
 ) -> dict[str, object]:
     """Inject one invariant failure and verify pointer/runtime rollback in-process."""
 
     plugin_id = "steam-mcp"
     installed_id = f"{INSTALLED_NAMES[plugin_id]}@github"
+    _rebuild_exact_latest_candidate(
+        sources[plugin_id],
+        bases[plugin_id],
+        runtime_stage,
+    )
+    _assert_exact_pointer_pair(
+        sources[plugin_id],
+        bases[plugin_id],
+        context="Steam in-process failure 前",
+    )
     prepared = await manager.prepare_candidate(installed_id)
     if prepared is None:
         raise GateBlocked("in-process failure probe 无法准备 Steam candidate")
@@ -851,16 +993,19 @@ async def _run_in_process_failure(
         raise RuntimeError("in-process failure 后 prepared generation 未清理")
     if manager.composition_generation_host.get(generation_id) is not None:
         raise RuntimeError("in-process failure 后 candidate runtime 未清理")
-    pointers = read_pointers(bases[plugin_id])
-    if pointers is None or pointers.stable != pointers.latest:
-        raise RuntimeError("in-process failure 后 artifact pointer 未恢复 stable")
+    stable_pointer, latest_pointer = _assert_exact_pointer_pair(
+        sources[plugin_id],
+        bases[plugin_id],
+        context="Steam in-process failure 后",
+        require_converged=True,
+    )
     return {
         "id": "in-process-failure",
         "status": "passed",
         "plugin_id": installed_id,
         "generation_id": generation_id,
         "error": observed,
-        "pointer": {"stable": pointers.stable.path, "latest": pointers.latest.path},
+        "pointer": {"stable": stable_pointer, "latest": latest_pointer},
     }
 
 
@@ -895,10 +1040,8 @@ async def _run_core_process_crash(
     workspace = crash_root / "workspace"
     evidence_path = crash_root / "child-evidence.json"
     providers.mkdir(parents=True)
-    crash_root.mkdir(exist_ok=True)
     for plugin_id in SHELL_PLUGIN_IDS:
         _copy_source_to_artifact(checkouts[plugin_id], providers / plugin_id)
-    crash_root.mkdir(parents=True, exist_ok=True)
     old_boot = f"e2-old-{os.getpid()}-{os.urandom(4).hex()}"
     new_boot = f"e2-new-{os.getpid()}-{os.urandom(4).hex()}"
     stage = sandbox / "runtime-python"
@@ -911,6 +1054,10 @@ async def _run_core_process_crash(
         import sys
         from pathlib import Path
         from agent.plugins.artifacts import ArtifactPointer, write_pointers
+        from agent.plugins.generation_activity_host import ActivityHost
+        from agent.plugins.generation_job_host import BackgroundJobActivityAdapter
+        from agent.plugins.generation_private_proactive_host import PrivateProactiveHost
+        from agent.plugins.generation_proactive_host import ProactiveActivityAdapter
         from agent.plugins.manager import PluginManager
         from agent.plugins.manifest import write_plugin_manifest
         from agent.plugins.static_manifest import load_static_plugin_manifest
@@ -923,11 +1070,9 @@ async def _run_core_process_crash(
             workspace = Path(sys.argv[4])
             stage = Path(sys.argv[5])
             evidence = Path(sys.argv[6])
-            manager = PluginManager([providers], event_bus=EventBus(), workspace=workspace, installed_cache_root=cache)
-            await manager.load_all()
-            data_root = workspace / "plugin-data" / "steam-github"
-            data_root.mkdir(parents=True, exist_ok=True)
-            (data_root / "steam_mcp_config.json").write_text(json.dumps({"steam_api_key": "test-only", "steam_id": "76561198000000000", "snapshot_interval_seconds": 3600}), encoding="utf-8")
+
+            # Stage the complete stable/latest pair before Core discovery.
+            cache.mkdir(parents=True, exist_ok=True)
             base = cache / "github" / "steam"
             stable = base / ".artifacts" / "stable"
             latest = base / ".artifacts" / "latest"
@@ -940,15 +1085,61 @@ async def _run_core_process_crash(
                     root = artifact / runtime.runtime_root
                     root.mkdir(parents=True, exist_ok=True)
                     (root / ".venv").symlink_to(stage, target_is_directory=True)
-            write_pointers(base, stable=ArtifactPointer(".artifacts/stable"), latest=ArtifactPointer(".artifacts/latest"))
+            write_pointers(
+                base,
+                stable=ArtifactPointer(".artifacts/stable"),
+                latest=ArtifactPointer(".artifacts/latest"),
+            )
             write_plugin_manifest({"steam@github": True}, plugins_home=cache.parent)
+            data_root = workspace / "plugin-data" / "steam-github"
+            data_root.mkdir(parents=True, exist_ok=True)
+            (data_root / "steam_mcp_config.json").write_text(
+                json.dumps(
+                    {
+                        "steam_api_key": "test-only",
+                        "steam_id": "76561198000000000",
+                        "snapshot_interval_seconds": 3600,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            event_bus = EventBus()
+            manager = PluginManager(
+                [providers],
+                event_bus=event_bus,
+                workspace=workspace,
+                installed_cache_root=cache,
+            )
+            manager.bind_activity_host(
+                ActivityHost(
+                    (
+                        ProactiveActivityAdapter(manager.composition_generation_host),
+                        PrivateProactiveHost(),
+                        BackgroundJobActivityAdapter(
+                            event_bus,
+                            manager.snapshot_store,
+                            workspace=str(workspace),
+                        ),
+                    )
+                )
+            )
+            await manager.load_all()
             candidate = await manager.prepare_candidate("steam@github")
             if candidate is None:
                 raise RuntimeError("child Core 未准备 Steam candidate")
             publication = await manager.publish_prepared("steam@github")
             if publication.get("publication_state") != "latest_ready":
                 raise RuntimeError(f"child Core candidate 未 latest_ready: {publication}")
-            evidence.write_text(json.dumps({"generation_id": candidate.generation_id, "tx_id": candidate.reload_tx_id}), encoding="utf-8")
+            evidence.write_text(
+                json.dumps(
+                    {
+                        "generation_id": candidate.generation_id,
+                        "tx_id": candidate.reload_tx_id,
+                    }
+                ),
+                encoding="utf-8",
+            )
             await asyncio.sleep(60)
 
         asyncio.run(main())
@@ -960,7 +1151,17 @@ async def _run_core_process_crash(
     child_env["PYTHONPATH"] = str(ROOT) + os.pathsep + child_env.get("PYTHONPATH", "")
     child_log = crash_root / "child.log"
     process = subprocess.Popen(
-        (str(runtime_python), "-c", child_code, str(steam_source), str(providers), str(cache_root), str(workspace), str(stage), str(evidence_path)),
+        (
+            str(runtime_python),
+            "-c",
+            child_code,
+            str(steam_source),
+            str(providers),
+            str(cache_root),
+            str(workspace),
+            str(stage),
+            str(evidence_path),
+        ),
         cwd=ROOT,
         env=child_env,
         stdout=child_log.open("w", encoding="utf-8"),
@@ -969,10 +1170,14 @@ async def _run_core_process_crash(
     )
     try:
         process.wait(timeout=30)
-    except subprocess.TimeoutExpired as error:
-        process.kill()
+    except subprocess.TimeoutExpired:
+        process.send_signal(signal.SIGKILL)
         _ = process.wait(timeout=5)
-        raise RuntimeError("Core crash child 未进入 SIGKILL probe 终点") from error
+        if process.returncode != -signal.SIGKILL:
+            log = child_log.read_text(encoding="utf-8", errors="replace")
+            raise RuntimeError(
+                f"Core crash child 未进入 SIGKILL probe 终点 {process.returncode}: {log[-2000:]}"
+            )
     if process.returncode != -9:
         log = child_log.read_text(encoding="utf-8", errors="replace")
         raise RuntimeError(f"Core crash child 非预期退出 {process.returncode}: {log[-2000:]}")
@@ -991,7 +1196,26 @@ async def _run_core_process_crash(
     try:
         os.environ["AKASHIC_BOOT_ID"] = new_boot
         os.environ["AKASHIC_SUPERVISED"] = "1"
-        manager = PluginManager([providers], event_bus=EventBus(), workspace=workspace, installed_cache_root=cache_root)
+        event_bus = EventBus()
+        manager = PluginManager(
+            [providers],
+            event_bus=event_bus,
+            workspace=workspace,
+            installed_cache_root=cache_root,
+        )
+        manager.bind_activity_host(
+            ActivityHost(
+                (
+                    ProactiveActivityAdapter(manager.composition_generation_host),
+                    PrivateProactiveHost(),
+                    BackgroundJobActivityAdapter(
+                        event_bus,
+                        manager.snapshot_store,
+                        workspace=str(workspace),
+                    ),
+                )
+            )
+        )
         await manager.load_all()
         pending = manager.reload_journal.pending_recovery()
         pointers = read_pointers(cache_root / "github" / "steam")
@@ -1015,7 +1239,11 @@ async def _run_core_process_crash(
     if stale_after_manager:
         from agent.background.boot_guardian import _cleanup_boot_processes
 
-        await asyncio.to_thread(_cleanup_boot_processes, boot_id=old_boot, gateway_group_id=None)
+        await asyncio.to_thread(
+            _cleanup_boot_processes,
+            boot_id=old_boot,
+            gateway_group_id=None,
+        )
         manual_cleanup = True
     stale_after_cleanup = _boot_process_ids(old_boot)
     pointer_ok = pointers is not None and pointers.stable == pointers.latest
@@ -1049,51 +1277,72 @@ async def _run_gate(
 ) -> dict[str, object]:
     """Run Shell, MCP candidate, and failure-cleanup checks in one Manager."""
 
-    # 1. Load only the three locked Shell providers as formal stable plugins.
+    # 1. Stage every installed stable/latest pointer before Manager discovery.
     workspace = sandbox / "workspace"
     cache_root = sandbox / "plugin-home" / "cache"
-    manager = PluginManager(
-        plugin_dirs=[sandbox / "providers"],
-        event_bus=EventBus(),
-        workspace=workspace,
-        installed_cache_root=cache_root,
-    )
     runtime_stage, runtime_python, runtime_requirements = _create_runtime_stage(
         bootstrap_python,
         sandbox,
         checkouts,
     )
-    bases: dict[str, Path] = {}
+    bases = _prepare_external_candidates(checkouts, cache_root, runtime_stage)
+    _write_formal_steam_config(workspace)
+
+    # 2. Load Shell and the staged MCP stable artifacts through the real Manager oracle.
+    event_bus = EventBus()
+    manager = PluginManager(
+        plugin_dirs=[sandbox / "providers"],
+        event_bus=event_bus,
+        workspace=workspace,
+        installed_cache_root=cache_root,
+    )
+    manager.bind_activity_host(
+        ActivityHost(
+            (
+                ProactiveActivityAdapter(manager.composition_generation_host),
+                PrivateProactiveHost(),
+                BackgroundJobActivityAdapter(
+                    event_bus,
+                    manager.snapshot_store,
+                    workspace=str(workspace),
+                ),
+            )
+        )
+    )
     root = None
-    shell_result: tuple[
-        tuple[str, ...], tuple[ScenarioEvidence, ...], list[dict[str, object]]
-    ] | None = None
+    shell_result: tuple[tuple[str, ...], tuple[ScenarioEvidence, ...], list[dict[str, object]]] | None = None
     runtime_evidence: list[RuntimeEvidence] = []
     in_process_failure: dict[str, object] | None = None
     core_crash: dict[str, object] | None = None
     try:
         await manager.load_all()
         shell_result = await _run_shell_scenarios(manager, sandbox)
-        bases = _prepare_external_candidates(checkouts, cache_root, runtime_stage)
         for plugin_id in MCP_PLUGIN_IDS:
-            runtime_evidence.append(await _probe_candidate(manager, plugin_id, bases))
-        in_process_failure = await _run_in_process_failure(manager, bases)
-        core_crash = await _run_core_process_crash(checkouts, sandbox, runtime_python)
-        root = (
-            manager.current_snapshot.composition_root
-            if manager.current_snapshot is not None
-            else None
+            runtime_evidence.append(
+                await _probe_candidate(manager, plugin_id, bases, checkouts)
+            )
+        in_process_failure = await _run_in_process_failure(
+            manager, bases, checkouts, runtime_stage
         )
+        core_crash = await _run_core_process_crash(
+            checkouts,
+            sandbox,
+            Path(sys.executable),
+        )
+        root = manager.current_snapshot.composition_root if manager.current_snapshot is not None else None
     finally:
         await manager.terminate_all()
 
     if shell_result is None or root is None:
         raise RuntimeError("E2 Gate 成功路径未保留稳定 Root 证据")
-    retained_failures: list[str] = []
-    for evidence in runtime_evidence:
-        failure = manager.composition_generation_host.failure(evidence.generation_id)
-        if failure is not None:
-            retained_failures.append(f"{failure.generation_id}:{failure.error}")
+    retained_failures = tuple(
+        f"{item.generation_id}:{item.error}"
+        for item in (
+            manager.composition_generation_host.failure(item.generation_id)
+            for item in (evidence for evidence in runtime_evidence)
+        )
+        if item is not None
+    )
     cleanup = CleanupEvidence(
         shell_generation_ids=tuple(
             generation.generation_id
@@ -1102,7 +1351,7 @@ async def _run_gate(
             )
             if generation is not None
         ),
-        retained_runtime_failures=tuple(retained_failures),
+        retained_runtime_failures=retained_failures,
         cleanup_failures=tuple(str(item) for item in manager.cleanup_failures),
         listeners=root.topology_view().listeners,
         effects=root.receipt().effects,
@@ -1148,7 +1397,7 @@ def main() -> int:
     checked_at = datetime.now(UTC).isoformat()
     core_status = _git_output(ROOT, "status", "--porcelain").splitlines()
     base_report: dict[str, object] = {
-        "status": "failed",
+        "status": "blocked",
         "gate_version": GATE_VERSION,
         "checked_at": checked_at,
         "core": {
@@ -1173,7 +1422,7 @@ def main() -> int:
         base_report["lock_sha256"] = _sha256(lock_path)
         locks = _load_lock(lock_path)
         base_report["lock_plugins"] = [asdict(item) for item in locks]
-        runtime_python = _runtime_interpreter(args.runtime_python)
+        bootstrap_python = _runtime_interpreter(args.runtime_python)
         with tempfile.TemporaryDirectory(prefix="akashic-plugin-v3-e2-") as raw:
             sandbox = Path(raw)
             providers = sandbox / "providers"
@@ -1181,27 +1430,35 @@ def main() -> int:
             checkouts: dict[str, Path] = {}
             evidences: list[PluginEvidence] = []
             for lock in locks:
-                checkout = (
-                    providers / lock.id
-                    if lock.id in SHELL_PLUGIN_IDS
-                    else sandbox / "sources" / lock.id
-                )
+                checkout = providers / lock.id if lock.id in SHELL_PLUGIN_IDS else sandbox / "sources" / lock.id
                 checkouts[lock.id] = checkout
                 evidences.append(_checkout_locked_plugin(lock, checkout))
             base_report["plugins"] = [asdict(item) for item in evidences]
-            base_report["runtime_python"] = str(runtime_python)
-            gate_result = asyncio.run(_run_gate(checkouts, sandbox, runtime_python))
+            base_report["runtime_python"] = str(bootstrap_python)
+            gate_result = asyncio.run(
+                _run_gate(checkouts, sandbox, bootstrap_python)
+            )
         base_report.update(gate_result)
         core_case = cast(dict[str, object], gate_result.get("core_process_crash", {}))
         if core_case.get("status") == "blocked":
             base_report["status"] = "blocked"
-            base_report["blockers"] = [str(core_case.get("reason") or "Core process crash recovery blocked")]
-            print(f"plugin v3 concentrated E2 gate blocked: {report_path}", file=sys.stderr)
+            base_report["blockers"] = [
+                str(core_case.get("reason") or "Core process crash recovery blocked")
+            ]
+            print(
+                f"plugin v3 concentrated E2 gate blocked: {report_path}",
+                file=sys.stderr,
+            )
             status = 2
         elif core_case.get("status") == "failed":
             base_report["status"] = "failed"
-            base_report["failures"] = [str(core_case.get("reason") or "Core process crash recovery failed")]
-            print(f"plugin v3 concentrated E2 gate failed: {report_path}", file=sys.stderr)
+            base_report["failures"] = [
+                str(core_case.get("reason") or "Core process crash recovery failed")
+            ]
+            print(
+                f"plugin v3 concentrated E2 gate failed: {report_path}",
+                file=sys.stderr,
+            )
             status = 1
         else:
             base_report["status"] = "passed"
@@ -1210,16 +1467,9 @@ def main() -> int:
     except GateBlocked as error:
         message = str(error) or type(error).__name__
         base_report["blockers"] = [message]
-        base_report["status"] = "blocked"
         print(f"plugin v3 concentrated E2 gate blocked: {message}", file=sys.stderr)
         status = 2
-    except (
-        OSError,
-        RuntimeError,
-        ValueError,
-        json.JSONDecodeError,
-        subprocess.CalledProcessError,
-    ) as error:
+    except (OSError, RuntimeError, ValueError, json.JSONDecodeError, subprocess.CalledProcessError) as error:
         message = str(error) or type(error).__name__
         base_report["failures"] = [message]
         print(f"plugin v3 concentrated E2 gate failed: {message}", file=sys.stderr)
