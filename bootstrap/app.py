@@ -1065,18 +1065,10 @@ class AppRuntime:
 
     async def _swap_plugin_endpoints(
         self,
-        plugin_id: str,
-        old_services: dict[str, dict[str, Any]],
-        new_services: dict[str, dict[str, Any]],
-        old_channels: tuple[Any, ...],
-        new_channels: tuple[Any, ...],
         old_commands: tuple[tuple[str, str], ...],
         new_commands: tuple[tuple[str, str], ...],
     ) -> None:
         assert self.channel_host is not None
-        del plugin_id
-        if old_services or new_services or old_channels or new_channels:
-            raise RuntimeError("v3 endpoint transaction 不接受 legacy endpoint")
         if old_commands != new_commands:
             await self.channel_host.swap_command_catalog(
                 old_commands,

@@ -24,7 +24,6 @@ from agent.plugin_composition import (
     CommandDescriptor,
     CommandRegistry,
     CommandResult,
-    CompositionError,
     CompositionRoot,
     PluginCommands,
     PluginRuntime,
@@ -48,12 +47,8 @@ from tests.provider_fakes import ProviderContextBudgetStub
 
 @pytest.fixture(autouse=True)
 def _clean_registry():
-    plugin_registry._handlers._handlers.clear()
-    plugin_registry._classes.clear()
     plugin_registry._instances.clear()
     yield
-    plugin_registry._handlers._handlers.clear()
-    plugin_registry._classes.clear()
     plugin_registry._instances.clear()
 
 
@@ -386,11 +381,6 @@ async def test_manager_keeps_candidate_commands_private_until_promotion(
     endpoint_calls: list[tuple[tuple[str, str], ...]] = []
 
     async def endpoint_switcher(
-        _plugin_id,
-        _old_services,
-        _new_services,
-        _old_channels,
-        _new_channels,
         _old_commands,
         new_commands,
     ) -> None:
@@ -466,11 +456,6 @@ async def test_command_catalog_failure_restores_old_stable_and_generation(
     published: list[tuple[tuple[str, str], ...]] = []
 
     async def endpoint_switcher(
-        _plugin_id,
-        _old_services,
-        _new_services,
-        _old_channels,
-        _new_channels,
         _old_commands,
         new_commands,
     ) -> None:
@@ -501,74 +486,6 @@ async def test_command_catalog_failure_restores_old_stable_and_generation(
     assert lease.snapshot is old_snapshot
     await lease.release()
     await manager.terminate_all()
-
-
-@pytest.mark.asyncio
-async def test_mixed_v2_v3_command_collision_prevents_stable_publish(
-    tmp_path: Path,
-) -> None:
-    _write_plugin(
-        tmp_path / "plugins",
-        "commands_v3",
-        _command_plugin("description", "v3"),
-    )
-    _write_plugin(
-        tmp_path / "plugins",
-        "legacy",
-        "from agent.plugins import Plugin\n"
-        "class Legacy(Plugin):\n"
-        "    name = 'legacy'\n"
-        "    def telegram_bot_commands(self): return [('hi', 'legacy')]\n",
-    )
-    manager = _manager(tmp_path)
-
-    with pytest.raises(RuntimeError, match="v2 channel command ABI 已删除.*hi"):
-        await manager.load_all()
-
-    assert manager.current_snapshot is None
-    assert manager.generation("commands_v3") is None
-    assert manager.generation("legacy") is None
-
-
-@pytest.mark.asyncio
-async def test_v2_only_command_collision_prevents_stable_publish(
-    tmp_path: Path,
-) -> None:
-    for plugin_id in ("legacy_a", "legacy_b"):
-        _write_plugin(
-            tmp_path / "plugins",
-            plugin_id,
-            "from agent.plugins import Plugin\n"
-            f"class {plugin_id.title().replace('_', '')}(Plugin):\n"
-            f"    name = {plugin_id!r}\n"
-            "    def telegram_bot_commands(self): return [('same', 'legacy')]\n",
-        )
-    manager = _manager(tmp_path)
-
-    with pytest.raises(RuntimeError, match="v2 channel command ABI 已删除.*same"):
-        await manager.load_all()
-
-    assert manager.current_snapshot is None
-    assert manager.loaded_count == 0
-
-
-@pytest.mark.asyncio
-async def test_v2_command_cannot_claim_core_stop_namespace(tmp_path: Path) -> None:
-    _write_plugin(
-        tmp_path / "plugins",
-        "legacy",
-        "from agent.plugins import Plugin\n"
-        "class Legacy(Plugin):\n"
-        "    name = 'legacy'\n"
-        "    def telegram_bot_commands(self): return [('stop', 'legacy')]\n",
-    )
-    manager = _manager(tmp_path)
-
-    await manager.load_all()
-
-    assert manager.current_snapshot is None
-    assert manager.loaded_count == 0
-    assert manager.stable_telegram_command_catalog() == ()
 
 
 class _CommandProvider(ProviderContextBudgetStub):
