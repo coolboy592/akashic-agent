@@ -7,6 +7,7 @@ import asyncio
 import hashlib
 import json
 import sqlite3
+import subprocess
 import sys
 import tempfile
 from dataclasses import asdict, dataclass
@@ -67,11 +68,11 @@ class RuntimeBundle:
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="运行 pure-v3 集中式 E1 Gate")
-    parser.add_argument("--lock", type=Path, default=DEFAULT_LOCK)
-    parser.add_argument("--report", type=Path, default=DEFAULT_REPORT)
-    parser.add_argument("--tmp-root", type=Path)
-    parser.add_argument("--plugin-root", action="append", default=[], metavar="PLUGIN_ID=PATH")
-    parser.add_argument("--offline", action="store_true")
+    _ = parser.add_argument("--lock", type=Path, default=DEFAULT_LOCK)
+    _ = parser.add_argument("--report", type=Path, default=DEFAULT_REPORT)
+    _ = parser.add_argument("--tmp-root", type=Path)
+    _ = parser.add_argument("--plugin-root", action="append", default=[], metavar="PLUGIN_ID=PATH")
+    _ = parser.add_argument("--offline", action="store_true")
     return parser.parse_args()
 
 
@@ -97,7 +98,7 @@ def _select_e1_locks(path: Path) -> dict[str, Any]:
 
     locks = fleet_gate._load_lock(path)  # pyright: ignore[reportPrivateUsage]
     by_id = {item.id: item for item in locks}
-    missing = sorted(set(E1_EXTERNAL_PLUGIN_IDS) - set(by_id))
+    missing = sorted(set(E1_EXTERNAL_PLUGIN_IDS).difference(by_id))
     if missing:
         raise E1GateError(f"E1 lock 缺少 external plugin: {missing}")
     return {plugin_id: by_id[plugin_id] for plugin_id in E1_EXTERNAL_PLUGIN_IDS}
@@ -145,14 +146,14 @@ def _resolve_external_roots(
             else:
                 checkout = staging / plugin_id
                 result = fleet_gate._checkout_locked_plugin(lock, checkout)  # pyright: ignore[reportPrivateUsage]
-                item = {**asdict(result), "path": str(checkout), "mode": "shallow-lock-checkout"}
+                item: dict[str, object] = {**cast(dict[str, object], asdict(result)), "path": str(checkout), "mode": "shallow-lock-checkout"}
             root = Path(str(item["path"]))
             static = fleet_gate._inspect_static_plugin(root, plugin_id)  # pyright: ignore[reportPrivateUsage]
             item["static"] = static
             if static["status"] != "passed":
                 raise E1GateError(f"external static v3 inspection failed: {plugin_id}")
             roots[plugin_id] = root
-            evidence.append(item)
+            evidence.append(cast(dict[str, object], item))
         except Exception as error:
             blockers.append(f"{plugin_id}: exact locked checkout unavailable: {type(error).__name__}: {error}")
             evidence.append({
@@ -195,7 +196,7 @@ async def _open_runtime(workspace: Path, engine: str, plugin_dirs: list[Path]) -
     tools = ToolRegistry()
     provider = LLMProvider(api_key="", provider_name="fixture", base_url="http://127.0.0.1:9")
     try:
-        ensure_memory_plugin_storage(config, workspace)
+        _ = ensure_memory_plugin_storage(config, workspace)
         memory = build_memory_runtime(config, workspace, tools, provider, None, http, event_publisher=event_bus)
         manager = PluginManager(
             plugin_dirs, event_bus=event_bus, workspace=workspace, tool_registry=tools,
@@ -247,7 +248,7 @@ def _runtime_identity(bundle: RuntimeBundle) -> dict[str, object]:
         "active_plugins": active,
         "generations": generations,
         "mobile_catalog": PluginMobileUiProvider(bundle.manager).catalog(),
-        "composition_active_plugin_ids": sorted(snapshot.composition_active_plugin_ids),
+        "composition_active_plugin_ids": sorted(snapshot.composition_active_plugin_ids or frozenset()),
     }
 
 
@@ -260,7 +261,7 @@ async def _probe_boot(bundle: RuntimeBundle) -> dict[str, object]:
         raise E1GateError("stable snapshot 在 mobile probe 前消失")
     before = snapshot.lease_count
     async with bundle.manager.snapshot_store.lease() as leased:
-        lease = {"snapshot_id": leased.snapshot_id, "during": leased.lease_count}
+        lease: dict[str, object] = {"snapshot_id": leased.snapshot_id, "during": leased.lease_count}
     lease["before"] = before
     lease["after"] = snapshot.lease_count
     identity["stable_lease"] = lease
@@ -405,7 +406,7 @@ async def _append_only(bundle: RuntimeBundle) -> dict[str, object]:
     """证明既有 SessionDB messages 不变且新 seq 只追加。"""
 
     key = "e1:append"
-    _seed_interaction(bundle.sessions, key=key, turn="turn:e1:append:1", label="append-1")
+    _ = _seed_interaction(bundle.sessions, key=key, turn="turn:e1:append:1", label="append-1")
     path = Path(bundle.sessions.db_path)
     before = _sqlite_state(path)
     old_messages = _messages(path)
@@ -450,7 +451,7 @@ async def _undo(bundle: RuntimeBundle) -> dict[str, object]:
     before = _sqlite_state(path)
     old_messages = _messages(path)
     old_seq = bundle.sessions.control_store.next_seq(key)
-    result = await InteractionUndoCoordinator(bundle.sessions, bundle.memory.engine).undo_latest(key)
+    result = await InteractionUndoCoordinator(cast(Any, bundle.sessions), bundle.memory.engine).undo_latest(key)
     if result is None or result.control_turn_id != "turn:e1:undo:target":
         raise E1GateError(f"未撤销 exact control_turn_id: {result}")
     after = _sqlite_state(path)
@@ -498,7 +499,7 @@ async def _crash_recovery(workspace: Path, plugin_dirs: list[Path]) -> dict[str,
     _memory_store(first).close()
     failure = ""
     try:
-        await InteractionUndoCoordinator(first.sessions, first.memory.engine).recover_pending()
+        await InteractionUndoCoordinator(cast(Any, first.sessions), first.memory.engine).recover_pending()
     except Exception as error:
         failure = f"{type(error).__name__}: {error}"
     if not failure:
@@ -511,15 +512,75 @@ async def _crash_recovery(workspace: Path, plugin_dirs: list[Path]) -> dict[str,
         raise E1GateError(f"重启前 cleanup 失败: {cleanup}")
     restarted = await _open_runtime(workspace, "default", plugin_dirs)
     try:
-        await InteractionUndoCoordinator(restarted.sessions, restarted.memory.engine).recover_pending()
+        await InteractionUndoCoordinator(cast(Any, restarted.sessions), restarted.memory.engine).recover_pending()
         if restarted.sessions.control_store.pending_interaction_memory_reconciliations("default_memory"):
             raise E1GateError("Core restart 后 pending receipt 未清空")
         if restarted.sessions.get_existing(key).messages:
             raise E1GateError("Core restart 后 deleted interaction 重现")
         backup = _sqlite_state(Path(deletion.backup_path))
-        return {"status": "passed", "control_turn_id": deletion.control_turn_id, "message_ids": list(ids),
-                "process_internal_failure": failure, "pending_attempts_before_restart": 1,
-                "pending_after_restart": 0, "backup": {"path": deletion.backup_path, "integrity": backup["integrity"]}}
+        process_workspace = workspace.parent / "runtime-process-crash"
+        child_code = '''
+import os
+import sys
+from datetime import UTC, datetime
+from pathlib import Path
+from session.manager import SessionManager
+
+root = Path(sys.argv[1])
+sessions = SessionManager(root)
+now = datetime.now(UTC).isoformat()
+sessions.control_store.persist_session(
+    "e1:process-crash", created_at=now, updated_at=now,
+    metadata={"gate": "process-crash"},
+    messages=[
+        {"role": "user", "content": "process crash question", "timestamp": now,
+         "extra": {"control_turn_id": "turn:e1:process-crash", "turn_input_ordinal": 0}},
+        {"role": "assistant", "content": "process crash answer", "timestamp": now,
+         "extra": {"control_turn_id": "turn:e1:process-crash", "turn_terminal": True, "turn_input_count": 1}},
+    ],
+)
+deletion = sessions.control_store.delete_interaction(
+    "turn:e1:process-crash", action_source="plugin_v3_e1_gate.process_crash",
+    expected_latest_session_key="e1:process-crash", reconciliation_owner="default_memory",
+)
+if deletion is None:
+    raise RuntimeError("process crash seed delete 未提交")
+os._exit(17)
+'''
+        crash = subprocess.run(
+            [sys.executable, "-c", child_code, str(process_workspace)], cwd=ROOT,
+            check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            timeout=30,
+        )
+        if crash.returncode != 17:
+            raise E1GateError(f"Core process crash child exit 不符合预期: {crash.returncode}; stderr={crash.stderr.strip()}")
+        crash_bundle = await _open_runtime(process_workspace, "default", plugin_dirs)
+        try:
+            await InteractionUndoCoordinator(cast(Any, crash_bundle.sessions), crash_bundle.memory.engine).recover_pending()
+            if crash_bundle.sessions.control_store.pending_interaction_memory_reconciliations("default_memory"):
+                raise E1GateError("Core process crash 后 pending receipt 未清空")
+            if crash_bundle.sessions.get_existing("e1:process-crash").messages:
+                raise E1GateError("Core process crash 后 interaction 重新出现")
+            connection = sqlite3.connect(str(crash_bundle.sessions.db_path))
+            try:
+                backup_row = connection.execute(
+                    "SELECT backup_path FROM session_source_mutation_audits ORDER BY completed_at DESC LIMIT 1"
+                ).fetchone()
+            finally:
+                connection.close()
+            if backup_row is None or backup_row[0] is None:
+                raise E1GateError("Core process crash audit 缺少 backup_path")
+            process_backup = _sqlite_state(Path(str(backup_row[0])))
+        finally:
+            cleanup = await _close_runtime(crash_bundle)
+            if cleanup:
+                raise E1GateError(f"Core process crash cleanup 失败: {cleanup}")
+        return {
+            "status": "passed", "control_turn_id": deletion.control_turn_id, "message_ids": list(ids),
+            "process_internal_failure": failure, "pending_attempts_before_restart": 1,
+            "pending_after_restart": 0, "backup": {"path": deletion.backup_path, "integrity": backup["integrity"]},
+            "core_process_crash": {"child_exit_code": crash.returncode, "pending_after_restart": 0, "backup_integrity": process_backup["integrity"]},
+        }
     finally:
         cleanup = await _close_runtime(restarted)
         if cleanup:
@@ -548,7 +609,7 @@ async def _scenarios(workspace: Path, plugin_dirs: list[Path], blockers: list[st
             blockers.append(f"runtime_boot_{engine}: {type(error).__name__}: {error}")
             if bundle is not None:
                 blockers.extend(f"runtime cleanup: {item}" for item in await _close_runtime(bundle))
-                runtimes.pop(engine, None)
+                _ = runtimes.pop(engine, None)
     default = runtimes.get("default")
     if default is None:
         scenarios.extend({"id": item, "status": "blocked", "reason": "Default Memory runtime 未启动"} for item in ("append_only_sessiondb", "plugin_undo", "core_crash_recovery"))
@@ -560,7 +621,7 @@ async def _scenarios(workspace: Path, plugin_dirs: list[Path], blockers: list[st
                 scenarios.append({"id": case_id, "status": "failed", "error": f"{type(error).__name__}: {error}"})
                 blockers.append(f"{case_id}: {type(error).__name__}: {error}")
         blockers.extend(f"runtime cleanup: {item}" for item in await _close_runtime(default))
-        runtimes.pop("default", None)
+        _ = runtimes.pop("default", None)
         try:
             scenarios.append({"id": "core_crash_recovery", **await _crash_recovery(workspace / "runtime-crash", plugin_dirs)})
         except Exception as error:
@@ -583,7 +644,7 @@ async def _run_gate(*, lock_path: Path, report_path: Path, tmp_root: Path | None
         blockers.append(f"lock/input: {type(error).__name__}: {error}")
     plugin_evidence: list[dict[str, object]] = []
     core = fleet_gate._core_evidence()  # pyright: ignore[reportPrivateUsage]
-    lock_evidence = {
+    lock_evidence: dict[str, object] = {
         "path": str(lock_path),
         "sha256": fleet_gate._sha256(lock_path) if lock_path.is_file() else None,  # pyright: ignore[reportPrivateUsage]
         "selected_external_ids": list(E1_EXTERNAL_PLUGIN_IDS),
@@ -604,8 +665,11 @@ async def _run_gate(*, lock_path: Path, report_path: Path, tmp_root: Path | None
             if status != "available":
                 blockers.append(f"{plugin_id}: in-tree source missing: {root}")
         scenarios, runtime = await _scenarios(workspace, _plugin_dirs(external), blockers)
-        active = sorted({plugin_id for item in runtime.values() for plugin_id in cast(list[str], item["active_plugins"])})
-        missing_runtime = sorted(set(E1_EXTERNAL_PLUGIN_IDS) - set(active))
+        active: set[str] = set()
+        for item in runtime.values():
+            evidence = cast(dict[str, object], item)
+            active.update(cast(list[str], evidence["active_plugins"]))
+        missing_runtime = sorted(set(E1_EXTERNAL_PLUGIN_IDS).difference(active))
         if missing_runtime:
             blockers.append("required external plugin runtime coverage absent: " + ", ".join(missing_runtime))
         scenarios.append({
@@ -621,7 +685,7 @@ async def _run_gate(*, lock_path: Path, report_path: Path, tmp_root: Path | None
             "runtime": runtime, "scenarios": scenarios, "blockers": sorted(set(blockers)),
         }
     report_path.parent.mkdir(parents=True, exist_ok=True)
-    report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    _ = report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return report
 
 
