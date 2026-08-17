@@ -4,16 +4,16 @@
     {
       "id": "citation",
       "repository": "https://github.com/akashic-plugins/citation",
-      "requested_ref": "a9abeb31c25458b8e799dc6aae25d3e83b912c83",
-      "resolved_sha": "a9abeb31c25458b8e799dc6aae25d3e83b912c83",
-      "change_source_pr_head": "a9abeb31c25458b8e799dc6aae25d3e83b912c83"
+      "requested_ref": "1c9695ded36ed16ed4b131ef8b789c2664329fc0",
+      "resolved_sha": "1c9695ded36ed16ed4b131ef8b789c2664329fc0",
+      "change_source_pr_head": "1c9695ded36ed16ed4b131ef8b789c2664329fc0"
     },
     {
       "id": "meme",
       "repository": "https://github.com/akashic-plugins/meme",
-      "requested_ref": "c6c01fc8a778a516e9f9ba5a57f7aa556b6651ee",
-      "resolved_sha": "c6c01fc8a778a516e9f9ba5a57f7aa556b6651ee",
-      "change_source_pr_head": "c6c01fc8a778a516e9f9ba5a57f7aa556b6651ee"
+      "requested_ref": "6761c87560faf08a2fc312fcca973bde92400e07",
+      "resolved_sha": "6761c87560faf08a2fc312fcca973bde92400e07",
+      "change_source_pr_head": "6761c87560faf08a2fc312fcca973bde92400e07"
     },
     {
       "id": "shell_restore",
@@ -81,16 +81,16 @@
     {
       "id": "status_commands",
       "repository": "https://github.com/akashic-plugins/status_commands",
-      "requested_ref": "9dd903e1649ef1c79138030eff4870ffc721c318",
-      "resolved_sha": "9dd903e1649ef1c79138030eff4870ffc721c318",
-      "change_source_pr_head": "9dd903e1649ef1c79138030eff4870ffc721c318"
+      "requested_ref": "eb245adea7d3ff490d18bfb453f80e6f42ed435c",
+      "resolved_sha": "eb245adea7d3ff490d18bfb453f80e6f42ed435c",
+      "change_source_pr_head": "eb245adea7d3ff490d18bfb453f80e6f42ed435c"
     },
     {
       "id": "feed-mcp",
       "repository": "https://github.com/akashic-plugins/feed-mcp",
-      "requested_ref": "b4a8626595bb369c61828314ebaed0594f30f4bf",
-      "resolved_sha": "b4a8626595bb369c61828314ebaed0594f30f4bf",
-      "change_source_pr_head": "b4a8626595bb369c61828314ebaed0594f30f4bf"
+      "requested_ref": "29919dcaac06b98af7ad29b2721054efefc197ab",
+      "resolved_sha": "29919dcaac06b98af7ad29b2721054efefc197ab",
+      "change_source_pr_head": "29919dcaac06b98af7ad29b2721054efefc197ab"
     },
     {
       "id": "feishu",
