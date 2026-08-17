@@ -116,7 +116,7 @@ Gate 报告。分支名、PR 号和浮动 ref 不能代替 commit。
 | C12 | scoped MCP capability | `CANDIDATE` | `8653bab0` 已接入 Root-local declaration、candidate/formal MCP catalog fence、exact snapshot route、跨 boot durable recovery；Calendar `654d078d` 的真实 Manager Gate 完成 stdio handshake、完整 14-tool catalog 与零 CallTool/Google 调用，24 个插件/迁移/Host tests、Pyright 0、独立 review 无 P0/P1；待最终 E2 exact lock | Calendar MCP |
 | C13 | managed process capability | `CANDIDATE` | `8653bab0` 已接入 generation-scoped start/readiness/port/log、sibling drain、retained tombstone 与不可取消 recovery；Calendar `654d078d` 的正式 `calendar_api` readiness `/health=200`，terminate 后端口、进程、task、Root Effect/listener 全零；待最终 E2 process 族 Gate | Calendar MCP |
 | C14 | inbound/outbound channel capability | `CANDIDATE` | `5e58d38d` 已在 `fc1a2a76` 基础上补齐 exact-binding control、typed turn presentation、EventBus owner-task bridge、provider identity 与同步 snapshot claim；provisional pause/drain 真实 Store oracle、Channel/Bus/Manager 相关 88～116 tests、Pyright 0，独立复核无 P0/P1。待 Feishu/QQ v3 adapter、Core built-in transition 与 E3 才进入 `READY` | Feishu / QQBot |
-| C15 | timer / proactive source / turn enqueue capability | `CANDIDATE` | `25a2ec81` + Calendar `654d078d` 已证明 exact committed source/MCP binding、candidate recording 零 OAuth/远端/ack、empty/items/failure/committed 可区分、ActivityHost cleanup 全零；v2→v3 数据由独占锁、源保留、SQLite integrity 与可恢复 receipt 明确迁移。待 Feed/Fitbit/Steam sources 与最终 fixed-clock E3 | Calendar MCP |
+| C15 | timer / proactive source / turn enqueue capability | `CANDIDATE` | Core `78e50d4d` 已修复 candidate/formal Root 重建时 proactive/private/background catalog 的 exact Root payload 替换；Calendar `654d078d`、Feed `b4a8626`、Steam `2c492d7` 已证明 exact committed source/MCP binding、candidate recording 零凭证/远端写入、typed empty/items/failure 与 ActivityHost cleanup。待 Fitbit source 与最终 fixed-clock E3 | Calendar、Feed、Steam |
 | C16 | v3 admission/lifecycle 收口 | `CANDIDATE` | `4ba266ad` 已通过独立 review；non-callable listener、spawn coroutine、apply signature、wrong-task lifecycle 全部 fail-loud，malformed admission 零 data-dir 写入 | Core |
 | C17 | mobile UI/query capability | `CANDIDATE` | `2c6e4f71` + `b173f551` 已通过独立 review；activation token、strict JSON、candidate 不发布与 exact lease 已由 372 个集成回归、Basedpyright/compileall/diff-check 验证，待 Akasha/Observe 迁移后进入 E1/E4 | Akasha / Observe |
 | C18 | Core-private v3 generation metadata | `CANDIDATE` | `2d9fb408` 已通过独立 review；v3 stable load、candidate clone 与 formal rebuild 不再构造或读取 `PluginContext`，59 loader + 208 Manager/hot-reload 回归通过 | Core |
@@ -169,12 +169,12 @@ Gate 报告。分支名、PR 号和浮动 ref 不能代替 commit。
 | Emotion | Dashboard、mobile、Drift Skill、proactive module、job/LLM | C09/C15/C17/C21 | `OPEN` | E1/E3 |
 | Plugin Undo | command、before-turn、显式 interaction 撤销 | C02/C11 | `OPEN` | E1/E3 |
 | Observe | Dashboard、mobile、committed event observers | C02/C17 | `OPEN` | E1 |
-| Setup Helper | lifecycle、command | C02/C11 | `OPEN` | E3 |
+| Setup Helper | command | C11 | `CANDIDATE` | Core `78e50d4d` + plugin `65770db`；`/chatid` 与 `/myid` 走 committed registry，在 Session/模型 admission 前短路，installed candidate→formal 晋升与 Root/validation cleanup 已通过，待 E3 |
 | Status Commands | mobile、command、只读 Session projection | C11/C17/C24 | `CANDIDATE` | Core `cb2011b4` + plugin `eb245ad`；真实 Manager command/Mobile/ledger oracle 通过，待 E3 复制 workspace |
 | Feed MCP | Skill、MCP、proactive source | C09/C12/C15 | `CANDIDATE` | Core `78e50d4d` + plugin `b4a8626`；真实 Manager/stdio、exact source lease、typed empty fetch、candidate data 排除、进程内回滚与进程崩溃后重启迁移均通过，待 E2/E3 |
 | Feishu | channel | C14 | `OPEN` | E3 |
 | Fitbit MCP | MCP、managed process、proactive source、mobile | C12/C13/C15/C17 | `OPEN` | E2/E3 |
-| Steam MCP | Skill、MCP、proactive source | C09/C12/C15 | `OPEN` | E2/E3 |
+| Steam MCP | Skill、MCP、proactive source | C09/C12/C15 | `CANDIDATE` | Core `78e50d4d` + plugin `2c492d7`；真实 stdio formal/candidate→promote、recording 零凭证/网络/DB、exact proactive catalog、显式 v2 数据迁移与 cleanup 已通过，待 E2/E3 |
 | QQBot | channel | C14 | `OPEN` | E3 |
 | Proactive Feedback | Dashboard、mobile、committed event observers | C02/C17 | `OPEN` | E1 |
 | Huayue Skills | Skill roots | C09 | `CANDIDATE` | plugin `1171904`；pure-v3 module-level skill roots、contract 与 Pyright 已通过，待 E3 |
