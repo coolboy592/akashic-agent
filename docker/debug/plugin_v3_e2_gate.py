@@ -86,6 +86,7 @@ FORMAL_PORTS = {"calendar-mcp": 18000, "fitbit-mcp": 18765}
 REQUIRED_IMPORTS = {
     "calendar-mcp": (
         "mcp",
+        "email_validator",
         "fastapi",
         "uvicorn",
         "dotenv",
@@ -373,15 +374,72 @@ def _check_imports(runtime_python: Path, plugin_ids: tuple[str, ...]) -> None:
         )
 
 
-def _create_runtime_stage(runtime_python: Path, sandbox: Path) -> Path:
-    """Create a disposable venv-shaped runtime link for static manifests."""
+def _create_runtime_stage(
+    bootstrap_python: Path,
+    sandbox: Path,
+    checkouts: Mapping[str, Path],
+) -> tuple[Path, Path, tuple[dict[str, object], ...]]:
+    """Build one disposable runtime from every locked manifest requirement."""
 
-    # 1. Keep plugin artifact trees immutable while exposing the supplied Python.
+    # 1. Inherit the verified Core environment without mutating it.
     stage = sandbox / "runtime-python"
-    binary = stage / "bin" / "python"
-    binary.parent.mkdir(parents=True, exist_ok=False)
-    binary.symlink_to(runtime_python)
-    return stage
+    created = subprocess.run(
+        (
+            str(bootstrap_python),
+            "-m",
+            "venv",
+            "--system-site-packages",
+            str(stage),
+        ),
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if created.returncode != 0:
+        raise GateBlocked(
+            "E2 recording runtime venv 创建失败: " + created.stderr.strip()
+        )
+    runtime_python = stage / (
+        "Scripts/python.exe" if os.name == "nt" else "bin/python"
+    )
+
+    # 2. Install exactly the requirements declared by the locked artifacts.
+    evidence: list[dict[str, object]] = []
+    for plugin_id in MCP_PLUGIN_IDS:
+        manifest = load_static_plugin_manifest(checkouts[plugin_id])
+        for runtime in manifest.python:
+            requirements = checkouts[plugin_id] / runtime.requirements
+            installed = subprocess.run(
+                (
+                    str(runtime_python),
+                    "-m",
+                    "pip",
+                    "install",
+                    "--disable-pip-version-check",
+                    "-r",
+                    str(requirements),
+                ),
+                cwd=checkouts[plugin_id],
+                check=False,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            if installed.returncode != 0:
+                raise GateBlocked(
+                    f"{plugin_id} requirements staging 失败: "
+                    + installed.stderr.strip()
+                )
+            evidence.append(
+                {
+                    "plugin_id": plugin_id,
+                    "requirements": runtime.requirements,
+                    "requirements_sha256": _sha256(requirements),
+                }
+            )
+    _check_imports(runtime_python, MCP_PLUGIN_IDS)
+    return stage, runtime_python, tuple(evidence)
 
 
 def _copy_source_to_artifact(source: Path, target: Path) -> None:
@@ -987,7 +1045,7 @@ async def _run_core_process_crash(
 async def _run_gate(
     checkouts: Mapping[str, Path],
     sandbox: Path,
-    runtime_python: Path,
+    bootstrap_python: Path,
 ) -> dict[str, object]:
     """Run Shell, MCP candidate, and failure-cleanup checks in one Manager."""
 
@@ -1000,7 +1058,11 @@ async def _run_gate(
         workspace=workspace,
         installed_cache_root=cache_root,
     )
-    runtime_stage = _create_runtime_stage(runtime_python, sandbox)
+    runtime_stage, runtime_python, runtime_requirements = _create_runtime_stage(
+        bootstrap_python,
+        sandbox,
+        checkouts,
+    )
     bases: dict[str, Path] = {}
     root = None
     shell_result: tuple[
@@ -1048,6 +1110,7 @@ async def _run_gate(
     if cleanup.retained_runtime_failures or cleanup.cleanup_failures or cleanup.effects:
         raise RuntimeError(f"E2 cleanup evidence 未清零: {cleanup}")
     return {
+        "runtime_requirements": list(runtime_requirements),
         "shell": {
             "listeners": list(shell_result[0]),
             "scenarios": [asdict(item) for item in shell_result[1]],
@@ -1111,7 +1174,6 @@ def main() -> int:
         locks = _load_lock(lock_path)
         base_report["lock_plugins"] = [asdict(item) for item in locks]
         runtime_python = _runtime_interpreter(args.runtime_python)
-        _check_imports(runtime_python, MCP_PLUGIN_IDS)
         with tempfile.TemporaryDirectory(prefix="akashic-plugin-v3-e2-") as raw:
             sandbox = Path(raw)
             providers = sandbox / "providers"
