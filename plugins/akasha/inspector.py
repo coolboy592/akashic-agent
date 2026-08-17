@@ -701,13 +701,32 @@ def mobile_summary(item: dict[str, object]) -> dict[str, object]:
         "right_count": item["right_count"],
         "pushes": item["pushes"],
         "residual_l1": item["residual_l1"],
-        "left": item["left"],
-        "right": item["right"],
+        "left": _mobile_detail_lane(item["left"]),
+        "right": _mobile_detail_lane(item["right"]),
         "tool_left_count": item["tool_left_count"],
         "tool_right_count": item["tool_right_count"],
-        "tool_left": item["tool_left"],
-        "tool_right": item["tool_right"],
+        "tool_left": _mobile_detail_lane(item["tool_left"]),
+        "tool_right": _mobile_detail_lane(item["tool_right"]),
     }
+
+
+def _mobile_detail_lane(value: object) -> list[dict[str, object]]:
+    """Project one Inspector lane into the bounded Mobile card shape."""
+
+    # 1. Keep only fields rendered by the mobile detail view.
+    rows = cast(list[dict[str, object]], value)
+    projected: list[dict[str, object]] = []
+    for row in rows:
+        visible = {
+            "user_preview": _clip(str(row["user_text"]), 100),
+            "assistant_preview": _clip(str(row["assistant_preview"]), 50),
+            "ts": row["ts"],
+        }
+        score = row.get("score")
+        if score is not None:
+            visible["score"] = score
+        projected.append(visible)
+    return projected
 
 
 def _tool_recall_lanes(

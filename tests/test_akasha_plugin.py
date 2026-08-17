@@ -36,6 +36,7 @@ from agent.plugin_composition import (
     ServiceView,
 )
 from agent.plugins.composable import ComposablePlugin
+from agent.plugins.mobile_ui import _normalize_rpc_result
 from agent.plugins.manifest import (
     builtin_plugin_data_dir,
     ensure_workspace_plugin_data_dir,
@@ -61,7 +62,7 @@ from plugins.akasha.engine import (
     PendingRetrieval,
     RetrievalRecords,
 )
-from plugins.akasha.inspector import AkashaInspectorReader
+from plugins.akasha.inspector import AkashaInspectorReader, mobile_summary
 from plugins.akasha.infrastructure.loader import load_turn_suffix, load_turns
 from plugins.akasha.infrastructure.persistence import (
     logical_state_sha256,
@@ -474,6 +475,63 @@ def test_mobile_recall_card_projection_preserves_bounded_lanes() -> None:
     )
 
 
+def test_mobile_inspector_detail_projects_large_assistant_text_to_bounded_rpc() -> None:
+    large_answer = "答" * (256 * 1024)
+    lane_item = {
+        "query_id": "prior-query",
+        "session_key": "test:one",
+        "user_text": "问" * 1_000,
+        "assistant_text": large_answer,
+        "assistant_preview": large_answer,
+        "ts": "2026-07-28T00:00:00Z",
+        "score": 0.5,
+        "sources": ["dense"],
+    }
+    detail = {
+        "query_id": "query",
+        "query_text": "当前问题",
+        "query_preview": "当前问题",
+        "ts": "2026-07-28T00:00:00Z",
+        "seed_count": 1,
+        "activation_capture_available": True,
+        "recall_capture_available": True,
+        "activation_count": 1,
+        "left_count": 1,
+        "right_count": 1,
+        "pushes": 1,
+        "residual_l1": 0.25,
+        "tool_left_count": 1,
+        "tool_right_count": 1,
+        "left": [lane_item],
+        "right": [lane_item],
+        "tool_left": [lane_item],
+        "tool_right": [lane_item],
+    }
+
+    projected = mobile_summary(detail)
+    rpc = _normalize_rpc_result(
+        projected,
+        plugin_id="akasha",
+        method="inspector.detail",
+    )
+    encoded = json.dumps(rpc, ensure_ascii=False, separators=(",", ":"))
+
+    assert "assistant_text" not in encoded
+    assert "user_text" not in encoded
+    assert len(encoded.encode("utf-8")) < 192 * 1024
+    for lane_name in ("left", "right", "tool_left", "tool_right"):
+        lane = cast(list[dict[str, object]], rpc[lane_name])
+        assert set(lane[0]) == {
+            "user_preview",
+            "assistant_preview",
+            "ts",
+            "score",
+        }
+        assert len(str(lane[0]["user_preview"])) == 103
+        assert len(str(lane[0]["assistant_preview"])) == 53
+    assert lane_item["assistant_text"] == large_answer
+
+
 def test_active_mobile_recall_marks_temporary_absence_as_pending() -> None:
     assert _empty_mobile_recall()["pending"] is False
     assert _empty_mobile_recall(pending=True)["pending"] is True
@@ -814,6 +872,7 @@ async def test_online_turn_recall_and_replay_share_one_state(
     assert total == 1
     assert detail is not None
     assert detail["query_text"] == "alpha follow"
+    assert detail["assistant_text"] == "second answer"
     assert detail["recall_capture_available"] is True
     assert detail["left_count"] == 1
     assert detail["tool_left_count"] == 1
