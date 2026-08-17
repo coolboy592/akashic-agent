@@ -2981,18 +2981,45 @@ def _write_inspector_config(workspace: Path) -> None:
 
 def test_inspector_overview_is_empty_before_first_akasha_commit(tmp_path: Path) -> None:
     _write_inspector_config(tmp_path)
-
-    assert AkashaInspectorReader(
+    reader = AkashaInspectorReader(
         memory_root=tmp_path / "memory",
         config=load_akasha_config(
             builtin_plugin_data_dir("akasha", tmp_path) / "config.local.toml"
         ),
-    ).get_overview() == {
+    )
+    sidecars = (reader.paths.memory, reader.paths.index)
+
+    assert reader.get_overview() == {
         "available": True,
         "total": 0,
         "latest_at": None,
         "earliest_at": None,
     }
+    assert reader.list_turns() == ([], 0)
+    assert reader.latest_for_session("fresh:empty") is None
+    assert reader.get_turn("missing") is None
+    assert reader.for_assistant_message("fresh:empty", "missing") is None
+    assert all(not path.exists() for path in sidecars)
+
+
+@pytest.mark.parametrize("present", ("memory", "index"))
+def test_inspector_partial_sidecar_fails_loud(
+    tmp_path: Path,
+    present: str,
+) -> None:
+    _write_inspector_config(tmp_path)
+    reader = AkashaInspectorReader(
+        memory_root=tmp_path / "memory",
+        config=load_akasha_config(
+            builtin_plugin_data_dir("akasha", tmp_path) / "config.local.toml"
+        ),
+    )
+    present_path = getattr(reader.paths, present)
+    present_path.parent.mkdir(parents=True, exist_ok=True)
+    sqlite3.connect(present_path).close()
+
+    with pytest.raises(sqlite3.OperationalError):
+        reader.list_turns()
 
 
 @pytest.mark.asyncio

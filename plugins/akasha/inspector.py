@@ -76,10 +76,15 @@ class AkashaInspectorReader:
         self._dense_lock = threading.RLock()
         self._dense_snapshot: _DenseSnapshot | None = None
 
+    def _is_fresh_empty(self) -> bool:
+        """Return whether neither derived sidecar exists yet."""
+
+        return not self.paths.memory.exists() and not self.paths.index.exists()
+
     def get_overview(self) -> dict[str, object]:
         """Return the number and time range of committed retrieval events."""
 
-        if not self.paths.memory.exists() and not self.paths.index.exists():
+        if self._is_fresh_empty():
             return {
                 "available": True,
                 "total": 0,
@@ -112,6 +117,9 @@ class AkashaInspectorReader:
         page_size: int = 50,
     ) -> tuple[list[dict[str, object]], int]:
         """List committed retrievals in reverse causal order."""
+
+        if self._is_fresh_empty():
+            return [], 0
 
         # 1. Build filters only from validated HTTP or mobile inputs.
         where: list[str] = []
@@ -205,6 +213,9 @@ class AkashaInspectorReader:
     def get_turn(self, query_id: str) -> dict[str, object] | None:
         """Return one retrieval with seeds, paths, prompt lanes, and learning."""
 
+        if self._is_fresh_empty():
+            return None
+
         # 1. Read the persisted causal evidence for this query turn.
         with closing(self._connect()) as connection:
             run = self._load_run(connection, query_id)
@@ -257,6 +268,9 @@ class AkashaInspectorReader:
     ) -> dict[str, object] | None:
         """Return the latest committed retrieval for one session."""
 
+        if self._is_fresh_empty():
+            return None
+
         with closing(self._connect()) as connection:
             row = connection.execute(
                 """
@@ -278,6 +292,9 @@ class AkashaInspectorReader:
         message_id: str,
     ) -> dict[str, object] | None:
         """Resolve one persisted assistant message to its retrieval event."""
+
+        if self._is_fresh_empty():
+            return None
 
         with closing(self._connect()) as connection:
             row = connection.execute(
