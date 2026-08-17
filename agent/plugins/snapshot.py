@@ -12,6 +12,7 @@ from agent.lifecycle.phase import topo_sort_modules
 from agent.mcp.generation import WorkspaceMcpGeneration
 from agent.plugins.generation import PluginGeneration
 from agent.plugins.jobs import RegisteredPluginJob, plugin_job_key
+from agent.plugins.private_proactive import PrivateProactiveCatalog
 from agent.plugins.specs import RegisteredProactiveSource, proactive_source_key
 from agent.tools.registry import ToolRegistry
 from agent.tool_hooks import ToolHook
@@ -105,6 +106,8 @@ class RuntimeSnapshot:
     managed_process_registry_identity: str | None = None
     proactive_component_catalog: ProactiveCatalog | None = None
     proactive_component_catalog_identity: str | None = None
+    private_proactive_catalog: PrivateProactiveCatalog | None = None
+    private_proactive_catalog_identity: str | None = None
     background_job_catalog: BackgroundJobCatalog | None = None
     background_job_catalog_identity: str | None = None
     tool_registry: ToolRegistry | None = None
@@ -196,6 +199,7 @@ class RuntimeSnapshotCompiler:
         snapshot_revision: str = "",
         workspace_mcp_generation: WorkspaceMcpGeneration | None = None,
         composition_root: CompositionRoot | None = None,
+        private_proactive_catalog: PrivateProactiveCatalog | None = None,
         require_composition_ready: bool = True,
     ) -> RuntimeSnapshot:
         ordered = [generations[key] for key in sorted(generations)]
@@ -276,6 +280,19 @@ class RuntimeSnapshotCompiler:
             else ""
         )
         identity += f"|snapshot:{snapshot_revision}"
+        if private_proactive_catalog is not None:
+            if composition_root is None:
+                raise RuntimeError(
+                    "RuntimeSnapshot private proactive catalog 缺少 Root Context"
+                )
+            if (
+                private_proactive_catalog.root_instance_token
+                is not composition_root.instance_token
+            ):
+                raise RuntimeError(
+                    "RuntimeSnapshot private proactive catalog 不属于 exact Root"
+                )
+            identity += f"|private-proactive:{private_proactive_catalog.identity}"
         composition_topology: TopologyView | None = None
         composition_active_plugin_ids: frozenset[str] | None = None
         command_registry: CommandRegistry | None = None
@@ -556,6 +573,12 @@ class RuntimeSnapshotCompiler:
                 None
                 if proactive_component_catalog is None
                 else proactive_component_catalog.identity
+            ),
+            private_proactive_catalog=private_proactive_catalog,
+            private_proactive_catalog_identity=(
+                None
+                if private_proactive_catalog is None
+                else private_proactive_catalog.identity
             ),
             background_job_catalog=background_job_catalog,
             background_job_catalog_identity=(
@@ -907,6 +930,12 @@ class RuntimeSnapshotStore:
         if self._pending is None:
             return None
         return self._pending.candidate
+
+    @property
+    def pending_transaction(self) -> SnapshotTransaction | None:
+        """Expose the exact pending owner for its caller's failure cleanup."""
+
+        return self._pending
 
     @property
     def retained_snapshot_ids(self) -> tuple[str, ...]:
@@ -1558,6 +1587,8 @@ class RuntimeSnapshotStore:
                 or snapshot.managed_process_registry_identity is not None
                 or snapshot.proactive_component_catalog is not None
                 or snapshot.proactive_component_catalog_identity is not None
+                or snapshot.private_proactive_catalog is not None
+                or snapshot.private_proactive_catalog_identity is not None
                 or snapshot.background_job_catalog is not None
                 or snapshot.background_job_catalog_identity is not None
             ):
@@ -1641,6 +1672,23 @@ class RuntimeSnapshotStore:
         ):
             raise RuntimeError(
                 "RuntimeSnapshot proactive catalog 不属于 exact Root"
+            )
+        if (
+            snapshot.private_proactive_catalog_identity
+            != (
+                None
+                if snapshot.private_proactive_catalog is None
+                else snapshot.private_proactive_catalog.identity
+            )
+        ):
+            raise RuntimeError("RuntimeSnapshot private proactive catalog 在编译后发生变化")
+        if (
+            snapshot.private_proactive_catalog is not None
+            and snapshot.private_proactive_catalog.root_instance_token
+            is not root.instance_token
+        ):
+            raise RuntimeError(
+                "RuntimeSnapshot private proactive catalog 不属于 exact Root"
             )
         if (
             snapshot.background_job_catalog_identity

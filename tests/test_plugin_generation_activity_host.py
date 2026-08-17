@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from typing import Any, cast
 
 import pytest
@@ -10,7 +10,15 @@ from agent.plugins.generation_activity_host import (
     ActivityCatalog,
     ActivityHost,
 )
+from agent.plugins.composable import ComposablePlugin
+from agent.plugins.generation import (
+    GateResult,
+    PluginContributions,
+    PluginGeneration,
+)
 from agent.plugins.manager import PluginManager
+from agent.plugins.private_proactive import PrivateProactiveCatalog
+from agent.plugins.scope import PluginScope
 from agent.plugins.snapshot import RuntimeSnapshotCompiler, RuntimeSnapshotStore
 from agent.plugin_composition import CompositionRoot
 from bus.event_bus import EventBus
@@ -64,6 +72,7 @@ def test_activity_identity_includes_exact_handler_generation() -> None:
     first = SimpleNamespace(
         proactive_component_catalog=catalog,
         background_job_catalog=None,
+        private_proactive_catalog=None,
         generations={
             "probe": SimpleNamespace(
                 generation_id="generation-a",
@@ -74,6 +83,7 @@ def test_activity_identity_includes_exact_handler_generation() -> None:
     second = SimpleNamespace(
         proactive_component_catalog=catalog,
         background_job_catalog=None,
+        private_proactive_catalog=None,
         generations={
             "probe": SimpleNamespace(
                 generation_id="generation-b",
@@ -183,6 +193,30 @@ async def test_activity_host_materialize_failure_closes_partial_children() -> No
 
     assert any(event.startswith("close:") for event in first.events)
     await host.rollback(transaction)
+    assert not target.active
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_activity_host_prepare_failure_discards_prior_child_plans() -> None:
+    class _PreparedChild(_RecordingChild):
+        def discard_plan(self, transaction_id, plan):
+            self.events.append(f"discard:{plan}")
+
+    class _FailingPrepareChild(_RecordingChild):
+        name = "failing-prepare"
+
+        def prepare_components(self, transaction_id, target_lease, target_catalog):
+            raise RuntimeError("prepare failed")
+
+    child = _PreparedChild()
+    host = ActivityHost((child, _FailingPrepareChild()))
+    store, target = _stable_lease("prepare-failure")
+
+    with pytest.raises(RuntimeError, match="prepare failed"):
+        await host.prepare_transaction(target)
+
+    assert child.events == ["prepare", f"discard:{target.snapshot.snapshot_id}"]
     assert not target.active
     await store.close()
 
@@ -465,3 +499,104 @@ async def test_manager_activity_only_change_uses_closed_provisional_boundary(
     ]
     await host.close()
     await manager._snapshot_store.close()
+
+
+@pytest.mark.asyncio
+async def test_initial_stable_activity_prepare_failure_discards_pending_candidate(
+    tmp_path,
+) -> None:
+    class _FailingChild:
+        name = "private_proactive"
+
+        def prepare_components(self, transaction_id, target_lease, target_catalog):
+            raise RuntimeError("private prepare failed")
+
+        async def stop_components(self, transaction_id, old_binding):
+            return None
+
+        async def materialize_closed(self, transaction_id, plan):
+            return None
+
+        def finalize_components(self, transaction_id, binding):
+            return None
+
+        def pause_components(self, binding):
+            return None
+
+        async def restore_components(self, transaction_id, old_binding):
+            return None
+
+        async def close_components(self, transaction_id, binding):
+            return None
+
+    host = ActivityHost((_FailingChild(),))
+    manager = PluginManager(
+        [],
+        event_bus=EventBus(),
+        workspace=tmp_path / "workspace",
+    )
+    manager.bind_activity_host(host)
+    root = CompositionRoot("initial-stable-failure")
+    module = ModuleType("plugins.test_stable_failure")
+    module.api_version = 3
+    module.name = "staged"
+    module.version = "test"
+    module.apply = lambda ctx, config: None
+    instance = ComposablePlugin.from_module(module)
+    generation = PluginGeneration(
+        plugin_id="staged",
+        generation_id="staged:generation",
+        module_path="plugins.test_stable_failure",
+        source_revision="source",
+        config_revision="config",
+        plugin_dir=tmp_path / "plugin",
+        data_dir=tmp_path / "plugin-data",
+        config=None,
+        instance=instance,
+        scope=PluginScope("staged"),
+        contributions=PluginContributions(manifest={"name": "staged"}),
+        gate_result=GateResult(
+            gate_id="test",
+            plugin_id="staged",
+            candidate_revision="source",
+            status="passed",
+            checks=(),
+        ),
+    )
+    private_catalog = PrivateProactiveCatalog(
+        (),
+        root_instance_token=root.instance_token,
+    )
+    snapshot = RuntimeSnapshotCompiler().compile(
+        {generation.plugin_id: generation},
+        snapshot_revision="initial-stable-failure",
+        composition_root=root,
+        private_proactive_catalog=private_catalog,
+    )
+
+    transaction = manager.snapshot_store.begin_publish(snapshot)
+
+    with pytest.raises(RuntimeError, match="private prepare failed"):
+        await manager._commit_snapshot_with_publication_participants(
+            transaction,
+            plugin_id="stable-boot",
+            old_services={},
+            new_services={},
+            old_channels=(),
+            new_channels=(),
+            old_commands=(),
+            new_commands=(),
+            promote_latest=False,
+        )
+
+    assert manager.snapshot_store.pending_transaction is transaction
+    await manager._discard_stable_batch(
+        [generation],
+        snapshot=snapshot,
+        catalog_id=None,
+        published_count=manager._legacy_publication_counts(),
+    )
+
+    assert manager.snapshot_store.pending_transaction is None
+    assert manager.snapshot_store.pending_candidate is None
+    await manager.snapshot_store.close()

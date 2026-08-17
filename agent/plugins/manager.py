@@ -161,6 +161,11 @@ from agent.plugins.generation_activity_host import (
     ActivityHost,
     ActivityTransaction,
 )
+from agent.plugins.private_proactive import (
+    PRIVATE_PROACTIVE_DEFINITIONS,
+    admit_private_proactive_module,
+    build_private_proactive_catalog,
+)
 from agent.plugins.snapshot import (
     RuntimeSnapshot,
     RuntimeSnapshotCompiler,
@@ -861,7 +866,8 @@ class PluginManager:
             return None
         proactive = snapshot.proactive_component_catalog
         jobs = snapshot.background_job_catalog
-        if proactive is None and jobs is None:
+        private = snapshot.private_proactive_catalog
+        if proactive is None and jobs is None and private is None:
             return None
         descriptors = (
             () if proactive is None else proactive.descriptors
@@ -877,10 +883,16 @@ class PluginManager:
             bindings.append(
                 f"{owner}:{generation.generation_id}:{generation.source_revision}"
             )
+        if private is not None:
+            for member in private.members:
+                bindings.append(
+                    f"{member.member}:{member.generation_id}:{member.source_revision}"
+                )
         return "|".join(
             (
                 "proactive:" + ("" if proactive is None else proactive.identity),
                 "jobs:" + ("" if jobs is None else jobs.identity),
+                "private-proactive:" + private.identity if private is not None else "private-proactive:",
                 "bindings:" + ",".join(bindings),
             )
         )
@@ -1723,6 +1735,7 @@ class PluginManager:
                 expected_activity = ActivityCatalog(
                     proactive=snapshot.proactive_component_catalog,
                     background_jobs=snapshot.background_job_catalog,
+                    private_proactive=snapshot.private_proactive_catalog,
                 ).identity
                 if (
                     activity is None
@@ -1890,19 +1903,40 @@ class PluginManager:
         """释放只归属于未发布启动批次的全部资源。"""
 
         self._restore_legacy_publication_counts(published_count)
-        if snapshot is not None:
+        pending = self._snapshot_store.pending_transaction
+        store_owned_pending = (
+            snapshot is not None
+            and pending is not None
+            and pending.candidate is snapshot
+        )
+        if snapshot is not None and not store_owned_pending:
             _ = self._snapshot_skill_catalogs.pop(snapshot.snapshot_id, None)
         for generation in reversed(staged):
             _ = self._active_generations.pop(generation.plugin_id, None)
-            generation.runtime_snapshot = None
-            await self._dispose_generation(generation, state="discarded")
-            if generation.boot_created_data_dir:
-                _remove_validation_data_dir(generation.data_dir)
-                generation.boot_created_data_dir = False
+            if not store_owned_pending:
+                generation.runtime_snapshot = None
+                await self._dispose_generation(generation, state="discarded")
+        if store_owned_pending:
+            assert pending is not None
+            await self._snapshot_store.abort(pending)
+            for generation in staged:
+                generation.runtime_snapshot = None
+                if generation.boot_created_data_dir:
+                    _remove_validation_data_dir(generation.data_dir)
+                    generation.boot_created_data_dir = False
+        else:
+            for generation in staged:
+                if generation.boot_created_data_dir:
+                    _remove_validation_data_dir(generation.data_dir)
+                    generation.boot_created_data_dir = False
         self._rollback_stable_kv(staged)
-        if snapshot is not None and snapshot.composition_root is not None:
+        if (
+            not store_owned_pending
+            and snapshot is not None
+            and snapshot.composition_root is not None
+        ):
             await snapshot.composition_root.dispose()
-        if catalog_id is not None:
+        if catalog_id is not None and not store_owned_pending:
             self._skill_host.close(catalog_id)
 
     async def _retry_stable_batch_without_failed(
@@ -3113,6 +3147,14 @@ class PluginManager:
                 snapshot_revision=catalog_id,
                 workspace_mcp_generation=self._active_workspace_mcp,
                 composition_root=composition_root,
+                private_proactive_catalog=build_private_proactive_catalog(
+                    generations.values(),
+                    root_instance_token=(
+                        None
+                        if composition_root is None
+                        else composition_root.instance_token
+                    ),
+                ),
             )
             _validate_static_manifest_runtime(snapshot, generations)
             snapshot.skill_catalog_generation_id = catalog_id
@@ -5404,6 +5446,29 @@ class PluginManager:
             loaded_module is not None
             and getattr(loaded_module, "api_version", None) == 3
         )
+        private_members = {item.member for item in PRIVATE_PROACTIVE_DEFINITIONS}
+        if (
+            isinstance(loaded_module, ModuleType)
+            and getattr(loaded_module, "name", None) in private_members
+        ):
+            try:
+                admit_private_proactive_module(loaded_module)
+            except Exception as error:
+                self._remove_module_tree(mp)
+                error_text = str(error) or type(error).__name__
+                self._record_failed_gate(
+                    plugin_id=initial_plugin_id,
+                    revision=source_revision,
+                    check_id="private_proactive_admission",
+                    reason=error_text,
+                )
+                self._abort_reload_attempt(
+                    reload_tx_id,
+                    error=f"private_proactive_admission: {error_text}",
+                )
+                raise RuntimeError(
+                    f"private proactive admission 失败: {initial_plugin_id}: {error_text}"
+                ) from error
         cls = plugin_registry.get_class(mp)
         if not is_v3 and cls is None:
             logger.warning("插件 %s 未注册类", mod["name"])
@@ -5958,6 +6023,14 @@ class PluginManager:
             candidate_owner=candidate_owner,
         )
         try:
+            private_proactive_catalog = build_private_proactive_catalog(
+                generations.values(),
+                root_instance_token=(
+                    None
+                    if composition_root is None
+                    else composition_root.instance_token
+                ),
+            )
             current = self.current_snapshot
             # V2_REMOVAL: legacy-only candidate 消失后删除 stable Root Health 豁免。
             reuses_stable_root = (
@@ -5971,6 +6044,7 @@ class PluginManager:
                 catalog_generation=generation,
                 workspace_mcp_generation=self._active_workspace_mcp,
                 composition_root=composition_root,
+                private_proactive_catalog=private_proactive_catalog,
                 require_composition_ready=not reuses_stable_root,
             )
             _validate_static_manifest_runtime(snapshot, generations)
@@ -6864,6 +6938,15 @@ class PluginManager:
                 self.current_snapshot.composition_root
                 if self.current_snapshot is not None
                 else None
+            ),
+            private_proactive_catalog=build_private_proactive_catalog(
+                self._active_generations.values(),
+                root_instance_token=(
+                    None
+                    if self.current_snapshot is None
+                    or self.current_snapshot.composition_root is None
+                    else self.current_snapshot.composition_root.instance_token
+                ),
             ),
         )
         snapshot.tool_registry = self._compile_snapshot_tools(

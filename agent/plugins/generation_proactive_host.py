@@ -505,6 +505,12 @@ class ProactiveActivityAdapter:
             self._plans.pop(transaction_id, None)
             raise
 
+    def discard_plan(self, transaction_id: str, plan: ProactiveActivityPlan) -> None:
+        """Discard a plan when a later Activity child rejects the transaction."""
+
+        if self._plans.get(transaction_id) is plan:
+            self._plans.pop(transaction_id, None)
+
     async def stop_components(
         self,
         transaction_id: str,

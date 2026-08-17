@@ -9,6 +9,7 @@ from typing import Any, Literal, Protocol
 
 from agent.plugin_composition.background_jobs import BackgroundJobCatalog
 from agent.plugin_composition.proactive import ProactiveCatalog
+from agent.plugins.private_proactive import PrivateProactiveCatalog
 from agent.plugins.snapshot import RuntimeSnapshotLease
 
 
@@ -18,6 +19,7 @@ class ActivityCatalog:
 
     proactive: ProactiveCatalog | None
     background_jobs: BackgroundJobCatalog | None
+    private_proactive: PrivateProactiveCatalog | None = None
 
     @property
     def identity(self) -> str:
@@ -26,8 +28,14 @@ class ActivityCatalog:
                 "proactive:" + ("" if self.proactive is None else self.proactive.identity),
                 "jobs:"
                 + ("" if self.background_jobs is None else self.background_jobs.identity),
+                "private-proactive:"
+                + ("" if self.private_proactive is None else self.private_proactive.identity),
             )
         )
+
+    @property
+    def private_proactive_identity(self) -> str | None:
+        return None if self.private_proactive is None else self.private_proactive.identity
 
 
 class ActivityChildAdapter(Protocol):
@@ -41,6 +49,8 @@ class ActivityChildAdapter(Protocol):
         target_lease: RuntimeSnapshotLease,
         target_catalog: ActivityCatalog,
     ) -> Any: ...
+
+    def discard_plan(self, transaction_id: str, plan: Any) -> None: ...
 
     async def stop_components(
         self,
@@ -190,19 +200,23 @@ class ActivityHost:
         catalog = ActivityCatalog(
             proactive=snapshot.proactive_component_catalog,
             background_jobs=snapshot.background_job_catalog,
+            private_proactive=snapshot.private_proactive_catalog,
         )
         transaction_id = secrets.token_hex(12)
+        plans: dict[str, object] = {}
         try:
-            plans = {
-                name: child.prepare_components(
+            for name, child in self._children.items():
+                plans[name] = child.prepare_components(
                     transaction_id,
                     target_lease,
                     catalog,
                 )
-                for name, child in self._children.items()
-            }
         except BaseException:
-            await target_lease.release()
+            try:
+                for name, plan in plans.items():
+                    self._children[name].discard_plan(transaction_id, plan)
+            finally:
+                await target_lease.release()
             raise
         transaction = ActivityTransaction(
             transaction_id=transaction_id,

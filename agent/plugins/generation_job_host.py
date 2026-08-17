@@ -452,15 +452,16 @@ class BackgroundJobActivityAdapter:
             raise RuntimeError("BackgroundJob target snapshot lease 已失效")
         catalog = _background_catalog(target_catalog)
         snapshot = target_lease.snapshot
-        if snapshot.background_job_catalog is not catalog:
-            if snapshot.background_job_catalog is None or (
-                snapshot.background_job_catalog.identity != catalog.identity
-            ):
+        snapshot_catalog = snapshot.background_job_catalog
+        if snapshot_catalog is not catalog:
+            if catalog is None or snapshot_catalog is None:
+                raise RuntimeError("BackgroundJob target catalog 与 snapshot 不匹配")
+            if snapshot_catalog.identity != catalog.identity:
                 raise RuntimeError("BackgroundJob target catalog 与 snapshot 不匹配")
         store = self._snapshot_store or _lease_store(target_lease)
         if store is None:
             raise RuntimeError("BackgroundJob 需要 RuntimeSnapshotStore")
-        bindings = tuple(catalog.values())
+        bindings = () if catalog is None else tuple(catalog.values())
         for binding in bindings:
             generation = snapshot.generations.get(binding.plugin_id)
             if generation is None:
@@ -470,7 +471,7 @@ class BackgroundJobActivityAdapter:
         plan = BackgroundJobPlan(
             transaction_id=transaction_id,
             snapshot_id=snapshot.snapshot_id,
-            catalog_identity=catalog.identity,
+            catalog_identity="" if catalog is None else catalog.identity,
             target_lease=target_lease,
             bindings=bindings,
             snapshot_store=store,
@@ -514,6 +515,9 @@ class BackgroundJobActivityAdapter:
                 snapshot_store=plan.snapshot_store,
             )
             # 2. Build producer resources while the binding remains closed.
+            if not jobs:
+                self._bindings[plan.snapshot_id] = runtime
+                return runtime
             if self._event_bus is not None:
                 runtime.subscriptions.append(
                     self._event_bus.on_any(
@@ -638,10 +642,17 @@ class BackgroundJobActivityAdapter:
             raise RuntimeError("BackgroundJob binding 已关闭")
         if binding.snapshot_id not in self._bindings:
             raise RuntimeError("BackgroundJob binding 不属于当前 adapter")
-        if binding.worker_task is None or binding.worker_task.done():
+        if binding.jobs and (binding.worker_task is None or binding.worker_task.done()):
             raise RuntimeError("BackgroundJob worker 尚未 materialize")
         binding.admission_open = True
         self._active = binding
+        self._plans.pop(transaction_id, None)
+
+    def discard_plan(self, transaction_id: str, plan: BackgroundJobPlan) -> None:
+        """Discard a plan when a later Activity child rejects the transaction."""
+
+        if self._plans.get(transaction_id) is plan:
+            self._plans.pop(transaction_id, None)
 
     def pause_components(self, binding: BackgroundJobRuntimeBinding) -> None:
         """Synchronously reject new producer admissions after committed cleanup failed."""
@@ -1420,8 +1431,10 @@ class BackgroundJobActivityAdapter:
 GenerationJobHost = BackgroundJobActivityAdapter
 
 
-def _background_catalog(value: object) -> BackgroundJobCatalog:
+def _background_catalog(value: object) -> BackgroundJobCatalog | None:
     catalog = getattr(value, "background_jobs", value)
+    if catalog is None:
+        return None
     if not isinstance(catalog, BackgroundJobCatalog):
         raise TypeError("target catalog 不是 BackgroundJobCatalog")
     return catalog

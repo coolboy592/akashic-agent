@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable, cast
 if TYPE_CHECKING:
     from core.memory.engine import MemoryRetrievalApi
     from agent.plugins.generation_activity_host import ActivityHost
+    from agent.plugins.generation_private_proactive_host import PrivateProactiveBinding
     from agent.plugins.snapshot import (
         RuntimeSnapshot,
         RuntimeSnapshotLease,
@@ -109,6 +110,7 @@ class ProactiveLoop:
         self._plugin_proactive_sources = proactive_sources or []
         self._runtime_snapshot_store = runtime_snapshot_store
         self._proactive_bridge = None
+        self._private_proactive_binding: PrivateProactiveBinding | None = None
         self._v3_proactive_runtime = None
         if activity_host is not None:
             from agent.plugins.generation_proactive_bridge import CommittedProactiveBridge
@@ -662,15 +664,32 @@ class ProactiveLoop:
             reset_runtime_snapshot(token)
 
     def _apply_snapshot(self, snapshot: RuntimeSnapshot) -> None:
-        self._plugin_proactive_modules = list(snapshot.proactive_modules)
-        self._plugin_proactive_lifecycles = list(snapshot.proactive_lifecycles)
-        self._plugin_proactive_module_factories = list(
-            snapshot.proactive_module_factories
-        )
-        self._plugin_proactive_runtime_factories = list(
-            snapshot.proactive_runtime_factories
-        )
-        self._plugin_proactive_sources = list(snapshot.proactive_sources.values())
+        private_binding = self._private_binding_for(snapshot)
+        self._private_proactive_binding = private_binding
+        if private_binding is not None:
+            # Private C20 binding is the sole runtime/factory/lifecycle owner.  The
+            # legacy snapshot lists remain only for the migration path without C20.
+            assert private_binding.lifecycle is not None
+            assert private_binding.runtime_factory is not None
+            self._plugin_proactive_modules = []
+            self._plugin_proactive_lifecycles = [private_binding.lifecycle]
+            self._plugin_proactive_module_factories = list(
+                private_binding.module_factories
+            )
+            self._plugin_proactive_runtime_factories = [
+                private_binding.runtime_factory
+            ]
+            self._plugin_proactive_sources = list(snapshot.proactive_sources.values())
+        else:
+            self._plugin_proactive_modules = list(snapshot.proactive_modules)
+            self._plugin_proactive_lifecycles = list(snapshot.proactive_lifecycles)
+            self._plugin_proactive_module_factories = list(
+                snapshot.proactive_module_factories
+            )
+            self._plugin_proactive_runtime_factories = list(
+                snapshot.proactive_runtime_factories
+            )
+            self._plugin_proactive_sources = list(snapshot.proactive_sources.values())
         bridge = getattr(self, "_proactive_bridge", None)
         if bridge is not None:
             activity = bridge.activity_host.active
@@ -683,6 +702,35 @@ class ProactiveLoop:
                     bridge.registered_sources(runtime)
                 )
         self._tool_hooks = list(snapshot.tool_hooks)
+
+    def _private_binding_for(
+        self,
+        snapshot: RuntimeSnapshot,
+    ) -> PrivateProactiveBinding | None:
+        """Resolve the exact private child without consulting Manager lists."""
+
+        if snapshot.private_proactive_catalog is None:
+            return None
+        bridge = getattr(self, "_proactive_bridge", None)
+        if bridge is None:
+            raise RuntimeError("private proactive snapshot 缺少 ActivityHost")
+        activity = bridge.activity_host.active
+        if activity is None or activity.snapshot_id != snapshot.snapshot_id:
+            raise RuntimeError("private proactive Activity binding 与 snapshot 不匹配")
+        binding = activity.child_bindings.get("private_proactive")
+        from agent.plugins.generation_private_proactive_host import (
+            PrivateProactiveBinding as Binding,
+        )
+
+        if not isinstance(binding, Binding):
+            raise RuntimeError("Activity binding 缺少 private proactive child")
+        if binding.catalog is not snapshot.private_proactive_catalog:
+            raise RuntimeError("private proactive binding catalog identity 不匹配")
+        if binding.snapshot is not snapshot:
+            raise RuntimeError("private proactive binding snapshot identity 不匹配")
+        if binding.family is None or not binding.active:
+            raise RuntimeError("private proactive binding 尚未开放")
+        return binding
 
 
 def build_proactive_loop(**kwargs: Any) -> ProactiveLoop:

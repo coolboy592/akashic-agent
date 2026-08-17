@@ -12,7 +12,7 @@ import tempfile
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import pytest
 
@@ -21,6 +21,11 @@ from agent.core.passive_turn import ContextStore as _  # noqa: F401
 from agent.config_models import Config
 from agent.lifecycle.types import AfterStepCtx, AfterToolResultCtx, BeforeToolCallCtx, BeforeTurnCtx
 from agent.plugins.context import PluginKVStore, PreparedPluginKVStore
+from agent.plugins.generation_activity_host import ActivityHost
+from agent.plugins.generation_private_proactive_host import (
+    PrivateProactiveBinding,
+    PrivateProactiveHost,
+)
 from agent.plugins.manager import PluginManager
 from agent.plugins.manifest import write_package_manifest
 from agent.plugins.jobs import (
@@ -70,6 +75,21 @@ def _make_manager(plugin_dirs: list[Path], *, event_bus: EventBus, tools: ToolRe
         workspace=TEST_PLUGIN_HOME / "workspace",
         installed_cache_root=TEST_PLUGIN_HOME / "cache",
     )
+
+
+def _bind_private_proactive(
+    mgr: PluginManager,
+    family: Literal["default", "wake"],
+) -> None:
+    mgr.bind_activity_host(ActivityHost((PrivateProactiveHost(family),)))
+
+
+def _private_binding(mgr: PluginManager) -> PrivateProactiveBinding:
+    activity = mgr.activity_host
+    assert activity is not None and activity.active is not None
+    binding = activity.active.child_bindings["private_proactive"]
+    assert isinstance(binding, PrivateProactiveBinding)
+    return binding
 
 
 class _FakePluginLlm:
@@ -131,23 +151,20 @@ async def test_load_hello_plugin():
 
 
 @pytest.mark.asyncio
-async def test_load_default_proactive_lifecycle():
+async def test_incomplete_private_primary_family_fails_loud():
     bus = EventBus()
     plugin_dir = Path(__file__).parents[1] / "plugins" / "default_proactive"
     mgr = _make_manager([plugin_dir], event_bus=bus)
+    _bind_private_proactive(mgr, "default")
 
-    await mgr.load_all()
-
-    assert len(mgr.proactive_lifecycles) == 1
-    lifecycle = mgr.proactive_lifecycles[0]
-    assert isinstance(lifecycle, ProactiveLifecycleSpec)
-    assert lifecycle.id == "default"
-    assert len(mgr.proactive_module_factories) == 1
-    assert len(mgr.proactive_runtime_factories) == 1
+    with pytest.raises(RuntimeError, match="family 不完整"):
+        await mgr.load_all()
+    assert mgr.current_snapshot is None
+    await mgr.terminate_all()
 
 
 @pytest.mark.asyncio
-async def test_wake_proactive_manifest_disables_legacy_flow_group():
+async def test_incomplete_private_wake_family_fails_loud():
     from agent.plugins.manifest import write_plugin_manifest
 
     plugins_root = Path(__file__).parents[1] / "plugins"
@@ -169,26 +186,26 @@ async def test_wake_proactive_manifest_disables_legacy_flow_group():
         ],
         event_bus=EventBus(),
     )
+    _bind_private_proactive(mgr, "wake")
 
-    await mgr.load_all()
-
-    assert mgr.loaded_count == 1
-    assert [item.id for item in mgr.proactive_lifecycles] == ["wake"]
-    assert len(mgr.proactive_module_factories) == 1
-    assert len(mgr.proactive_runtime_factories) == 1
+    with pytest.raises(RuntimeError, match="family 不完整"):
+        await mgr.load_all()
+    assert mgr.current_snapshot is None
     await mgr.terminate_all()
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("plugin_name", ["proactive_flow", "drift_flow"])
-async def test_load_proactive_flow_factory(plugin_name: str):
+async def test_incomplete_private_flow_family_fails_loud(plugin_name: str):
     bus = EventBus()
     plugin_dir = Path(__file__).parents[1] / "plugins" / plugin_name
     mgr = _make_manager([plugin_dir], event_bus=bus)
+    _bind_private_proactive(mgr, "default")
 
-    await mgr.load_all()
-
-    assert len(mgr.proactive_module_factories) == 1
+    with pytest.raises(RuntimeError, match="family 不完整"):
+        await mgr.load_all()
+    assert mgr.current_snapshot is None
+    await mgr.terminate_all()
 
 
 @pytest.mark.asyncio
@@ -204,15 +221,20 @@ async def test_builtin_package_completes_proactive_lifecycle(
     plugin_root = Path(__file__).parents[1] / "plugins"
     write_package_manifest({package_id: True}, plugins_home=TEST_PLUGIN_HOME)
     mgr = _make_manager([plugin_root], event_bus=bus)
+    _bind_private_proactive(
+        mgr,
+        cast(Literal["default", "wake"], lifecycle_id),
+    )
 
     try:
         await mgr.load_all()
 
-        assert [item.id for item in mgr.proactive_lifecycles] == [lifecycle_id]
-        assert [
-            item.lifecycle_id for item in mgr.proactive_runtime_factories
-        ] == [lifecycle_id]
-        assert len(mgr.proactive_module_factories) == 3
+        assert mgr.proactive_lifecycles == []
+        binding = _private_binding(mgr)
+        assert binding.lifecycle is not None
+        assert binding.lifecycle.id == lifecycle_id
+        assert getattr(binding.runtime_factory, "lifecycle_id") == lifecycle_id
+        assert len(binding.module_factories) == 3
     finally:
         await mgr.terminate_all()
 

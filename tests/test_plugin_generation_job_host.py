@@ -4,7 +4,7 @@ import asyncio
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from types import ModuleType, SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -259,6 +259,39 @@ async def test_prepare_is_pure_and_materialized_binding_is_closed(tmp_path) -> N
     assert store.leases == 0
     assert adapter.subscription_count == 0
     assert adapter.timer_count == 0
+
+
+@pytest.mark.asyncio
+async def test_missing_job_catalog_materializes_closed_noop_without_worker(tmp_path) -> None:
+    snapshot = SimpleNamespace(
+        snapshot_id="empty-jobs",
+        background_job_catalog=None,
+        generations={},
+        lease_count=1,
+    )
+    store = _Store(snapshot)
+    target_lease = RuntimeSnapshotLease(cast(Any, store), cast(Any, snapshot))
+    adapter = BackgroundJobActivityAdapter(
+        EventBus(),
+        cast(Any, store),
+        ledger=JobOutcomeLedger(tmp_path / "outcomes.sqlite"),
+    )
+
+    plan = adapter.prepare_components(
+        "tx-empty",
+        target_lease,
+        SimpleNamespace(background_jobs=None),
+    )
+    binding = await adapter.materialize_closed("tx-empty", plan)
+
+    assert binding.jobs == {}
+    assert binding.worker_task is None
+    assert binding.subscription_count == 0
+    assert binding.timer_count == 0
+    adapter.finalize_components("tx-empty", binding)
+    assert binding.admission_open
+
+    await adapter.close_components("shutdown", binding)
 
 
 @pytest.mark.asyncio
