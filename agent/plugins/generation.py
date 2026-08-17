@@ -69,21 +69,11 @@ class GateResult:
 
 @dataclass(frozen=True)
 class PluginContributions:
-    # V2_REMOVAL(plugin-contributions-v2)：phase/MCP/process/proactive/job/channel/mobile 字段是
-    # Manager 对 v2 固定方法的冻结结果。对应首个真实 v3 capability 与 full-fleet Gate 建立后
-    # 逐族删除；manifest/Skill/Dashboard 等 v3 暂用字段须先迁入明确的 generation projection。
     manifest: dict[str, object]
     skill_roots: tuple[Path, ...] = ()
     drift_skill_roots: tuple[Path, ...] = ()
     mcp_servers: dict[str, dict[str, Any]] = field(default_factory=dict)
     managed_services: dict[str, dict[str, Any]] = field(default_factory=dict)
-    before_turn_modules: tuple[object, ...] = ()
-    before_reasoning_modules: tuple[object, ...] = ()
-    prompt_render_modules: tuple[object, ...] = ()
-    before_step_modules: tuple[object, ...] = ()
-    after_step_modules: tuple[object, ...] = ()
-    after_reasoning_modules: tuple[object, ...] = ()
-    after_turn_modules: tuple[object, ...] = ()
     proactive_modules: tuple[object, ...] = ()
     proactive_lifecycles: tuple[object, ...] = ()
     proactive_module_factories: tuple[object, ...] = ()

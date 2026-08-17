@@ -584,48 +584,6 @@ class AgentLoop:
         if self._compaction_runtime is not None:
             await self._compaction_runtime.shutdown()
 
-    def add_before_turn_plugin_modules(
-        self,
-        modules: list[object],
-    ) -> None:
-        self._passive_pipeline.add_before_turn_plugin_modules(modules)
-
-    def add_before_reasoning_plugin_modules(
-        self,
-        modules: list[object],
-    ) -> None:
-        self._passive_pipeline.add_before_reasoning_plugin_modules(modules)
-
-    def add_after_reasoning_plugin_modules(
-        self,
-        modules: list[object],
-    ) -> None:
-        self._passive_pipeline.add_after_reasoning_plugin_modules(modules)
-
-    def add_after_turn_plugin_modules(
-        self,
-        modules: list[object],
-    ) -> None:
-        self._passive_pipeline.add_after_turn_plugin_modules(modules)
-
-    def add_prompt_render_plugin_modules(
-        self,
-        modules: list[object],
-    ) -> None:
-        self._reasoner.add_prompt_render_plugin_modules(modules)
-
-    def add_before_step_plugin_modules(
-        self,
-        modules: list[object],
-    ) -> None:
-        self._reasoner.add_before_step_plugin_modules(modules)
-
-    def add_after_step_plugin_modules(
-        self,
-        modules: list[object],
-    ) -> None:
-        self._reasoner.add_after_step_plugin_modules(modules)
-
     # ── 中断控制面 ────────────────────────────────────────────────
 
     def request_interrupt(

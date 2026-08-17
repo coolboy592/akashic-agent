@@ -330,13 +330,6 @@ class PluginManager:
         ) = None
         self._loaded: set[str] = set()
         self._channels: list[Channel] = []
-        self._before_turn_modules: list[object] = []
-        self._before_reasoning_modules: list[object] = []
-        self._prompt_render_modules: list[object] = []
-        self._before_step_modules: list[object] = []
-        self._after_step_modules: list[object] = []
-        self._after_reasoning_modules: list[object] = []
-        self._after_turn_modules: list[object] = []
         self._proactive_modules: list[object] = []
         self._proactive_lifecycles: list[object] = []
         self._proactive_module_factories: list[object] = []
@@ -401,7 +394,7 @@ class PluginManager:
     def loaded_count(self) -> int:
         return len(self._loaded)
 
-    # V2_REMOVAL(plugin-manager-projections)：channels/phase/proactive/jobs 是 v2 固定贡献的
+    # V2_REMOVAL(plugin-manager-projections)：channels/proactive/jobs 是 v2 固定贡献的
     # Manager 投影。每个族群迁入 stable Root capability/catalog 且 bootstrap consumer 改读新
     # owner 后，删除下面的属性与 mutable fallback。
     @property
@@ -409,48 +402,6 @@ class PluginManager:
         if self.current_snapshot is not None:
             return list(self.current_snapshot.channels.values())
         return list(self._channels)
-
-    @property
-    def before_turn_modules(self) -> list[object]:
-        if self.current_snapshot is not None:
-            return list(self.current_snapshot.before_turn_modules)
-        return list(self._before_turn_modules)
-
-    @property
-    def before_reasoning_modules(self) -> list[object]:
-        if self.current_snapshot is not None:
-            return list(self.current_snapshot.before_reasoning_modules)
-        return list(self._before_reasoning_modules)
-
-    @property
-    def prompt_render_modules(self) -> list[object]:
-        if self.current_snapshot is not None:
-            return list(self.current_snapshot.prompt_render_modules)
-        return list(self._prompt_render_modules)
-
-    @property
-    def before_step_modules(self) -> list[object]:
-        if self.current_snapshot is not None:
-            return list(self.current_snapshot.before_step_modules)
-        return list(self._before_step_modules)
-
-    @property
-    def after_step_modules(self) -> list[object]:
-        if self.current_snapshot is not None:
-            return list(self.current_snapshot.after_step_modules)
-        return list(self._after_step_modules)
-
-    @property
-    def after_reasoning_modules(self) -> list[object]:
-        if self.current_snapshot is not None:
-            return list(self.current_snapshot.after_reasoning_modules)
-        return list(self._after_reasoning_modules)
-
-    @property
-    def after_turn_modules(self) -> list[object]:
-        if self.current_snapshot is not None:
-            return list(self.current_snapshot.after_turn_modules)
-        return list(self._after_turn_modules)
 
     @property
     def jobs(self) -> list[RegisteredPluginJob]:
@@ -6782,13 +6733,6 @@ class PluginManager:
             _ = self._active_plugins.pop(mp, None)
         self._loaded.clear()
         self._active_plugins.clear()
-        self._before_turn_modules.clear()
-        self._before_reasoning_modules.clear()
-        self._prompt_render_modules.clear()
-        self._before_step_modules.clear()
-        self._after_step_modules.clear()
-        self._after_reasoning_modules.clear()
-        self._after_turn_modules.clear()
         self._proactive_modules.clear()
         self._proactive_lifecycles.clear()
         self._proactive_module_factories.clear()
@@ -7532,13 +7476,6 @@ def _replace_snapshot_payload(
         raise RuntimeError("只能刷新无 lease 的 candidate snapshot")
     for name in (
         "generations",
-        "before_turn_modules",
-        "before_reasoning_modules",
-        "prompt_render_modules",
-        "before_step_modules",
-        "after_step_modules",
-        "after_reasoning_modules",
-        "after_turn_modules",
         "jobs",
         "proactive_sources",
         "proactive_modules",

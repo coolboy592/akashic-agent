@@ -280,12 +280,6 @@ class PassiveTurnDeps:
     reasoner: "Reasoner"
     event_bus: "EventBus | None" = None
     outbound_port: "OutboundPort | None" = None
-    before_turn_plugin_modules: list[object] | None = None
-    before_reasoning_plugin_modules: list[object] | None = None
-    before_step_plugin_modules: list[object] | None = None
-    after_step_plugin_modules: list[object] | None = None
-    after_reasoning_plugin_modules: list[object] | None = None
-    after_turn_plugin_modules: list[object] | None = None
 
 
 @dataclass
@@ -324,55 +318,10 @@ class PassiveTurnPipeline:
         self._context = deps.context
         self._tools = deps.tools
         self._reasoner = deps.reasoner
-        if deps.before_step_plugin_modules is not None:
-            self._reasoner.add_before_step_plugin_modules(
-                list(deps.before_step_plugin_modules)
-            )
-        if deps.after_step_plugin_modules is not None:
-            self._reasoner.add_after_step_plugin_modules(
-                list(deps.after_step_plugin_modules)
-            )
         self._outbound_port = deps.outbound_port or _NoopOutboundPort()
-        self._before_turn_plugin_modules = list(deps.before_turn_plugin_modules or [])
-        self._before_reasoning_plugin_modules = list(
-            deps.before_reasoning_plugin_modules or []
-        )
-        self._after_reasoning_plugin_modules = list(
-            deps.after_reasoning_plugin_modules or []
-        )
-        self._after_turn_plugin_modules = list(deps.after_turn_plugin_modules or [])
         bus = deps.event_bus or EventBus()
         self._bus = bus
 
-        self._snapshot_phases: tuple[str, _PassivePhaseBundle] | None = None
-        self._rebuild_phases()
-
-    def add_before_turn_plugin_modules(
-        self,
-        modules: list[object],
-    ) -> None:
-        self._before_turn_plugin_modules.extend(modules)
-        self._rebuild_phases()
-
-    def add_before_reasoning_plugin_modules(
-        self,
-        modules: list[object],
-    ) -> None:
-        self._before_reasoning_plugin_modules.extend(modules)
-        self._rebuild_phases()
-
-    def add_after_reasoning_plugin_modules(
-        self,
-        modules: list[object],
-    ) -> None:
-        self._after_reasoning_plugin_modules.extend(modules)
-        self._rebuild_phases()
-
-    def add_after_turn_plugin_modules(
-        self,
-        modules: list[object],
-    ) -> None:
-        self._after_turn_plugin_modules.extend(modules)
         self._rebuild_phases()
 
     def _rebuild_phases(self) -> None:
@@ -382,32 +331,21 @@ class PassiveTurnPipeline:
             after_reasoning=self._build_after_reasoning_phase(),
             after_turn=self._build_after_turn_phase(),
         )
-        self._snapshot_phases = None
 
     def _build_before_turn_phase(
         self,
-        plugin_modules: list[object] | None = None,
     ) -> Phase[TurnState, BeforeTurnCtx, BeforeTurnFrame]:
         return Phase(
             default_before_turn_modules(
                 self._bus,
                 self._session.session_manager,
                 self._context_store,
-                plugin_modules=cast(
-                    "list[Any]",
-                    (
-                        self._before_turn_plugin_modules
-                        if plugin_modules is None
-                        else plugin_modules
-                    ),
-                ),
             ),
             frame_factory=BeforeTurnFrame,
         )
 
     def _build_before_reasoning_phase(
         self,
-        plugin_modules: list[object] | None = None,
     ) -> Phase[BeforeReasoningInput, BeforeReasoningCtx, BeforeReasoningFrame]:
         return Phase(
             default_before_reasoning_modules(
@@ -415,85 +353,35 @@ class PassiveTurnPipeline:
                 self._tools,
                 self._session.session_manager,
                 self._context,
-                plugin_modules=cast(
-                    "list[Any]",
-                    (
-                        self._before_reasoning_plugin_modules
-                        if plugin_modules is None
-                        else plugin_modules
-                    ),
-                ),
             ),
             frame_factory=BeforeReasoningFrame,
         )
 
     def _build_after_reasoning_phase(
         self,
-        plugin_modules: list[object] | None = None,
     ) -> Phase[AfterReasoningInput, TurnSnapshot, AfterReasoningFrame]:
         return Phase(
             default_after_reasoning_modules(
                 self._bus,
                 self._session,
-                plugin_modules=cast(
-                    "list[Any]",
-                    (
-                        self._after_reasoning_plugin_modules
-                        if plugin_modules is None
-                        else plugin_modules
-                    ),
-                ),
             ),
             frame_factory=AfterReasoningFrame,
         )
 
     def _build_after_turn_phase(
         self,
-        plugin_modules: list[object] | None = None,
     ) -> Phase[TurnSnapshot, OutboundMessage, AfterTurnFrame]:
         return Phase(
             default_after_turn_modules(
                 self._bus,
                 self._outbound_port,
                 self._context,
-                plugin_modules=cast(
-                    "list[Any]",
-                    (
-                        self._after_turn_plugin_modules
-                        if plugin_modules is None
-                        else plugin_modules
-                    ),
-                ),
             ),
             frame_factory=AfterTurnFrame,
         )
 
     def _runtime_phases(self) -> _PassivePhaseBundle:
-        snapshot = get_current_runtime_snapshot()
-        if snapshot is None:
-            return self._phases
-        if (
-            self._snapshot_phases is None
-            or self._snapshot_phases[0] != snapshot.snapshot_id
-        ):
-            self._snapshot_phases = (
-                snapshot.snapshot_id,
-                _PassivePhaseBundle(
-                    before_turn=self._build_before_turn_phase(
-                        list(snapshot.before_turn_modules)
-                    ),
-                    before_reasoning=self._build_before_reasoning_phase(
-                        list(snapshot.before_reasoning_modules)
-                    ),
-                    after_reasoning=self._build_after_reasoning_phase(
-                        list(snapshot.after_reasoning_modules)
-                    ),
-                    after_turn=self._build_after_turn_phase(
-                        list(snapshot.after_turn_modules)
-                    ),
-                ),
-            )
-        return self._snapshot_phases[1]
+        return self._phases
 
     async def run_command(
         self,
@@ -1023,24 +911,6 @@ class Reasoner(ABC):
     ) -> "TurnRunResult":
         """执行完整被动 turn，包括 retry / trim / tool loop。"""
 
-    def add_prompt_render_plugin_modules(
-        self,
-        modules: list[object],
-    ) -> None:
-        """子类可重写以注入 prompt render modules。默认 no-op。"""
-
-    def add_before_step_plugin_modules(
-        self,
-        modules: list[object],
-    ) -> None:
-        """子类可重写以注入 before-step modules。默认 no-op。"""
-
-    def add_after_step_plugin_modules(
-        self,
-        modules: list[object],
-    ) -> None:
-        """子类可重写以注入 after-step modules。默认 no-op。"""
-
     async def render_prompt(
         self,
         input: PromptRenderInput,
@@ -1073,26 +943,6 @@ class DefaultReasoner(Reasoner):
         self._context = context
         self._event_bus = event_bus
         self._non_preloadable_names = non_preloadable_names or set
-        self._prompt_render_plugin_modules: list[object] = []
-        self._before_step_plugin_modules: list[object] = []
-        self._after_step_plugin_modules: list[object] = []
-        self._snapshot_step_phases: (
-            tuple[
-                str,
-                tuple[
-                    Phase[BeforeStepInput, BeforeStepCtx, BeforeStepFrame],
-                    Phase[AfterStepCtx, AfterStepCtx, AfterStepFrame],
-                ],
-            ]
-            | None
-        ) = None
-        self._snapshot_prompt_render_phase: (
-            tuple[
-                str,
-                Phase[PromptRenderInput, PromptRenderResult, PromptRenderFrame],
-            ]
-            | None
-        ) = None
         self._tool_executor = ToolExecutor()
         self._stream_sink_factory: (
             Callable[[object], Callable[[dict[str, str] | str], Awaitable[None]] | None]
@@ -1113,87 +963,28 @@ class DefaultReasoner(Reasoner):
             self._build_prompt_render_phase(context) if context is not None else None
         )
 
-    def add_prompt_render_plugin_modules(
-        self,
-        modules: list[object],
-    ) -> None:
-        self._prompt_render_plugin_modules.extend(modules)
-        self._snapshot_prompt_render_phase = None
-        if self._context is not None:
-            self._prompt_render = self._build_prompt_render_phase(self._context)
-
-    def add_before_step_plugin_modules(
-        self,
-        modules: list[object],
-    ) -> None:
-        self._before_step_plugin_modules.extend(modules)
-        self._snapshot_step_phases = None
-        self._before_step = self._build_before_step_phase()
-
-    def add_after_step_plugin_modules(
-        self,
-        modules: list[object],
-    ) -> None:
-        self._after_step_plugin_modules.extend(modules)
-        self._snapshot_step_phases = None
-        self._after_step = self._build_after_step_phase()
-
     def _build_before_step_phase(
         self,
-        plugin_modules: list[object] | None = None,
     ) -> Phase[BeforeStepInput, BeforeStepCtx, BeforeStepFrame]:
         return Phase(
-            default_before_step_modules(
-                self._bus,
-                plugin_modules=cast(
-                    "list[Any]",
-                    (
-                        self._before_step_plugin_modules
-                        if plugin_modules is None
-                        else plugin_modules
-                    ),
-                ),
-            ),
+            default_before_step_modules(self._bus),
             frame_factory=BeforeStepFrame,
         )
 
     def _build_after_step_phase(
         self,
-        plugin_modules: list[object] | None = None,
     ) -> Phase[AfterStepCtx, AfterStepCtx, AfterStepFrame]:
         return Phase(
-            default_after_step_modules(
-                self._bus,
-                plugin_modules=cast(
-                    "list[Any]",
-                    (
-                        self._after_step_plugin_modules
-                        if plugin_modules is None
-                        else plugin_modules
-                    ),
-                ),
-            ),
+            default_after_step_modules(self._bus),
             frame_factory=AfterStepFrame,
         )
 
     def _build_prompt_render_phase(
         self,
         context: "ContextBuilder",
-        plugin_modules: list[object] | None = None,
     ) -> Phase[PromptRenderInput, PromptRenderResult, PromptRenderFrame]:
         return Phase(
-            default_prompt_render_modules(
-                self._bus,
-                context,
-                plugin_modules=cast(
-                    "list[Any]",
-                    (
-                        self._prompt_render_plugin_modules
-                        if plugin_modules is None
-                        else plugin_modules
-                    ),
-                ),
-            ),
+            default_prompt_render_modules(self._bus, context),
             frame_factory=PromptRenderFrame,
         )
 
@@ -1203,19 +994,6 @@ class DefaultReasoner(Reasoner):
     ) -> PromptRenderResult:
         if self._context is None:
             raise RuntimeError("DefaultReasoner.render_prompt requires context")
-        snapshot = get_current_runtime_snapshot()
-        if snapshot is not None:
-            cached = self._snapshot_prompt_render_phase
-            if cached is None or cached[0] != snapshot.snapshot_id:
-                cached = (
-                    snapshot.snapshot_id,
-                    self._build_prompt_render_phase(
-                        self._context,
-                        list(snapshot.prompt_render_modules),
-                    ),
-                )
-                self._snapshot_prompt_render_phase = cached
-            return await cached[1].run(input)
         if self._prompt_render is None:
             self._prompt_render = self._build_prompt_render_phase(self._context)
         return await self._prompt_render.run(input)
@@ -1226,20 +1004,7 @@ class DefaultReasoner(Reasoner):
         Phase[BeforeStepInput, BeforeStepCtx, BeforeStepFrame],
         Phase[AfterStepCtx, AfterStepCtx, AfterStepFrame],
     ]:
-        snapshot = get_current_runtime_snapshot()
-        if snapshot is None:
-            return self._before_step, self._after_step
-        cached = self._snapshot_step_phases
-        if cached is None or cached[0] != snapshot.snapshot_id:
-            cached = (
-                snapshot.snapshot_id,
-                (
-                    self._build_before_step_phase(list(snapshot.before_step_modules)),
-                    self._build_after_step_phase(list(snapshot.after_step_modules)),
-                ),
-            )
-            self._snapshot_step_phases = cached
-        return cached[1]
+        return self._before_step, self._after_step
 
     def _build_compaction_state(
         self,

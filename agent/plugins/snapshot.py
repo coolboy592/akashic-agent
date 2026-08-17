@@ -8,7 +8,6 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Literal, cast
 
-from agent.lifecycle.phase import topo_sort_modules
 from agent.mcp.generation import WorkspaceMcpGeneration
 from agent.plugins.generation import PluginGeneration
 from agent.plugins.jobs import RegisteredPluginJob, plugin_job_key
@@ -73,16 +72,6 @@ RuntimeSelector = Literal["stable", "latest"]
 class RuntimeSnapshot:
     snapshot_id: str
     generations: Mapping[str, PluginGeneration]
-    # V2_REMOVAL(snapshot-fixed-contributions)：这些 phase/job/proactive/channel/MCP/process 字段
-    # 是 v2 固定贡献目录。最后一个 consumer 迁到 stable Root capability/catalog 后删除，最终
-    # snapshot 只保留 generation、CompositionRoot/topology 与必要的派生 catalog identity。
-    before_turn_modules: tuple[object, ...]
-    before_reasoning_modules: tuple[object, ...]
-    prompt_render_modules: tuple[object, ...]
-    before_step_modules: tuple[object, ...]
-    after_step_modules: tuple[object, ...]
-    after_reasoning_modules: tuple[object, ...]
-    after_turn_modules: tuple[object, ...]
     jobs: Mapping[str, RegisteredPluginJob]
     proactive_sources: Mapping[str, RegisteredProactiveSource]
     proactive_modules: tuple[object, ...]
@@ -173,24 +162,7 @@ class SnapshotTransaction:
     candidate: RuntimeSnapshot
 
 
-@dataclass(frozen=True)
-class _SnapshotModuleOrder:
-    module: object
-    slot: str
-    requires: tuple[str, ...]
-
-
 class RuntimeSnapshotCompiler:
-    _PHASE_FIELDS = (
-        "before_turn_modules",
-        "before_reasoning_modules",
-        "prompt_render_modules",
-        "before_step_modules",
-        "after_step_modules",
-        "after_reasoning_modules",
-        "after_turn_modules",
-    )
-
     def compile(
         self,
         generations: Mapping[str, PluginGeneration],
@@ -205,14 +177,6 @@ class RuntimeSnapshotCompiler:
         ordered = [generations[key] for key in sorted(generations)]
         if any(generation.plugin_id != key for key, generation in generations.items()):
             raise RuntimeError("RuntimeSnapshot generation key 与 plugin_id 不一致")
-        phases: dict[str, tuple[object, ...]] = {}
-        for field_name in self._PHASE_FIELDS:
-            modules = tuple(
-                module
-                for generation in ordered
-                for module in getattr(generation.contributions, field_name)
-            )
-            phases[field_name] = self.order_plugin_modules(modules)
         jobs = self._compile_jobs(ordered)
         sources = self._compile_sources(ordered)
         proactive_modules = tuple(
@@ -611,38 +575,10 @@ class RuntimeSnapshotCompiler:
                 else None
             ),
             command_registry=command_registry,
-            before_turn_modules=phases["before_turn_modules"],
-            before_reasoning_modules=phases["before_reasoning_modules"],
-            prompt_render_modules=phases["prompt_render_modules"],
-            before_step_modules=phases["before_step_modules"],
-            after_step_modules=phases["after_step_modules"],
-            after_reasoning_modules=phases["after_reasoning_modules"],
-            after_turn_modules=phases["after_turn_modules"],
             composition_root=composition_root,
             composition_topology=composition_topology,
             composition_active_plugin_ids=composition_active_plugin_ids,
         )
-    @staticmethod
-    def order_plugin_modules(modules: tuple[object, ...]) -> tuple[object, ...]:
-        slots = {
-            str(slot)
-            for slot in (getattr(module, "slot", None) for module in modules)
-            if isinstance(slot, str) and slot
-        }
-        bindings = [
-            _SnapshotModuleOrder(
-                module=module,
-                slot=str(getattr(module, "slot", "")),
-                requires=tuple(
-                    str(required)
-                    for required in getattr(module, "requires", ())
-                    if str(required) in slots
-                ),
-            )
-            for module in modules
-        ]
-        ordered = cast(list[_SnapshotModuleOrder], topo_sort_modules(bindings))
-        return tuple(binding.module for binding in ordered)
 
     @staticmethod
     def _validate_proactive_component_catalog(
