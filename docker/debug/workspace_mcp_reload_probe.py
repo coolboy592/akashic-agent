@@ -588,13 +588,44 @@ async def _run_plugin_conflict(root: Path, checks: list[dict[str, object]]) -> N
     plugins = root / "conflict-plugins"
     plugin = plugins / "collision"
     plugin.mkdir(parents=True)
+    (plugin / "synthetic_mcp.py").write_text(SERVER_SOURCE, encoding="utf-8")
+    (plugin / "watch.txt").write_text("plugin", encoding="utf-8")
+    (plugin / "requirements.txt").write_text("", encoding="utf-8")
+    interpreter = plugin / ".venv/bin/python"
+    interpreter.parent.mkdir(parents=True)
+    interpreter.write_text(
+        f"#!/bin/sh\nexec {sys.executable} \"$@\"\n",
+        encoding="utf-8",
+    )
+    interpreter.chmod(0o755)
     (plugin / "plugin.py").write_text(
-        "from agent.plugins import McpServerSpec, Plugin\n"
-        "class CollisionPlugin(Plugin):\n"
-        "    name = 'collision'\n"
-        "    @classmethod\n"
-        "    def mcp_servers(cls):\n"
-        "        return [McpServerSpec(name='docs', command=('python', 'unused.py'))]\n",
+        "from agent.plugin_composition import MCP_SERVERS, McpServerDefinition\n"
+        "api_version = 3\n"
+        "name = 'collision'\n"
+        "version = '1.0.0'\n"
+        "inject = (MCP_SERVERS,)\n"
+        "async def apply(ctx, config):\n"
+        "    await ctx.require(MCP_SERVERS).register(ctx, McpServerDefinition(\n"
+        "        name='docs', command=('python', 'synthetic_mcp.py'),\n"
+        f"        env={{'VERSION': 'plugin', 'INSTANCE': 'plugin', "
+        f"'LIFECYCLE_LOG': {str(lifecycle)!r}, "
+        f"'MARKER_PATH': {str(plugin / 'watch.txt')!r}}}))\n",
+        encoding="utf-8",
+    )
+    (plugin / "akashic.plugin.toml").write_text(
+        "schema_version = 1\n"
+        "name = 'collision'\n"
+        "version = '1.0.0'\n"
+        "api_version = 3\n"
+        "entrypoint = 'plugin.py'\n\n"
+        "[[python]]\n"
+        "requirements = 'requirements.txt'\n\n"
+        "[[mcp]]\n"
+        "name = 'docs'\n"
+        "command = ['python', 'synthetic_mcp.py']\n"
+        f"env = {{VERSION = 'plugin', INSTANCE = 'plugin', "
+        f"LIFECYCLE_LOG = {str(lifecycle)!r}, "
+        f"MARKER_PATH = {str(plugin / 'watch.txt')!r}}}\n",
         encoding="utf-8",
     )
     previous = os.environ.get("AKASHIC_EXTRA_PLUGIN_DIRS")
@@ -614,7 +645,7 @@ async def _run_plugin_conflict(root: Path, checks: list[dict[str, object]]) -> N
     _check(
         checks,
         "plugin-name-conflict-fail-loud",
-        "workspace MCP 与插件声明冲突" in error
+        "MCP 工具名称重复: mcp_docs__version" in error
         and not _running_pids(lifecycle),
         error=error,
         runningPids=_running_pids(lifecycle),
