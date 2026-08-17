@@ -797,3 +797,75 @@ async def test_web_turn_started_rejects_missing_server_turn_id() -> None:
             content="question",
             timestamp=datetime.now(UTC),
         ))
+
+
+@pytest.mark.asyncio
+async def test_web_final_without_socket_caches_terminal_for_refill() -> None:
+    channel = WebChatChannel()
+    channel._active_turn_ids["web:abc"] = "turn-1"
+    await channel._on_response(
+        OutboundMessage(
+            channel="web",
+            chat_id="abc",
+            content="answer",
+            thinking="reasoning",
+            media=[],
+            metadata={},
+            control_turn_id="turn-1",
+        )
+    )
+
+    cached = channel._pending_terminal["web:abc"]
+    assert cached["turn_id"] == "turn-1"
+    assert cached["content"] == "answer"
+
+
+@pytest.mark.asyncio
+async def test_web_attach_refills_cached_terminal() -> None:
+    channel = WebChatChannel()
+    channel._active_turn_ids["web:abc"] = "turn-1"
+    await channel._on_response(
+        OutboundMessage(
+            channel="web",
+            chat_id="abc",
+            content="answer",
+            thinking="reasoning",
+            media=[],
+            metadata={},
+            control_turn_id="turn-1",
+        )
+    )
+    assert "web:abc" in channel._pending_terminal
+
+    socket = _WebSocket()
+    await channel._attach_session(cast(Any, socket), "req-1", {"session_id": "web:abc"})
+
+    assert socket.frames == [{
+        "type": "message.final",
+        "session_id": "web:abc",
+        "turn_id": "turn-1",
+        "content": "answer",
+        "thinking": "reasoning",
+        "media": [],
+        "duration_ms": None,
+        "metadata": {},
+    }]
+    assert "web:abc" not in channel._pending_terminal
+
+
+@pytest.mark.asyncio
+async def test_web_final_without_turn_is_not_cached() -> None:
+    channel = WebChatChannel()
+    with pytest.raises(RuntimeError, match="缺少 Server 权威 active turn"):
+        await channel._on_response(
+            OutboundMessage(
+                channel="web",
+                chat_id="abc",
+                content="（消息发送失败，请稍后重试）",
+                thinking="",
+                media=[],
+                metadata={},
+            )
+        )
+
+    assert "web:abc" not in channel._pending_terminal
