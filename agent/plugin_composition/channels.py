@@ -888,6 +888,96 @@ class ChannelDefinition:
 
 
 @dataclass(frozen=True, slots=True)
+class CoreChannelDefinition:
+    """Describe one Core-owned channel projection without opening provider state."""
+
+    name: str
+    capabilities: frozenset[ChannelCapability]
+    factory: Callable[[ChannelFactoryContext], ChannelAdapter]
+    inbound_identity: InboundIdentity | None
+    source_revision: str
+    config_revision: str
+    generation_id: str
+    credential_paths: tuple[str, ...] = ()
+    factory_export: str = ""
+    config: Mapping[str, object] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.name, str) or _NAME.fullmatch(self.name) is None:
+            raise ValueError(f"core channel name 无效: {self.name}")
+        if not isinstance(self.capabilities, frozenset) or not self.capabilities:
+            raise ValueError("core channel capabilities 必须是非空 frozenset")
+        if any(not isinstance(item, ChannelCapability) for item in self.capabilities):
+            raise ValueError("core channel capabilities 必须只包含 ChannelCapability")
+        if not callable(self.factory):
+            raise TypeError("core channel factory 必须可调用")
+        has_inbound = ChannelCapability.INBOUND in self.capabilities
+        if has_inbound and not isinstance(self.inbound_identity, InboundIdentity):
+            raise ValueError("inbound core channel 必须声明 inbound_identity")
+        if not has_inbound and self.inbound_identity is not None:
+            raise ValueError("非 inbound core channel 不得声明 inbound_identity")
+        factory_export = self.factory_export or (
+            "core."
+            + self.name.replace("-", "_")
+            + ".factory"
+        )
+        if (
+            not isinstance(factory_export, str)
+            or _FACTORY_EXPORT.fullmatch(factory_export) is None
+            or ".." in factory_export
+            or factory_export.endswith((".", ":"))
+        ):
+            raise ValueError(f"core channel factory_export 无效: {factory_export}")
+        for field_name in ("source_revision", "config_revision", "generation_id"):
+            if not isinstance(getattr(self, field_name), str) or not getattr(
+                self, field_name
+            ):
+                raise ValueError(f"core channel {field_name} 必须是非空字符串")
+        if not isinstance(self.config, Mapping):
+            raise TypeError("core channel config 必须是 mapping")
+        object.__setattr__(
+            self,
+            "credential_paths",
+            _credential_paths(self.credential_paths, allow_empty=True),
+        )
+        frozen_config = _freeze_channel_config(self.config)
+        if not isinstance(frozen_config, Mapping):
+            raise TypeError("core channel config 必须是 mapping")
+        object.__setattr__(self, "config", frozen_config)
+        object.__setattr__(self, "factory_export", factory_export)
+
+    @property
+    def descriptor(self) -> "ChannelDescriptor":
+        """Project this Core definition into the common immutable descriptor."""
+
+        return ChannelDescriptor(
+            owner="core",
+            name=self.name,
+            capabilities=tuple(
+                sorted(self.capabilities, key=lambda item: item.value)
+            ),
+            factory_export=self.factory_export,
+            inbound_identity=self.inbound_identity,
+            credential_paths=self.credential_paths,
+        )
+
+    @property
+    def provenance(self) -> "ChannelFactoryProvenance":
+        """Return the stable provenance identity used by a committed catalog."""
+
+        return ChannelFactoryProvenance(
+            plugin_id="core",
+            generation_id=self.generation_id,
+            channel_name=self.name,
+            source_revision=self.source_revision,
+            config_revision=(
+                f"{self.config_revision}:{channel_config_revision(self.config)}"
+            ),
+            factory_export=self.factory_export,
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class ChannelDescriptor:
     owner: str
     name: str
@@ -918,7 +1008,14 @@ class ChannelDescriptor:
             raise ValueError("inbound channel descriptor 必须声明 inbound_identity")
         if not has_inbound and self.inbound_identity is not None:
             raise ValueError("非 inbound channel descriptor 不得声明 inbound_identity")
-        object.__setattr__(self, "credential_paths", _credential_paths(self.credential_paths))
+        object.__setattr__(
+            self,
+            "credential_paths",
+            _credential_paths(
+                self.credential_paths,
+                allow_empty=self.owner == "core",
+            ),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -986,6 +1083,96 @@ class ChannelRegistrySnapshot:
             raise ValueError("channel registry identity 与内容不匹配")
         object.__setattr__(self, "descriptors", descriptors)
         object.__setattr__(self, "factories", factories)
+
+
+@dataclass(frozen=True, slots=True)
+class CommittedChannelCatalog:
+    """Own the immutable merge of Core definitions and the plugin registry."""
+
+    plugin_registry: ChannelRegistrySnapshot | None = None
+    core_definitions: tuple[CoreChannelDefinition, ...] = ()
+    root_instance_token: object | None = field(default=None, repr=False, compare=False)
+    registry: ChannelRegistrySnapshot = field(init=False)
+
+    def __post_init__(self) -> None:
+        raw_definitions = tuple(self.core_definitions)
+        if any(not isinstance(item, CoreChannelDefinition) for item in raw_definitions):
+            raise TypeError("core_definitions 必须只包含 CoreChannelDefinition")
+        definitions = tuple(sorted(raw_definitions, key=lambda item: item.name))
+        core_names = tuple(item.name for item in definitions)
+        if len(set(core_names)) != len(core_names):
+            raise ValueError("Core channel 名称重复")
+
+        plugin_registry = self.plugin_registry
+        root_token = self.root_instance_token
+        if plugin_registry is not None:
+            if not isinstance(plugin_registry, ChannelRegistrySnapshot):
+                raise TypeError("plugin_registry 类型无效")
+            if root_token is not None and root_token is not plugin_registry.root_instance_token:
+                raise ValueError("CommittedChannelCatalog root token 与 plugin registry 不一致")
+            root_token = plugin_registry.root_instance_token
+            plugin_names = {item.name for item in plugin_registry.descriptors}
+            collisions = sorted(plugin_names.intersection(core_names))
+            if collisions:
+                raise ValueError(
+                    "Core channel 与 v3 plugin channel 名称冲突: "
+                    + ", ".join(collisions)
+                )
+            plugin_descriptors = plugin_registry.descriptors
+            plugin_factories = plugin_registry.factories
+        else:
+            if root_token is None:
+                root_token = object()
+            plugin_descriptors = ()
+            plugin_factories = ()
+
+        descriptors = tuple(
+            sorted(
+                tuple(item.descriptor for item in definitions) + plugin_descriptors,
+                key=lambda item: item.name,
+            )
+        )
+        factories = tuple(
+            sorted(
+                tuple(item.provenance for item in definitions) + plugin_factories,
+                key=_factory_sort_key,
+            )
+        )
+        registry = ChannelRegistrySnapshot(
+            descriptors=descriptors,
+            factories=factories,
+            identity=_registry_identity(descriptors, factories),
+            root_instance_token=root_token,
+        )
+        object.__setattr__(self, "core_definitions", definitions)
+        object.__setattr__(self, "root_instance_token", root_token)
+        object.__setattr__(self, "registry", registry)
+
+    @property
+    def identity(self) -> str:
+        """Return the content identity of the merged committed registry."""
+
+        return self.registry.identity
+
+    @property
+    def descriptors(self) -> tuple[ChannelDescriptor, ...]:
+        """Expose the merged descriptor projection without a mutable registry."""
+
+        return self.registry.descriptors
+
+    @property
+    def factories(self) -> tuple[ChannelFactoryProvenance, ...]:
+        """Expose the merged factory provenance projection."""
+
+        return self.registry.factories
+
+    def definition(self, channel_name: str) -> CoreChannelDefinition | None:
+        """Resolve one Core definition by exact channel name."""
+
+        for definition in self.core_definitions:
+            if definition.name == channel_name:
+                return definition
+        return None
 
 
 CHANNELS = ServiceKey["PluginChannels"]("core.channels")
@@ -1276,9 +1463,11 @@ def _registry_identity(
     ).hexdigest()
 
 
-def _credential_paths(value: object) -> tuple[str, ...]:
-    if not isinstance(value, tuple) or not value:
+def _credential_paths(value: object, *, allow_empty: bool = False) -> tuple[str, ...]:
+    if not isinstance(value, tuple) or (not allow_empty and not value):
         raise ValueError("credential_paths 必须是非空 tuple")
+    if not value:
+        return ()
     result: list[str] = []
     for path in value:
         if not isinstance(path, str) or not path or path.strip() != path:
@@ -1540,6 +1729,8 @@ __all__ = [
     "ControlResponseBodies",
     "ChannelDefinition",
     "ChannelDescriptor",
+    "CoreChannelDefinition",
+    "CommittedChannelCatalog",
     "ChannelFactoryFreezeInput",
     "ChannelFactoryProvenance",
     "ChannelRegistrySnapshot",
