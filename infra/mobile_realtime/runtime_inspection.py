@@ -5,9 +5,10 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
+from typing import cast
 
 from agent.plugin_composition import TopologyFiberView
-from agent.mcp.host import PreparedMcpServer
+from agent.plugins.composable import ComposablePlugin
 from agent.plugins.snapshot import (
     RuntimeSnapshot,
     RuntimeSnapshotLease,
@@ -152,20 +153,13 @@ class RuntimeInspectionService:
 
     async def get_mcp(self, owner_id: str, server_name: str) -> dict[str, object]:
         async with await self._acquire_snapshot() as snapshot:
-            server = _find_mcp_server(snapshot, owner_id, server_name)
+            server = _find_mcp_item(snapshot, owner_id, server_name)
             if server is None:
                 raise RuntimeInspectionError(
                     "mcp_not_found",
                     f"MCP server 不存在: {owner_id}/{server_name}",
                 )
-            tools: list[dict[str, object]] = [
-                {
-                    "name": info.name,
-                    "description": info.description,
-                    "input_schema": info.input_schema,
-                }
-                for info in server.client.tool_infos
-            ]
+            tools = cast(list[dict[str, object]], server["tools"])
             return {
                 "owner_id": owner_id,
                 "name": server_name,
@@ -216,9 +210,9 @@ def _plugin_items(snapshot: RuntimeSnapshot) -> list[dict[str, object]]:
         snapshot.active_generations(),
         key=lambda item: item.plugin_id,
     ):
-        api_version = int(getattr(generation.instance, "api_version", 2))
+        api_version = cast(ComposablePlugin, generation.instance).api_version
         current = composition.get(generation.plugin_id)
-        if api_version == 3 and current is None:
+        if current is None:
             raise RuntimeError(
                 f"stable v3 插件缺少 composition inspection: {generation.plugin_id}"
             )
@@ -228,7 +222,7 @@ def _plugin_items(snapshot: RuntimeSnapshot) -> list[dict[str, object]]:
                 "revision": generation.source_revision,
                 "generation_id": generation.generation_id,
                 "api_version": api_version,
-                "composition": current if api_version == 3 else None,
+                "composition": current,
             }
         )
     return items
@@ -247,15 +241,10 @@ def _plugin_composition_items(
         raise RuntimeError("stable snapshot 的 composition Root 与 Topology 必须成对存在")
 
     # 1. Frozen parent edges assign every nested Fiber to one top-level plugin.
-    all_v3_plugin_ids = {
-        generation.plugin_id
-        for generation in snapshot.generations.values()
-        if getattr(generation.instance, "api_version", 2) == 3
-    }
+    all_v3_plugin_ids = set(snapshot.generations)
     active_v3_plugin_ids = {
         generation.plugin_id
         for generation in snapshot.active_generations()
-        if getattr(generation.instance, "api_version", 2) == 3
     }
     all_owners = _top_level_plugin_owners(topology.fibers, all_v3_plugin_ids)
     receipt = root.receipt()
@@ -387,46 +376,88 @@ def _skill_items(workspace: Path, snapshot: RuntimeSnapshot) -> list[dict[str, o
     ]
 
 
-def _mcp_catalogs(snapshot: RuntimeSnapshot):
-    for generation in sorted(
-        snapshot.active_generations(),
-        key=lambda item: item.plugin_id,
-    ):
-        if generation.mcp_catalog is not None:
-            yield generation.plugin_id, generation.mcp_catalog
-    if snapshot.workspace_mcp_generation is not None:
-        yield "workspace", snapshot.workspace_mcp_generation.catalog
-
-
 def _mcp_items(snapshot: RuntimeSnapshot) -> list[dict[str, object]]:
-    return [
-        {
-            "owner_id": owner_id,
-            "name": server.name,
-            "tool_count": len(server.tools),
-            "tools": [
+    """Project exact v3 and workspace MCP servers from stable owners."""
+
+    # 1. v3 declarations provide owner identity; ToolRegistry provides live schemas.
+    items: list[dict[str, object]] = []
+    registry = snapshot.mcp_server_registry
+    if registry is not None:
+        if snapshot.tool_registry is None:
+            raise RuntimeError("stable v3 MCP registry 缺少 exact ToolRegistry")
+        for descriptor in registry.descriptors:
+            tools = _mcp_tools_from_registry(snapshot, descriptor.name)
+            items.append(
+                {
+                    "owner_id": descriptor.owner,
+                    "name": descriptor.name,
+                    "tool_count": len(tools),
+                    "tools": tools,
+                }
+            )
+
+    # 2. Workspace MCP remains owned by its prepared workspace generation.
+    workspace_generation = snapshot.workspace_mcp_generation
+    if workspace_generation is not None:
+        for server in workspace_generation.catalog.servers.values():
+            tools = [
                 {
                     "name": info.name,
                     "description": info.description,
+                    "input_schema": info.input_schema,
                 }
                 for info in server.client.tool_infos
-            ],
-        }
-        for owner_id, catalog in _mcp_catalogs(snapshot)
-        for server in sorted(catalog.servers.values(), key=lambda item: item.name)
-    ]
+            ]
+            items.append(
+                {
+                    "owner_id": "workspace",
+                    "name": server.name,
+                    "tool_count": len(tools),
+                    "tools": tools,
+                }
+            )
+    return sorted(items, key=lambda item: (str(item["owner_id"]), str(item["name"])))
 
 
-def _find_mcp_server(
+def _mcp_tools_from_registry(
+    snapshot: RuntimeSnapshot,
+    server_name: str,
+) -> list[dict[str, object]]:
+    """Read one exact live MCP server projection from the frozen ToolRegistry."""
+
+    registry = snapshot.tool_registry
+    if registry is None:
+        raise RuntimeError("stable v3 MCP registry 缺少 exact ToolRegistry")
+    prefix = f"mcp_{server_name}__"
+    tools: list[dict[str, object]] = []
+    for name in registry.get_registered_order(
+        registry.get_source_tool_names("mcp", server_name)
+    ):
+        tool = registry.get_tool(name)
+        if tool is None:
+            raise RuntimeError(f"stable MCP ToolRegistry 缺少已登记工具: {name}")
+        remote_name = name.removeprefix(prefix)
+        description = tool.description.removeprefix(f"[MCP:{server_name}] ")
+        tools.append(
+            {
+                "name": remote_name,
+                "description": description,
+                "input_schema": tool.parameters or {},
+            }
+        )
+    return tools
+
+
+def _find_mcp_item(
     snapshot: RuntimeSnapshot,
     owner_id: str,
     server_name: str,
-) -> PreparedMcpServer | None:
+) -> dict[str, object] | None:
     return next(
         (
-            catalog.servers.get(server_name)
-            for candidate_owner, catalog in _mcp_catalogs(snapshot)
-            if candidate_owner == owner_id
+            item
+            for item in _mcp_items(snapshot)
+            if item["owner_id"] == owner_id and item["name"] == server_name
         ),
         None,
     )

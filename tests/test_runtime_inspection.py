@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 
 import pytest
@@ -9,9 +10,13 @@ import pytest
 from infra.mobile_realtime.runtime_inspection import (
     RuntimeInspectionError,
     RuntimeInspectionService,
+    _mcp_items,
 )
+from agent.plugins.snapshot import RuntimeSnapshot
 from agent.plugins.manager import PluginManager
 from agent.scheduler import LatencyTracker, ScheduledJob, SchedulerService
+from agent.tools.base import Tool
+from agent.tools.registry import ToolRegistry
 from bus.event_bus import EventBus
 
 
@@ -33,6 +38,26 @@ def _write_plugin(root: Path, name: str, source: str) -> None:
     plugin_dir = root / name
     plugin_dir.mkdir(parents=True)
     (plugin_dir / "plugin.py").write_text(source, encoding="utf-8")
+
+
+class _InspectionMcpTool(Tool):
+    @property
+    def name(self) -> str:
+        return "mcp_calendar__list_events"
+
+    @property
+    def description(self) -> str:
+        return "[MCP:calendar] List calendar events"
+
+    @property
+    def parameters(self) -> dict[str, object]:
+        return {
+            "type": "object",
+            "properties": {"date": {"type": "string"}},
+        }
+
+    async def execute(self, **kwargs: object) -> str:
+        return "unused"
 
 
 def test_documents_use_fixed_allowlist_and_return_markdown(tmp_path: Path) -> None:
@@ -81,6 +106,45 @@ async def test_capabilities_fail_loud_without_runtime_snapshot(tmp_path: Path) -
 
     with pytest.raises(RuntimeInspectionError, match="快照尚未就绪"):
         await service.list_capabilities()
+
+
+def test_mcp_projection_uses_exact_v3_registry_and_live_tool_view() -> None:
+    registry = ToolRegistry()
+    registry.register(
+        _InspectionMcpTool(),
+        source_type="mcp",
+        source_name="calendar",
+    )
+    snapshot = cast(
+        RuntimeSnapshot,
+        SimpleNamespace(
+            mcp_server_registry=SimpleNamespace(
+                descriptors=(
+                    SimpleNamespace(owner="calendar-plugin", name="calendar"),
+                )
+            ),
+            tool_registry=registry,
+            workspace_mcp_generation=None,
+        ),
+    )
+
+    assert _mcp_items(snapshot) == [
+        {
+            "owner_id": "calendar-plugin",
+            "name": "calendar",
+            "tool_count": 1,
+            "tools": [
+                {
+                    "name": "list_events",
+                    "description": "List calendar events",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"date": {"type": "string"}},
+                    },
+                }
+            ],
+        }
+    ]
 
 
 @pytest.mark.asyncio
