@@ -86,14 +86,14 @@ async def test_installed_plugin_without_static_manifest_fails_before_import(
     """在任何插件代码或正式数据写入前拒绝无 manifest 的 installed artifact。"""
 
     # 1. 构造缺少静态 admission manifest 的旧 installed artifact。
-    plugin_dir = (
+    plugin_base = (
         tmp_path
         / "home"
         / "cache"
         / "lab"
         / "missing_manifest"
-        / "1.0.0"
     )
+    plugin_dir = plugin_base / ".artifacts" / "1.0.0-test"
     plugin_dir.mkdir(parents=True)
     import_marker = plugin_dir / "imported"
     (plugin_dir / "plugin.py").write_text(
@@ -105,10 +105,15 @@ async def test_installed_plugin_without_static_manifest_fails_before_import(
         "async def apply(ctx, config): pass\n",
         encoding="utf-8",
     )
+    (plugin_base / ".pointers.json").write_text(
+        '{"stable":".artifacts/1.0.0-test",'
+        '"latest":".artifacts/1.0.0-test"}\n',
+        encoding="utf-8",
+    )
     manager = _manager(tmp_path)
 
     # 2. Admission 必须在 import、generation 和正式 data root 之前失败。
-    with pytest.raises(ValueError, match="缺少静态 v3 manifest"):
+    with pytest.raises(ValueError, match="缺少静态 manifest"):
         await manager.load_all()
     assert not import_marker.exists()
     assert manager.current_snapshot is None

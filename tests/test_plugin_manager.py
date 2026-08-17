@@ -22,6 +22,7 @@ from agent.plugins.generation_private_proactive_host import (
     PrivateProactiveBinding,
     PrivateProactiveHost,
 )
+from agent.plugins.artifacts import ArtifactPointer, write_pointers
 from agent.plugins.manager import PluginManager
 from agent.plugins.manifest import write_package_manifest
 from agent.plugins.registry import plugin_registry
@@ -72,6 +73,27 @@ def _write_v3_plugin(
             encoding="utf-8",
         )
     return plugin_dir
+
+
+def _write_installed_v3_plugin(
+    cache_root: Path,
+    *,
+    marketplace: str,
+    name: str,
+    version: str = "1.0.0",
+    source: str = "def apply(ctx, config):\n    return None\n",
+) -> Path:
+    plugin_base = cache_root / marketplace / name
+    artifact_id = f"{version}-test"
+    plugin_root = _write_v3_plugin(
+        plugin_base / ".artifacts" / artifact_id,
+        name=name,
+        version=version,
+        source=source,
+    )
+    pointer = ArtifactPointer(f".artifacts/{artifact_id}")
+    _ = write_pointers(plugin_base, stable=pointer, latest=pointer)
+    return plugin_root
 
 
 def _make_manager(
@@ -234,8 +256,9 @@ async def test_installed_plugin_shadows_builtin_with_same_name(tmp_path: Path):
     builtin_root = tmp_path / "plugins"
     installed_root = tmp_path / "cache"
     _write_v3_plugin(builtin_root / "shadow", name="shadow")
-    _write_v3_plugin(
-        installed_root / "github" / "shadow" / "0.1.0",
+    _write_installed_v3_plugin(
+        installed_root,
+        marketplace="github",
         name="shadow",
         version="0.1.0",
     )
@@ -580,9 +603,9 @@ async def test_active_plugins_exposes_v3_metadata(tmp_path: Path):
 @pytest.mark.asyncio
 async def test_loads_installed_v3_plugin(tmp_path: Path):
     cache_root = tmp_path / "cache"
-    plugin_root = cache_root / "lab" / "feed" / "0.1.0"
-    _write_v3_plugin(
-        plugin_root,
+    plugin_root = _write_installed_v3_plugin(
+        cache_root,
+        marketplace="lab",
         name="feed",
         version="1.0.0",
         source=(
@@ -624,9 +647,9 @@ async def test_sync_manifest_covers_builtin_and_installed_plugins(tmp_path: Path
     _write_v3_plugin(builtin_root / "hello", name="hello", version="0.1.0")
 
     cache_root = tmp_path / "cache"
-    installed_root = cache_root / "lab" / "feed" / "0.1.0"
-    _write_v3_plugin(
-        installed_root,
+    installed_root = _write_installed_v3_plugin(
+        cache_root,
+        marketplace="lab",
         name="feed",
         version="1.0.0",
         source=(

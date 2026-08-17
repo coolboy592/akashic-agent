@@ -1276,7 +1276,11 @@ async def test_subagent_shutdown_releases_unstarted_snapshot_lease() -> None:
 
 
 @pytest.mark.asyncio
-async def test_dashboard_routes_follow_snapshot_generation(tmp_path: Path) -> None:
+async def test_dashboard_routes_follow_snapshot_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AKASHIC_PLUGIN_HOME", str(tmp_path / "home"))
     plugin_dir = _write_plugin(
         tmp_path / "plugins",
         "snapshot_dashboard",
