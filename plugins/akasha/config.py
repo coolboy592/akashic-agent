@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import tomllib
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from .domain.model import MemoryConfig
 
@@ -92,16 +92,27 @@ def render_akasha_config(config: AkashaConfig = AkashaConfig()) -> str:
     )
 
 
-def resolve_workspace_path(
-    workspace: Path,
+def resolve_memory_path(
+    memory_root: Path,
     configured: str,
 ) -> Path:
-    """Resolve one configured path and keep it inside the workspace."""
+    """Resolve historical storage syntax inside the declared memory root."""
 
-    root = workspace.resolve(strict=False)
-    path = (root / configured).resolve(strict=False)
+    # 1. Accept the historical ``memory/file`` form and a direct filename.
+    raw = PurePosixPath(configured)
+    parts = raw.parts
+    if not parts or raw.is_absolute():
+        raise ValueError(f"Akasha sidecar path 无效: {configured}")
+    if parts[0] == memory_root.name:
+        parts = parts[1:]
+    elif len(parts) != 1:
+        raise ValueError(f"Akasha sidecar 必须位于 memory root: {configured}")
+    if not parts:
+        raise ValueError(f"Akasha sidecar path 无效: {configured}")
+
+    # 2. Resolve traversal and symlinks against the one capability root.
+    root = memory_root.resolve(strict=False)
+    path = root.joinpath(*parts).resolve(strict=False)
     if not path.is_relative_to(root):
-        raise ValueError(
-            f"Akasha V2 storage path must stay in workspace: {configured}"
-        )
+        raise ValueError(f"Akasha sidecar 必须位于 memory root: {configured}")
     return path

@@ -115,6 +115,53 @@ def test_akasha_is_inactive_when_default_memory_owns_runtime() -> None:
     )
 
 
+def test_engine_and_inspector_resolve_sidecars_from_same_memory_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep engine writes and inspector reads on the same declared root."""
+
+    # 1. Construct the real engine with the direct filename syntax.
+    _create_sessions(tmp_path / "sessions.db")
+    monkeypatch.setattr("plugins.akasha.engine.Embedder", _Embedder)
+    config = AkashaConfig(
+        db_path="akasha.db",
+        index_path="akasha-v2-index.db",
+    )
+    engine = AkashaMemoryEngine(
+        config=Config(
+            provider="openai",
+            model="chat-model",
+            api_key="chat-key",
+            system_prompt="system",
+            memory=HostMemoryConfig(
+                embedding=MemoryEmbeddingConfig(
+                    model="embedding-model",
+                    output_dimensionality=2,
+                )
+            ),
+        ),
+        akasha_config=config,
+        workspace=tmp_path,
+        http_resources=cast(Any, SimpleNamespace(external_default=object())),
+        event_publisher=None,
+    )
+
+    # 2. Resolve the same config through the dashboard/mobile inspector.
+    inspector = AkashaInspectorReader(
+        memory_root=tmp_path / "memory",
+        config=config,
+    )
+    try:
+        assert engine._runtime.memory_path == inspector.paths.memory  # noqa: SLF001
+        assert engine._runtime.index_path == inspector.paths.index  # noqa: SLF001
+        assert inspector.paths.memory == tmp_path / "memory" / "akasha.db"
+        assert inspector.paths.index == tmp_path / "memory" / "akasha-v2-index.db"
+    finally:
+        engine._runtime.close()  # noqa: SLF001
+        engine._embedding_store.close()  # noqa: SLF001
+
+
 @pytest.mark.asyncio
 async def test_feedback_tools_compose_correction_from_two_markers(
     tmp_path: Path,

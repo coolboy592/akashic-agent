@@ -13,7 +13,7 @@ from uuid import uuid4
 from agent.config import Config
 from agent.plugins.manifest import builtin_plugin_data_dir
 from plugins.akasha.application.rebuild import rebuild_memory
-from plugins.akasha.config import AkashaConfig, load_akasha_config, resolve_workspace_path
+from plugins.akasha.config import AkashaConfig, load_akasha_config, resolve_memory_path
 from plugins.akasha.infrastructure.loader import load_turns
 from plugins.akasha.infrastructure.persistence import load_memory_state
 from plugins.akasha.infrastructure.sparse_index import (
@@ -47,8 +47,8 @@ def rebuild_akasha_sidecars(
     )
     paths = AkashaSidecars(
         sessions=workspace / "sessions.db",
-        index=resolve_workspace_path(workspace, plugin.index_path),
-        memory=resolve_workspace_path(workspace, plugin.db_path),
+        index=resolve_memory_path(workspace / "memory", plugin.index_path),
+        memory=resolve_memory_path(workspace / "memory", plugin.db_path),
     )
     if not paths.sessions.is_file():
         raise RuntimeError(f"Akasha 重建缺少权威源: {paths.sessions}")

@@ -9,13 +9,13 @@ import threading
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import cast
 from zoneinfo import ZoneInfo
 
 import numpy as np
 
-from .config import AkashaConfig
+from .config import AkashaConfig, resolve_memory_path
 from .infrastructure.sparse_index.schema import (
     INDEX_VERSION,
     TOOL_CHAIN_PROJECTION_VERSION,
@@ -53,31 +53,9 @@ def resolve_inspector_paths(
 
     config.validate()
     return InspectorPaths(
-        memory=_resolve_declared_memory_path(memory_root, config.db_path),
-        index=_resolve_declared_memory_path(memory_root, config.index_path),
+        memory=resolve_memory_path(memory_root, config.db_path),
+        index=resolve_memory_path(memory_root, config.index_path),
     )
-
-
-def _resolve_declared_memory_path(memory_root: Path, configured: str) -> Path:
-    """Resolve legacy config syntax without escaping the declared memory root."""
-
-    # 1. Accept the historical ``memory/file`` form and direct root filenames.
-    parts = PurePosixPath(configured).parts
-    if not parts or PurePosixPath(configured).is_absolute():
-        raise ValueError(f"Akasha sidecar path 无效: {configured}")
-    if parts[0] == memory_root.name:
-        parts = parts[1:]
-    elif len(parts) != 1:
-        raise ValueError(f"Akasha sidecar 必须位于 memory root: {configured}")
-    if not parts:
-        raise ValueError(f"Akasha sidecar path 无效: {configured}")
-
-    # 2. Resolve symlinks and traversal against the capability root.
-    root = memory_root.resolve(strict=False)
-    path = root.joinpath(*parts).resolve(strict=False)
-    if not path.is_relative_to(root):
-        raise ValueError(f"Akasha sidecar 必须位于 memory root: {configured}")
-    return path
 
 
 class AkashaInspectorReader:

@@ -46,7 +46,7 @@ from session.store import InteractionDeletion
 
 from .application.cycle import RetrievalTicket
 from .application.runtime import OnlineMemoryRuntime, StagedOnlineCommit
-from .config import AkashaConfig, resolve_workspace_path
+from .config import AkashaConfig, resolve_memory_path
 from .domain.model import Turn
 
 if TYPE_CHECKING:
@@ -321,14 +321,15 @@ class AkashaMemoryEngine:
         self._workspace = workspace
         self._sessions_path = workspace / "sessions.db"
         self._embedding_store = MessageEmbeddingStore(self._sessions_path)
+        memory_root = workspace / "memory"
         self._runtime = OnlineMemoryRuntime(
             sessions_path=self._sessions_path,
-            index_path=resolve_workspace_path(
-                workspace,
+            index_path=resolve_memory_path(
+                memory_root,
                 akasha_config.index_path,
             ),
-            memory_path=resolve_workspace_path(
-                workspace,
+            memory_path=resolve_memory_path(
+                memory_root,
                 akasha_config.db_path,
             ),
             embedding_model=embedding.model,

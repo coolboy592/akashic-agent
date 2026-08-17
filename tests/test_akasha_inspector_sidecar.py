@@ -167,3 +167,33 @@ def test_inspector_rejects_sidecars_outside_declared_memory_root(
                 index_path="memory/akasha-v2-index.db",
             ),
         )
+
+
+def test_engine_and_inspector_share_declared_memory_path_contract(
+    tmp_path: Path,
+) -> None:
+    memory_root = tmp_path / "memory"
+
+    direct = AkashaInspectorReader(
+        memory_root=memory_root,
+        config=AkashaConfig(
+            db_path="akasha.db",
+            index_path="akasha-v2-index.db",
+        ),
+    )
+    historical = AkashaInspectorReader(
+        memory_root=memory_root,
+        config=AkashaConfig(),
+    )
+
+    assert direct.paths == historical.paths
+    assert direct.paths.memory == memory_root / "akasha.db"
+    assert direct.paths.index == memory_root / "akasha-v2-index.db"
+    with pytest.raises(ValueError, match="必须位于 memory root"):
+        AkashaInspectorReader(
+            memory_root=memory_root,
+            config=AkashaConfig(
+                db_path="custom/akasha.db",
+                index_path="akasha-v2-index.db",
+            ),
+        )
