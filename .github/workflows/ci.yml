@@ -33,7 +33,7 @@ jobs:
           name: change-impact-gate
           path: docker/debug/reports/change-gate/
 
-  mobile-plugin-contract-gate:
+  plugin-v3-mobile-gate:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -50,15 +50,42 @@ jobs:
         with:
           node-version: "22"
 
-      - name: Verify locked mobile plugin contract
-        run: python docker/debug/mobile_plugin_contract_gate.py --require-clean-core
+      - name: Verify locked pure-v3 Mobile fleet
+        run: python docker/debug/plugin_v3_mobile_gate.py --require-clean-core
 
-      - name: Upload mobile plugin contract evidence
+      - name: Upload pure-v3 Mobile evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: mobile-plugin-contract-gate
-          path: docker/debug/reports/mobile-plugin-contract/
+          name: plugin-v3-mobile-gate
+          path: docker/debug/reports/plugin-v3-mobile/
+
+  plugin-v3-fleet-static-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out full repository history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Verify locked pure-v3 fleet and retired-plugin exclusions
+        run: >-
+          python docker/debug/plugin_v3_fleet_gate.py
+          --require-clean-core
+          --require-full-core-history
+
+      - name: Upload pure-v3 fleet evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: plugin-v3-fleet-static-gate
+          path: docker/debug/reports/plugin-v3-fleet/
 
   plugin-passive-composition-v3-gate:
     runs-on: ubuntu-latest
