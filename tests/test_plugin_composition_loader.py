@@ -12,14 +12,18 @@ from pydantic import BaseModel
 
 import agent.plugins.manager as plugin_manager_module
 from agent.plugin_composition import (
+    BACKGROUND_JOBS,
     CHANNELS,
+    PROACTIVE_COMPONENTS,
     AttachmentKind,
     ChannelCapability,
     ChannelDefinition,
     CompositionRoot,
     CredentialRef,
     InboundIdentity,
+    PluginBackgroundJobs,
     PluginChannels,
+    PluginProactiveComponents,
     PluginRuntime,
     ServiceView,
 )
@@ -27,8 +31,10 @@ from agent.plugins.composable import ComposablePlugin
 from agent.plugins.artifacts import ArtifactPointer, read_pointer, write_pointers
 from agent.plugins.dashboard_host import DashboardBinding, PluginDashboardHost
 from agent.plugins.generation import PluginGeneration
+from agent.plugins.generation_activity_host import ActivityHost
 from agent.plugins.manager import PluginManager
 from agent.plugins.manifest import write_plugin_manifest
+from agent.plugins.private_proactive import PrivateProactiveCatalog
 from agent.plugins.registry import plugin_registry
 from agent.plugins.snapshot import (
     RuntimeSnapshotCompiler,
@@ -76,6 +82,86 @@ def _manager(
         installed_cache_root=tmp_path / "home" / "cache",
         memory_engine=memory_engine,
     )
+
+
+@pytest.mark.asyncio
+async def test_replace_snapshot_payload_rebinds_all_exact_root_activity_catalogs(
+) -> None:
+    """让全部 activity catalog 随载荷一起切换到正式 Root。"""
+
+    async def compile_snapshot(label: str):
+        # 1. 每棵 Root 独立拥有三类 activity catalog。
+        root = CompositionRoot(label)
+        _ = await root.context.provide(
+            PROACTIVE_COMPONENTS,
+            PluginProactiveComponents(root.instance_token),
+        )
+        _ = await root.context.provide(
+            BACKGROUND_JOBS,
+            PluginBackgroundJobs(root.instance_token),
+        )
+        snapshot = RuntimeSnapshotCompiler().compile(
+            {},
+            composition_root=root,
+            private_proactive_catalog=PrivateProactiveCatalog(
+                (),
+                root_instance_token=root.instance_token,
+            ),
+        )
+        return root, snapshot
+
+    validation_root, target = await compile_snapshot("activity:validation")
+    formal_root, source = await compile_snapshot("activity:formal")
+    try:
+        # 2. identity 值应等价，但对象保持可区分，确保六个字段都真实替换。
+        identity_fields = (
+            "proactive_component_catalog_identity",
+            "private_proactive_catalog_identity",
+            "background_job_catalog_identity",
+        )
+        for name in identity_fields:
+            target_identity = getattr(target, name)
+            source_identity = getattr(source, name)
+            assert isinstance(target_identity, str)
+            assert target_identity == source_identity
+            distinct_source_identity = (source_identity + "#")[:-1]
+            assert distinct_source_identity == source_identity
+            assert distinct_source_identity is not target_identity
+            setattr(source, name, distinct_source_identity)
+
+        old_catalogs = (
+            target.proactive_component_catalog,
+            target.private_proactive_catalog,
+            target.background_job_catalog,
+        )
+        assert all(catalog is not None for catalog in old_catalogs)
+        target.state = "validating"
+
+        plugin_manager_module._replace_snapshot_payload(  # pyright: ignore[reportPrivateUsage]
+            target,
+            source,
+        )
+
+        # 3. catalog、identity 与 Root 必须来自同一份 formal snapshot。
+        catalog_fields = (
+            "proactive_component_catalog",
+            "private_proactive_catalog",
+            "background_job_catalog",
+        )
+        for name, old_catalog in zip(catalog_fields, old_catalogs, strict=True):
+            catalog = getattr(target, name)
+            assert catalog is getattr(source, name)
+            assert catalog is not old_catalog
+            assert catalog.root_instance_token is formal_root.instance_token
+        for name in identity_fields:
+            assert getattr(target, name) is getattr(source, name)
+        assert target.composition_root is formal_root
+        RuntimeSnapshotStore._validate_composition(  # pyright: ignore[reportPrivateUsage]
+            target
+        )
+    finally:
+        await validation_root.dispose()
+        await formal_root.dispose()
 
 
 def _channel_plugin_source(
@@ -2445,14 +2531,16 @@ async def test_installed_v3_candidate_rebuilds_runtime_then_promotes(
     latest_root.mkdir(parents=True)
     source = (
         "from pydantic import BaseModel\n"
-        "from agent.plugin_composition import MEMORY_RUNTIME\n"
+        "from agent.plugin_composition import (\n"
+        "    BACKGROUND_JOBS, MEMORY_RUNTIME, PROACTIVE_COMPONENTS,\n"
+        ")\n"
         "api_version = 3\n"
         "name = 'installed_v3'\n"
         "version = '1.0.0'\n"
         "skill_roots = ('skills',)\n"
         "drift_skill_roots = ('drift/skills',)\n"
         "dashboard_module = 'dashboard.py'\n"
-        "inject = (MEMORY_RUNTIME,)\n"
+        "inject = (MEMORY_RUNTIME, PROACTIVE_COMPONENTS, BACKGROUND_JOBS)\n"
         "class Config(BaseModel):\n"
         "    marker: str = 'default'\n"
         "applied = []\n"
@@ -2512,6 +2600,7 @@ async def test_installed_v3_candidate_rebuilds_runtime_then_promotes(
         tmp_path,
         memory_engine=SimpleNamespace(describe=describe_memory_runtime),
     )
+    manager.bind_activity_host(ActivityHost(()))
     await manager.load_all()
     stable = manager.generation("installed_v3@lab")
     stable_snapshot = manager.current_snapshot
@@ -2561,6 +2650,17 @@ async def test_installed_v3_candidate_rebuilds_runtime_then_promotes(
     assert promoted["publication_state"] == "promoted"
     promoted_snapshot = manager.current_snapshot
     assert promoted_snapshot is not None
+    assert promoted_snapshot.composition_root is not None
+    assert promoted_snapshot.proactive_component_catalog is not None
+    assert promoted_snapshot.background_job_catalog is not None
+    assert (
+        promoted_snapshot.proactive_component_catalog.root_instance_token
+        is promoted_snapshot.composition_root.instance_token
+    )
+    assert (
+        promoted_snapshot.background_job_catalog.root_instance_token
+        is promoted_snapshot.composition_root.instance_token
+    )
     assert promoted_snapshot.plugin_skill_index is not None
     assert "body v2" in promoted_snapshot.plugin_skill_index.get(
         "installed-skill"
@@ -2840,6 +2940,8 @@ async def test_builtin_v3_dashboard_candidate_clones_data_root_before_publish(
         "api_version = 3\n"
         "name = 'dashboard_builtin_v3'\n"
         "version = '1.0.0'\n"
+        "from agent.plugin_composition import PROACTIVE_COMPONENTS\n"
+        "inject = (PROACTIVE_COMPONENTS,)\n"
         "dashboard_module = 'dashboard.py'\n"
         "def apply(ctx, config): pass\n",
     )
@@ -2848,6 +2950,7 @@ async def test_builtin_v3_dashboard_candidate_clones_data_root_before_publish(
         encoding="utf-8",
     )
     manager = _manager(tmp_path)
+    manager.bind_activity_host(ActivityHost(()))
     await manager.load_all()
     stable = manager.generation("dashboard_builtin_v3")
     stable_snapshot = manager.current_snapshot
@@ -2868,6 +2971,8 @@ async def test_builtin_v3_dashboard_candidate_clones_data_root_before_publish(
         "api_version = 3\n"
         "name = 'dashboard_builtin_v3'\n"
         "version = '2.0.0'\n"
+        "from agent.plugin_composition import PROACTIVE_COMPONENTS\n"
+        "inject = (PROACTIVE_COMPONENTS,)\n"
         "dashboard_module = 'dashboard.py'\n"
         "def apply(ctx, config): pass\n",
         encoding="utf-8",
@@ -2888,6 +2993,12 @@ async def test_builtin_v3_dashboard_candidate_clones_data_root_before_publish(
     assert result["publication_state"] == "committed"
     current = manager.current_snapshot
     assert current is not None
+    assert current.composition_root is not None
+    assert current.proactive_component_catalog is not None
+    assert (
+        current.proactive_component_catalog.root_instance_token
+        is current.composition_root.instance_token
+    )
     binding = current.dashboard_bindings[0]
     assert isinstance(binding, DashboardBinding)
     assert binding.runtime_data_root == stable.data_dir.resolve()
