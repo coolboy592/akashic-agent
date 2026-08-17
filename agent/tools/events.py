@@ -109,7 +109,7 @@ class ToolInput:
 
 @dataclass(frozen=True, slots=True)
 class ToolResult:
-    """Freeze the settled tool fact observed after all legacy post hooks."""
+    """Freeze the settled tool fact observed after the invoker returns."""
 
     input: ToolInput
     status: ToolStatus

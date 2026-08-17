@@ -21,7 +21,6 @@ from agent.background.subagent_profiles import (
     SubagentRuntime,
     build_spawn_spec,
 )
-from agent.tool_hooks.base import ToolHook
 from bus.internal_events import (
     SpawnCompletionEvent,
 )
@@ -146,9 +145,6 @@ class SubagentManager:
         self._cancel_announced: set[str] = set()
         self._snapshot_release_tasks: set[asyncio.Task[None]] = set()
         self._admission = _SubagentAdmission()
-
-    def add_tool_hooks(self, hooks: list[ToolHook]) -> None:
-        object.__setattr__(self._runtime, "tool_hooks", list(hooks))
 
     def _spawn_jobs_dir(self) -> Path:
         root = self._workspace / "subagent-runs"

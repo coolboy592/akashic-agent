@@ -90,8 +90,6 @@ async def test_recall_inspector_records_context_and_recall(tmp_path: Path) -> No
                 status="success",
                 final_arguments={"query": "用户偏好"},
                 extra_messages=[],
-                pre_hook_trace=[],
-                post_hook_trace=[],
                 output=json.dumps(
                     {
                         "items": [
@@ -143,8 +141,6 @@ async def test_recall_inspector_keeps_v2_passive_source_boundary(
                 status="success",
                 final_arguments={"query": "不应记录"},
                 extra_messages=[],
-                pre_hook_trace=[],
-                post_hook_trace=[],
                 output='{"items": []}',
             ),
         )

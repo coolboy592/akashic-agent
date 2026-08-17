@@ -300,7 +300,6 @@ def make_proactive_pipeline(
             workspace_context_fn=workspace_context_fn,
             drift_pipeline=drift_pipeline,
             event_bus=event_bus,
-            tool_hooks=None,
         )
     )
 

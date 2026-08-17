@@ -1782,7 +1782,6 @@ async def test_agent_tick_drift_emits_delivery_result(
                 ),
                 max_steps=5,
             ),
-            tool_hooks=None,
         )
     )
 

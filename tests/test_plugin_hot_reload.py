@@ -49,7 +49,6 @@ from agent.plugins.dashboard_host import (
 from agent.skills import SkillsLoader
 from agent.tools.registry import ToolRegistry
 from agent.tools.base import Tool
-from agent.tool_hooks import ToolExecutionRequest, ToolExecutor
 from bus.event_bus import EventBus
 from bus.events import InboundMessage
 from bus.events_lifecycle import TurnCommitted

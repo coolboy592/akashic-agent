@@ -97,7 +97,7 @@ def build_drift_pipeline(
         else ()
     )
 
-    # 2. 绑定同一套工作区、工具、hooks 和事件总线
+    # 2. 绑定同一套工作区、工具和事件总线
     workspace = Path(scope.state_store.workspace_dir)
     drift_dir = workspace / "drift"
     store = DriftStateStore(drift_dir, plugin_skill_roots=plugin_skill_roots)
@@ -115,6 +115,5 @@ def build_drift_pipeline(
             ),
             veda_fn=lambda: read_veda(workspace),
             max_steps=scope.cfg.drift_max_steps,
-            tool_hooks=scope.tool_hooks,
         )
     )

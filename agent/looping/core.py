@@ -71,7 +71,6 @@ if TYPE_CHECKING:
     from core.memory.engine import MemoryEngine
     from core.memory.markdown import MemoryProfileApi
     from core.memory.runtime import MemoryRuntime
-    from agent.tool_hooks.base import ToolHook
     from agent.plugins.snapshot import RuntimeSnapshotStore
 
 logger = logging.getLogger("agent.loop")
@@ -584,9 +583,6 @@ class AgentLoop:
 
         if self._compaction_runtime is not None:
             await self._compaction_runtime.shutdown()
-
-    def add_tool_hooks(self, hooks: list["ToolHook"]) -> None:
-        self._reasoner.add_tool_hooks(hooks)
 
     def add_before_turn_plugin_modules(
         self,

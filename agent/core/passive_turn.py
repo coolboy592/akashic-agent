@@ -119,7 +119,6 @@ if TYPE_CHECKING:
     from agent.core.runtime_support import SessionLike, TurnRunResult
     from agent.looping.ports import LLMConfig, LLMServices, SessionServices
     from agent.retrieval.protocol import MemoryRetrievalPipeline
-    from agent.tool_hooks.base import ToolHook
     from agent.tools.registry import ToolRegistry
 
 # 1. 统一通过模块 logger 记录关键分支，供排障和回归测试抓取。
@@ -246,10 +245,9 @@ def _phase_error_reason(phase: str) -> str:
 
 
 def _is_tool_loop_guard_denial(exec_result: ToolExecutionResult) -> bool:
-    traces = exec_result.pre_hook_trace
-    return any(
-        item.decision == "deny" and item.reason.startswith("tool_loop_guard:")
-        for item in traces
+    return (
+        exec_result.status == "denied"
+        and str(exec_result.output).startswith("tool_loop_guard:")
     )
 
 
@@ -1025,9 +1023,6 @@ class Reasoner(ABC):
     ) -> "TurnRunResult":
         """执行完整被动 turn，包括 retry / trim / tool loop。"""
 
-    def add_tool_hooks(self, hooks: list["ToolHook"]) -> None:
-        """子类可重写以注入 tool hooks。默认 no-op。"""
-
     def add_prompt_render_plugin_modules(
         self,
         modules: list[object],
@@ -1098,7 +1093,7 @@ class DefaultReasoner(Reasoner):
             ]
             | None
         ) = None
-        self._tool_executor = ToolExecutor([])
+        self._tool_executor = ToolExecutor()
         self._stream_sink_factory: (
             Callable[[object], Callable[[dict[str, str] | str], Awaitable[None]] | None]
             | None
@@ -1117,9 +1112,6 @@ class DefaultReasoner(Reasoner):
         ) = (
             self._build_prompt_render_phase(context) if context is not None else None
         )
-
-    def add_tool_hooks(self, hooks: list["ToolHook"]) -> None:
-        self._tool_executor.add_hooks(hooks)
 
     def add_prompt_render_plugin_modules(
         self,
@@ -2033,17 +2025,6 @@ class DefaultReasoner(Reasoner):
                                     "status": exec_result.status,
                                     "arguments": tool_call.arguments,
                                     "final_arguments": exec_result.final_arguments,
-                                    "pre_hook_trace": [
-                                        {
-                                            "hook_name": item.hook_name,
-                                            "event": item.event,
-                                            "matched": item.matched,
-                                            "decision": item.decision,
-                                            "reason": item.reason,
-                                            "extra_message": item.extra_message,
-                                        }
-                                        for item in exec_result.pre_hook_trace
-                                    ],
                                     "result": result,
                                 }
                             )
@@ -2133,7 +2114,7 @@ class DefaultReasoner(Reasoner):
                         )
                         continue
 
-                    # 6.2 通过统一执行器跑 pre/post hooks + 真实工具。
+                    # 6.2 通过统一执行器跑 typed admission + 真实工具。
                     async def _execute_tool(
                         name: str,
                         arguments: dict[str, Any],
@@ -2164,8 +2145,7 @@ class DefaultReasoner(Reasoner):
                         tool_name=tool_call.name,
                         arguments=tool_call.arguments,
                     )
-                    # 工具调用统一先过 ToolExecutor：
-                    # pre_hook 可改参/拒绝，真实执行后再补 post_hook trace。
+                    # 工具调用统一先过 ToolExecutor，完成 typed prepare/authorize。
                     await self._bus.fanout(
                         BeforeToolCallCtx(
                             session_key=tool_event_session_key,
@@ -2187,7 +2167,6 @@ class DefaultReasoner(Reasoner):
                             tool_batch=tool_batch,
                             tool_batch_index=tool_batch_index,
                         ),
-                        # hook 只负责拦截与记录，不替代 registry。
                         _execute_tool,
                     )
                     if exec_result.status == "success":
@@ -2277,7 +2256,7 @@ class DefaultReasoner(Reasoner):
                         else:
                             logger.info("[工具解锁] tool_search 未解锁新工具")
                     # tool_chain 持久化的是“执行后的事实”：
-                    # 最终参数、hook trace、结果预览，供后续回放与 session 复原。
+                    # 最终参数、结果状态与预览，供后续回放与 session 复原。
                     iter_calls.append(
                         {
                             "call_id": tool_call.id,
@@ -2285,28 +2264,6 @@ class DefaultReasoner(Reasoner):
                             "status": exec_result.status,
                             "arguments": tool_call.arguments,
                             "final_arguments": exec_result.final_arguments,
-                            "pre_hook_trace": [
-                                {
-                                    "hook_name": item.hook_name,
-                                    "event": item.event,
-                                    "matched": item.matched,
-                                    "decision": item.decision,
-                                    "reason": item.reason,
-                                    "extra_message": item.extra_message,
-                                }
-                                for item in exec_result.pre_hook_trace
-                            ],
-                            "post_hook_trace": [
-                                {
-                                    "hook_name": item.hook_name,
-                                    "event": item.event,
-                                    "matched": item.matched,
-                                    "decision": item.decision,
-                                    "reason": item.reason,
-                                    "extra_message": item.extra_message,
-                                }
-                                for item in exec_result.post_hook_trace
-                            ],
                             "result": normalized.preview(),
                         }
                     )

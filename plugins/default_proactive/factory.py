@@ -76,7 +76,6 @@ class AgentTickFactory:
             drift_pipeline=drift_pipeline,
             schedule_fn=self._deps.schedule_fn,
             event_bus=self._deps.event_bus,
-            tool_hooks=self._deps.tool_hooks,
         )
 
     def _get_session_key(self) -> str:

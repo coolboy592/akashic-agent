@@ -1,10 +1,8 @@
 from __future__ import annotations
 
-import asyncio
 from contextlib import asynccontextmanager
 from dataclasses import replace
-from typing import AsyncIterator
-from typing import Any
+from typing import Any, AsyncIterator
 
 import pytest
 
@@ -15,9 +13,8 @@ from agent.plugins.snapshot import (
     bind_runtime_snapshot,
     reset_runtime_snapshot,
 )
-from agent.tool_hooks.base import ToolHook
 from agent.tool_hooks.executor import ToolExecutor
-from agent.tool_hooks.types import HookContext, HookOutcome, ToolExecutionRequest
+from agent.tool_hooks.types import ToolExecutionRequest
 from agent.tools.events import (
     TOOL_EXECUTION_AUTHORIZE,
     TOOL_INPUT_PREPARE,
@@ -25,35 +22,6 @@ from agent.tools.events import (
     ToolInput,
     ToolResult,
 )
-
-
-class _SpyHook(ToolHook):
-    def __init__(
-        self,
-        *,
-        name: str,
-        event: str,
-        matched: bool = True,
-        outcome: HookOutcome | None = None,
-    ) -> None:
-        self.name = name
-        self.event = event
-        self._matched = matched
-        self._outcome = outcome or HookOutcome()
-        self.calls: list[HookContext] = []
-        self._match_error: Exception | None = None
-        self._run_error: Exception | None = None
-
-    def matches(self, ctx: HookContext) -> bool:
-        if self._match_error is not None:
-            raise self._match_error
-        return self._matched
-
-    async def run(self, ctx: HookContext) -> HookOutcome:
-        if self._run_error is not None:
-            raise self._run_error
-        self.calls.append(ctx)
-        return self._outcome
 
 
 async def _invoke(tool_name: str, arguments: dict[str, Any]) -> Any:
@@ -74,244 +42,43 @@ async def _bound_root(root: CompositionRoot) -> AsyncIterator[None]:
         await store.close()
 
 
-class _OrderHook(ToolHook):
-    event = "pre_tool_use"
-
-    def __init__(self, name: str, order: list[str]) -> None:
-        self.name = name
-        self._order = order
-
-    def matches(self, ctx: HookContext) -> bool:
-        return True
-
-    async def run(self, ctx: HookContext) -> HookOutcome:
-        self._order.append(self.name)
-        if self.name == "legacy-restore":
-            command = str(ctx.current_arguments["command"])
-            return HookOutcome(
-                updated_input={"command": command.replace("rm ", "mv ", 1)}
-            )
-        if self.name == "legacy-safety" and str(
-            ctx.current_arguments["command"]
-        ).startswith("rm "):
-            return HookOutcome(decision="deny", reason="unsafe rm")
-        return HookOutcome()
-
-
-class _PostOrderHook(_OrderHook):
-    event = "post_tool_use"
-
-    async def run(self, ctx: HookContext) -> HookOutcome:
-        self._order.append(self.name)
-        return HookOutcome()
-
-
-def test_tool_executor_pre_hook_can_update_arguments() -> None:
-    hook = _SpyHook(
-        name="rewrite",
-        event="pre_tool_use",
-        outcome=HookOutcome(updated_input={"x": 2}),
-    )
-    executor = ToolExecutor([hook])
-
-    result = asyncio.run(
-        executor.execute(
-            ToolExecutionRequest(
-                call_id="c1",
-                tool_name="dummy",
-                arguments={"x": 1},
-                source="passive",
-            ),
-            _invoke,
-        )
-    )
-
-    assert result.status == "success"
-    assert result.final_arguments == {"x": 2}
-    assert result.output == {"tool": "dummy", "arguments": {"x": 2}}
-    assert hook.calls[0].request.arguments == {"x": 1}
-
-
-def test_tool_executor_denied_is_not_error() -> None:
-    hook = _SpyHook(
-        name="deny",
-        event="pre_tool_use",
-        outcome=HookOutcome(decision="deny", reason="blocked"),
-    )
-    executor = ToolExecutor([hook])
-
-    result = asyncio.run(
-        executor.execute(
-            ToolExecutionRequest(
-                call_id="c1",
-                tool_name="dummy",
-                arguments={"x": 1},
-                source="passive",
-            ),
-            _invoke,
-        )
-    )
-
-    assert result.status == "denied"
-    assert result.output == "blocked"
-
-
-def test_tool_executor_post_hook_only_adds_extra_message() -> None:
-    hook = _SpyHook(
-        name="post",
-        event="post_tool_use",
-        outcome=HookOutcome(extra_message="hint"),
-    )
-    executor = ToolExecutor([hook])
-
-    result = asyncio.run(
-        executor.execute(
-            ToolExecutionRequest(
-                call_id="c1",
-                tool_name="dummy",
-                arguments={"x": 1},
-                source="passive",
-            ),
-            _invoke,
-        )
-    )
-
-    assert result.status == "success"
-    assert result.output == {"tool": "dummy", "arguments": {"x": 1}}
-    assert result.extra_messages == ["hint"]
-
-
-def test_tool_executor_post_error_hook_cannot_swallow_error() -> None:
-    hook = _SpyHook(
-        name="post_error",
-        event="post_tool_error",
-        outcome=HookOutcome(extra_message="logged"),
-    )
-    executor = ToolExecutor([hook])
-
-    async def _broken(_tool_name: str, _arguments: dict[str, Any]) -> Any:
-        raise RuntimeError("boom")
-
-    result = asyncio.run(
-        executor.execute(
-            ToolExecutionRequest(
-                call_id="c1",
-                tool_name="dummy",
-                arguments={},
-                source="passive",
-            ),
-            _broken,
-        )
-    )
-
-    assert result.status == "error"
-    assert result.output == "工具执行出错: boom"
-    assert result.extra_messages == ["logged"]
-
-
-def test_tool_executor_hook_exception_becomes_controlled_error() -> None:
-    hook = _SpyHook(name="boom_hook", event="pre_tool_use")
-    hook._run_error = RuntimeError("hook boom")
-    executor = ToolExecutor([hook])
-
-    result = asyncio.run(
-        executor.execute(
-            ToolExecutionRequest(
-                call_id="c1",
-                tool_name="dummy",
-                arguments={"x": 1},
-                source="passive",
-            ),
-            _invoke,
-        )
-    )
-
-    assert result.status == "error"
-    assert "boom_hook" in result.output
-    assert "hook boom" in result.output
-
-
-def test_tool_executor_post_tool_use_hook_failure_does_not_pollute_success() -> None:
-    hook = _SpyHook(name="boom_hook", event="post_tool_use")
-    hook._run_error = RuntimeError("post hook boom")
-    executor = ToolExecutor([hook])
-
-    result = asyncio.run(
-        executor.execute(
-            ToolExecutionRequest(
-                call_id="c1",
-                tool_name="dummy",
-                arguments={"x": 1},
-                source="passive",
-            ),
-            _invoke,
-        )
-    )
-
-    assert result.status == "success"
-    assert result.output == {"tool": "dummy", "arguments": {"x": 1}}
-    assert result.post_hook_trace[-1].reason == "hook failed: post hook boom"
-
-
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("restore_version", "safety_version", "expected_prefix"),
-    [
-        ("v2", "v2", ["legacy-restore", "legacy-safety"]),
-        ("v3", "v2", ["v3-restore", "legacy-safety"]),
-        ("v2", "v3", ["legacy-restore", "v3-safety"]),
-        ("v3", "v3", ["v3-restore", "v3-safety"]),
-    ],
-)
-async def test_tool_migration_sandwich_preserves_all_four_combinations(
-    restore_version: str,
-    safety_version: str,
-    expected_prefix: list[str],
-) -> None:
+async def test_tool_executor_runs_typed_events_in_order() -> None:
     order: list[str] = []
     observed: list[ToolResult] = []
-    root = CompositionRoot(f"tool-sandwich:{restore_version}:{safety_version}")
+    root = CompositionRoot("typed-tool-events")
 
     async def composition(ctx) -> None:
-        if restore_version == "v3":
-            def restore(tool_input: ToolInput) -> ToolInput:
-                order.append("v3-restore")
-                arguments = tool_input.mutable_arguments()
-                command = str(arguments["command"])
-                arguments["command"] = command.replace("rm ", "mv ", 1)
-                return tool_input.with_arguments(arguments)
+        def prepare(tool_input: ToolInput) -> ToolInput:
+            order.append("prepare")
+            arguments = tool_input.mutable_arguments()
+            arguments["command"] = str(arguments["command"]).replace(
+                "rm ", "mv ", 1
+            )
+            return tool_input.with_arguments(arguments)
 
-            _ = await ctx.on(TOOL_INPUT_PREPARE, restore)
-        if safety_version == "v3":
-            def authorize(tool_input: ToolInput):
-                order.append("v3-safety")
-                if str(tool_input.arguments["command"]).startswith("rm "):
-                    return Bail("unsafe rm")
-                return None
+        def authorize(tool_input: ToolInput) -> None:
+            order.append("authorize")
+            assert tool_input.arguments["command"] == "mv file.txt"
+            return None
 
-            _ = await ctx.on(TOOL_EXECUTION_AUTHORIZE, authorize)
+        _ = await ctx.on(TOOL_INPUT_PREPARE, prepare)
+        _ = await ctx.on(TOOL_EXECUTION_AUTHORIZE, authorize)
 
         def observe(result: ToolResult) -> None:
-            order.append("v3-result")
+            order.append("result")
             observed.append(result)
 
         _ = await ctx.on(TOOL_RESULT, observe)
 
     _ = await root.mount(composition, name="composition")
-    hooks: list[ToolHook] = []
-    if restore_version == "v2":
-        hooks.append(_OrderHook("legacy-restore", order))
-    if safety_version == "v2":
-        hooks.append(_OrderHook("legacy-safety", order))
-    hooks.append(_PostOrderHook("legacy-post", order))
-    executor = ToolExecutor(hooks)
 
     async def invoke(tool_name: str, arguments: dict[str, Any]) -> str:
         order.append("invoke")
         return f"{tool_name}:{arguments['command']}"
 
     async with _bound_root(root):
-        result = await executor.execute(
+        result = await ToolExecutor().execute(
             ToolExecutionRequest(
                 call_id="call-1",
                 tool_name="shell",
@@ -324,7 +91,7 @@ async def test_tool_migration_sandwich_preserves_all_four_combinations(
 
     assert result.status == "success"
     assert result.final_arguments == {"command": "mv file.txt"}
-    assert order == [*expected_prefix, "invoke", "legacy-post", "v3-result"]
+    assert order == ["prepare", "authorize", "invoke", "result"]
     assert len(observed) == 1
     assert observed[0].status == "success"
     assert observed[0].arguments == {"command": "mv file.txt"}
@@ -344,7 +111,6 @@ async def test_v3_authorize_denial_is_observed_without_invoking() -> None:
         _ = await ctx.on(TOOL_RESULT, observed.append)
 
     _ = await root.mount(composition, name="authorizer")
-    executor = ToolExecutor()
 
     async def invoke(_: str, __: dict[str, Any]) -> str:
         nonlocal invoked
@@ -352,7 +118,7 @@ async def test_v3_authorize_denial_is_observed_without_invoking() -> None:
         return "unreachable"
 
     async with _bound_root(root):
-        result = await executor.execute(
+        result = await ToolExecutor().execute(
             ToolExecutionRequest(
                 call_id="call-2",
                 tool_name="shell",
@@ -369,7 +135,7 @@ async def test_v3_authorize_denial_is_observed_without_invoking() -> None:
 
 
 @pytest.mark.asyncio
-async def test_v3_prepare_failure_records_incident_and_settles_error() -> None:
+async def test_typed_prepare_failure_records_incident_and_settles_error() -> None:
     observed: list[ToolResult] = []
     root = CompositionRoot("tool-prepare-failure")
 
@@ -404,7 +170,7 @@ async def test_v3_prepare_failure_records_incident_and_settles_error() -> None:
 
 
 @pytest.mark.asyncio
-async def test_v3_authorize_failure_records_incident_and_settles_error() -> None:
+async def test_typed_authorize_failure_records_incident_and_settles_error() -> None:
     observed: list[ToolResult] = []
     root = CompositionRoot("tool-authorize-failure")
 
@@ -439,7 +205,7 @@ async def test_v3_authorize_failure_records_incident_and_settles_error() -> None
 
 
 @pytest.mark.asyncio
-async def test_v3_authorize_rejects_invalid_bail_with_owner_incident() -> None:
+async def test_typed_authorize_rejects_invalid_bail_with_owner_incident() -> None:
     observed: list[ToolResult] = []
     invoked = False
     root = CompositionRoot("tool-authorize-invalid-bail")
@@ -503,42 +269,32 @@ def test_tool_input_replace_cannot_bypass_recursive_freeze() -> None:
 
 
 @pytest.mark.asyncio
-async def test_legacy_non_json_rewrite_settles_one_error_result() -> None:
+async def test_invoker_error_is_observed_as_one_settled_error() -> None:
     observed: list[ToolResult] = []
-    invoked = False
-    root = CompositionRoot("legacy-non-json")
+    root = CompositionRoot("tool-invoker-error")
 
     async def composition(ctx) -> None:
         _ = await ctx.on(TOOL_RESULT, observed.append)
 
     _ = await root.mount(composition, name="observer")
-    hook = _SpyHook(
-        name="legacy-invalid",
-        event="pre_tool_use",
-        outcome=HookOutcome(updated_input={"bad": object()}),
-    )
 
-    async def invoke(_: str, __: dict[str, Any]) -> str:
-        nonlocal invoked
-        invoked = True
-        return "unreachable"
+    async def broken(_: str, __: dict[str, Any]) -> str:
+        raise RuntimeError("invoker failed")
 
     async with _bound_root(root):
-        result = await ToolExecutor([hook]).execute(
+        result = await ToolExecutor().execute(
             ToolExecutionRequest(
-                call_id="call-legacy-invalid",
+                call_id="call-invoker-error",
                 tool_name="dummy",
                 arguments={"x": 1},
                 source="passive",
             ),
-            invoke,
+            broken,
         )
 
     assert result.status == "error"
-    assert "legacy-invalid" in str(result.output)
-    assert invoked is False
+    assert "invoker failed" in str(result.output)
     assert [item.status for item in observed] == ["error"]
-    assert observed[0].arguments == {"x": 1}
 
 
 @pytest.mark.asyncio
@@ -574,7 +330,7 @@ async def test_v3_result_observer_failure_does_not_change_settled_result() -> No
 
 
 @pytest.mark.asyncio
-async def test_preflight_runs_v3_admission_without_publishing_result() -> None:
+async def test_preflight_runs_typed_admission_without_publishing_result() -> None:
     observed: list[ToolResult] = []
     root = CompositionRoot("tool-preflight")
 

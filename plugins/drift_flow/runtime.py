@@ -20,7 +20,7 @@ from __future__ import annotations
 import inspect
 import json
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, cast
 
@@ -31,7 +31,6 @@ from agent.prompting import (
     build_context_frame_message,
 )
 from agent.tool_hooks import ToolExecutionRequest, ToolExecutor
-from agent.tool_hooks.base import ToolHook
 from bus.events_lifecycle import DriftFinished
 from plugins.default_proactive.context import AgentTickContext
 from plugins.drift_flow.state import DriftStateStore, SkillMeta
@@ -62,7 +61,6 @@ class DriftTurnPipelineDeps:
     veda_fn: Callable[[], str]
     max_steps: int = 20
     step_recorder: StepRecorder | None = None
-    tool_hooks: list[ToolHook] = field(default_factory=list)
 
 
 # ── 主 Pipeline ─────────────────────────────────────────────────────────
@@ -94,7 +92,7 @@ class DriftTurnPipeline:
         self._veda_fn = deps.veda_fn
         self._max_steps = deps.max_steps
         self.step_recorder = deps.step_recorder
-        self._tool_executor = ToolExecutor(deps.tool_hooks)
+        self._tool_executor = ToolExecutor()
 
     # ── 入口 ──────────────────────────────────────────────────────────
 

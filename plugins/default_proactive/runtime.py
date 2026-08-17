@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable
 
-from agent.tool_hooks import ToolExecutor, ToolHook
+from agent.tool_hooks import ToolExecutor
 from agent.turns.orchestrator import TurnOrchestrator
 from agent.turns.result import TurnOutbound, TurnResult, TurnTrace
 from bus.event_bus import EventBus
@@ -126,7 +126,6 @@ class ProactiveFlowDeps:
     drift_pipeline: DriftTurnPipeline | None
     schedule_fn: Callable[[float | None], int] | None = None
     event_bus: EventBus | None = None
-    tool_hooks: list[ToolHook] | None = None
 
 
 # ── 主 Pipeline ─────────────────────────────────────────────────────────
@@ -167,7 +166,7 @@ class ProactiveFlowRuntime:
         self._drift_pipeline = deps.drift_pipeline
         self._schedule_fn = deps.schedule_fn
         self._event_bus = deps.event_bus
-        self._tool_executor = ToolExecutor(deps.tool_hooks or [])
+        self._tool_executor = ToolExecutor()
         self._proactive_slots: dict[str, Any] = {}
         self._proactive_prompt_sections: list[str] = []
         self._proactive_effect_logs: list[dict[str, Any]] = []

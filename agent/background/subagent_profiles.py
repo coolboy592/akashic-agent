@@ -7,7 +7,6 @@ from typing import Sequence
 from agent.provider import LLMProvider
 from agent.host_bridge.factory import build_shell_process_manager
 from agent.subagent import SubAgent
-from agent.tool_hooks.base import ToolHook
 from agent.tool_bundles import build_readonly_research_tools
 from agent.tools.base import Tool
 from agent.tools.filesystem import (
@@ -29,7 +28,6 @@ class SubagentRuntime:
     provider: LLMProvider
     model: str
     max_tokens: int
-    tool_hooks: list[ToolHook] = field(default_factory=list)
 
 
 @dataclass
@@ -49,8 +47,6 @@ class SubagentSpec:
             max_tokens=runtime.max_tokens,
             mandatory_exit_tools=self.mandatory_exit_tools,
         )
-        if runtime.tool_hooks:
-            agent.add_tool_hooks(runtime.tool_hooks)
         return agent
 
 

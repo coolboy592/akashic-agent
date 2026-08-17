@@ -15,7 +15,6 @@ from agent.model_runtime.context_compaction import (
 from agent.model_runtime.types import ModelUsage
 from agent.provider import LLMProvider
 from agent.tool_hooks import ToolExecutionRequest, ToolExecutor
-from agent.tool_hooks.base import ToolHook
 from agent.tool_runtime import (
     append_assistant_tool_calls,
     append_tool_result,
@@ -83,12 +82,10 @@ _FORCED_FINAL_SUMMARY_FALLBACK = (
 )
 
 
-def _is_tool_loop_guard_denial(exec_result: object) -> bool:
-    traces = getattr(exec_result, "pre_hook_trace", ()) or ()
-    return any(
-        getattr(item, "decision", "") == "deny"
-        and str(getattr(item, "reason", "")).startswith("tool_loop_guard:")
-        for item in traces
+def _is_tool_loop_guard_denial(exec_result: ToolExecutionResult) -> bool:
+    return (
+        exec_result.status == "denied"
+        and str(exec_result.output).startswith("tool_loop_guard:")
     )
 
 
@@ -198,10 +195,7 @@ class SubAgent:
         tool_map = build_tool_map(tools)
         self._tool_map: dict[str, Tool] = tool_map
         self._tool_schemas: list[dict[str, Any]] = tool_schemas
-        self._tool_executor = ToolExecutor([])
-
-    def add_tool_hooks(self, hooks: list[ToolHook]) -> None:
-        self._tool_executor.add_hooks(hooks)
+        self._tool_executor = ToolExecutor()
 
     async def run(self, task: str) -> str:
         """执行单次任务，并在 owner 结束时回收 shell execution。"""
@@ -569,7 +563,7 @@ class SubAgent:
         session_key: str = "",
         tool_batch: tuple[dict[str, Any], ...] = (),
         tool_batch_index: int = 0,
-    ):
+    ) -> ToolExecutionResult:
         tool = self._tool_map.get(tool_name)
         if tool is None:
             return ToolExecutionResult(

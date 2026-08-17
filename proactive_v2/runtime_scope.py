@@ -4,7 +4,6 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from agent.plugins.specs import RegisteredProactiveSource
-from agent.tool_hooks import ToolHook
 from agent.tools.registry import ToolRegistry
 from agent.turns.orchestrator import TurnOrchestrator
 from bus.event_bus import EventBus
@@ -31,5 +30,4 @@ class ProactiveRuntimeScope:
     shared_tools: ToolRegistry | None = None
     turn_orchestrator: TurnOrchestrator | None = None
     event_bus: EventBus | None = None
-    tool_hooks: list[ToolHook] = field(default_factory=list)
     schedule_fn: Callable[[float | None], int] | None = None
