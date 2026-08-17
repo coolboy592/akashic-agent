@@ -18,23 +18,23 @@
     {
       "id": "shell_restore",
       "repository": "https://github.com/akashic-plugins/shell_restore",
-      "requested_ref": "0bbcf41885791b843b1d3f553674b0856c93155b",
-      "resolved_sha": "0bbcf41885791b843b1d3f553674b0856c93155b",
-      "change_source_pr_head": "0bbcf41885791b843b1d3f553674b0856c93155b"
+      "requested_ref": "d9b9e17c7e783463a4981f60c05170361fd29827",
+      "resolved_sha": "d9b9e17c7e783463a4981f60c05170361fd29827",
+      "change_source_pr_head": "d9b9e17c7e783463a4981f60c05170361fd29827"
     },
     {
       "id": "shell_safety",
       "repository": "https://github.com/akashic-plugins/shell_safety",
-      "requested_ref": "a3a1ed8aceed03e62530a384343a0769ac10b52e",
-      "resolved_sha": "a3a1ed8aceed03e62530a384343a0769ac10b52e",
-      "change_source_pr_head": "a3a1ed8aceed03e62530a384343a0769ac10b52e"
+      "requested_ref": "5230f8ac8aec521636e28e9c313ba60a49552fde",
+      "resolved_sha": "5230f8ac8aec521636e28e9c313ba60a49552fde",
+      "change_source_pr_head": "5230f8ac8aec521636e28e9c313ba60a49552fde"
     },
     {
       "id": "tool_loop_guard",
       "repository": "https://github.com/akashic-plugins/tool_loop_guard",
-      "requested_ref": "a6bf7dbe0212d6aeb38f365b8c464be648d2bbfe",
-      "resolved_sha": "a6bf7dbe0212d6aeb38f365b8c464be648d2bbfe",
-      "change_source_pr_head": "a6bf7dbe0212d6aeb38f365b8c464be648d2bbfe"
+      "requested_ref": "29b35728989724ffa415e61ad2df123895598649",
+      "resolved_sha": "29b35728989724ffa415e61ad2df123895598649",
+      "change_source_pr_head": "29b35728989724ffa415e61ad2df123895598649"
     },
     {
       "id": "calendar-mcp",
@@ -137,9 +137,9 @@
     {
       "id": "github_watch",
       "repository": "https://github.com/kachofugetsu09/github-watch.git",
-      "requested_ref": "aea802c0966b0e000406c8ef4ac44bede2f1d9d9",
-      "resolved_sha": "aea802c0966b0e000406c8ef4ac44bede2f1d9d9",
-      "change_source_pr_head": "aea802c0966b0e000406c8ef4ac44bede2f1d9d9"
+      "requested_ref": "7334ae5f7a8a7ad3642b4d42256de65cac8a7eec",
+      "resolved_sha": "7334ae5f7a8a7ad3642b4d42256de65cac8a7eec",
+      "change_source_pr_head": "7334ae5f7a8a7ad3642b4d42256de65cac8a7eec"
     }
   ]
 }
