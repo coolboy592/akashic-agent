@@ -245,23 +245,7 @@ class CoreRuntime:
         from agent.lifecycle.phases.before_turn import default_before_turn_modules
         from agent.lifecycle.phases.prompt_render import default_prompt_render_modules
 
-        # 2. 收集各阶段插件贡献。
-        # V2_REMOVAL(plugin-manager-projections)：inspect 改读 stable Root lifecycle topology 后，
-        # 删除 Manager.before_*/after_*/prompt_render_modules 的诊断投影。
-        manager = self.plugin_manager
-        before_turn_modules = manager.before_turn_modules if manager is not None else []
-        before_reasoning_modules = (
-            manager.before_reasoning_modules if manager is not None else []
-        )
-        prompt_render_modules = manager.prompt_render_modules if manager is not None else []
-        before_step_modules = manager.before_step_modules if manager is not None else []
-        after_step_modules = manager.after_step_modules if manager is not None else []
-        after_reasoning_modules = (
-            manager.after_reasoning_modules if manager is not None else []
-        )
-        after_turn_modules = manager.after_turn_modules if manager is not None else []
-
-        # 3. 从 AgentLoop 的构造不变量取得阶段依赖。
+        # 2. 从 AgentLoop 的构造不变量取得固定 Core 阶段依赖。
         pipeline = self.loop._passive_pipeline
         context = self.loop.context
 
@@ -272,7 +256,6 @@ class CoreRuntime:
                     self.event_bus,
                     self.session_manager,
                     pipeline._context_store,
-                    plugin_modules=cast(Any, before_turn_modules),
                 ),
             ),
             (
@@ -282,7 +265,6 @@ class CoreRuntime:
                     self.tools,
                     self.session_manager,
                     context,
-                    plugin_modules=cast(Any, before_reasoning_modules),
                 ),
             ),
             (
@@ -290,29 +272,21 @@ class CoreRuntime:
                 default_prompt_render_modules(
                     self.event_bus,
                     context,
-                    plugin_modules=cast(Any, prompt_render_modules),
                 ),
             ),
             (
                 "before_step",
-                default_before_step_modules(
-                    self.event_bus,
-                    plugin_modules=cast(Any, before_step_modules),
-                ),
+                default_before_step_modules(self.event_bus),
             ),
             (
                 "after_step",
-                default_after_step_modules(
-                    self.event_bus,
-                    plugin_modules=cast(Any, after_step_modules),
-                ),
+                default_after_step_modules(self.event_bus),
             ),
             (
                 "after_reasoning",
                 default_after_reasoning_modules(
                     self.event_bus,
                     pipeline._session,
-                    plugin_modules=cast(Any, after_reasoning_modules),
                 ),
             ),
             (
@@ -321,18 +295,32 @@ class CoreRuntime:
                     self.event_bus,
                     pipeline._outbound_port,
                     context,
-                    plugin_modules=cast(Any, after_turn_modules),
                 ),
             ),
         ]
 
-        # 4. 统一渲染执行顺序和依赖树。
+        # 3. 分开渲染 Core phase DAG 与 committed v3 Root 拓扑。
         parts: list[str] = []
         for phase_name, modules in phases:
             parts.append("=" * 60)
             parts.append(phase_name)
             parts.append("=" * 60)
             parts.append(inspect_phase(modules))
+        snapshot = (
+            self.plugin_manager.current_snapshot
+            if self.plugin_manager is not None
+            else None
+        )
+        topology = None if snapshot is None else snapshot.composition_topology
+        if topology is not None:
+            parts.extend(("=" * 60, "composition", "=" * 60))
+            parts.append(f"identity: {topology.identity}")
+            parts.append(f"revision: {topology.composition_revision}")
+            for fiber in topology.fibers:
+                parent = fiber.parent or "<root>"
+                parts.append(f"fiber: {parent} -> {fiber.name}")
+            for listener in topology.listeners:
+                parts.append(f"listener: {listener}")
         return "\n".join(parts)
 
     async def stop(self) -> None:
