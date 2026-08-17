@@ -98,7 +98,7 @@ class RuntimeSnapshot:
         default=None,
         repr=False,
     )
-    # V2_REMOVAL: legacy-only candidate 消失后删除此 stable Root Health 豁免令牌。
+    # 正式恢复可用已封存的 stable Root 验证替换载荷。
     composition_health_exempt_root_token: object | None = field(
         default=None,
         repr=False,

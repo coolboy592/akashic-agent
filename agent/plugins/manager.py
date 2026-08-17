@@ -4979,7 +4979,7 @@ class PluginManager:
                 ),
             )
             current = self.current_snapshot
-            # V2_REMOVAL: legacy-only candidate 消失后删除 stable Root Health 豁免。
+            # 正式恢复可复用已封存的 stable Root 载荷。
             reuses_stable_root = (
                 allow_unready_stable_composition
                 and candidate_owner is None
