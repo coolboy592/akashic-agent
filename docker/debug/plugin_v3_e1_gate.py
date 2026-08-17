@@ -1,0 +1,644 @@
+"""集中式、一次性 workspace 的 pure-v3 E1 Gate。"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import hashlib
+import json
+import sqlite3
+import sys
+import tempfile
+from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any, cast
+
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from agent.config_models import Config, MemoryConfig, MemoryEmbeddingConfig  # noqa: E402
+from agent.plugins.interaction_undo import InteractionUndoCoordinator  # noqa: E402
+from agent.plugins.manager import PluginManager  # noqa: E402
+from agent.plugins.mobile_ui import PluginMobileUiProvider  # noqa: E402
+from agent.provider import LLMProvider  # noqa: E402
+from agent.tools.registry import ToolRegistry  # noqa: E402
+from bootstrap.memory import build_memory_runtime, ensure_memory_plugin_storage  # noqa: E402
+from bus.event_bus import EventBus  # noqa: E402
+from core.net.http import SharedHttpResources  # noqa: E402
+from memory2.store import MemoryStore2  # noqa: E402
+from session.manager import SessionManager  # noqa: E402
+
+try:
+    from docker.debug import plugin_v3_fleet_gate as fleet_gate  # noqa: E402
+except ModuleNotFoundError:  # pragma: no cover
+    import plugin_v3_fleet_gate as fleet_gate  # type: ignore[no-redef] # noqa: E402
+
+
+DEFAULT_LOCK = ROOT / "docker" / "debug" / "plugin-v3-fleet.lock.json"
+DEFAULT_REPORT = ROOT / "docker" / "debug" / "reports" / "plugin-v3-e1" / "gate.json"
+E1_PLUGIN_IDS = (
+    "akasha", "default_memory", "citation", "meme", "emotion", "observe",
+    "proactive_feedback", "plugin_undo",
+)
+E1_EXTERNAL_PLUGIN_IDS = E1_PLUGIN_IDS[2:]
+BUILTIN_PLUGIN_ROOTS = {
+    "akasha": ROOT / "plugins" / "akasha",
+    "default_memory": ROOT / "plugins" / "default_memory",
+}
+
+
+class E1GateError(RuntimeError):
+    """报告可复现的 E1 输入或证据失败。"""
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeBundle:
+    """保存一个 disposable Core runtime 的 owner。"""
+
+    workspace: Path
+    engine_name: str
+    sessions: SessionManager
+    memory: Any
+    manager: PluginManager
+    http: SharedHttpResources
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="运行 pure-v3 集中式 E1 Gate")
+    parser.add_argument("--lock", type=Path, default=DEFAULT_LOCK)
+    parser.add_argument("--report", type=Path, default=DEFAULT_REPORT)
+    parser.add_argument("--tmp-root", type=Path)
+    parser.add_argument("--plugin-root", action="append", default=[], metavar="PLUGIN_ID=PATH")
+    parser.add_argument("--offline", action="store_true")
+    return parser.parse_args()
+
+
+def _parse_plugin_roots(raw: list[str]) -> dict[str, Path]:
+    """在 CLI 边界解析 explicit exact checkout 路径。"""
+
+    roots: dict[str, Path] = {}
+    for value in raw:
+        plugin_id, separator, path = value.partition("=")
+        if not separator or not plugin_id.strip() or not path.strip():
+            raise E1GateError(f"--plugin-root 必须是 PLUGIN_ID=PATH: {value!r}")
+        if plugin_id in roots:
+            raise E1GateError(f"--plugin-root 重复: {plugin_id}")
+        roots[plugin_id] = Path(path).expanduser().resolve(strict=False)
+    unknown = sorted(set(roots) - set(E1_EXTERNAL_PLUGIN_IDS))
+    if unknown:
+        raise E1GateError(f"--plugin-root 只允许 E1 external plugin: {unknown}")
+    return roots
+
+
+def _select_e1_locks(path: Path) -> dict[str, Any]:
+    """从完整 immutable fleet lock 选择 E1 external revisions。"""
+
+    locks = fleet_gate._load_lock(path)  # pyright: ignore[reportPrivateUsage]
+    by_id = {item.id: item for item in locks}
+    missing = sorted(set(E1_EXTERNAL_PLUGIN_IDS) - set(by_id))
+    if missing:
+        raise E1GateError(f"E1 lock 缺少 external plugin: {missing}")
+    return {plugin_id: by_id[plugin_id] for plugin_id in E1_EXTERNAL_PLUGIN_IDS}
+
+
+def _local_checkout_evidence(lock: Any, root: Path) -> dict[str, object]:
+    """验证 local checkout 的 commit、tree、clean 状态。"""
+
+    if not root.is_dir() or root.is_symlink():
+        raise E1GateError(f"checkout 不是实体目录: {root}")
+    actual = fleet_gate._git_output(root, "rev-parse", "HEAD")  # pyright: ignore[reportPrivateUsage]
+    if actual != lock.resolved_sha:
+        raise E1GateError(f"checkout SHA 与锁不一致: {lock.id} expected={lock.resolved_sha} actual={actual}")
+    dirty = tuple(fleet_gate._git_output(root, "status", "--porcelain").splitlines())  # pyright: ignore[reportPrivateUsage]
+    if dirty:
+        raise E1GateError(f"checkout 工作树不干净: {lock.id}: {dirty}")
+    return {
+        "id": lock.id,
+        "repository": lock.repository,
+        "resolved_sha": lock.resolved_sha,
+        "tree": fleet_gate._git_output(root, "rev-parse", "HEAD^{tree}"),  # pyright: ignore[reportPrivateUsage]
+        "clean": True,
+        "history": fleet_gate._git_output(root, "rev-parse", "--is-shallow-repository"),  # pyright: ignore[reportPrivateUsage]
+        "path": str(root),
+        "mode": "provided-checkout",
+    }
+
+
+def _resolve_external_roots(
+    locks: dict[str, Any], staging: Path, provided: dict[str, Path], *, offline: bool
+) -> tuple[dict[str, Path], list[dict[str, object]], list[str]]:
+    """解析 exact lock checkout；绝不回退到旧 v2 checkout。"""
+
+    roots: dict[str, Path] = {}
+    evidence: list[dict[str, object]] = []
+    blockers: list[str] = []
+    for plugin_id in E1_EXTERNAL_PLUGIN_IDS:
+        lock = locks[plugin_id]
+        try:
+            if plugin_id in provided:
+                checkout = provided[plugin_id]
+                item = _local_checkout_evidence(lock, checkout)
+            elif offline:
+                raise E1GateError(f"offline 模式没有精确 checkout: {plugin_id}@{lock.resolved_sha}")
+            else:
+                checkout = staging / plugin_id
+                result = fleet_gate._checkout_locked_plugin(lock, checkout)  # pyright: ignore[reportPrivateUsage]
+                item = {**asdict(result), "path": str(checkout), "mode": "shallow-lock-checkout"}
+            root = Path(str(item["path"]))
+            static = fleet_gate._inspect_static_plugin(root, plugin_id)  # pyright: ignore[reportPrivateUsage]
+            item["static"] = static
+            if static["status"] != "passed":
+                raise E1GateError(f"external static v3 inspection failed: {plugin_id}")
+            roots[plugin_id] = root
+            evidence.append(item)
+        except Exception as error:
+            blockers.append(f"{plugin_id}: exact locked checkout unavailable: {type(error).__name__}: {error}")
+            evidence.append({
+                "id": plugin_id,
+                "resolved_sha": lock.resolved_sha,
+                "status": "blocked",
+                "error": f"{type(error).__name__}: {error}",
+                "mode": "not-run",
+            })
+    return roots, evidence, blockers
+
+
+def _plugin_dirs(external: dict[str, Path]) -> list[Path]:
+    """组装真实 PluginManager 的 in-tree 与 exact checkout source roots。"""
+
+    return [BUILTIN_PLUGIN_ROOTS["akasha"], BUILTIN_PLUGIN_ROOTS["default_memory"]] + [
+        external[plugin_id] for plugin_id in E1_EXTERNAL_PLUGIN_IDS if plugin_id in external
+    ]
+
+
+def _config(engine: str) -> Config:
+    return Config(
+        provider="fixture", model="fixture", api_key="", system_prompt="",
+        base_url="http://127.0.0.1:9",
+        memory=MemoryConfig(
+            enabled=True, engine=engine,
+            embedding=MemoryEmbeddingConfig(output_dimensionality=32),
+        ),
+    )
+
+
+async def _open_runtime(workspace: Path, engine: str, plugin_dirs: list[Path]) -> RuntimeBundle:
+    """在 disposable workspace 启动真实 memory runtime 与 PluginManager。"""
+
+    workspace.mkdir(parents=True, exist_ok=True)
+    config = _config(engine)
+    sessions = SessionManager(workspace)
+    http = SharedHttpResources()
+    event_bus = EventBus()
+    tools = ToolRegistry()
+    provider = LLMProvider(api_key="", provider_name="fixture", base_url="http://127.0.0.1:9")
+    try:
+        ensure_memory_plugin_storage(config, workspace)
+        memory = build_memory_runtime(config, workspace, tools, provider, None, http, event_publisher=event_bus)
+        manager = PluginManager(
+            plugin_dirs, event_bus=event_bus, workspace=workspace, tool_registry=tools,
+            session_manager=sessions, memory_engine=memory.engine,
+            installed_cache_root=workspace / "installed-plugins",
+        )
+        await manager.load_all()
+    except BaseException:
+        sessions.close()
+        await http.aclose()
+        raise
+    return RuntimeBundle(workspace, engine, sessions, memory, manager, http)
+
+
+async def _close_runtime(bundle: RuntimeBundle) -> list[str]:
+    """关闭所有 owner，并返回 cleanup failure 证据。"""
+
+    errors: list[str] = []
+    for label, action in (
+        ("PluginManager", bundle.manager.terminate_all),
+        ("MemoryRuntime", bundle.memory.aclose),
+        ("SessionManager", bundle.sessions.close),
+        ("HTTP", bundle.http.aclose),
+    ):
+        try:
+            result = action()
+            if asyncio.iscoroutine(result):
+                await result
+        except Exception as error:
+            errors.append(f"{label}: {type(error).__name__}: {error}")
+    return errors
+
+
+def _runtime_identity(bundle: RuntimeBundle) -> dict[str, object]:
+    """读取 stable snapshot、generation 与 mobile catalog。"""
+
+    snapshot = bundle.manager.current_snapshot
+    if snapshot is None:
+        raise E1GateError(f"{bundle.engine_name} runtime 没有 stable snapshot")
+    active = sorted(item.plugin_id for item in bundle.manager.active_plugins())
+    generations = {
+        plugin_id: generation.source_revision
+        for plugin_id in active
+        if (generation := bundle.manager.generation(plugin_id)) is not None
+    }
+    return {
+        "engine": bundle.engine_name,
+        "snapshot_id": snapshot.snapshot_id,
+        "active_plugins": active,
+        "generations": generations,
+        "mobile_catalog": PluginMobileUiProvider(bundle.manager).catalog(),
+        "composition_active_plugin_ids": sorted(snapshot.composition_active_plugin_ids),
+    }
+
+
+async def _probe_boot(bundle: RuntimeBundle) -> dict[str, object]:
+    """执行 stable lease 与 Akasha bounded mobile query。"""
+
+    identity = _runtime_identity(bundle)
+    snapshot = bundle.manager.current_snapshot
+    if snapshot is None:
+        raise E1GateError("stable snapshot 在 mobile probe 前消失")
+    before = snapshot.lease_count
+    async with bundle.manager.snapshot_store.lease() as leased:
+        lease = {"snapshot_id": leased.snapshot_id, "during": leased.lease_count}
+    lease["before"] = before
+    lease["after"] = snapshot.lease_count
+    identity["stable_lease"] = lease
+    if bundle.engine_name == "akasha":
+        generation = bundle.manager.generation("akasha")
+        if generation is None:
+            raise E1GateError("Akasha generation 缺失")
+        provider = PluginMobileUiProvider(bundle.manager)
+        try:
+            result = await provider.query(
+                "akasha", generation.source_revision, "inspector.recent", {},
+                session_id="e1:mobile", turn_id="turn:e1:mobile",
+            )
+        except Exception as error:
+            identity["mobile_query"] = {
+                "plugin_id": "akasha", "method": "inspector.recent", "status": "blocked",
+                "error": f"{type(error).__name__}: {error}",
+            }
+        else:
+            identity["mobile_query"] = {
+                "plugin_id": "akasha", "method": "inspector.recent", "status": "passed", "result": result,
+            }
+    else:
+        identity["mobile_query"] = {"status": "not_applicable", "reason": "Default Memory 无 mobile UI"}
+    if snapshot.lease_count != before:
+        raise E1GateError("stable snapshot lease 未归还")
+    return identity
+
+
+def _now() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+def _seed_interaction(sessions: SessionManager, *, key: str, turn: str, label: str) -> tuple[str, ...]:
+    """通过 SessionStore append 一个完整 U+A interaction。"""
+
+    timestamp = _now()
+    rows = sessions.control_store.persist_session(
+        key, created_at=timestamp, updated_at=timestamp, metadata={"gate": label},
+        messages=[
+            {"role": "user", "content": f"E1 {label} question", "timestamp": timestamp,
+             "extra": {"control_turn_id": turn, "turn_input_ordinal": 0}},
+            {"role": "assistant", "content": f"E1 {label} answer", "timestamp": timestamp,
+             "extra": {"control_turn_id": turn, "turn_terminal": True, "turn_input_count": 1}},
+        ],
+    )
+    return tuple(str(row["id"]) for row in rows)
+
+
+def _freeze(value: object) -> object:
+    if isinstance(value, bytes):
+        return {"sha256": hashlib.sha256(value).hexdigest(), "length": len(value)}
+    if value is None or isinstance(value, str | int | float):
+        return value
+    return repr(value)
+
+
+def _sqlite_state(path: Path) -> dict[str, object]:
+    """读取 SQLite integrity、schema 与所有表的行 hash，不写入数据库。"""
+
+    connection = sqlite3.connect(str(path))
+    try:
+        integrity = str(connection.execute("PRAGMA integrity_check").fetchone()[0])
+        if integrity != "ok":
+            raise E1GateError(f"SQLite integrity_check 失败: {path}: {integrity}")
+        names = [str(row[0]) for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+        )]
+        tables: dict[str, object] = {}
+        for name in names:
+            quote = '"' + name.replace('"', '""') + '"'
+            schema = connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (name,)
+            ).fetchone()[0]
+            info = list(connection.execute(f"PRAGMA table_info({quote})"))
+            columns = [str(row[1]) for row in info]
+            primary = [name for order, name in sorted((int(row[5]), str(row[1])) for row in info if int(row[5]) > 0)]
+            without_rowid = "WITHOUT ROWID" in str(schema or "").upper()
+            rows = connection.execute(f"SELECT * FROM {quote}").fetchall() if without_rowid else connection.execute(f"SELECT rowid, * FROM {quote}").fetchall()
+            values: dict[str, str] = {}
+            for row in rows:
+                frozen = [_freeze(item) for item in row]
+                if without_rowid:
+                    positions = {column: index for index, column in enumerate(columns)}
+                    key_values = [frozen[positions[item]] for item in primary] if primary else frozen
+                    key = json.dumps(key_values, ensure_ascii=False, sort_keys=True)
+                    payload = frozen
+                else:
+                    key = str(frozen[0])
+                    payload = frozen[1:]
+                encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+                values[key] = hashlib.sha256(encoded.encode()).hexdigest()
+            tables[name] = {"schema": schema, "rows": values}
+        return {"path": str(path), "integrity": integrity, "tables": tables}
+    finally:
+        connection.close()
+
+
+def _sqlite_diff(before: dict[str, object], after: dict[str, object]) -> dict[str, object]:
+    """从两个 SQLite snapshot 生成紧凑完整 write-set。"""
+
+    left = cast(dict[str, object], before["tables"])
+    right = cast(dict[str, object], after["tables"])
+    inserted: list[str] = []
+    deleted: list[str] = []
+    updated: list[str] = []
+    for table in sorted(set(left) | set(right)):
+        old = cast(dict[str, str], cast(dict[str, object], left.get(table, {"rows": {}}))["rows"])
+        new = cast(dict[str, str], cast(dict[str, object], right.get(table, {"rows": {}}))["rows"])
+        inserted.extend(f"{table}:{key}" for key in sorted(set(new) - set(old)))
+        deleted.extend(f"{table}:{key}" for key in sorted(set(old) - set(new)))
+        updated.extend(f"{table}:{key}" for key in sorted(set(old) & set(new)) if old[key] != new[key])
+    return {"inserted": inserted, "deleted": deleted, "updated": updated,
+            "inserted_count": len(inserted), "deleted_count": len(deleted), "updated_count": len(updated)}
+
+
+def _messages(path: Path) -> dict[str, tuple[object, ...]]:
+    connection = sqlite3.connect(str(path))
+    try:
+        return {str(row[0]): tuple(row[1:]) for row in connection.execute(
+            "SELECT id, session_key, seq, role, content, tool_chain, extra, ts FROM messages ORDER BY id"
+        )}
+    finally:
+        connection.close()
+
+
+def _memory_store(bundle: RuntimeBundle) -> MemoryStore2:
+    stores = [item for item in bundle.memory.closeables if isinstance(item, MemoryStore2)]
+    if len(stores) != 1:
+        raise E1GateError(f"MemoryStore2 owner 数量异常: {len(stores)}")
+    return stores[0]
+
+
+def _item_id(receipt: str) -> str:
+    prefix, separator, value = receipt.partition(":")
+    if prefix not in {"new", "reinforced"} or not separator or not value:
+        raise E1GateError(f"MemoryStore2 receipt 无效: {receipt}")
+    return value
+
+
+async def _append_only(bundle: RuntimeBundle) -> dict[str, object]:
+    """证明既有 SessionDB messages 不变且新 seq 只追加。"""
+
+    key = "e1:append"
+    _seed_interaction(bundle.sessions, key=key, turn="turn:e1:append:1", label="append-1")
+    path = Path(bundle.sessions.db_path)
+    before = _sqlite_state(path)
+    old_messages = _messages(path)
+    old_seq = bundle.sessions.control_store.next_seq(key)
+    new_ids = _seed_interaction(bundle.sessions, key=key, turn="turn:e1:append:2", label="append-2")
+    after = _sqlite_state(path)
+    new_messages = _messages(path)
+    if any(new_messages[item] != row for item, row in old_messages.items()):
+        raise E1GateError("append 修改既有 canonical message")
+    if set(old_messages) - set(new_messages):
+        raise E1GateError("append 删除 canonical message")
+    if set(new_messages) - set(old_messages) != set(new_ids):
+        raise E1GateError("append 新增 message 集合不匹配")
+    new_seq = bundle.sessions.control_store.next_seq(key)
+    if new_seq != old_seq + len(new_ids):
+        raise E1GateError(f"seq 高水位异常: {old_seq}->{new_seq}")
+    return {"status": "passed", "database": str(path), "before": before, "after": after,
+            "write_set": _sqlite_diff(before, after), "existing_messages_unchanged": True,
+            "new_message_ids": list(new_ids), "seq_highwater": {"before": old_seq, "after": new_seq}}
+
+
+async def _undo(bundle: RuntimeBundle) -> dict[str, object]:
+    """在 disposable workspace 执行 exact latest interaction undo 与 Memory2 rollback。"""
+
+    key = "e1:undo"
+    guard_ids = _seed_interaction(bundle.sessions, key=key, turn="turn:e1:undo:guard", label="undo-guard")
+    target_ids = _seed_interaction(bundle.sessions, key=key, turn="turn:e1:undo:target", label="undo-target")
+    store = _memory_store(bundle)
+    target_source = json.dumps([target_ids[0]], ensure_ascii=False)
+    guard_source = json.dumps([guard_ids[0]], ensure_ascii=False)
+    old_id = _item_id(store.upsert_item("fact", "E1 old memory", [0.0] * 32, target_source))
+    new_id = _item_id(store.upsert_item("fact", "E1 replacement memory", [0.0] * 32, target_source))
+    guard_memory_id = _item_id(store.upsert_item("fact", "E1 guard memory", [0.0] * 32, guard_source))
+    old_item = bundle.memory.engine.get_item_for_dashboard(old_id)
+    new_item = bundle.memory.engine.get_item_for_dashboard(new_id)
+    if old_item is None or new_item is None:
+        raise E1GateError("Memory2 replacement seed 读取失败")
+    bundle.memory.engine.update_item_for_dashboard(old_id, status="superseded")
+    if store.record_replacements(old_items=[old_item], new_item=new_item, source_ref=target_source) != 1:
+        raise E1GateError("Memory2 replacement seed 未写入")
+    path = Path(bundle.sessions.db_path)
+    before = _sqlite_state(path)
+    old_messages = _messages(path)
+    old_seq = bundle.sessions.control_store.next_seq(key)
+    result = await InteractionUndoCoordinator(bundle.sessions, bundle.memory.engine).undo_latest(key)
+    if result is None or result.control_turn_id != "turn:e1:undo:target":
+        raise E1GateError(f"未撤销 exact control_turn_id: {result}")
+    after = _sqlite_state(path)
+    new_messages = _messages(path)
+    backup_path = Path(result.backup_path)
+    backup = _sqlite_state(backup_path)
+    target_missing = set(target_ids).isdisjoint(new_messages)
+    guard_unchanged = all(new_messages.get(item) == old_messages[item] for item in guard_ids)
+    if not target_missing or not guard_unchanged:
+        raise E1GateError("Undo target/non-target message write-set 不符合合同")
+    if bundle.sessions.control_store.pending_interaction_memory_reconciliations("default_memory"):
+        raise E1GateError("Undo 成功后仍有 pending receipt")
+    old_after = bundle.memory.engine.get_item_for_dashboard(old_id)
+    new_after = bundle.memory.engine.get_item_for_dashboard(new_id)
+    guard_after = bundle.memory.engine.get_item_for_dashboard(guard_memory_id)
+    if old_after is None or new_after is None or guard_after is None:
+        raise E1GateError("Memory2 undo item 缺失")
+    if old_after["status"] != "active" or new_after["status"] != "superseded" or guard_after["status"] != "active":
+        raise E1GateError("Memory2 replacement/cursor rollback 不成立")
+    new_seq = bundle.sessions.control_store.next_seq(key)
+    if new_seq != old_seq:
+        raise E1GateError(f"Undo 改变 seq 高水位: {old_seq}->{new_seq}")
+    return {"status": "passed", "workspace": str(bundle.workspace), "control_turn_id": result.control_turn_id,
+            "message_ids": list(result.message_ids), "backup": {"path": str(backup_path), "integrity": backup["integrity"]},
+            "before": before, "after": after, "write_set": _sqlite_diff(before, after),
+            "target_missing": target_missing, "non_target_messages_unchanged": guard_unchanged,
+            "seq_highwater": {"before": old_seq, "after": new_seq},
+            "memory2": {"old_item_id": old_id, "new_item_id": new_id, "guard_item_id": guard_memory_id,
+                        "old_status_after": old_after["status"], "new_status_after": new_after["status"],
+                        "guard_status_after": guard_after["status"], "replacement_rows": 1}}
+
+
+async def _crash_recovery(workspace: Path, plugin_dirs: list[Path]) -> dict[str, object]:
+    """用真实 closed MemoryStore2 触发内部失败，再模拟 Core 进程重启恢复。"""
+
+    first = await _open_runtime(workspace, "default", plugin_dirs)
+    key = "e1:crash"
+    ids = _seed_interaction(first.sessions, key=key, turn="turn:e1:crash", label="crash")
+    deletion = first.sessions.control_store.delete_interaction(
+        "turn:e1:crash", action_source="plugin_v3_e1_gate.crash",
+        expected_latest_session_key=key, reconciliation_owner="default_memory",
+    )
+    if deletion is None:
+        raise E1GateError("crash seed delete 未提交")
+    _memory_store(first).close()
+    failure = ""
+    try:
+        await InteractionUndoCoordinator(first.sessions, first.memory.engine).recover_pending()
+    except Exception as error:
+        failure = f"{type(error).__name__}: {error}"
+    if not failure:
+        raise E1GateError("closed MemoryStore2 未触发 process-internal failure")
+    pending = first.sessions.control_store.pending_interaction_memory_reconciliations("default_memory")
+    if len(pending) != 1 or pending[0].attempts != 1:
+        raise E1GateError(f"失败后 receipt 不可重试: {pending}")
+    cleanup = await _close_runtime(first)
+    if cleanup:
+        raise E1GateError(f"重启前 cleanup 失败: {cleanup}")
+    restarted = await _open_runtime(workspace, "default", plugin_dirs)
+    try:
+        await InteractionUndoCoordinator(restarted.sessions, restarted.memory.engine).recover_pending()
+        if restarted.sessions.control_store.pending_interaction_memory_reconciliations("default_memory"):
+            raise E1GateError("Core restart 后 pending receipt 未清空")
+        if restarted.sessions.get_existing(key).messages:
+            raise E1GateError("Core restart 后 deleted interaction 重现")
+        backup = _sqlite_state(Path(deletion.backup_path))
+        return {"status": "passed", "control_turn_id": deletion.control_turn_id, "message_ids": list(ids),
+                "process_internal_failure": failure, "pending_attempts_before_restart": 1,
+                "pending_after_restart": 0, "backup": {"path": deletion.backup_path, "integrity": backup["integrity"]}}
+    finally:
+        cleanup = await _close_runtime(restarted)
+        if cleanup:
+            raise E1GateError(f"重启后 cleanup 失败: {cleanup}")
+
+
+async def _scenarios(workspace: Path, plugin_dirs: list[Path], blockers: list[str]) -> tuple[list[dict[str, object]], dict[str, object]]:
+    """运行两个 memory engine、SQLite write-set、Undo 与 restart 场景。"""
+
+    scenarios: list[dict[str, object]] = []
+    runtimes: dict[str, RuntimeBundle] = {}
+    evidence: dict[str, object] = {}
+    for engine in ("default", "akasha"):
+        bundle: RuntimeBundle | None = None
+        try:
+            bundle = await _open_runtime(workspace / f"runtime-{engine}", engine, plugin_dirs)
+            runtimes[engine] = bundle
+            boot = await _probe_boot(bundle)
+            evidence[engine] = boot
+            scenarios.append({"id": f"runtime_boot_{engine}", "status": "passed", "evidence": boot})
+            mobile = cast(dict[str, object], boot["mobile_query"])
+            if mobile.get("status") == "blocked":
+                blockers.append(f"runtime_boot_{engine}.mobile_query: {mobile.get('error', 'unavailable')}")
+        except Exception as error:
+            scenarios.append({"id": f"runtime_boot_{engine}", "status": "failed", "error": f"{type(error).__name__}: {error}"})
+            blockers.append(f"runtime_boot_{engine}: {type(error).__name__}: {error}")
+            if bundle is not None:
+                blockers.extend(f"runtime cleanup: {item}" for item in await _close_runtime(bundle))
+                runtimes.pop(engine, None)
+    default = runtimes.get("default")
+    if default is None:
+        scenarios.extend({"id": item, "status": "blocked", "reason": "Default Memory runtime 未启动"} for item in ("append_only_sessiondb", "plugin_undo", "core_crash_recovery"))
+    else:
+        for case_id, action in (("append_only_sessiondb", _append_only), ("plugin_undo", _undo)):
+            try:
+                scenarios.append({"id": case_id, **await action(default)})
+            except Exception as error:
+                scenarios.append({"id": case_id, "status": "failed", "error": f"{type(error).__name__}: {error}"})
+                blockers.append(f"{case_id}: {type(error).__name__}: {error}")
+        blockers.extend(f"runtime cleanup: {item}" for item in await _close_runtime(default))
+        runtimes.pop("default", None)
+        try:
+            scenarios.append({"id": "core_crash_recovery", **await _crash_recovery(workspace / "runtime-crash", plugin_dirs)})
+        except Exception as error:
+            scenarios.append({"id": "core_crash_recovery", "status": "failed", "error": f"{type(error).__name__}: {error}"})
+            blockers.append(f"core_crash_recovery: {type(error).__name__}: {error}")
+    for bundle in runtimes.values():
+        blockers.extend(f"runtime cleanup: {item}" for item in await _close_runtime(bundle))
+    return scenarios, evidence
+
+
+async def _run_gate(*, lock_path: Path, report_path: Path, tmp_root: Path | None, provided_raw: list[str], offline: bool) -> dict[str, object]:
+    """执行一次 combined E1 Gate 并持久化 truthful report。"""
+
+    blockers: list[str] = []
+    try:
+        locks = _select_e1_locks(lock_path)
+        provided = _parse_plugin_roots(provided_raw)
+    except Exception as error:
+        locks, provided = {}, {}
+        blockers.append(f"lock/input: {type(error).__name__}: {error}")
+    plugin_evidence: list[dict[str, object]] = []
+    core = fleet_gate._core_evidence()  # pyright: ignore[reportPrivateUsage]
+    lock_evidence = {
+        "path": str(lock_path),
+        "sha256": fleet_gate._sha256(lock_path) if lock_path.is_file() else None,  # pyright: ignore[reportPrivateUsage]
+        "selected_external_ids": list(E1_EXTERNAL_PLUGIN_IDS),
+    }
+    with tempfile.TemporaryDirectory(dir=tmp_root, prefix="akashic-plugin-v3-e1-") as raw:
+        workspace = Path(raw) / "workspace"
+        staging = Path(raw) / "locked-checkouts"
+        staging.mkdir()
+        if locks:
+            external, external_evidence, external_blockers = _resolve_external_roots(locks, staging, provided, offline=offline)
+            plugin_evidence.extend(external_evidence)
+            blockers.extend(external_blockers)
+        else:
+            external = {}
+        for plugin_id, root in BUILTIN_PLUGIN_ROOTS.items():
+            status = "available" if root.is_dir() else "blocked"
+            plugin_evidence.append({"id": plugin_id, "status": status, "path": str(root), "source": "in-tree"})
+            if status != "available":
+                blockers.append(f"{plugin_id}: in-tree source missing: {root}")
+        scenarios, runtime = await _scenarios(workspace, _plugin_dirs(external), blockers)
+        active = sorted({plugin_id for item in runtime.values() for plugin_id in cast(list[str], item["active_plugins"])})
+        missing_runtime = sorted(set(E1_EXTERNAL_PLUGIN_IDS) - set(active))
+        if missing_runtime:
+            blockers.append("required external plugin runtime coverage absent: " + ", ".join(missing_runtime))
+        scenarios.append({
+            "id": "passive_prompt_metadata_media", "status": "blocked",
+            "reason": "当前 primitives 没有受控真实 provider/recording sink 与 media fixture；oracle 未执行，不能伪造通过",
+        })
+        blockers.append("passive_prompt_metadata_media: no controlled real provider/recording sink and media fixture")
+        report: dict[str, object] = {
+            "status": "passed" if not blockers and all(item["status"] == "passed" for item in scenarios) else "blocked",
+            "phase": "e1", "gate_version": 1, "checked_at": datetime.now(UTC).isoformat(),
+            "disposable_workspace": str(workspace), "workspace_persisted": False,
+            "core": core, "lock": lock_evidence, "plugins": plugin_evidence,
+            "runtime": runtime, "scenarios": scenarios, "blockers": sorted(set(blockers)),
+        }
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return report
+
+
+def main() -> int:
+    """运行 E1 Gate；blocked/failed 证据返回非零。"""
+
+    args = _parse_args()
+    report = asyncio.run(_run_gate(
+        lock_path=args.lock.resolve(), report_path=args.report.resolve(),
+        tmp_root=None if args.tmp_root is None else args.tmp_root.resolve(),
+        provided_raw=cast(list[str], args.plugin_root), offline=bool(args.offline),
+    ))
+    print(f"plugin v3 E1 Gate {report['status']}: {args.report.resolve()}")
+    for blocker in cast(list[str], report["blockers"]):
+        print(f"- {blocker}", file=sys.stderr)
+    return 0 if report["status"] == "passed" else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

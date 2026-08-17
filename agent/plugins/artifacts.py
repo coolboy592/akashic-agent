@@ -95,11 +95,10 @@ def resolve_pointer(plugin_base: Path, pointer: ArtifactPointer) -> Path | None:
         return None
     relative = PurePosixPath(pointer.path)
     parts = relative.parts
-    valid_legacy = len(parts) == 1 and _safe_segment(parts[0])
     valid_artifact = (
         len(parts) == 2 and parts[0] == ".artifacts" and _safe_segment(parts[1])
     )
-    if relative.is_absolute() or not (valid_legacy or valid_artifact):
+    if relative.is_absolute() or not valid_artifact:
         raise ValueError(f"插件 artifact pointer 越界: {pointer.path}")
     target = plugin_base.joinpath(*parts)
     current = plugin_base
@@ -110,12 +109,9 @@ def resolve_pointer(plugin_base: Path, pointer: ArtifactPointer) -> Path | None:
     if not target.is_dir():
         raise FileNotFoundError(f"插件 artifact pointer 目标不存在: {target}")
     manifest_path = target / STATIC_MANIFEST_FILENAME
-    if manifest_path.exists() or manifest_path.is_symlink():
-        _ = load_static_plugin_manifest(target)
-    else:
-        plugin_file = target / "plugin.py"
-        if plugin_file.is_symlink() or not plugin_file.is_file():
-            raise ValueError(f"插件 artifact 缺少普通 plugin.py: {plugin_file}")
+    if not manifest_path.exists() and not manifest_path.is_symlink():
+        raise ValueError(f"installed v3 artifact 缺少静态 manifest: {target}")
+    _ = load_static_plugin_manifest(target)
     return target
 
 

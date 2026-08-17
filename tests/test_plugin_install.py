@@ -474,6 +474,27 @@ def test_install_rejects_visible_nonversion_cache_entry(tmp_path: Path) -> None:
     assert not (invalid_entry.parent / "1.0.0").exists()
 
 
+def test_install_rejects_legacy_visible_version_directory(tmp_path: Path) -> None:
+    repo = tmp_path / "feed"
+    _write_v3_plugin(repo, name="feed")
+    _commit(repo)
+    home = tmp_path / "plugins-home"
+    legacy = home / "cache/lab/feed/1.0.0"
+    legacy.mkdir(parents=True)
+    (legacy / "state.txt").write_text("keep", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="不受支持的旧版可见目录"):
+        install_git_plugin(
+            workspace=tmp_path / "workspace",
+            source=str(repo),
+            marketplace="lab",
+            plugins_home=home,
+        )
+
+    assert (legacy / "state.txt").read_text(encoding="utf-8") == "keep"
+    assert not (legacy.parent / ".pointers.json").exists()
+
+
 def test_install_allows_internal_source_symlink(tmp_path: Path) -> None:
     repo = tmp_path / "feed"
     _write_v3_plugin(repo, name="feed")

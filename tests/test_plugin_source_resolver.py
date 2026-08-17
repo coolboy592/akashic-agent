@@ -51,47 +51,28 @@ def test_installed_resolver_ignores_transaction_directories(tmp_path: Path) -> N
     assert resolve_plugin_sources([], installed_cache_root=tmp_path / "cache") == []
 
 
-def test_installed_resolver_rejects_ambiguous_visible_versions(tmp_path: Path) -> None:
+def test_installed_resolver_rejects_legacy_visible_versions(tmp_path: Path) -> None:
     plugin_root = tmp_path / "cache" / "lab" / "feed"
     for version in ("1.0.0", "2.0.0"):
         (plugin_root / version).mkdir(parents=True)
         (plugin_root / version / "plugin.py").write_text("", encoding="utf-8")
 
-    with pytest.raises(ValueError, match="版本冲突"):
+    with pytest.raises(ValueError, match="不受支持的旧版可见目录"):
         resolve_plugin_sources([], installed_cache_root=tmp_path / "cache")
 
 
 def test_installed_resolver_rejects_missing_static_manifest(tmp_path: Path) -> None:
-    version_root = tmp_path / "cache" / "lab" / "feed" / "1.0.0"
-    version_root.mkdir(parents=True)
+    plugin_base = tmp_path / "cache" / "lab" / "feed"
+    artifact = plugin_base / ".artifacts" / "1.0.0-aaaa"
+    artifact.mkdir(parents=True)
+    (artifact / "plugin.py").write_text("", encoding="utf-8")
+    (plugin_base / ".pointers.json").write_text(
+        '{"stable":".artifacts/1.0.0-aaaa",'
+        '"latest":".artifacts/1.0.0-aaaa"}\n',
+        encoding="utf-8",
+    )
 
-    with pytest.raises(ValueError, match="缺少静态 v3 manifest"):
-        resolve_plugin_sources([], installed_cache_root=tmp_path / "cache")
-
-
-def test_installed_resolver_retries_version_moved_during_scan(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    version_root = tmp_path / "cache" / "lab" / "feed" / "1.0.0"
-    version_root.mkdir(parents=True)
-    _ = _write_artifact(version_root.parent.parent, version_root.name)
-    artifact_root = version_root.parent.parent / ".artifacts" / version_root.name
-    version_root.rmdir()
-    artifact_root.rename(version_root)
-    manifest_file = version_root / "akashic.plugin.toml"
-    moved_root = tmp_path / "moved-version"
-    original_exists = Path.exists
-
-    def move_before_manifest_check(path: Path) -> bool:
-        if path == manifest_file:
-            version_root.rename(moved_root)
-            return False
-        return original_exists(path)
-
-    monkeypatch.setattr(Path, "exists", move_before_manifest_check)
-
-    with pytest.raises(FileNotFoundError, match="扫描期间已变化"):
+    with pytest.raises(ValueError, match="缺少静态 manifest"):
         resolve_plugin_sources([], installed_cache_root=tmp_path / "cache")
 
 

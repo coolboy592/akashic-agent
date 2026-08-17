@@ -309,9 +309,9 @@ def _activate_plugin_version(
     plugin_base = cache_root / plugin_name
     _ensure_directory(plugin_base)
     visible_versions = _cache_version_dirs(plugin_base)
-    if len(visible_versions) > 1:
+    if visible_versions:
         paths = ", ".join(str(path) for path in visible_versions)
-        raise ValueError(f"插件 cache 可见版本冲突: {paths}")
+        raise ValueError(f"插件 cache 含不受支持的旧版可见目录: {paths}")
     previous_pointers = read_pointers(plugin_base)
     if (
         previous_pointers is not None
@@ -320,9 +320,11 @@ def _activate_plugin_version(
         raise RuntimeError(
             f"插件已有 latest 等待 promote/discard: {plugin_name}@{marketplace}"
         )
-    stable = previous_pointers.stable if previous_pointers is not None else None
-    if stable is None:
-        stable = ArtifactPointer(visible_versions[0].name if visible_versions else None)
+    stable = (
+        previous_pointers.stable
+        if previous_pointers is not None
+        else ArtifactPointer(None)
+    )
     stage_latest = stage_candidate
 
     artifacts_root = plugin_base / ".artifacts"
@@ -421,7 +423,7 @@ def _restore_pointers(
 
 
 def _cache_version_dirs(plugin_base: Path) -> list[Path]:
-    """列出可被 watcher 发现的旧版本目录。"""
+    """列出不能再参与安装或发布的旧版可见目录。"""
 
     result: list[Path] = []
     for child in sorted(plugin_base.iterdir()):

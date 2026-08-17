@@ -283,36 +283,6 @@ def test_plugin_doctor_rejects_legacy_visible_version_without_pointer(
     assert _check(report, "install")["detail"] == "未找到插件目录"
 
 
-def test_plugin_doctor_rejects_pointer_artifact_without_static_manifest(
-    tmp_path: Path,
-) -> None:
-    plugins_home = tmp_path / ".akashic-plugin"
-    plugin_base = plugins_home / "cache/github/demo"
-    plugin_root = plugin_base / ".artifacts/1.0.0-aaaa"
-    plugin_root.mkdir(parents=True)
-    (plugin_root / "plugin.py").write_text(
-        "api_version = 3\nname = 'demo'\nversion = '1.0.0'\n"
-        "def apply(ctx, config): pass\n",
-        encoding="utf-8",
-    )
-    _ = write_pointers(
-        plugin_base,
-        stable=ArtifactPointer(".artifacts/1.0.0-aaaa"),
-        latest=ArtifactPointer(".artifacts/1.0.0-aaaa"),
-    )
-    upsert_plugin_manifest("demo@github", enabled=True, plugins_home=plugins_home)
-
-    report = run_plugin_doctor(
-        plugin_id="demo@github",
-        config_path=str(_init_config(tmp_path)),
-        plugins_home=plugins_home,
-        workspace=tmp_path / "workspace",
-    )
-
-    assert report["status"] == "broken"
-    assert "缺少静态 manifest" in _check(report, "declaration")["detail"]
-
-
 def test_plugin_doctor_defers_candidate_projection_until_promotion(
     tmp_path: Path,
 ) -> None:

@@ -118,30 +118,16 @@ def _iter_installed_plugin_roots(
                         )
                     )
                 continue
-            version_dirs: list[Path] = []
-            for child in sorted(plugin_dir.iterdir()):
-                if child.name.startswith("."):
-                    continue
-                _require_safe_cache_segment(child, "version")
-                _require_cache_directory(child, "version")
-                version_dirs.append(child)
-            if len(version_dirs) > 1:
-                paths = ", ".join(str(path) for path in version_dirs)
-                raise ValueError(f"installed cache 可见版本冲突: {paths}")
-            if len(version_dirs) != 1:
-                continue
-            static_manifest = _require_installed_plugin_root(version_dirs[0])
-            _validate_installed_identity(plugin_dir.name, static_manifest)
-            result.append(
-                ResolvedPluginSource(
-                    plugin_root=version_dirs[0],
-                    source_type="installed",
-                    marketplace=marketplace_dir.name,
-                    plugin_name=plugin_dir.name,
-                    entrypoint=static_manifest.entrypoint,
-                    static_manifest=static_manifest,
-                )
+            visible = tuple(
+                child
+                for child in sorted(plugin_dir.iterdir())
+                if not child.name.startswith(".")
             )
+            if visible:
+                paths = ", ".join(str(path) for path in visible)
+                raise ValueError(
+                    f"installed cache 含不受支持的旧版可见目录: {paths}"
+                )
     return result
 
 
