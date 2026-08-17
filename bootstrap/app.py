@@ -36,7 +36,6 @@ from bootstrap.workspace_lock import WorkspaceInstanceLock
 from bootstrap.workspace_token import ensure_workspace_token
 from bus.event_bus import EventBus
 from bus.queue import MessageBus
-from agent.plugins.jobs import PluginJobRuntime
 from agent.plugins.service_host import PluginServiceHost
 from agent.plugins.turn_rollout import TurnPluginRollout
 from agent.plugins.watcher import PluginWatcher
@@ -136,17 +135,6 @@ async def _run_primary_tasks(tasks: list[asyncio.Future[Any]]) -> None:
         raise
 
 
-def _stop_plugin_jobs(
-    runtime: PluginJobRuntime | None,
-) -> Callable[[], Awaitable[None]]:
-    async def stop() -> None:
-        if runtime is not None:
-            runtime.stop()
-            await runtime.wait_stopped()
-
-    return stop
-
-
 def _stop_proactive(runtime: ProactiveLoop | None) -> Callable[[], Awaitable[None]]:
     async def stop() -> None:
         if runtime is not None:
@@ -240,7 +228,6 @@ class AppRuntime:
         self.mobile_gateway_runtime = None
         self.mobile_gateway_server = None
         self.mobile_gateway_task: asyncio.Task[None] | None = None
-        self.plugin_job_runtime: PluginJobRuntime | None = None
         self.plugin_service_host: PluginServiceHost | None = None
         self.plugin_watcher: PluginWatcher | None = None
         self.plugin_watcher_task: asyncio.Task[None] | None = None
@@ -547,16 +534,6 @@ class AppRuntime:
             if plugin_manager is not None:
                 assert self.plugin_service_host is not None
                 self.tasks.append(self.plugin_service_host.wait_fatal_failure())
-                assert self.core.plugin_manager is not None
-                llm = self.core.plugin_manager.llm
-                if llm is not None:
-                    self.plugin_job_runtime = PluginJobRuntime(
-                        event_bus=event_bus,
-                        llm=llm,
-                        model_provider=self.provider,
-                        snapshot_store=plugin_manager.snapshot_store,
-                    )
-                    self.tasks.append(self.plugin_job_runtime.run())
             optimizer_tasks, self._memory_optimizer = build_memory_optimizer_task(
                 self.config,
                 provider=self.provider,
@@ -851,10 +828,6 @@ class AppRuntime:
                 (
                     "proactive.stop",
                     _stop_proactive(self.proactive_loop),
-                ),
-                (
-                    "plugin_jobs.stop",
-                    _stop_plugin_jobs(self.plugin_job_runtime),
                 ),
                 (
                     "app_server.stop",

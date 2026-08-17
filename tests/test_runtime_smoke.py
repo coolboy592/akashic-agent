@@ -518,20 +518,6 @@ async def test_serve_smoke_loads_config_and_runs_shutdown(monkeypatch, tmp_path)
         bootstrap_app, "build_chat_server", lambda **_: _FakeChatServer()
     )
 
-    class _FakePluginJobRuntime:
-        def __init__(self, **_: object) -> None:
-            pass
-
-        async def run(self) -> None:
-            return None
-
-        def stop(self) -> None:
-            return None
-
-        async def wait_stopped(self) -> None:
-            return None
-
-    monkeypatch.setattr(bootstrap_app, "PluginJobRuntime", _FakePluginJobRuntime)
     monkeypatch.setattr(main.Path, "home", lambda: tmp_path)
 
     await main.serve(str(config_path), tmp_path)
