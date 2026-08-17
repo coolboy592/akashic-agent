@@ -17,6 +17,51 @@ def test_e1_catalog_is_exact_and_has_no_implicit_pass() -> None:
     assert "not_run" not in {"passed", "blocked", "failed"}
 
 
+def test_passive_webui_report_oracle_accepts_synthetic_pass(tmp_path: Path) -> None:
+    locks = gate._select_e1_locks(gate.DEFAULT_LOCK)
+    report_path = tmp_path / "plugin-passive-webui-v3.json"
+    payload: dict[str, object] = {
+        "status": "passed",
+        "scenario_profile": gate.PASSIVE_WEBUI_SCENARIO_PROFILE,
+        "sources": [
+            {"kind": "contract", "id": "plugin_contracts"},
+            {
+                "kind": "plugin", "id": "citation",
+                "resolved_sha": locks["citation"].resolved_sha,
+            },
+            {
+                "kind": "plugin", "id": "meme",
+                "resolved_sha": locks["meme"].resolved_sha,
+            },
+        ],
+        "runtime": {
+            "status": "passed",
+            "model_request": {"citation_index": 10, "meme_index": 20},
+            "messages": [
+                {"role": "user"},
+                {
+                    "role": "assistant",
+                    "cited_memory_ids": ["mem_1"],
+                    "media": ["/sandbox/workspace/memes/shy/001.png"],
+                },
+            ],
+        },
+        "cleanup": {
+            "residuals": [], "sandbox_removed": True, "source_unchanged": True,
+        },
+    }
+    report_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    evidence = gate._validate_passive_webui_report(report_path, locks)
+
+    assert evidence["status"] == "passed"
+    assert evidence["source_shas"] == {
+        "citation": locks["citation"].resolved_sha,
+        "meme": locks["meme"].resolved_sha,
+    }
+    assert evidence["prompt_order"] == {"citation_index": 10, "meme_index": 20}
+
+
 def test_sqlite_state_covers_without_rowid_tables(tmp_path: Path) -> None:
     sessions = gate.SessionManager(tmp_path)
     try:
@@ -43,6 +88,7 @@ async def test_combined_gate_runs_real_disposable_write_sets(tmp_path: Path) -> 
         tmp_root=tmp_path,
         provided_raw=[],
         offline=True,
+        passive_webui_report=tmp_path / "missing-plugin-passive-webui-v3.json",
     )
     assert report["status"] == "blocked"
     scenarios = {item["id"]: item for item in report["scenarios"]}

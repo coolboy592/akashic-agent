@@ -21,6 +21,10 @@ if str(ROOT) not in sys.path:
 
 from agent.config_models import Config, MemoryConfig, MemoryEmbeddingConfig  # noqa: E402
 from agent.plugins.interaction_undo import InteractionUndoCoordinator  # noqa: E402
+from agent.plugins.generation_activity_host import ActivityHost  # noqa: E402
+from agent.plugins.generation_job_host import BackgroundJobActivityAdapter  # noqa: E402
+from agent.plugins.generation_private_proactive_host import PrivateProactiveHost  # noqa: E402
+from agent.plugins.generation_proactive_host import ProactiveActivityAdapter  # noqa: E402
 from agent.plugins.manager import PluginManager  # noqa: E402
 from agent.plugins.mobile_ui import PluginMobileUiProvider  # noqa: E402
 from agent.provider import LLMProvider  # noqa: E402
@@ -39,11 +43,14 @@ except ModuleNotFoundError:  # pragma: no cover
 
 DEFAULT_LOCK = ROOT / "docker" / "debug" / "plugin-v3-fleet.lock.json"
 DEFAULT_REPORT = ROOT / "docker" / "debug" / "reports" / "plugin-v3-e1" / "gate.json"
+DEFAULT_PASSIVE_WEBUI_REPORT = ROOT / "docker" / "debug" / "reports" / "plugin-passive-webui-v3" / "gate.json"
 E1_PLUGIN_IDS = (
     "akasha", "default_memory", "citation", "meme", "emotion", "observe",
     "proactive_feedback", "plugin_undo",
 )
 E1_EXTERNAL_PLUGIN_IDS = E1_PLUGIN_IDS[2:]
+PASSIVE_WEBUI_SCENARIO_PROFILE = "citation-meme-webui-v3-v1"
+PASSIVE_WEBUI_PLUGIN_IDS = ("citation", "meme")
 BUILTIN_PLUGIN_ROOTS = {
     "akasha": ROOT / "plugins" / "akasha",
     "default_memory": ROOT / "plugins" / "default_memory",
@@ -70,6 +77,7 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="运行 pure-v3 集中式 E1 Gate")
     _ = parser.add_argument("--lock", type=Path, default=DEFAULT_LOCK)
     _ = parser.add_argument("--report", type=Path, default=DEFAULT_REPORT)
+    _ = parser.add_argument("--passive-webui-report", type=Path, default=DEFAULT_PASSIVE_WEBUI_REPORT)
     _ = parser.add_argument("--tmp-root", type=Path)
     _ = parser.add_argument("--plugin-root", action="append", default=[], metavar="PLUGIN_ID=PATH")
     _ = parser.add_argument("--offline", action="store_true")
@@ -166,6 +174,117 @@ def _resolve_external_roots(
     return roots, evidence, blockers
 
 
+def _report_object(value: object, label: str) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise E1GateError(f"{label} 必须是 object")
+    return cast(dict[str, object], value)
+
+
+def _report_index(value: object, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise E1GateError(f"{label} 必须是非负整数")
+    return value
+
+
+def _validate_passive_sources(report: dict[str, object], locks: dict[str, Any]) -> dict[str, str]:
+    """验证 WebUI 报告只引用 E1 fleet 锁定的 Citation/Meme source。"""
+
+    missing_locks = sorted(set(PASSIVE_WEBUI_PLUGIN_IDS) - set(locks))
+    if missing_locks:
+        raise E1GateError(f"E1 fleet lock 缺少 passive WebUI source: {missing_locks}")
+    raw_sources = report.get("sources")
+    if not isinstance(raw_sources, list):
+        raise E1GateError("passive WebUI report.sources 必须是列表")
+    source_shas: dict[str, str] = {}
+    for raw_source in cast(list[object], raw_sources):
+        source = _report_object(raw_source, "passive WebUI report.sources item")
+        if source.get("kind") != "plugin":
+            continue
+        plugin_id = source.get("id")
+        if not isinstance(plugin_id, str) or plugin_id not in PASSIVE_WEBUI_PLUGIN_IDS:
+            raise E1GateError(f"passive WebUI report 包含非 E1 Citation/Meme source: {plugin_id!r}")
+        if plugin_id in source_shas:
+            raise E1GateError(f"passive WebUI report source 重复: {plugin_id}")
+        resolved_sha = source.get("resolved_sha")
+        if not isinstance(resolved_sha, str) or resolved_sha != locks[plugin_id].resolved_sha:
+            raise E1GateError(
+                f"passive WebUI {plugin_id} source SHA 与 E1 fleet lock 不一致: "
+                f"expected={locks[plugin_id].resolved_sha} actual={resolved_sha!r}"
+            )
+        source_shas[plugin_id] = resolved_sha
+    if set(source_shas) != set(PASSIVE_WEBUI_PLUGIN_IDS):
+        raise E1GateError(
+            "passive WebUI report 缺少 Citation/Meme source: "
+            + ", ".join(sorted(set(PASSIVE_WEBUI_PLUGIN_IDS) - set(source_shas)))
+        )
+    return source_shas
+
+
+def _validate_passive_assistant(report: dict[str, object]) -> dict[str, object]:
+    """验证 WebUI 持久 assistant 同时保留 citation metadata 与 Meme media。"""
+
+    runtime = _report_object(report.get("runtime"), "passive WebUI report.runtime")
+    if runtime.get("status") != "passed":
+        raise E1GateError(f"passive WebUI runtime.status 不是 passed: {runtime.get('status')!r}")
+    messages = runtime.get("messages")
+    if not isinstance(messages, list) or len(cast(list[object], messages)) != 2:
+        raise E1GateError("passive WebUI runtime.messages 必须包含 user + assistant")
+    message_items = cast(list[object], messages)
+    _ = _report_object(message_items[0], "passive WebUI user message")
+    assistant = _report_object(message_items[1], "passive WebUI assistant message")
+    if assistant.get("role") != "assistant":
+        raise E1GateError("passive WebUI assistant message role 错误")
+    if assistant.get("cited_memory_ids") != ["mem_1"]:
+        raise E1GateError("passive WebUI assistant citation metadata 缺失")
+    expected_media = ["/sandbox/workspace/memes/shy/001.png"]
+    if assistant.get("media") != expected_media:
+        raise E1GateError("passive WebUI assistant media 不符合 fixture")
+    return {
+        "cited_memory_ids": assistant["cited_memory_ids"],
+        "media": assistant["media"],
+    }
+
+
+def _validate_passive_webui_report(path: Path, locks: dict[str, Any]) -> dict[str, object]:
+    """严格验证已完成的 WebUI Gate report，返回可并入 E1 的证据。"""
+
+    if not path.is_file():
+        raise E1GateError(f"passive WebUI report 不存在: {path}")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise E1GateError(f"passive WebUI report 无法读取: {type(error).__name__}: {error}") from error
+    report = _report_object(payload, "passive WebUI report")
+    if report.get("status") != "passed":
+        raise E1GateError(f"passive WebUI report.status 不是 passed: {report.get('status')!r}")
+    if report.get("scenario_profile") != PASSIVE_WEBUI_SCENARIO_PROFILE:
+        raise E1GateError(f"passive WebUI scenario_profile 不匹配: {report.get('scenario_profile')!r}")
+    source_shas = _validate_passive_sources(report, locks)
+    runtime = _report_object(report.get("runtime"), "passive WebUI report.runtime")
+    request = _report_object(runtime.get("model_request"), "passive WebUI model_request")
+    citation_index = _report_index(request.get("citation_index"), "passive WebUI citation_index")
+    meme_index = _report_index(request.get("meme_index"), "passive WebUI meme_index")
+    if citation_index >= meme_index:
+        raise E1GateError(f"passive WebUI prompt 顺序错误: citation={citation_index} meme={meme_index}")
+    assistant = _validate_passive_assistant(report)
+    cleanup = _report_object(report.get("cleanup"), "passive WebUI report.cleanup")
+    if cleanup.get("residuals") != []:
+        raise E1GateError(f"passive WebUI cleanup residuals 非空: {cleanup.get('residuals')!r}")
+    if cleanup.get("sandbox_removed") is not True or cleanup.get("source_unchanged") is not True:
+        raise E1GateError("passive WebUI cleanup 未同时证明 sandbox_removed/source_unchanged")
+    return {
+        "status": "passed",
+        "report": str(path),
+        "scenario_profile": report["scenario_profile"],
+        "source_shas": source_shas,
+        "prompt_order": {"citation_index": citation_index, "meme_index": meme_index},
+        "assistant": assistant,
+        "cleanup": {
+            "residuals": [], "sandbox_removed": True, "source_unchanged": True,
+        },
+    }
+
+
 def _plugin_dirs(external: dict[str, Path]) -> list[Path]:
     """组装真实 PluginManager 的 in-tree 与 exact checkout source roots。"""
 
@@ -203,6 +322,11 @@ async def _open_runtime(workspace: Path, engine: str, plugin_dirs: list[Path]) -
             session_manager=sessions, memory_engine=memory.engine,
             installed_cache_root=workspace / "installed-plugins",
         )
+        manager.bind_activity_host(ActivityHost((
+            ProactiveActivityAdapter(manager.composition_generation_host),
+            PrivateProactiveHost(config.proactive.lifecycle),
+            BackgroundJobActivityAdapter(event_bus, manager.snapshot_store, workspace=str(workspace)),
+        )))
         await manager.load_all()
     except BaseException:
         sessions.close()
@@ -632,7 +756,15 @@ async def _scenarios(workspace: Path, plugin_dirs: list[Path], blockers: list[st
     return scenarios, evidence
 
 
-async def _run_gate(*, lock_path: Path, report_path: Path, tmp_root: Path | None, provided_raw: list[str], offline: bool) -> dict[str, object]:
+async def _run_gate(
+    *,
+    lock_path: Path,
+    report_path: Path,
+    tmp_root: Path | None,
+    provided_raw: list[str],
+    offline: bool,
+    passive_webui_report: Path = DEFAULT_PASSIVE_WEBUI_REPORT,
+) -> dict[str, object]:
     """执行一次 combined E1 Gate 并持久化 truthful report。"""
 
     blockers: list[str] = []
@@ -672,11 +804,18 @@ async def _run_gate(*, lock_path: Path, report_path: Path, tmp_root: Path | None
         missing_runtime = sorted(set(E1_EXTERNAL_PLUGIN_IDS).difference(active))
         if missing_runtime:
             blockers.append("required external plugin runtime coverage absent: " + ", ".join(missing_runtime))
-        scenarios.append({
-            "id": "passive_prompt_metadata_media", "status": "blocked",
-            "reason": "当前 primitives 没有受控真实 provider/recording sink 与 media fixture；oracle 未执行，不能伪造通过",
-        })
-        blockers.append("passive_prompt_metadata_media: no controlled real provider/recording sink and media fixture")
+        try:
+            if not locks:
+                raise E1GateError("E1 fleet lock 不可用，无法绑定 passive WebUI source SHA")
+            passive = _validate_passive_webui_report(passive_webui_report, locks)
+        except E1GateError as error:
+            scenarios.append({
+                "id": "passive_prompt_metadata_media", "status": "blocked",
+                "reason": str(error), "report": str(passive_webui_report),
+            })
+            blockers.append(f"passive_prompt_metadata_media: {error}")
+        else:
+            scenarios.append({"id": "passive_prompt_metadata_media", **passive})
         report: dict[str, object] = {
             "status": "passed" if not blockers and all(item["status"] == "passed" for item in scenarios) else "blocked",
             "phase": "e1", "gate_version": 1, "checked_at": datetime.now(UTC).isoformat(),
@@ -697,6 +836,7 @@ def main() -> int:
         lock_path=args.lock.resolve(), report_path=args.report.resolve(),
         tmp_root=None if args.tmp_root is None else args.tmp_root.resolve(),
         provided_raw=cast(list[str], args.plugin_root), offline=bool(args.offline),
+        passive_webui_report=args.passive_webui_report.resolve(),
     ))
     print(f"plugin v3 E1 Gate {report['status']}: {args.report.resolve()}")
     for blocker in cast(list[str], report["blockers"]):
