@@ -709,7 +709,6 @@ class ProactiveLoop:
                 self._plugin_proactive_sources.extend(
                     bridge.registered_sources(runtime)
                 )
-        self._tool_hooks = list(snapshot.tool_hooks)
 
     def _private_binding_for(
         self,

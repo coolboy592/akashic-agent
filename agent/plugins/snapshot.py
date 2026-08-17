@@ -15,7 +15,6 @@ from agent.plugins.jobs import RegisteredPluginJob, plugin_job_key
 from agent.plugins.private_proactive import PrivateProactiveCatalog
 from agent.plugins.specs import RegisteredProactiveSource, proactive_source_key
 from agent.tools.registry import ToolRegistry
-from agent.tool_hooks import ToolHook
 from agent.skills import SkillIndex
 from agent.plugin_composition import (
     CHANNELS,
@@ -91,8 +90,6 @@ class RuntimeSnapshot:
     proactive_lifecycles: tuple[object, ...]
     proactive_module_factories: tuple[object, ...]
     proactive_runtime_factories: tuple[object, ...]
-    # V2_REMOVAL(tool-hooks)：全部 hook consumer 迁移后删除 catalog 与编译路径。
-    tool_hooks: tuple[ToolHook, ...]
     channels: Mapping[str, Channel]
     skill_catalog_generation_id: str | None
     mcp_catalog_generation_ids: Mapping[str, str]
@@ -561,7 +558,6 @@ class RuntimeSnapshotCompiler:
             proactive_lifecycles=proactive_lifecycles,
             proactive_module_factories=proactive_module_factories,
             proactive_runtime_factories=proactive_runtime_factories,
-            tool_hooks=(),
             channels=MappingProxyType(channels),
             skill_catalog_generation_id=(
                 catalog_owner.skill_catalog.generation_id

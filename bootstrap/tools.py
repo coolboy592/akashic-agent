@@ -44,7 +44,6 @@ from agent.scheduler import SchedulerService
 from agent.tools.base import ToolExecutionContext, get_current_tool_context
 from agent.tools.message_push import MessagePushTool
 from agent.tools.registry import ToolRegistry
-from agent.tools.spawn import SpawnTool
 from bootstrap.toolsets.meta import build_readonly_tools
 from bootstrap.toolsets.protocol import ToolsetDeps
 from bootstrap.toolsets.schedule import build_scheduler
@@ -221,16 +220,6 @@ class CoreRuntime:
                 manifest_path = sync_manifest()
                 logger.info("插件清单已同步: %s", manifest_path)
             logger.info("插件加载完成: %d 个", self.plugin_manager.loaded_count)
-            # V2_REMOVAL(tool-hooks)：全部 ToolHook consumer 迁到 typed Tool events 后，删除
-            # passive loop 与 SpawnTool 的 hook 注入；子代理/proactive 转发点按同一删除批次处理。
-            if self.plugin_manager.tool_hooks:
-                self.loop.add_tool_hooks(self.plugin_manager.tool_hooks)
-                spawn_tool = self.tools.get_tool("spawn")
-                if spawn_tool is not None:
-                    if not isinstance(spawn_tool, SpawnTool):
-                        raise TypeError("spawn 工具未建立 SpawnTool 内部不变量")
-                    spawn_tool.add_tool_hooks(self.plugin_manager.tool_hooks)
-
         # 3. 首次启动全部成功后才启动容错热重载 watcher
         self.workspace_mcp_watcher_task = asyncio.create_task(
             self.workspace_mcp_watcher.run(), name="workspace_mcp_watcher"

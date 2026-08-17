@@ -225,7 +225,6 @@ def test_legacy_only_snapshot_does_not_require_active_activity_binding() -> None
         proactive_module_factories=(),
         proactive_runtime_factories=(),
         proactive_sources={},
-        tool_hooks=(),
         private_proactive_catalog=None,
     )
 

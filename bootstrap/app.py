@@ -637,9 +637,6 @@ class AppRuntime:
                 presence=self.presence,
                 agent_loop=self.agent_loop,
                 event_bus=event_bus,
-                # V2_REMOVAL(tool-hooks)：全部 ToolHook consumer 与 Tool Gate 迁到 typed events
-                # 后，独立删除此参数；不以 proactive 族群迁移完成作为前置。
-                tool_hooks=list(plugin_manager.tool_hooks) if plugin_manager else None,
                 proactive_modules=(
                     list(plugin_manager.proactive_modules) if plugin_manager else None
                 ),

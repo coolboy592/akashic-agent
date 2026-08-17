@@ -448,7 +448,7 @@ class ToolExecutor:
             for hook in self._hooks
             if not getattr(hook, "snapshot_managed", False)
         ]
-        return [*fixed, *snapshot.tool_hooks], snapshot.composition_root
+        return fixed, snapshot.composition_root
 
     async def _run_input_prepare(
         self,

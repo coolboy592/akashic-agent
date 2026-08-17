@@ -109,7 +109,6 @@ from agent.lifecycle.types import (
     BeforeStepCtx,
     BeforeToolCallCtx,
     BeforeTurnCtx,
-    PreToolCtx,
     PromptRenderCtx,
 )
 from infra.channels.base import SessionIdentityIndex
@@ -188,8 +187,6 @@ from agent.plugins.snapshot import (
 )
 from proactive_v2.lifecycle import ProactiveLifecycleSpec
 from proactive_v2.lifecycle import ProactiveLifecycleBuilder
-from agent.tool_hooks.base import ToolHook
-from agent.tool_hooks.types import HookContext, HookOutcome
 from bus.event_bus import EventBus
 from infra.channels.contract import Channel
 from infra.persistence.json_store import atomic_save_json
@@ -371,8 +368,6 @@ class PluginManager:
         ) = None
         self._loaded: set[str] = set()
         self._channels: list[Channel] = []
-        # V2_REMOVAL(tool-hooks)：迁移完外部 consumer 后删除可变 catalog。
-        self._tool_hooks: list[ToolHook] = []
         self._before_turn_modules: list[object] = []
         self._before_reasoning_modules: list[object] = []
         self._prompt_render_modules: list[object] = []
@@ -443,12 +438,6 @@ class PluginManager:
     @property
     def loaded_count(self) -> int:
         return len(self._loaded)
-
-    @property
-    def tool_hooks(self) -> list[ToolHook]:
-        if self.current_snapshot is not None:
-            return list(self.current_snapshot.tool_hooks)
-        return list(self._tool_hooks)
 
     # V2_REMOVAL(plugin-manager-projections)：channels/phase/proactive/jobs 是 v2 固定贡献的
     # Manager 投影。每个族群迁入 stable Root capability/catalog 且 bootstrap consumer 改读新
@@ -1863,7 +1852,6 @@ class PluginManager:
                     generation.plugin_id,
                     [],
                 )
-                self._bind_tool_hooks(instance, generation.module_path)
                 self._publish_contributions(generation.contributions)
                 self._channels.extend(generation.contributions.channels)
                 if generation.staged_event_bus is not None:
@@ -1990,7 +1978,6 @@ class PluginManager:
         """记录启动回滚可移除的 v2 发布尾部。"""
 
         return (
-            len(self._tool_hooks),
             len(self._before_turn_modules),
             len(self._before_reasoning_modules),
             len(self._prompt_render_modules),
@@ -2011,7 +1998,6 @@ class PluginManager:
         """只移除失败启动批次发布的 v2 兼容尾部。"""
 
         collections = (
-            self._tool_hooks,
             self._before_turn_modules,
             self._before_reasoning_modules,
             self._prompt_render_modules,
@@ -3155,7 +3141,6 @@ class PluginManager:
                 self._active_workspace_mcp,
                 snapshot.plugin_tool_catalog,
             )
-            snapshot.tool_hooks = self._compile_snapshot_tool_hooks(generations)
             self._validate_snapshot_command_claims(snapshot)
             return snapshot, catalog_id
         except BaseException:
@@ -5268,7 +5253,6 @@ class PluginManager:
             logger.info("插件已禁用（manifest.toml）: %s", initial_plugin_id)
             return None
         tool_names: list[str] = []
-        hook_count_before = len(self._tool_hooks)
         before_turn_count_before = len(self._before_turn_modules)
         before_reasoning_count_before = len(self._before_reasoning_modules)
         prompt_render_count_before = len(self._prompt_render_modules)
@@ -5587,7 +5571,6 @@ class PluginManager:
             for tool_name in tool_names:
                 if self._tool_registry is not None:
                     self._tool_registry.unregister(tool_name)
-            del self._tool_hooks[hook_count_before:]
             del self._before_turn_modules[before_turn_count_before:]
             del self._before_reasoning_modules[before_reasoning_count_before:]
             del self._prompt_render_modules[prompt_render_count_before:]
@@ -5931,7 +5914,6 @@ class PluginManager:
                     instance.context.kv_store.commit()
             load_phase = "publish"
             self._register_tools(instance, mp, generation.plugin_id, tool_names)
-            self._bind_tool_hooks(instance, mp)
             self._publish_contributions(contributions)
             self._channels.extend(contributions.channels)
             if generation.staged_event_bus is not None:
@@ -6043,7 +6025,6 @@ class PluginManager:
                 self._active_workspace_mcp,
                 snapshot.plugin_tool_catalog,
             )
-            snapshot.tool_hooks = self._compile_snapshot_tool_hooks(generations)
             self._validate_snapshot_command_claims(snapshot)
             return snapshot
         except Exception as error:
@@ -7017,9 +6998,6 @@ class PluginManager:
             generation,
             snapshot.plugin_tool_catalog,
         )
-        snapshot.tool_hooks = self._compile_snapshot_tool_hooks(
-            self._active_generations
-        )
         self._compile_snapshot_event_handlers(snapshot)
         return snapshot
 
@@ -7034,32 +7012,6 @@ class PluginManager:
             for server in generation.catalog.servers.values()
         ):
             raise RuntimeError("workspace MCP 候选 client 已断开")
-
-    def _compile_snapshot_tool_hooks(
-        self,
-        generations: dict[str, PluginGeneration],
-    ) -> tuple[ToolHook, ...]:
-        # V2_REMOVAL(tool-hooks)：typed Tool events 接管后删除 metadata 编译。
-        hooks: list[ToolHook] = []
-        for generation in sorted(generations.values(), key=lambda item: item.plugin_id):
-            for metadata in plugin_registry.get_handlers_by_module_path(
-                generation.module_path
-            ):
-                if metadata.kind != MetadataKind.TOOL_HOOK:
-                    continue
-                hooks.append(
-                    _PluginToolHook(
-                        name=(
-                            f"plugin:{getattr(generation.instance, 'name', generation.module_path)}:"
-                            f"{metadata.handler_name}"
-                        ),
-                        handler=functools.partial(
-                            metadata.handler, generation.instance
-                        ),
-                        tool_name_filter=metadata.hook_tool_name,
-                    )
-                )
-        return tuple(hooks)
 
     async def _publish_committed_snapshot(
         self,
@@ -7594,20 +7546,6 @@ class PluginManager:
             )
             logger.info("插件工具已注册: %s (来自 %s)", tool_name, plugin_id)
 
-    def _bind_tool_hooks(self, instance: Any, module_path: str) -> None:
-        # V2_REMOVAL(tool-hooks)：legacy 非 generation load path，随 v2 Manager 删除。
-        for md in plugin_registry.get_handlers_by_module_path(module_path):
-            if md.kind != MetadataKind.TOOL_HOOK:
-                continue
-            bound = functools.partial(md.handler, instance)
-            hook = _PluginToolHook(
-                name=f"plugin:{getattr(instance, 'name', module_path)}:{md.handler_name}",
-                handler=bound,
-                tool_name_filter=md.hook_tool_name,
-            )
-            self._tool_hooks.append(hook)
-            logger.info("插件 tool hook 已注册: %s", hook.name)
-
     async def terminate_all(self) -> None:
         """完成快照、插件生命周期和作用域资源的全量关闭。"""
 
@@ -7739,7 +7677,6 @@ class PluginManager:
             _ = self._active_plugins.pop(mp, None)
         self._loaded.clear()
         self._active_plugins.clear()
-        self._tool_hooks.clear()
         self._before_turn_modules.clear()
         self._before_reasoning_modules.clear()
         self._prompt_render_modules.clear()
@@ -8715,7 +8652,6 @@ def _replace_snapshot_payload(
         "proactive_lifecycles",
         "proactive_module_factories",
         "proactive_runtime_factories",
-        "tool_hooks",
         "channels",
         "skill_catalog_generation_id",
         "mcp_catalog_generation_ids",
@@ -9081,57 +9017,6 @@ def _make_execute(bound: Any) -> Any:
         return str(result)
 
     return execute
-
-
-class _PluginToolHook(ToolHook):
-    """将插件的 @on_tool_pre handler 适配为 ToolExecutor 的 ToolHook 接口。"""
-
-    # V2_REMOVAL(tool-hooks)：四矩阵 Gate 全绿且 consumer 迁完后删除 adapter。
-
-    event = "pre_tool_use"
-    snapshot_managed = True
-
-    def __init__(
-        self,
-        name: str,
-        handler: Any,
-        tool_name_filter: str | None = None,
-    ) -> None:
-        self.name = name
-        self._handler = handler
-        self._tool_name_filter = tool_name_filter
-
-    def matches(self, ctx: HookContext) -> bool:
-        if self._tool_name_filter is None:
-            return True
-        return ctx.request.tool_name == self._tool_name_filter
-
-    async def run(self, ctx: HookContext) -> HookOutcome:
-        # 1. 构造 PreToolCtx（复制 arguments，避免插件直接改原对象）
-        event = PreToolCtx(
-            session_key=ctx.request.session_key,
-            channel=ctx.request.channel,
-            chat_id=ctx.request.chat_id,
-            tool_name=ctx.request.tool_name,
-            arguments=dict(ctx.current_arguments),
-            call_id=ctx.request.call_id,
-            source=ctx.request.source,
-            request_text=ctx.request.request_text,
-            tool_batch=ctx.request.tool_batch,
-            tool_batch_index=ctx.request.tool_batch_index,
-        )
-        # 2. 调插件 handler，返回值决定行为
-        result = self._handler(event)
-        if inspect.isawaitable(result):
-            result = await result
-        # 3. None → 不改参；dict → 新 arguments；HookOutcome → 允许插件直接 deny
-        if result is None:
-            return HookOutcome()
-        if isinstance(result, HookOutcome):
-            return result
-        if isinstance(result, dict):
-            return HookOutcome(updated_input=cast("dict[str, Any]", result))
-        return HookOutcome()
 
 
 def _file_revision(path: Path) -> str:

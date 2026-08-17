@@ -5948,59 +5948,6 @@ async def test_kernel_start_failure_releases_old_lease_and_stays_fail_closed(
     await manager.terminate_all()
 
 
-def _snapshot_hook_source(version: str) -> str:
-    return (
-        "from agent.plugins import Plugin, on_tool_pre\n"
-        "class SnapshotHookPlugin(Plugin):\n"
-        "    name = 'snapshot_hook'\n"
-        "    @on_tool_pre(tool_name='target')\n"
-        "    async def hook(self, event):\n"
-        f"        return {{**event.arguments, 'version': '{version}'}}\n"
-    )
-
-
-@pytest.mark.asyncio
-async def test_tool_hooks_follow_bound_snapshot_generation(tmp_path: Path) -> None:
-    plugin_dir = _write_plugin(
-        tmp_path / "plugins",
-        "snapshot_hook",
-        _snapshot_hook_source("v1"),
-    )
-    manager = _manager(tmp_path)
-    await manager.load_all()
-    old_lease = manager.snapshot_store.lease()
-    _ = (plugin_dir / "plugin.py").write_text(
-        _snapshot_hook_source("v2"),
-        encoding="utf-8",
-    )
-    assert await manager.prepare_candidate("snapshot_hook") is not None
-    await manager.publish_prepared("snapshot_hook")
-    executor = ToolExecutor()
-    request = ToolExecutionRequest(
-        call_id="hook",
-        tool_name="target",
-        arguments={},
-        source="passive",
-    )
-    from agent.plugins.snapshot import bind_runtime_snapshot, reset_runtime_snapshot
-
-    async def execute(lease):
-        token = bind_runtime_snapshot(lease)
-        try:
-            return await executor.execute(request, lambda _name, args: asyncio.sleep(0, result=args))
-        finally:
-            reset_runtime_snapshot(token)
-            await lease.release()
-
-    old_result = await execute(old_lease)
-    new_result = await execute(manager.snapshot_store.lease())
-
-    assert old_result.final_arguments == {"version": "v1"}
-    assert new_result.final_arguments == {"version": "v2"}
-    await manager.terminate_all()
-
-
-@pytest.mark.asyncio
 async def test_subagent_shutdown_releases_unstarted_snapshot_lease() -> None:
     store = RuntimeSnapshotStore()
     snapshot = RuntimeSnapshotCompiler().compile({})
