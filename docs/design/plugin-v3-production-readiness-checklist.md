@@ -121,12 +121,13 @@ Gate 报告。分支名、PR 号和浮动 ref 不能代替 commit。
 | C17 | mobile UI/query capability | `CANDIDATE` | `2c6e4f71` + `b173f551` 已通过独立 review；activation token、strict JSON、candidate 不发布与 exact lease 已由 372 个集成回归、Basedpyright/compileall/diff-check 验证，待 Akasha/Observe 迁移后进入 E1/E4 | Akasha / Observe |
 | C18 | Core-private v3 generation metadata | `CANDIDATE` | `2d9fb408` 已通过独立 review；v3 stable load、candidate clone 与 formal rebuild 不再构造或读取 `PluginContext`，59 loader + 208 Manager/hot-reload 回归通过 | Core |
 | C19 | full-fleet Health/Incident/Topology inspection | `CANDIDATE` | stable lease 按插件投影 current Fiber/Health、累计与 bounded Incident、Topology；mixed active/inactive v3 + v2 inspection 与 kernel/protocol 回归通过，独立 review 的 inactive projection P1 已关闭 | 全量 runtime |
-| C20 | Proactive 私有兼容岛 | `OPEN` | Core-private registry 只接收六个内建 module identity；外部 v2 manifest/import/discovery fail-loud | Default/Wake Proactive |
-| C21 | generation-scoped background job / LLM capability | `CANDIDATE` | Core `de08b698` + `467a4c93` 已完成 committed catalog、trigger/interval、exact LLM lease、cancel/drain、Emotion domain receipt 与 paired-document recovery；105 个 job/documents/ledger/activity/snapshot 回归、BasedPyright/compileall/diff-check、独立只读复审无 P0/P1。Emotion `3584b49` 的 candidate apply unit 与临时复制 artifact 的真实 Manager stable load 均未创建 `emotion.db`；formal snapshot 冻结 exact effect/lookup/documents identity，terminate 后 listener/effect 为零。插件其他能力仍待 C09/C15/C17 与 E1/E3 | Emotion |
+| C20 | Proactive 私有兼容岛 | `CANDIDATE` | Core `1968e503` 已把 Default/Wake 六个内建 module 收进 Core-private catalog/Host；跨 publication tx reload/rollback、lexical symlink admission 与 kernel start failure 的 exact ownership 已闭合。独立复审无 P0/P1，主任务复跑 4 个关键 mutant，累计 private/Manager/hot-reload/ActivityHost 回归与 Pyright 0 通过，待 E3 fixed-clock/recording Gate | Default/Wake Proactive |
+| C21 | generation-scoped background job / LLM capability | `CANDIDATE` | Core `de08b698` + `467a4c93` 已完成 committed catalog、trigger/interval、exact LLM lease、cancel/drain、Emotion domain receipt 与 paired-document recovery；Emotion `d3a4c8c` 又把 `emotion_state`、projection 与 durable domain receipt 收进同一 SQLite transaction，并以真实 Manager 覆盖 precommit rollback、commit 后取消重入和 Core 进程崩溃重入。Core/插件定向回归、Pyright/contract/compileall/diff-check 通过，待 E1/E3 | Emotion |
 | C22 | static v3 artifact manifest / install staging | `CANDIDATE` | 集成 head `3e1f5c10`（独立复审 head `b6967d13`）已在 import 前校验 identity/runtime/validation、custom entrypoint 与 C12/C13 descriptor，不成功 staging 不创建正式 data/artifact/pointer；Calendar `654d078d` 已由真实 Host 消费 exact staged `.venv/bin/python`，manifest/apply/runtime identity 一致且候选排除 credential/receipt；待全部 external v3 与最终 artifact Gate | Calendar MCP / 全部 external v3 |
 | C23 | Core-owned Channel attachment artifact / Session binding | `CANDIDATE` | `0bd2d928` 已完成 immutable opaque artifact、fixed-ID resumable Mobile import、SessionDB 原子 message binding、exact fd read lease、无自动 GC 与目录/SQLite 可恢复备份；Mobile 114、Bus/lifecycle/Host 124、最终 ownership 聚焦 201 tests、Basedpyright 0，独立 review 无 P0/P1；待 Feishu/QQ 与复制 workspace E3/E4 进入 `READY` | Feishu / QQBot / Core channels |
 | C24 | read-only existing Session projection | `CANDIDATE` | Core `cb2011b4` formal 只经 `get_existing` 返回 detached snapshot，candidate 同名 Service 调用即 fail-loud；Status Commands `eb245ad` 的真实 active compaction ledger 同时驱动 committed command 与 Mobile query，查询前后 `sessions.db*` 摘要不变。Core 38、插件 6、面板 7 tests、Pyright/contract/compileall/diff-check 通过；待 E3 复制 workspace | Status Commands |
-| C25 | explicit interaction undo coordinator | `IN_PROGRESS` | latest interaction 事务 fence、SQLite backup、Default Memory durable receipt、Akasha source gate、进程内取消与 Core 重启重放 | Plugin Undo |
+| C25 | explicit interaction undo coordinator | `CANDIDATE` | Core `b58b7905` + Plugin Undo `7b0e4cd` 已通过独立复审：destructive owner、latest interaction/active/pending-compaction fence、SQLite backup、Default Memory durable receipt、Akasha source gate、进程内取消与 Core 重启重放均闭合；`/undo` 已回显可恢复 backup 与强制存在的 compaction cursor receipt。Core 6、插件 Manager 4、既有 Memory/Akasha/SessionStore 回归与 Pyright/contract/compileall/diff-check 通过，待 E1/E3 copied-workspace Gate | Plugin Undo |
+| C26 | exact programmatic Turn / v3 Tool catalog | `CANDIDATE` | Core `7d68020a` + `dfee8cda` 已建立 Root-local Tool catalog、exact generation handler、invocation-scoped programmatic Turn port 与主服务/stdio 启动前 owner binding；整张 candidate snapshot 均不取得 Turn port且不发布 Tool，durable Session 只可由同一 plugin/job 跨 invocation 复用，`submitting/admitted` receipt 与 typed pre-admission/uncertain failure 防止失败、取消及进程崩溃后重复 Turn。307 个 Manager/hot-reload/runtime/job/tool 回归、BasedPyright/compileall/diff-check 通过，待 GitHub Watcher 迁移与 E3 controlled repository Gate | GitHub Watcher |
 
 实现原则：C11～C17、C21～C22 只由表中的首个真实 consumer 拉动，不提前复制
 `commands()/mcp_servers()/managed_services()/channels()/jobs()/proactive_*()/mobile_ui()` 旧方法。
@@ -167,30 +168,30 @@ Gate 报告。分支名、PR 号和浮动 ref 不能代替 commit。
 | 插件 | 当前 v2 能力 | 依赖 Core seam | 状态 | 最终组合批次 |
 |---|---|---|---|---|
 | Daynight Gate | proactive module / prompt gate | C15 | `CANDIDATE` | plugin `e5adbd2`；真实 Manager/ActivityHost exact lease、配置行为、dispose、contract 与 Pyright 已通过，待 E3 |
-| Emotion | Dashboard、mobile、Drift Skill、proactive module、job/LLM | C09/C15/C17/C21 | `OPEN` | E1/E3 |
-| Plugin Undo | command、显式 interaction 撤销 | C11/C25 | `OPEN` | E1/E3 |
-| Observe | Dashboard、mobile、committed event observers | C02/C17 | `OPEN` | E1 |
+| Emotion | Dashboard、mobile、Drift Skill、proactive module、job/LLM | C09/C15/C17/C21 | `CANDIDATE` | plugin `d3a4c8c`；candidate 不写正式数据，formal exact Root 冻结 UI/Skill/proactive/job，领域写集与 receipt 原子提交；真实 Manager 的进程内失败、取消与 Core 进程崩溃重入通过，待 E1/E3 |
+| Plugin Undo | command、显式 interaction 撤销 | C11/C25 | `CANDIDATE` | Core `b58b7905` + plugin `7b0e4cd` 已把 destructive owner 留在 Core；candidate 调用拒绝、formal `/undo`、backup/事务 fence、Memory/Akasha 恢复与 Core 重启重放均通过，用户响应可直接审阅 backup 与 cursor，待 E1/E3 copied-workspace Gate |
+| Observe | Dashboard、mobile、committed event observers | C02/C17 | `CANDIDATE` | plugin `bac337f` 已完成 pure-v3 typed committed observers、generation-owned workspace、Dashboard/Mobile exact binding、candidate discard/formal rebuild 与全局错误 hook 逆序清理；按插件 CI 入口复跑 15 tests 通过，独立实现复审无 P0/P1。待 E1 exact lock 与复制 workspace write-set Gate |
 | Setup Helper | command | C11 | `CANDIDATE` | Core `78e50d4d` + plugin `65770db`；`/chatid` 与 `/myid` 走 committed registry，在 Session/模型 admission 前短路，installed candidate→formal 晋升与 Root/validation cleanup 已通过，待 E3 |
 | Status Commands | mobile、command、只读 Session projection | C11/C17/C24 | `CANDIDATE` | Core `cb2011b4` + plugin `eb245ad`；真实 Manager command/Mobile/ledger oracle 通过，待 E3 复制 workspace |
 | Feed MCP | Skill、MCP、proactive source | C09/C12/C15 | `CANDIDATE` | Core `78e50d4d` + plugin `b4a8626`；真实 Manager/stdio、exact source lease、typed empty fetch、candidate data 排除、进程内回滚与进程崩溃后重启迁移均通过，待 E2/E3 |
-| Feishu | channel | C14 | `OPEN` | E3 |
+| Feishu | channel | C14 | `CANDIDATE` | plugin `fc2b4ba` 已完成 pure-v3 exact channel binding、credential redaction、provider identity、reply-aware inbound、control、preview/final 与 cleanup；多行/reply `/stop` P1 已闭合，25 个 Feishu/真实 Manager tests、Pyright/contract/compileall/diff-check 与独立复审通过，待 E3 recording adapter 与受控 Feishu provider Gate |
 | Fitbit MCP | MCP、managed process、proactive source、mobile | C12/C13/C15/C17 | `CANDIDATE` | Core `78e50d4d` + plugin `f3fd6ee`；真实 formal monitor/MCP 与 candidate recording route 已验证只读 typed empty、写工具拒绝、exact Root 重建、敏感数据排除、显式 v2 数据迁移的进程内回滚与 Core 进程崩溃后重启恢复；40 个 Python、12 个面板测试、contract、Pyright、compileall、diff-check 与独立 review 通过，待 E2/E3 |
 | Steam MCP | Skill、MCP、proactive source | C09/C12/C15 | `CANDIDATE` | Core `78e50d4d` + plugin `2c492d7`；真实 stdio formal/candidate→promote、recording 零凭证/网络/DB、exact proactive catalog、显式 v2 数据迁移与 cleanup 已通过，待 E2/E3 |
-| QQBot | channel | C14 | `OPEN` | E3 |
-| Proactive Feedback | Dashboard、mobile、committed event observers | C02/C17 | `OPEN` | E1 |
+| QQBot | channel | C14 | `CANDIDATE` | plugin `9c4fa62` 已完成 pure-v3 exact channel binding、provider identity、control、input-notify/preview/final 分离、附件 fail-closed 与三态外部效果；24 个 adapter 回归及真实 Manager stable→candidate discard→formal promote/terminate 共 25 tests、Pyright/contract/compileall/diff-check 通过。待 E3 recording adapter 与受控 QQ provider Gate |
+| Proactive Feedback | Dashboard、mobile、committed event observers | C02/C17 | `CANDIDATE` | plugin `41be8198` 已完成 pure-v3 committed input/outbox、candidate read/write 拒绝、ordered user IDs、重启重放与 session 公平轮转；30 个 Python、5 个 Node、Pyright/API v3 contract/compileall/diff-check 通过，主任务复核 3 个公平性/取消 oracle 通过。待 E1 exact lock 与进程崩溃 grouped Gate |
 | Huayue Skills | Skill roots | C09 | `CANDIDATE` | plugin `1171904`；pure-v3 module-level skill roots、contract 与 Pyright 已通过，待 E3 |
 
 ### 4.3 In-tree plugins 与保留族群
 
 | 插件实现 | 目标 | 依赖 Core seam | 状态 | 最终组合批次 |
 |---|---|---|---|---|
-| Akasha | pure v3，保持 Memory engine、Dashboard 与 mobile recall | C08/C17/C18 | `OPEN` | E1/E4 |
-| Default Proactive | v3 薄入口 + 原内部 runtime | C15/C20 | `OPEN` | E3/E4 |
-| Proactive Flow | Default 族私有实现 | C20 | `OPEN` | E3/E4 |
-| Drift Flow | Default 族私有实现 | C20 | `OPEN` | E3/E4 |
-| Wake Proactive | v3 薄入口 + 原内部 runtime | C15/C20 | `OPEN` | E3/E4 |
-| Wake Proactive Flow | Wake 族私有实现 | C20 | `OPEN` | E3/E4 |
-| Wake Drift Flow | Wake 族私有实现 | C20 | `OPEN` | E3/E4 |
+| Akasha | pure v3，保持 Memory engine、Dashboard 与 mobile recall | C08/C17/C18 | `CANDIDATE` | Core `713c6d9d` 已完成 tool-chain sidecar、pure-v3 lifecycle/Mobile/Dashboard、统一 memory root、symlink fail-loud 与 bounded Mobile Inspector detail；独立复审无 P0/P1，48 个 Memory/Inspector/Akasha 回归、5 个 Mobile Node tests、Pyright 0 errors、compileall/diff-check 通过。待 E1/E4 copied-workspace Gate |
+| Default Proactive | v3 薄入口 + 原内部 runtime | C15/C20 | `PRIVATE_LEGACY_RUNTIME` | Core `1968e503`；只允许 default family 的 exact Core-private catalog/Host 使用，外部同名/re-export/symlink fail-loud，待 E3/E4 |
+| Proactive Flow | Default 族私有实现 | C20 | `PRIVATE_LEGACY_RUNTIME` | Core `1968e503`；仅作为 default family 私有 member，待 E3/E4 |
+| Drift Flow | Default 族私有实现 | C20 | `PRIVATE_LEGACY_RUNTIME` | Core `1968e503`；仅作为 default family 私有 member，待 E3/E4 |
+| Wake Proactive | v3 薄入口 + 原内部 runtime | C15/C20 | `PRIVATE_LEGACY_RUNTIME` | Core `1968e503`；只允许 wake family 的 exact Core-private catalog/Host 使用，外部同名/re-export/symlink fail-loud，待 E3/E4 |
+| Wake Proactive Flow | Wake 族私有实现 | C20 | `PRIVATE_LEGACY_RUNTIME` | Core `1968e503`；仅作为 wake family 私有 member，待 E3/E4 |
+| Wake Drift Flow | Wake 族私有实现 | C20 | `PRIVATE_LEGACY_RUNTIME` | Core `1968e503`；仅作为 wake family 私有 member，待 E3/E4 |
 
 Default Memory 是第 8 个 in-tree 实现，已列在 4.1；本节列出其余七个。六个 Proactive
 实现最终不得继续继承通用 `Plugin`、声明 `api_version = 2` 或让
@@ -201,9 +202,9 @@ dedupe、ack、cursor、hazard 和原数据库协议。
 
 | 项目 | 状态 | 解除阻塞条件 |
 |---|---|---|
-| canonical source 与公开凭据审计 | `BLOCKED` | 定位真实 repository、确认没有凭据和私有 artifact |
-| v3 迁移 | `BLOCKED` | source 固定后使用 C02/C06/C15，不建立 GitHub 领域 Core Service |
-| 行为 Gate | `BLOCKED` | fake/controlled client + 一次可控只读真实 API probe |
+| canonical source 与公开凭据审计 | `CANDIDATE` | canonical repo 已确认为 `kachofugetsu09/github-watch`，候选 `3613956a`；tracked inventory 未发现 PEM/private key 或私有 artifact。最终 lock 仍须固定迁移后的新 head |
+| v3 迁移 | `OPEN` | 现有 `3613956a` 仍引用已移除的 `AGENT_INPUT/PLUGIN_TOOLS/TIMER_SERVICE`；改用 C06/C15 `BACKGROUND_JOBS`，并由首个真实 consumer补齐窄 Turn enqueue 与 v3 Tool catalog，不建立 GitHub 领域 Core Service |
+| 行为 Gate | `BLOCKED` | 当前 v3 适配完成后运行 controlled client + 专用远端测试仓库的只读/受控写 probe，candidate 不读取正式 PEM |
 
 GitHub Watcher 在 canonical source 未确认前不计入“已完成”，也不允许通过复制 cache 制造候选。
 
@@ -214,7 +215,7 @@ GitHub Watcher 在 canonical source 未确认前不计入“已完成”，也�
 
 | 批次 | 对象 | 状态 |
 |---|---|---|
-| A | Default Memory legacy data name | `OPEN` |
+| A | Default Memory legacy data name | `CANDIDATE`（Core `3f25f767` 已删除正式/candidate 对 `workspace/observe/recall_inspector.jsonl` 的读取与 hard-link；旧文件不删除，exact generation data root 与 discard write-set 由 51 个定向回归锁定，待 E1/E4） |
 | B | legacy assistant metadata slots | `OPEN` |
 | C | legacy Dashboard ABI | `OPEN` |
 | D | ToolHook ABI、catalog 与 traces | `OPEN` |
@@ -277,11 +278,11 @@ E1～E3 使用一次性 workspace 和受控端点。E4 只能使用经过校验�
 ## 8. 实施波次
 
 - [x] W0：提交本清单，冻结状态定义、数据边界和 E2E 批次；
-- [ ] W1：完成 C16、C18、C19，并复核 C01～C10；
-- [ ] W2：以真实 consumer 依次完成 C11～C17、C21～C22；
+- [x] W1：完成 C16、C18、C19，并复核 C01～C10；
+- [x] W2：以真实 consumer 依次完成 C11～C17、C21～C22；
 - [ ] W3：并行迁移 lifecycle/metadata/command 插件；
-- [ ] W4：并行迁移 MCP/process/channel 插件；
-- [ ] W5：迁移 Akasha、Proactive Feedback，并建立 C20；
+- [x] W4：并行迁移 MCP/process/channel 插件；
+- [x] W5：迁移 Akasha、Proactive Feedback，并建立 C20；
 - [ ] W6：执行 A～I 删除批次，运行 production v2 consumer scan；
 - [ ] W7：集中运行 E1～E3，关闭所有行为差异；
 - [ ] W8：执行 J、运行 E4 与独立只读 review；
