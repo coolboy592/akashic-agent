@@ -1275,6 +1275,7 @@ async def test_app_runtime_start_passes_markdown_store_to_memory_optimizer(
         provider=MagicMock(),
         light_provider=MagicMock(),
         memory_runtime=memory_runtime,
+        channel_attachment_store=MagicMock(),
         presence=MagicMock(),
         plugin_manager=MagicMock(),
         workspace_mcp_watcher_task=None,
