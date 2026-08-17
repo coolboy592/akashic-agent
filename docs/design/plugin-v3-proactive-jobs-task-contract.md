@@ -87,9 +87,13 @@ ProactiveModuleDefinition(
     slot="proactive.gate.daynight",
     lifecycle_id="default.proactive.frame.v1",
     requires=(),
-    produces=("proactive:gate:pass_probability",),
+    produces=(
+        "proactive:gate:pass_probability",
+        "proactive:gate:reason",
+        "proactive:effect:daynight_gate",
+    ),
     collects=(),
-    handler_export="apply_daynight_gate",
+    handler_export="run_daynight_gate",
 )
 ```
 
