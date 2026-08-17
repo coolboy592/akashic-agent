@@ -3,18 +3,15 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 from contextlib import asynccontextmanager
-import importlib.util
 import inspect
 from pathlib import Path, PureWindowsPath
 import logging
 import json
 import sqlite3
-import sys
 import threading
 import os
 import shutil
-from types import ModuleType
-from typing import Any, Protocol, cast, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 from uuid import uuid4
 
 import subprocess
@@ -30,7 +27,6 @@ from agent.plugins.manifest import (
     load_plugin_manifest,
     plugins_root as resolve_plugins_root,
 )
-from agent.plugins.importer import FreshPluginImporter
 from agent.plugins.packages import enabled_plugin_packages
 from agent.plugins.source_resolver import resolve_plugin_sources
 from bootstrap.cleanup import run_cleanup_steps
@@ -864,110 +860,6 @@ async def _close_plugin_panel_cache(cache_root: Path, workspace: Path) -> None:
     _reset_plugin_panel_cache(cache_root, workspace)
 
 
-def _load_plugin_dashboard(
-    app: FastAPI,
-    plugin_dir: Path,
-    workspace: Path,
-    importer: FreshPluginImporter,
-    module_names: set[str],
-    import_namespace: str,
-) -> list[object]:
-    try:
-        mod = _load_plugin_dashboard_module(
-            plugin_dir,
-            importer,
-            module_names,
-            import_namespace,
-        )
-        if hasattr(mod, "register"):
-            result = mod.register(app, plugin_dir, workspace)
-            logger.info("插件 dashboard 已挂载: %s", plugin_dir.name)
-            return _dashboard_closeables(result)
-    except Exception as e:
-        logger.warning("插件 dashboard 挂载失败 (%s): %s", plugin_dir.name, e)
-    return []
-
-
-def _plugin_dashboard_enabled(
-    app: FastAPI,
-    plugin_dir: Path,
-    importer: FreshPluginImporter,
-    module_names: set[str],
-    import_namespace: str,
-) -> bool:
-    dash_path = plugin_dir / "dashboard.py"
-    if not dash_path.exists():
-        return False
-    try:
-        mod = _load_plugin_dashboard_module(
-            plugin_dir,
-            importer,
-            module_names,
-            import_namespace,
-        )
-    except Exception as e:
-        logger.warning("插件 dashboard 检查失败 (%s): %s", plugin_dir.name, e)
-        return False
-    enabled = getattr(mod, "plugin_enabled", None)
-    if not callable(enabled):
-        return True
-    return bool(enabled(app))
-
-
-def _load_plugin_dashboard_module(
-    plugin_dir: Path,
-    importer: FreshPluginImporter,
-    module_names: set[str],
-    import_namespace: str,
-) -> ModuleType:
-    dash_path = plugin_dir / "dashboard.py"
-    module_name = _dashboard_module_name(plugin_dir, import_namespace)
-    importer.register(module_name, plugin_dir)
-    module_names.add(module_name)
-    spec = importer.root_spec(module_name, dash_path)
-    if spec is None or spec.loader is None:
-        importer.unregister(module_name)
-        module_names.discard(module_name)
-        raise ImportError(f"cannot load {dash_path}")
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = mod
-    spec.loader.exec_module(mod)
-    return mod
-
-
-async def _close_plugin_dashboard_imports(
-    importer: FreshPluginImporter,
-    module_names: set[str],
-) -> None:
-    """Release source-only import ownership after plugin closeables finish."""
-
-    for module_name in sorted(module_names):
-        importer.unregister(module_name)
-        for loaded_name in tuple(sys.modules):
-            if loaded_name == module_name or loaded_name.startswith(f"{module_name}."):
-                sys.modules.pop(loaded_name, None)
-    module_names.clear()
-
-
-def _dashboard_module_name(plugin_dir: Path, import_namespace: str) -> str:
-    raw = str(plugin_dir.resolve(strict=False))
-    normalized = "".join(ch if ch.isalnum() else "_" for ch in raw)
-    return f"akasic_dashboard_plugin_{import_namespace}_{normalized}"
-
-
-def _dashboard_closeables(value: object) -> list[object]:
-    if value is None:
-        return []
-    if isinstance(value, list):
-        items = cast(list[object], value)
-        return [item for item in items if _is_dashboard_closeable(item)]
-    if _is_dashboard_closeable(value):
-        return [value]
-    return []
-
-
-def _is_dashboard_closeable(value: object) -> bool:
-    return callable(getattr(value, "close", None))
 
 
 async def _close_dashboard_value(value: object) -> None:
@@ -992,11 +884,7 @@ def create_dashboard_app(
     optimizer_task: asyncio.Task[None] | None = None
     optimizer_last_status = "idle"
     optimizer_last_error: str | None = None
-    plugin_closeables: list[object] = []
     pending_panel_builds = _PluginPanelBuildQueue()
-    dashboard_importer = FreshPluginImporter()
-    dashboard_module_names: set[str] = set()
-    dashboard_import_namespace = uuid4().hex
     project_root = Path(__file__).resolve().parent.parent
     static_dir = project_root / "static" / "dashboard"
     plugin_panel_cache = _plugin_panel_cache_root(workspace)
@@ -1035,20 +923,6 @@ def create_dashboard_app(
                     "dashboard.memory_admin.close",
                     lambda: _close_dashboard_value(memory_admin),
                 ),
-                *[
-                    (
-                        f"dashboard.plugin_closeable[{index}].close",
-                        lambda value=closeable: _close_dashboard_value(value),
-                    )
-                    for index, closeable in enumerate(reversed(plugin_closeables))
-                ],
-                (
-                    "dashboard.plugin_importer.close",
-                    lambda: _close_plugin_dashboard_imports(
-                        dashboard_importer,
-                        dashboard_module_names,
-                    ),
-                ),
             )
 
     app = FastAPI(title="Akashic Dashboard API", lifespan=lifespan)
@@ -1065,16 +939,8 @@ def create_dashboard_app(
     )
     plugin_dirs = _dashboard_plugin_dirs(project_root)
 
-    # 编译 TypeScript 插件面板并挂载插件路由
+    # 插件后端只从 committed RuntimeSnapshot 挂载；这里仅准备前端派生面板。
     for _plugin_id, _plugin_dir in sorted(plugin_dirs.items()):
-        if plugin_manager is None and not _plugin_dashboard_enabled(
-            app,
-            _plugin_dir,
-            dashboard_importer,
-            dashboard_module_names,
-            dashboard_import_namespace,
-        ):
-            continue
         _ = _build_plugin_panels_js(
             project_root,
             _plugin_dir,
@@ -1085,19 +951,6 @@ def create_dashboard_app(
             ),
             pending_panel_builds,
         )
-        if (plugin_manager is None or (_plugin_dir / "package.toml").exists()) and (
-            _plugin_dir / "dashboard.py"
-        ).exists():
-            plugin_closeables.extend(
-                _load_plugin_dashboard(
-                    app,
-                    _plugin_dir,
-                    workspace,
-                    dashboard_importer,
-                    dashboard_module_names,
-                    dashboard_import_namespace,
-                )
-            )
 
     # Vite 会在 /assets 下生成带内容哈希的资源 URL，因此直接原样提供 index.html；
     # 不需要手动处理缓存失效。
@@ -1734,9 +1587,6 @@ def create_dashboard_app(
         )
 
         dashboard_host = PluginDashboardHost(
-            workspace=workspace,
-            memory_admin=memory_admin,
-            memory_store=app.state.memory_store,
             core_routes=tuple(app.routes),
         )
         snapshot = plugin_manager.current_snapshot
@@ -1766,14 +1616,7 @@ def create_dashboard_app(
     else:
 
         def dashboard_plugin_enabled(plugin_id: str, plugin_dir: Path) -> bool:
-            _ = plugin_id
-            return _plugin_dashboard_enabled(
-                app,
-                plugin_dir,
-                dashboard_importer,
-                dashboard_module_names,
-                dashboard_import_namespace,
-            )
+            return plugin_dirs.get(plugin_id) == plugin_dir
 
     return app
 

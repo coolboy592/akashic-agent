@@ -5988,22 +5988,21 @@ async def test_dashboard_routes_follow_snapshot_generation(tmp_path: Path) -> No
     plugin_dir = _write_plugin(
         tmp_path / "plugins",
         "snapshot_dashboard",
-        "from agent.plugins import Plugin\n"
-        "class SnapshotDashboardPlugin(Plugin):\n"
-        "    name = 'snapshot_dashboard'\n"
-        "    @classmethod\n"
-        "    def dashboard_module(cls): return 'dashboard.py'\n",
+        "api_version = 3\n"
+        "name = 'snapshot_dashboard'\n"
+        "version = '1.0.0'\n"
+        "dashboard_module = 'dashboard.py'\n"
+        "def apply(ctx, config): pass\n",
     )
 
     def write_dashboard(version: str) -> None:
         _ = (plugin_dir / "dashboard.py").write_text(
-            "from fastapi import FastAPI\n"
-            "def register(app: FastAPI, plugin_dir, workspace):\n"
+            "def register(app, context):\n"
             "    @app.get('/api/dashboard/snapshot-version')\n"
             f"    def version(): return {{'version': '{version}'}}\n"
             "    class Closeable:\n"
             "        def close(self):\n"
-            f"            (workspace / 'dashboard-{version}-closed').write_text('closed')\n"
+            f"            (context.data_root / 'dashboard-{version}-closed').write_text('closed')\n"
             "    return Closeable()\n",
             encoding="utf-8",
         )
@@ -6031,10 +6030,10 @@ async def test_dashboard_routes_follow_snapshot_generation(tmp_path: Path) -> No
     assert TestClient(old_binding.app).get(  # type: ignore[attr-defined]
         "/api/dashboard/snapshot-version"
     ).json() == {"version": "v1"}
-    assert not (tmp_path / "workspace" / "dashboard-v1-closed").exists()
+    assert not (old_generation.data_dir / "dashboard-v1-closed").exists()
     await old_lease.release()
     await manager.snapshot_store.retry_drains()
-    assert (tmp_path / "workspace" / "dashboard-v1-closed").exists()
+    assert (old_generation.data_dir / "dashboard-v1-closed").exists()
     assert old_generation.scope.closed
     assert f"{old_generation.module_path}.dashboard" not in sys.modules
     client.close()
@@ -6046,24 +6045,24 @@ async def test_dashboard_candidate_cannot_override_core_route(tmp_path: Path) ->
     plugin_dir = _write_plugin(
         tmp_path / "plugins",
         "dashboard_conflict",
-        "from agent.plugins import Plugin\n"
-        "class DashboardConflictPlugin(Plugin):\n"
-        "    name = 'dashboard_conflict'\n"
-        "    @classmethod\n"
-        "    def dashboard_module(cls): return 'dashboard.py'\n",
+        "api_version = 3\n"
+        "name = 'dashboard_conflict'\n"
+        "version = '1.0.0'\n"
+        "dashboard_module = 'dashboard.py'\n"
+        "def apply(ctx, config): pass\n",
     )
 
     def write_dashboard(path: str, *, async_close: bool = False) -> None:
         cleanup = (
             "    class Closeable:\n"
             "        async def close(self):\n"
-            "            (workspace / 'async-dashboard-closed').write_text('closed')\n"
+            "            (context.data_root / 'async-dashboard-closed').write_text('closed')\n"
             "    return Closeable()\n"
             if async_close
             else ""
         )
         _ = (plugin_dir / "dashboard.py").write_text(
-            "def register(app, plugin_dir, workspace):\n"
+            "def register(app, context):\n"
             f"    @app.get('{path}')\n"
             "    def route(): return {'owner': 'plugin'}\n"
             f"{cleanup}",
@@ -6092,7 +6091,7 @@ async def test_dashboard_candidate_cannot_override_core_route(tmp_path: Path) ->
     assert "dashboard:" in str(status["candidate_error"])
     assert "/api/dashboard/sessions" in str(status["candidate_error"])
     assert manager.generation("dashboard_conflict") is old_generation
-    assert not (tmp_path / "workspace" / "async-dashboard-closed").exists()
+    assert not (old_generation.data_dir / "async-dashboard-closed").exists()
     assert not validation_root.exists()
     assert TestClient(app).get("/api/dashboard/plugin-owned").json() == {
         "owner": "plugin"
@@ -6111,25 +6110,25 @@ async def test_dashboard_candidate_cannot_override_other_plugin(tmp_path: Path) 
     first_dir = _write_plugin(
         root,
         "dashboard_first",
-        "from agent.plugins import Plugin\n"
-        "class DashboardFirstPlugin(Plugin):\n"
-        "    name = 'dashboard_first'\n"
-        "    @classmethod\n"
-        "    def dashboard_module(cls): return 'dashboard.py'\n",
+        "api_version = 3\n"
+        "name = 'dashboard_first'\n"
+        "version = '1.0.0'\n"
+        "dashboard_module = 'dashboard.py'\n"
+        "def apply(ctx, config): pass\n",
     )
     second_dir = _write_plugin(
         root,
         "dashboard_second",
-        "from agent.plugins import Plugin\n"
-        "class DashboardSecondPlugin(Plugin):\n"
-        "    name = 'dashboard_second'\n"
-        "    @classmethod\n"
-        "    def dashboard_module(cls): return 'dashboard.py'\n",
+        "api_version = 3\n"
+        "name = 'dashboard_second'\n"
+        "version = '1.0.0'\n"
+        "dashboard_module = 'dashboard.py'\n"
+        "def apply(ctx, config): pass\n",
     )
 
     def write_dashboard(directory: Path, path: str) -> None:
         _ = (directory / "dashboard.py").write_text(
-            "def register(app, plugin_dir, workspace):\n"
+            "def register(app, context):\n"
             f"    @app.get('{path}')\n"
             f"    def route(): return {{'owner': '{directory.name}'}}\n",
             encoding="utf-8",
@@ -6160,14 +6159,14 @@ async def test_dashboard_allows_static_route_before_dynamic_route(tmp_path: Path
     plugin_dir = _write_plugin(
         tmp_path / "plugins",
         "dashboard_ordered",
-        "from agent.plugins import Plugin\n"
-        "class DashboardOrderedPlugin(Plugin):\n"
-        "    name = 'dashboard_ordered'\n"
-        "    @classmethod\n"
-        "    def dashboard_module(cls): return 'dashboard.py'\n",
+        "api_version = 3\n"
+        "name = 'dashboard_ordered'\n"
+        "version = '1.0.0'\n"
+        "dashboard_module = 'dashboard.py'\n"
+        "def apply(ctx, config): pass\n",
     )
     _ = (plugin_dir / "dashboard.py").write_text(
-        "def register(app, plugin_dir, workspace):\n"
+        "def register(app, context):\n"
         "    @app.get('/api/dashboard/items/overview')\n"
         "    def overview(): return {'route': 'overview'}\n"
         "    @app.get('/api/dashboard/items/{item_id}')\n"

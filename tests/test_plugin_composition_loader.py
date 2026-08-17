@@ -1409,9 +1409,6 @@ async def test_v3_loader_publishes_declared_package_contributions(
     assert snapshot.plugin_skill_index.records["package-skill"].root_dir != skill_dir
 
     dashboard_host = PluginDashboardHost(
-        workspace=tmp_path / "workspace",
-        memory_admin=object(),
-        memory_store=object(),
         core_routes=(),
     )
     dashboard_host.prepare_snapshot(snapshot)
@@ -1453,9 +1450,6 @@ async def test_v3_dashboard_rejects_legacy_register_signature(tmp_path: Path) ->
     snapshot = manager.current_snapshot
     assert snapshot is not None
     dashboard_host = PluginDashboardHost(
-        workspace=tmp_path / "workspace",
-        memory_admin=object(),
-        memory_store=object(),
         core_routes=(),
     )
 
@@ -1514,9 +1508,6 @@ async def test_v3_dashboard_rejects_invalid_callable_contracts(
     snapshot = manager.current_snapshot
     assert generation is not None and snapshot is not None
     dashboard_host = PluginDashboardHost(
-        workspace=tmp_path / "workspace",
-        memory_admin=object(),
-        memory_store=object(),
         core_routes=(),
     )
 
@@ -2760,9 +2751,6 @@ async def test_installed_v3_dashboard_uses_composition_runtime_until_promotion(
     stable_snapshot = manager.current_snapshot
     assert stable_snapshot is not None
     dashboard_host = PluginDashboardHost(
-        workspace=tmp_path / "workspace",
-        memory_admin=object(),
-        memory_store=object(),
         core_routes=(),
     )
     dashboard_host.prepare_initial_snapshot(stable_snapshot)
@@ -2878,9 +2866,6 @@ async def test_v3_dashboard_uses_exact_root_workspace_declaration(
     assert generation is not None and snapshot is not None
     generation.instance.workspace_roots = ("drifted",)
     dashboard_host = PluginDashboardHost(
-        workspace=tmp_path / "workspace",
-        memory_admin=object(),
-        memory_store=object(),
         core_routes=(),
     )
 
@@ -2957,9 +2942,6 @@ async def test_builtin_v3_dashboard_candidate_clones_data_root_before_publish(
     assert stable is not None and stable_snapshot is not None
     (stable.data_dir / "existing.txt").write_text("stable", encoding="utf-8")
     dashboard_host = PluginDashboardHost(
-        workspace=tmp_path / "workspace",
-        memory_admin=object(),
-        memory_store=object(),
         core_routes=(),
     )
     dashboard_host.prepare_initial_snapshot(stable_snapshot)

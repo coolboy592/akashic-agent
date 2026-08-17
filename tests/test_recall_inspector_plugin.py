@@ -309,9 +309,6 @@ async def test_recall_inspector_v3_runs_from_formal_snapshot(
     assert current["recall_memory_count"] == 1
 
     host = PluginDashboardHost(
-        workspace=workspace,
-        memory_admin=object(),
-        memory_store=object(),
         core_routes=(),
     )
     host.prepare_snapshot(snapshot)
@@ -381,9 +378,6 @@ async def test_recall_inspector_candidate_writes_only_isolated_data_root(
     assert (stable_path.read_bytes() if stable_path.exists() else b"") == stable_bytes
 
     host = PluginDashboardHost(
-        workspace=tmp_path / "workspace",
-        memory_admin=object(),
-        memory_store=object(),
         core_routes=(),
     )
     host.prepare_snapshot(candidate.runtime_snapshot)
@@ -487,9 +481,6 @@ async def test_installed_default_memory_candidate_preserves_static_projection(
     )
     assert skill_link.exists()
     host = PluginDashboardHost(
-        workspace=tmp_path / "workspace",
-        memory_admin=object(),
-        memory_store=object(),
         core_routes=(),
     )
     stable_snapshot = manager.current_snapshot
@@ -605,9 +596,6 @@ async def test_recall_inspector_v3_is_inactive_for_akasha(tmp_path: Path) -> Non
         tmp_path / "workspace" / "drift" / "skills" / "audit-dirty-memories"
     ).exists()
     host = PluginDashboardHost(
-        workspace=tmp_path / "workspace",
-        memory_admin=object(),
-        memory_store=object(),
         core_routes=(),
     )
     host.prepare_snapshot(snapshot)

@@ -339,9 +339,6 @@ async def _verify_composition(providers: Path, sandbox: Path) -> dict[str, objec
     )
     root = None
     dashboard_host = PluginDashboardHost(
-        workspace=workspace,
-        memory_admin=object(),
-        memory_store=object(),
         core_routes=(),
     )
     dashboard_module = ""

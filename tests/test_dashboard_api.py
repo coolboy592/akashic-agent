@@ -1279,68 +1279,18 @@ def test_memory_dashboard_filters_survive_parallel_requests(tmp_path) -> None:
             assert "total" in payload
 
 
-def test_proactive_dashboard_endpoints(tmp_path, monkeypatch) -> None:
+def test_standalone_dashboard_does_not_execute_proactive_backend(
+    tmp_path, monkeypatch
+) -> None:
     monkeypatch.setattr(
         "bootstrap.dashboard_api.load_package_manifest",
         lambda: {"default-proactive": True, "wake-proactive": False},
     )
     _seed_workspace(tmp_path)
     with TestClient(create_dashboard_app(tmp_path)) as client:
-        overview_resp = client.get("/api/dashboard/proactive/overview")
-        assert overview_resp.status_code == 200
-        overview = overview_resp.json()
-        assert overview["counts"]["deliveries"] == 2
-        assert overview["counts"]["tick_logs"] == 2
-        assert overview["flow_counts"]["drift"] == 1
-        assert overview["flow_counts"]["proactive"] == 1
-        assert overview["last_tick_at"] == "2026-04-19T03:00:00+00:00"
-        assert overview["last_send_at"] == "2026-04-19T02:06:00+00:00"
-        assert overview["last_skip_reason"] == "busy"
-
-        deliveries_resp = client.get(
-            "/api/dashboard/proactive/deliveries",
-            params={"session_key": "telegram:100"},
-        )
-        assert deliveries_resp.status_code == 200
-        assert deliveries_resp.json()["total"] == 1
-        assert deliveries_resp.json()["items"][0]["delivery_key"] == "delivery-a"
-
-        tick_logs_resp = client.get(
-            "/api/dashboard/proactive/tick_logs",
-            params={"terminal_action": "skip"},
-        )
-        assert tick_logs_resp.status_code == 200
-        assert tick_logs_resp.json()["total"] == 1
-        assert tick_logs_resp.json()["items"][0]["tick_id"] == "tick-2"
-
-        drift_logs_resp = client.get(
-            "/api/dashboard/proactive/tick_logs",
-            params={"flow": "drift"},
-        )
-        assert drift_logs_resp.status_code == 200
-        assert drift_logs_resp.json()["total"] == 1
-        assert drift_logs_resp.json()["items"][0]["tick_id"] == "tick-2"
-
-        proactive_sorted_resp = client.get(
-            "/api/dashboard/proactive/tick_logs",
-            params={"sort_by": "started_at", "sort_order": "asc"},
-        )
-        assert proactive_sorted_resp.status_code == 200
-        assert proactive_sorted_resp.json()["items"][0]["tick_id"] == "tick-1"
-
-        tick_detail_resp = client.get("/api/dashboard/proactive/tick_logs/tick-1")
-        assert tick_detail_resp.status_code == 200
-        assert tick_detail_resp.json()["interesting_ids"] == ["mcp:feed:feed-1"]
-        assert tick_detail_resp.json()["final_message"] == "记得早点休息"
-
-        tick_steps_resp = client.get("/api/dashboard/proactive/tick_logs/tick-1/steps")
-        assert tick_steps_resp.status_code == 200
-        assert tick_steps_resp.json()["total"] == 2
-        assert tick_steps_resp.json()["items"][0]["tool_name"] == "message_push"
-        assert (
-            tick_steps_resp.json()["items"][0]["tool_args"]["message"] == "记得早点休息"
-        )
-        assert tick_steps_resp.json()["items"][1]["terminal_action_after"] == "reply"
+        assert client.get("/api/dashboard/proactive/overview").status_code == 404
+        assert client.get("/api/dashboard/proactive/deliveries").status_code == 404
+        assert client.get("/api/dashboard/proactive/tick_logs").status_code == 404
 
 
 def test_proactive_reader_rejects_corrupt_json() -> None:
@@ -1371,11 +1321,8 @@ def test_wake_package_owns_dashboard_visibility(tmp_path, monkeypatch) -> None:
         assert "wake-proactive" in plugin_ids
         assert "default-proactive" not in plugin_ids
         assert client.get("/api/dashboard/proactive/overview").status_code == 404
-        assert client.get("/api/dashboard/wake-proactive/runs").status_code == 200
-        meter = client.get("/api/dashboard/wake-proactive/meter")
-        assert meter.status_code == 200
-        assert meter.json()["should_wake"] == 0
-        assert meter.json()["unread_count"] == 0
+        assert client.get("/api/dashboard/wake-proactive/runs").status_code == 404
+        assert client.get("/api/dashboard/wake-proactive/meter").status_code == 404
 
 
 def test_dashboard_lists_installed_plugin_panels(tmp_path, monkeypatch) -> None:
@@ -1750,7 +1697,7 @@ def test_standalone_dashboard_rejects_invalid_manifest(tmp_path, monkeypatch) ->
         _dashboard_plugin_dirs(Path.cwd())
 
 
-def test_installed_plugin_dashboard_supports_relative_imports(
+def test_standalone_dashboard_does_not_import_plugin_backend(
     tmp_path, monkeypatch
 ) -> None:
     _seed_workspace(tmp_path)
@@ -1762,9 +1709,10 @@ def test_installed_plugin_dashboard_supports_relative_imports(
         encoding="utf-8",
     )
     (plugin_dir / "dashboard.py").write_text(
-        "from fastapi import FastAPI\n"
+        "from pathlib import Path\n"
+        "Path(__file__).with_name('backend-imported').write_text('yes')\n"
         "from .db import ping\n"
-        "def register(app: FastAPI, plugin_dir, workspace):\n"
+        "def register(app, context):\n"
         "    @app.get('/api/dashboard/test-relative-import')\n"
         "    def route():\n"
         "        return {'value': ping()}\n",
@@ -1780,14 +1728,16 @@ def test_installed_plugin_dashboard_supports_relative_imports(
         '[plugins."observe@github"]\nenabled = true\n', encoding="utf-8"
     )
     monkeypatch.setenv("HOME", str(home))
+    source_before = _test_tree_digest(plugin_dir)
 
     with TestClient(create_dashboard_app(tmp_path)) as client:
         response = client.get("/api/dashboard/test-relative-import")
-    assert response.status_code == 200
-    assert response.json() == {"value": "ok"}
+    assert response.status_code == 404
+    assert not (plugin_dir / "backend-imported").exists()
+    assert _test_tree_digest(plugin_dir) == source_before
 
 
-def test_two_dashboard_apps_isolate_deferred_relative_imports(
+def test_two_standalone_dashboard_apps_do_not_import_plugin_backend(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1798,7 +1748,9 @@ def test_two_dashboard_apps_isolate_deferred_relative_imports(
         encoding="utf-8",
     )
     (plugin_dir / "dashboard.py").write_text(
-        "def register(app, plugin_dir, workspace):\n"
+        "from pathlib import Path\n"
+        "Path(__file__).with_name('backend-imported').write_text('yes')\n"
+        "def register(app, context):\n"
         "    @app.get('/api/dashboard/deferred-relative-import')\n"
         "    def route():\n"
         "        from .db import ping\n"
@@ -1816,13 +1768,10 @@ def test_two_dashboard_apps_isolate_deferred_relative_imports(
 
     with TestClient(app_a) as client_a:
         with TestClient(app_b) as client_b:
-            assert client_b.get(
-                "/api/dashboard/deferred-relative-import"
-            ).json() == {"value": "ok"}
-        assert client_a.get("/api/dashboard/deferred-relative-import").json() == {
-            "value": "ok"
-        }
+            assert client_b.get("/api/dashboard/deferred-relative-import").status_code == 404
+        assert client_a.get("/api/dashboard/deferred-relative-import").status_code == 404
 
+    assert not (plugin_dir / "backend-imported").exists()
     assert _test_tree_digest(plugin_dir) == source_before
 
 
