@@ -191,6 +191,8 @@ def _public_result(
         message_ids=deletion.message_ids,
         backup_path=deletion.backup_path,
         reconciliation_pending=reconciliation_pending,
+        old_last_consolidated=deletion.old_last_consolidated,
+        new_last_consolidated=deletion.new_last_consolidated,
     )
 
 

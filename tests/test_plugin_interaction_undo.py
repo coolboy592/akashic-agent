@@ -111,6 +111,8 @@ async def test_default_memory_failure_keeps_durable_pending_receipt(tmp_path) ->
     assert result is not None
     assert result.message_ids == message_ids
     assert result.reconciliation_pending is True
+    assert result.old_last_consolidated == 0
+    assert result.new_last_consolidated == 0
     assert manager._cache.get("cli:undo") is None
     assert manager.get_existing("cli:undo").messages == []
     assert manager.control_store.get_session_meta("cli:undo") is not None
