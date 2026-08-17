@@ -170,7 +170,7 @@ def _disable_candidate_side_effect_tools(
     """把本次 candidate lease 的副作用工具加入 turn-local 禁用集合。"""
     if tools is None or not candidate_plugin_ids:
         return
-    generations = cast(Any, snapshot).generations
+    mcp_registry = cast(Any, snapshot).mcp_server_registry
     raw_disabled = msg.metadata.get("disabled_tools")
     if isinstance(raw_disabled, str):
         disabled = {raw_disabled} if raw_disabled else set()
@@ -179,12 +179,20 @@ def _disable_candidate_side_effect_tools(
     else:
         disabled = set()
     for plugin_id in candidate_plugin_ids:
-        generation = generations[plugin_id]
         disabled |= tools.get_non_read_only_source_tool_names(
             "plugin",
             plugin_id,
         )
-        for server_name in generation.contributions.mcp_servers:
+        server_names = (
+            ()
+            if mcp_registry is None
+            else (
+                descriptor.name
+                for descriptor in mcp_registry.descriptors
+                if descriptor.owner == plugin_id
+            )
+        )
+        for server_name in server_names:
             disabled |= tools.get_non_read_only_source_tool_names(
                 "mcp",
                 server_name,

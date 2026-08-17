@@ -1031,17 +1031,14 @@ async def test_watchdog_failure_revokes_ready_candidate_and_restores_base(
         manager._reload_journal.advance(  # pyright: ignore[reportPrivateUsage]
             action.tx_id,
             "degraded",
-            resource="plugin-endpoint,plugin-skill-projection",
-            error="formal endpoint and skill rollback incomplete",
+            resource="plugin-skill-projection",
+            error="formal skill rollback incomplete",
             recovery_target="base",
         )
 
         recovered = await manager.retry_runtime_recovery("calendar@lab")
 
         assert recovered["recovery_target"] == "base"
-        assert "stable-plugin-endpoints-restored" in str(
-            recovered["retry_receipt"]
-        )
         assert "stable-skill-projection-restored" in str(
             recovered["retry_receipt"]
         )

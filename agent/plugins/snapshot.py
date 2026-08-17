@@ -72,11 +72,7 @@ class RuntimeSnapshot:
     generations: Mapping[str, PluginGeneration]
     channels: Mapping[str, Channel]
     skill_catalog_generation_id: str | None
-    mcp_catalog_generation_ids: Mapping[str, str]
     workspace_mcp_generation: WorkspaceMcpGeneration | None = None
-    managed_services: Mapping[str, Mapping[str, object]] = field(
-        default_factory=lambda: MappingProxyType({})
-    )
     dashboard_bindings: tuple[object, ...] = ()
     mobile_ui_registry: MobileUiRegistry | None = None
     mobile_ui_registry_identity: str | None = None
@@ -165,18 +161,6 @@ class RuntimeSnapshotCompiler:
         )
         if catalog_owner is not None and generations.get(catalog_owner.plugin_id) is not catalog_owner:
             raise RuntimeError("RuntimeSnapshot catalog owner 不属于 generations")
-        mcp_catalogs = {
-            generation.plugin_id: generation.mcp_catalog.generation_id
-            for generation in ordered
-            if generation.mcp_catalog is not None
-        }
-        managed_services = {
-            generation.plugin_id: MappingProxyType(
-                dict(generation.contributions.managed_services)
-            )
-            for generation in ordered
-            if generation.contributions.managed_services
-        }
         identity = "|".join(
             f"{generation.plugin_id}:{generation.generation_id}:"
             f"{generation.source_revision}:{generation.config_revision}"
@@ -186,10 +170,6 @@ class RuntimeSnapshotCompiler:
             catalog_owner.skill_catalog.generation_id
             if catalog_owner is not None and catalog_owner.skill_catalog is not None
             else ""
-        )
-        identity += "|mcp:" + "|".join(
-            f"{plugin_id}:{generation_id}"
-            for plugin_id, generation_id in sorted(mcp_catalogs.items())
         )
         identity += "|workspace-mcp:" + (
             workspace_mcp_generation.generation_id
@@ -348,19 +328,6 @@ class RuntimeSnapshotCompiler:
                     process_declarations,
                     composition_root.instance_token,
                 )
-                legacy_process_names = {
-                    name
-                    for generation in ordered
-                    for name in generation.contributions.managed_services
-                }
-                process_collisions = legacy_process_names.intersection(
-                    frozen_processes
-                )
-                if process_collisions:
-                    raise RuntimeError(
-                        "RuntimeSnapshot v2/v3 managed process 名称冲突: "
-                        + ", ".join(sorted(process_collisions))
-                    )
                 for descriptor in frozen_processes.descriptors:
                     if descriptor.owner not in generations:
                         raise RuntimeError(
@@ -375,17 +342,6 @@ class RuntimeSnapshotCompiler:
                     mcp_servers,
                     composition_root.instance_token,
                 )
-                legacy_names = {
-                    name
-                    for generation in ordered
-                    for name in generation.contributions.mcp_servers
-                }
-                collisions = legacy_names.intersection(frozen_mcp)
-                if collisions:
-                    raise RuntimeError(
-                        "RuntimeSnapshot v2/v3 MCP server 名称冲突: "
-                        + ", ".join(sorted(collisions))
-                    )
                 for descriptor in frozen_mcp.descriptors:
                     generation = generations.get(descriptor.owner)
                     if generation is None:
@@ -468,9 +424,7 @@ class RuntimeSnapshotCompiler:
                 if catalog_owner is not None and catalog_owner.skill_catalog is not None
                 else None
             ),
-            mcp_catalog_generation_ids=MappingProxyType(mcp_catalogs),
             workspace_mcp_generation=workspace_mcp_generation,
-            managed_services=MappingProxyType(managed_services),
             mobile_ui_registry=mobile_ui_registry,
             mobile_ui_registry_identity=(
                 None if mobile_ui_registry is None else mobile_ui_registry.identity

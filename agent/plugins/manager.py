@@ -11,7 +11,6 @@ import logging
 import os
 import secrets
 import shutil
-import socket
 import sys
 import tomllib
 from dataclasses import dataclass, field, replace
@@ -19,7 +18,6 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from types import MappingProxyType, ModuleType, UnionType
 from collections.abc import Awaitable, Callable, Mapping
 from typing import Any, Literal, TypeVar, Union, cast, get_args, get_origin
-from urllib.parse import urlsplit, urlunsplit
 
 from pydantic import AliasChoices, AliasPath, BaseModel, ValidationError
 
@@ -202,7 +200,6 @@ class ActivePluginInfo:
     module_path: str
     skill_roots: tuple[Path, ...] = ()
     drift_skill_roots: tuple[Path, ...] = ()
-    mcp_servers: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -280,20 +277,6 @@ class PluginManager:
         self._dashboard_preparer: Callable[[RuntimeSnapshot], None] | None = None
         self._dashboard_validation_releaser: (
             Callable[[RuntimeSnapshot], Awaitable[None]] | None
-        ) = None
-        self._service_switcher: (
-            Callable[
-                [str, dict[str, dict[str, Any]], dict[str, dict[str, Any]]],
-                Awaitable[None],
-            ]
-            | None
-        ) = None
-        self._candidate_service_starter: (
-            Callable[[str, dict[str, dict[str, Any]]], Awaitable[None]] | None
-        ) = None
-        self._candidate_service_stopper: Callable[[str], Awaitable[None]] | None = None
-        self._candidate_service_health_check: (
-            Callable[[str], Awaitable[None]] | None
         ) = None
         self._endpoint_quiescer: Callable[[], Awaitable[None]] | None = None
         self._endpoint_resumer: Callable[[], Awaitable[None]] | None = None
@@ -419,7 +402,6 @@ class PluginManager:
             module_path=generation.module_path,
             skill_roots=contributions.skill_roots,
             drift_skill_roots=contributions.drift_skill_roots,
-            mcp_servers=contributions.mcp_servers,
         )
         stable = self.active_plugins()
         post_promotion = [
@@ -461,9 +443,6 @@ class PluginManager:
 
     def skill_catalog(self, generation_id: str) -> PreparedSkillCatalog | None:
         return self._skill_host.get(generation_id)
-
-    def mcp_catalog(self, generation_id: str) -> PreparedMcpCatalog | None:
-        return self._mcp_host.get(generation_id)
 
     @property
     def active_workspace_mcp(self) -> WorkspaceMcpGeneration | None:
@@ -608,16 +587,23 @@ class PluginManager:
         self,
         server_specs: Mapping[str, object],
     ) -> None:
+        snapshots = [
+            snapshot
+            for snapshot in (
+                self.current_snapshot,
+                self.latest_snapshot,
+                *(
+                    generation.runtime_snapshot
+                    for generation in self._prepared_generations.values()
+                ),
+            )
+            if snapshot is not None and snapshot.mcp_server_registry is not None
+        ]
         occupied = {
-            server_name
-            for generation in self._active_generations.values()
-            for server_name in generation.contributions.mcp_servers
+            descriptor.name
+            for snapshot in snapshots
+            for descriptor in snapshot.mcp_server_registry.descriptors
         }
-        occupied.update(
-            server_name
-            for generation in self._prepared_generations.values()
-            for server_name in generation.contributions.mcp_servers
-        )
         conflicts = sorted(occupied.intersection(server_specs))
         if conflicts:
             raise RuntimeError(
@@ -641,28 +627,6 @@ class PluginManager:
     ) -> None:
         self._dashboard_preparer = preparer
         self._dashboard_validation_releaser = validation_releaser
-
-    def bind_service_switcher(
-        self,
-        switcher: Callable[
-            [str, dict[str, dict[str, Any]], dict[str, dict[str, Any]]],
-            Awaitable[None],
-        ],
-    ) -> None:
-        self._service_switcher = switcher
-
-    def bind_candidate_service_host(
-        self,
-        *,
-        start: Callable[[str, dict[str, dict[str, Any]]], Awaitable[None]],
-        stop: Callable[[str], Awaitable[None]],
-        assert_healthy: Callable[[str], Awaitable[None]],
-    ) -> None:
-        """Bind isolated managed-service ownership for validation candidates."""
-
-        self._candidate_service_starter = start
-        self._candidate_service_stopper = stop
-        self._candidate_service_health_check = assert_healthy
 
     async def wait_mcp_fatal_failure(self) -> None:
         """Escalate exhausted active MCP recovery to the runtime owner."""
@@ -1681,8 +1645,6 @@ class PluginManager:
         await self._publish_committed_snapshot(snapshot)
         for generation in staged:
             generation.boot_created_data_dir = False
-            if generation.mcp_catalog is not None:
-                self._mcp_host.mark_active(generation.generation_id)
             logger.info("插件已加载: %s", generation.plugin_id)
 
     async def _discard_stable_batch(
@@ -2116,8 +2078,6 @@ class PluginManager:
             return
         generation.retire_started = True
         generation.state = "retired"
-        if generation.mcp_catalog is not None:
-            self._mcp_host.mark_draining(generation.generation_id)
         self._draining_generations.setdefault(generation.plugin_id, []).append(
             generation
         )
@@ -2397,11 +2357,15 @@ class PluginManager:
             await self._dispose_unreferenced_composition_root(snapshot)
             raise
 
-        old_services = active.contributions.managed_services
-        old_channels = active.contributions.channels
+        old_services: dict[str, dict[str, Any]] = {}
+        old_channels: tuple[Channel, ...] = ()
         old_commands = self.stable_telegram_command_catalog()
         new_commands = self._snapshot_bot_commands(snapshot)
-        exclusive_endpoint_changed = bool(old_services or old_channels)
+        current_snapshot = self.current_snapshot
+        exclusive_endpoint_changed = (
+            current_snapshot is not None
+            and self._composition_runtime_declared(current_snapshot, plugin_id)
+        )
         command_catalog_changed = old_commands != new_commands
         v3_channel_catalog_changed = (
             self._channel_catalog_identity(self.current_snapshot)
@@ -2536,12 +2500,8 @@ class PluginManager:
                 new_commands,
             )
             return
-        if services_changed and channels_changed:
-            raise RuntimeError("同时切换 managed service 与 Channel 需要统一端点宿主")
         if services_changed:
-            if self._service_switcher is None:
-                raise RuntimeError("managed service 宿主未绑定")
-            await self._service_switcher(plugin_id, old_services, new_services)
+            raise RuntimeError("v3 publication 不接受 legacy managed service")
         if channels_changed:
             if self._channel_switcher is None:
                 raise RuntimeError("Channel 宿主未绑定")
@@ -2849,21 +2809,10 @@ class PluginManager:
             if self._reload_journal.get(tx_id).phase != "latest_ready":
                 raise RuntimeError("latest candidate 已被 runtime recovery 撤销准入")
 
-            old_services = (
-                ready.previous.contributions.managed_services
-                if ready.previous is not None
-                else {}
-            )
-            target_contributions = (
-                generation.production_contributions or generation.contributions
-            )
-            new_services = target_contributions.managed_services
-            old_channels = (
-                ready.previous.contributions.channels
-                if ready.previous is not None
-                else ()
-            )
-            new_channels = target_contributions.channels
+            old_services: dict[str, dict[str, Any]] = {}
+            new_services: dict[str, dict[str, Any]] = {}
+            old_channels: tuple[Channel, ...] = ()
+            new_channels: tuple[Channel, ...] = ()
             old_commands = self.stable_telegram_command_catalog()
             new_commands = self._snapshot_bot_commands(ready.snapshot)
             stable_snapshot = self.current_snapshot
@@ -2934,8 +2883,6 @@ class PluginManager:
                     runtime_restore_started = True
                     await self._restore_ready_runtime(ready)
                     generation = ready.candidate
-                    new_services = generation.contributions.managed_services
-                    new_channels = generation.contributions.channels
                     new_commands = self._snapshot_bot_commands(ready.snapshot)
                 except BaseException:
                     gated_runtime_error: BaseException | None = None
@@ -3044,8 +2991,6 @@ class PluginManager:
             def after_open() -> None:
                 self._activate_published_generation(generation, ready.previous)
                 generation.state = "active"
-                if generation.mcp_catalog is not None:
-                    self._mcp_host.mark_active(generation.generation_id)
                 self._scopes[generation.module_path] = generation.scope
                 self._loaded.add(generation.module_path)
                 self._active_generations[plugin_id] = generation
@@ -3337,30 +3282,6 @@ class PluginManager:
             ):
                 await self._restore_replaced_composition_runtime(ready.candidate)
                 receipts.append("stable-composition-runtime-restored")
-            if "plugin-endpoint" in resource:
-                if ready is None:
-                    raise RuntimeError("runtime recovery 缺少 endpoint candidate owner")
-                old_services = (
-                    {} if ready.previous is None else ready.previous.contributions.managed_services
-                )
-                old_channels = (
-                    () if ready.previous is None else ready.previous.contributions.channels
-                )
-                new_contributions = (
-                    ready.candidate.production_contributions
-                    or ready.candidate.contributions
-                )
-                old_commands = self.stable_telegram_command_catalog()
-                await self._switch_plugin_endpoints(
-                    plugin_id,
-                    new_contributions.managed_services,
-                    old_services,
-                    new_contributions.channels,
-                    old_channels,
-                    old_commands,
-                    old_commands,
-                )
-                receipts.append("stable-plugin-endpoints-restored")
             if "plugin-skill-projection" in resource:
                 if ready is None:
                     raise RuntimeError("runtime recovery 缺少 skill candidate owner")
@@ -3509,18 +3430,7 @@ class PluginManager:
         if validation_root is not None:
             await validation_root.dispose()
 
-        # 2. Stop isolated services after every validation lease has ended.
-        if generation.validation_managed_services:
-            if self._candidate_service_stopper is None:
-                raise RuntimeError("候选 managed service 隔离宿主未绑定")
-            if self._candidate_service_health_check is None:
-                raise RuntimeError("候选 managed service 健康检查未绑定")
-            await self._candidate_service_health_check(generation.generation_id)
-        if generation.validation_managed_services:
-            assert self._candidate_service_stopper is not None
-            await self._candidate_service_stopper(generation.generation_id)
-
-        # 3. Restore the formal data projection, then refresh the exact Root payload.
+        # 2. Restore the formal data projection, then refresh the exact Root payload.
         generation.contributions = production
         generation.data_dir = production_data_dir
         replacement = await self._compile_generation_snapshot(
@@ -3560,7 +3470,6 @@ class PluginManager:
         if self._dashboard_preparer is not None:
             self._dashboard_preparer(ready.snapshot)
         generation.production_contributions = None
-        generation.validation_managed_services = {}
         generation.production_data_dir = None
 
     async def drop_candidate(self, plugin_id: str) -> dict[str, object]:
@@ -3675,7 +3584,17 @@ class PluginManager:
         owned_tools = registry.get_source_tool_names(
             "plugin", plugin_id, risk="read-only"
         )
-        for server_name in generation.contributions.mcp_servers:
+        mcp_registry = ready.snapshot.mcp_server_registry
+        server_names = (
+            ()
+            if mcp_registry is None
+            else (
+                descriptor.name
+                for descriptor in mcp_registry.descriptors
+                if descriptor.owner == plugin_id
+            )
+        )
+        for server_name in server_names:
             owned_tools.update(
                 registry.get_source_tool_names(
                     "mcp", server_name, risk="read-only"
@@ -3748,12 +3667,6 @@ class PluginManager:
             raise RuntimeError("插件候选已被 runtime recovery 撤销准入")
         active = self._active_generations.get(plugin_id)
         stage_latest = _installed_generation_is_candidate(generation)
-        production = generation.production_contributions or generation.contributions
-        production_endpoint_changed = (
-            active.contributions.managed_services if active is not None else {}
-        ) != production.managed_services or (
-            active.contributions.channels if active is not None else ()
-        ) != production.channels
         try:
             if stage_latest:
                 if (
@@ -3761,47 +3674,6 @@ class PluginManager:
                     or generation.production_data_dir is None
                 ):
                     raise RuntimeError("installed candidate 缺少隔离 plugin-data 身份")
-                if (
-                    generation.mcp_catalog is not None
-                    and not generation.contributions.mcp_servers
-                    and not generation.contributions.proactive_sources
-                ):
-                    await self._mcp_host.close(generation.generation_id)
-                    generation.mcp_catalog = None
-                if generation.validation_managed_services:
-                    if self._candidate_service_starter is None:
-                        raise RuntimeError("候选 managed service 隔离宿主未绑定")
-                    await self._candidate_service_starter(
-                        generation.generation_id,
-                        generation.validation_managed_services,
-                    )
-                    candidate_service_stopper = self._candidate_service_stopper
-                    assert candidate_service_stopper is not None
-                    generation.scope.defer(
-                        "validation_managed_services",
-                        lambda: candidate_service_stopper(
-                            generation.generation_id
-                        ),
-                    )
-            workspace_generations = tuple(
-                item
-                for item in (
-                    self._active_workspace_mcp,
-                    self._prepared_workspace_mcp,
-                )
-                if item is not None
-            )
-            conflicts = sorted(
-                set(generation.contributions.mcp_servers).intersection(
-                    server_name
-                    for item in workspace_generations
-                    for server_name in item.catalog.servers
-                )
-            )
-            if conflicts:
-                raise RuntimeError(
-                    f"插件 MCP 与 workspace server 名称冲突: {', '.join(conflicts)}"
-                )
             prepared_snapshot = generation.runtime_snapshot
             generation.runtime_snapshot = await self._compile_generation_snapshot(
                 generation,
@@ -3861,12 +3733,10 @@ class PluginManager:
             )
             return result
 
-        old_services = (
-            active.contributions.managed_services if active is not None else {}
-        )
-        new_services = generation.contributions.managed_services
-        old_channels = active.contributions.channels if active is not None else ()
-        new_channels = generation.contributions.channels
+        old_services: dict[str, dict[str, Any]] = {}
+        new_services: dict[str, dict[str, Any]] = {}
+        old_channels: tuple[Channel, ...] = ()
+        new_channels: tuple[Channel, ...] = ()
         old_commands = self.stable_telegram_command_catalog()
         new_commands = self._snapshot_bot_commands(snapshot)
         current = self.current_snapshot
@@ -3892,24 +3762,6 @@ class PluginManager:
             or command_catalog_changed
             or v3_channel_catalog_changed
         )
-        if stage_latest and production_endpoint_changed:
-            self._reload_journal.annotate(
-                cast(str, generation.reload_tx_id),
-                {
-                    "event": "exclusive_endpoints_deferred",
-                    "managed_services_changed": (
-                        active is None
-                        or active.contributions.managed_services
-                        != production.managed_services
-                    ),
-                    "channels_changed": (
-                        active is None
-                        and bool(production.channels)
-                        or active is not None
-                        and active.contributions.channels != production.channels
-                    ),
-                },
-            )
         if self._dashboard_preparer is not None:
             try:
                 self._dashboard_preparer(snapshot)
@@ -4377,7 +4229,6 @@ class PluginManager:
             module_path=generation.module_path,
             skill_roots=generation.contributions.skill_roots,
             drift_skill_roots=generation.contributions.drift_skill_roots,
-            mcp_servers=generation.contributions.mcp_servers,
         )
 
     async def _prepare_generation(
@@ -4415,12 +4266,6 @@ class PluginManager:
         catalog_id = snapshot.skill_catalog_generation_id
         if catalog_id is not None and self._skill_host.get(catalog_id) is None:
             raise RuntimeError("RuntimeSnapshot skill catalog 不可用")
-        for generation_id in snapshot.mcp_catalog_generation_ids.values():
-            catalog = self._mcp_host.get(generation_id)
-            if catalog is None:
-                raise RuntimeError("RuntimeSnapshot MCP catalog 不可用")
-            if any(not server.client.connected for server in catalog.servers.values()):
-                raise RuntimeError("RuntimeSnapshot MCP client 已断开")
         workspace_mcp = snapshot.workspace_mcp_generation
         if workspace_mcp is not None:
             if (
@@ -5162,12 +5007,6 @@ class PluginManager:
                     _candidate_data_exclude_paths(generation),
                 )
                 generation.data_dir = validation_data_dir
-                generation.contributions = _validation_contributions(
-                    generation,
-                    self._active_generations.get(plugin_id),
-                    validation_workspace=generation.validation_workspace,
-                )
-                contributions = generation.contributions
             if not activate:
                 generation.runtime_snapshot = await self._compile_generation_snapshot(
                     generation,
@@ -5231,7 +5070,6 @@ class PluginManager:
             module_path=mp,
             skill_roots=contributions.skill_roots,
             drift_skill_roots=contributions.drift_skill_roots,
-            mcp_servers=contributions.mcp_servers,
         )
         generation.state = "active"
         self._active_generations[plugin_id] = generation
@@ -5242,8 +5080,6 @@ class PluginManager:
         sys.modules[stable_module_path] = sys.modules[mp]
         assert generation.runtime_snapshot is not None
         await self._publish_committed_snapshot(generation.runtime_snapshot)
-        if generation.mcp_catalog is not None:
-            self._mcp_host.mark_active(generation.generation_id)
         logger.info("插件已加载: %s", mod["name"])
         return generation
 
@@ -6122,44 +5958,9 @@ class PluginManager:
     ) -> Any:
         if self._tool_registry is None:
             return None
-        plugin_mcp_sources = {
-            ("mcp", server_name)
-            for generation in generations.values()
-            for server_name in generation.contributions.mcp_servers
-        }
-        workspace_mcp_sources: set[tuple[str, str]] = (
-            {("mcp", server_name) for server_name in workspace_mcp.catalog.servers}
-            if workspace_mcp is not None
-            else set()
-        )
         registry = self._tool_registry.fork(
-            excluded_source_types={"plugin"},
-            excluded_sources=plugin_mcp_sources | workspace_mcp_sources,
+            excluded_source_types={"plugin", "mcp"},
         )
-        for generation in sorted(generations.values(), key=lambda item: item.plugin_id):
-            if generation.mcp_catalog is None:
-                continue
-            for server in generation.mcp_catalog.servers.values():
-                server_spec = generation.contributions.mcp_servers[server.name]
-                candidate_read_only_tools = _candidate_mcp_read_only_tools(
-                    generation,
-                    server.name,
-                    server_spec,
-                    {tool.name for tool in server.tools},
-                )
-                for tool in server.tools:
-                    if registry.has_tool(tool.name):
-                        raise RuntimeError(f"MCP 工具名称重复: {tool.name}")
-                    registry.register(
-                        tool,
-                        risk=(
-                            "read-only"
-                            if tool.name in candidate_read_only_tools
-                            else "external-side-effect"
-                        ),
-                        source_type="mcp",
-                        source_name=server.name,
-                    )
         if plugin_tools is not None:
             for binding in plugin_tools.values():
                 if registry.has_tool(binding.descriptor.name):
@@ -7044,108 +6845,6 @@ def _resolve_composable_mobile_ui_asset(
     )
 
 
-def _validation_contributions(
-    candidate: PluginGeneration,
-    previous: PluginGeneration | None,
-    *,
-    validation_workspace: Path,
-) -> PluginContributions:
-    """构造候选路径隔离视图；同 UID 进程仍可绕过它，它不是安全沙箱。"""
-
-    # 1. Allocate one loopback port for every changed managed service.
-    production = candidate.contributions
-    old_services = (
-        previous.contributions.managed_services if previous is not None else {}
-    )
-    validation_services: dict[str, dict[str, Any]] = {}
-    validation_env: dict[str, str] = {}
-    for service_id, spec in production.managed_services.items():
-        if old_services.get(service_id) == spec:
-            continue
-        port_env = str(spec.get("validation_port_env") or "")
-        readiness_url = str(spec.get("readiness_url") or "")
-        if not port_env or not readiness_url:
-            raise RuntimeError(
-                "候选插件改变独占 managed service，但未声明通用隔离端口: "
-                f"plugin={candidate.plugin_id} service={service_id} "
-                "需要 ManagedServiceSpec.validation_port_env 和 readiness_url"
-            )
-        port = _allocate_validation_port()
-        validation_env[port_env] = str(port)
-        isolated = dict(spec)
-        isolated["env"] = {
-            **dict(spec.get("env") or {}),
-            port_env: str(port),
-            "AKA_PLUGIN_DATA_DIR": str(candidate.data_dir),
-            "AKASHIC_WORKSPACE": str(validation_workspace),
-        }
-        isolated["readiness_url"] = _replace_url_port(readiness_url, port)
-        validation_services[service_id] = isolated
-
-    # 2. Candidate MCP processes inherit only declared endpoint variables.
-    mcp_servers = {
-        name: {
-            **spec,
-            "env": {
-                **dict(spec.get("env") or {}),
-                **validation_env,
-                "AKA_PLUGIN_DATA_DIR": str(candidate.data_dir),
-                "AKASHIC_WORKSPACE": str(validation_workspace),
-            },
-        }
-        for name, spec in production.mcp_servers.items()
-    }
-    candidate.validation_managed_services = validation_services
-    return replace(
-        production,
-        mcp_servers=mcp_servers,
-        managed_services=validation_services,
-        channels=(previous.contributions.channels if previous is not None else ()),
-    )
-
-
-def _candidate_mcp_read_only_tools(
-    generation: PluginGeneration,
-    server_name: str,
-    server_spec: dict[str, Any],
-    available_tools: set[str],
-) -> frozenset[str]:
-    """严格校验并返回只对候选开放的 MCP 只读工具集合。"""
-
-    # 1. 正式 snapshot 不继承候选验证专用的只读声明。
-    if (
-        generation.production_data_dir is None
-        or generation.data_dir == generation.production_data_dir
-    ):
-        return frozenset()
-
-    # 2. 候选声明精确匹配且默认拒绝；未知工具直接失败。
-    raw_names = server_spec.get("candidate_read_only_tools", ())
-    if not isinstance(raw_names, tuple) or not all(
-        isinstance(name, str) and name for name in raw_names
-    ):
-        raise RuntimeError(
-            f"MCP candidate 只读工具声明无效: server={server_name}"
-        )
-    declared = frozenset(raw_names)
-    public_names = frozenset(
-        f"mcp_{server_name}__{remote_name}" for remote_name in declared
-    )
-    unknown = public_names.difference(available_tools)
-    if unknown:
-        raise RuntimeError(
-            "MCP candidate 只读工具不存在: "
-            f"server={server_name} tools={', '.join(sorted(declared))}"
-        )
-    return public_names
-
-
-def _allocate_validation_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
-        listener.bind(("127.0.0.1", 0))
-        return cast(int, listener.getsockname()[1])
-
-
 def _remove_validation_data_dir(path: Path) -> None:
     if path.exists():
         shutil.rmtree(path)
@@ -7216,18 +6915,6 @@ def _copy_validation_data(
     return tuple(sorted(inventory))
 
 
-def _replace_url_port(url: str, port: int) -> str:
-    parsed = urlsplit(url)
-    if parsed.scheme not in {"http", "https"} or parsed.hostname is None:
-        raise RuntimeError(f"managed service readiness_url 无效: {url}")
-    host = parsed.hostname
-    if ":" in host and not host.startswith("["):
-        host = f"[{host}]"
-    return urlunsplit(
-        (parsed.scheme, f"{host}:{port}", parsed.path, parsed.query, parsed.fragment)
-    )
-
-
 def _replace_snapshot_payload(
     target: RuntimeSnapshot,
     source: RuntimeSnapshot,
@@ -7240,9 +6927,7 @@ def _replace_snapshot_payload(
         "generations",
         "channels",
         "skill_catalog_generation_id",
-        "mcp_catalog_generation_ids",
         "workspace_mcp_generation",
-        "managed_services",
         "dashboard_bindings",
         "mobile_ui_registry",
         "mobile_ui_registry_identity",
@@ -7712,8 +7397,22 @@ def _skill_body_hashes(
 
 
 def _mcp_tool_names(generation: PluginGeneration) -> list[str]:
-    catalog = generation.mcp_catalog
-    return list(catalog.tool_names) if catalog is not None else []
+    snapshot = generation.runtime_snapshot
+    if snapshot is None or snapshot.tool_registry is None:
+        return []
+    registry = snapshot.mcp_server_registry
+    if registry is None:
+        return []
+    names: set[str] = set()
+    for descriptor in registry.descriptors:
+        if descriptor.owner == generation.plugin_id:
+            names.update(
+                snapshot.tool_registry.get_source_tool_names(
+                    "mcp",
+                    descriptor.name,
+                )
+            )
+    return sorted(names)
 
 
 def _log_candidate_status(result: dict[str, object]) -> None:

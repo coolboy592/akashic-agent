@@ -36,7 +36,6 @@ from bootstrap.workspace_lock import WorkspaceInstanceLock
 from bootstrap.workspace_token import ensure_workspace_token
 from bus.event_bus import EventBus
 from bus.queue import MessageBus
-from agent.plugins.service_host import PluginServiceHost
 from agent.plugins.turn_rollout import TurnPluginRollout
 from agent.plugins.watcher import PluginWatcher
 from core.net.http import (
@@ -228,7 +227,6 @@ class AppRuntime:
         self.mobile_gateway_runtime = None
         self.mobile_gateway_server = None
         self.mobile_gateway_task: asyncio.Task[None] | None = None
-        self.plugin_service_host: PluginServiceHost | None = None
         self.plugin_watcher: PluginWatcher | None = None
         self.plugin_watcher_task: asyncio.Task[None] | None = None
         self.workspace_mcp_watcher_task: asyncio.Task[None] | None = None
@@ -419,29 +417,6 @@ class AppRuntime:
                 await self.app_server.start()
 
             plugin_manager = getattr(self.core, "plugin_manager", None)
-            if plugin_manager is not None:
-                self.plugin_service_host = PluginServiceHost()
-                snapshot = plugin_manager.current_snapshot
-                service_bindings = {
-                    plugin_id: {
-                        service_id: dict(spec) for service_id, spec in services.items()
-                    }
-                    for plugin_id, services in (
-                        snapshot.managed_services.items()
-                        if snapshot is not None
-                        else ()
-                    )
-                }
-                self.plugin_service_host.bind_plugin_services(service_bindings)
-                await self.plugin_service_host.start_all()
-                plugin_manager.bind_service_switcher(
-                    self.plugin_service_host.swap_plugin_services
-                )
-                plugin_manager.bind_candidate_service_host(
-                    start=self.plugin_service_host.start_candidate,
-                    stop=self.plugin_service_host.stop_candidate,
-                    assert_healthy=self.plugin_service_host.assert_candidate_healthy,
-                )
             if self.readiness is not None:
                 self.readiness.mark_stage("services.ready")
             from infra.mobile_realtime.runtime_inspection import (
@@ -531,9 +506,6 @@ class AppRuntime:
             host_bridge_monitor = build_host_bridge_monitor()
             if host_bridge_monitor is not None:
                 self.tasks.append(host_bridge_monitor)
-            if plugin_manager is not None:
-                assert self.plugin_service_host is not None
-                self.tasks.append(self.plugin_service_host.wait_fatal_failure())
             optimizer_tasks, self._memory_optimizer = build_memory_optimizer_task(
                 self.config,
                 provider=self.provider,
@@ -873,14 +845,6 @@ class AppRuntime:
                     "mobile_gateway.close",
                     _close_mobile_gateway(self.mobile_gateway_runtime),
                 ),
-                (
-                    "plugin_services.stop",
-                    (
-                        self.plugin_service_host.stop_all
-                        if self.plugin_service_host
-                        else _noop_async
-                    ),
-                ),
                 ("core.stop", self.core.stop if self.core else _noop_async),
                 (
                     "memory_runtime.aclose",
@@ -1110,58 +1074,14 @@ class AppRuntime:
         new_commands: tuple[tuple[str, str], ...],
     ) -> None:
         assert self.channel_host is not None
-        assert self.plugin_service_host is not None
-        if old_channels or new_channels:
-            raise RuntimeError("v3 endpoint transaction 不接受 legacy Channel")
-        services_switched = False
-        commands_switched = False
-        try:
-            if old_services != new_services:
-                await self.plugin_service_host.swap_plugin_services(
-                    plugin_id,
-                    old_services,
-                    new_services,
-                )
-                services_switched = True
-            if old_commands != new_commands:
-                await self.channel_host.swap_command_catalog(
-                    old_commands,
-                    new_commands,
-                )
-                commands_switched = True
-        except BaseException as error:
-            command_restore_error: BaseException | None = None
-            if commands_switched:
-                try:
-                    await self.channel_host.swap_command_catalog(
-                        new_commands,
-                        old_commands,
-                    )
-                except BaseException as restore_error:
-                    command_restore_error = restore_error
-            service_restore_error: BaseException | None = None
-            if services_switched:
-                try:
-                    await self.plugin_service_host.swap_plugin_services(
-                        plugin_id,
-                        new_services,
-                        old_services,
-                    )
-                except BaseException as restore_error:
-                    service_restore_error = restore_error
-            if (
-                command_restore_error is not None
-                or service_restore_error is not None
-            ):
-                details: list[str] = []
-                if command_restore_error is not None:
-                    details.append(f"command catalog: {command_restore_error}")
-                if service_restore_error is not None:
-                    details.append(f"managed service: {service_restore_error}")
-                raise RuntimeError(
-                    "插件旧端点恢复失败: " + "; ".join(details)
-                ) from error
-            raise
+        del plugin_id
+        if old_services or new_services or old_channels or new_channels:
+            raise RuntimeError("v3 endpoint transaction 不接受 legacy endpoint")
+        if old_commands != new_commands:
+            await self.channel_host.swap_command_catalog(
+                old_commands,
+                new_commands,
+            )
 
 
 def build_app_runtime(
