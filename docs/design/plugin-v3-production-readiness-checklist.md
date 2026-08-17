@@ -173,7 +173,7 @@ Gate 报告。分支名、PR 号和浮动 ref 不能代替 commit。
 | Observe | Dashboard、mobile、committed event observers | C02/C17 | `CANDIDATE` | plugin `bac337f` 已完成 pure-v3 typed committed observers、generation-owned workspace、Dashboard/Mobile exact binding、candidate discard/formal rebuild 与全局错误 hook 逆序清理；按插件 CI 入口复跑 15 tests 通过，独立实现复审无 P0/P1。待 E1 exact lock 与复制 workspace write-set Gate |
 | Setup Helper | command | C11 | `CANDIDATE` | Core `78e50d4d` + plugin `65770db`；`/chatid` 与 `/myid` 走 committed registry，在 Session/模型 admission 前短路，installed candidate→formal 晋升与 Root/validation cleanup 已通过，待 E3 |
 | Status Commands | mobile、command、只读 Session projection | C11/C17/C24 | `CANDIDATE` | Core `cb2011b4` + plugin `eb245ad`；真实 Manager command/Mobile/ledger oracle 通过，待 E3 复制 workspace |
-| Feed MCP | Skill、MCP、proactive source | C09/C12/C15 | `CANDIDATE` | Core `78e50d4d` + plugin `b4a8626`；真实 Manager/stdio、exact source lease、typed empty fetch、candidate data 排除、进程内回滚与进程崩溃后重启迁移均通过，待 E2/E3 |
+| Feed MCP | Skill、MCP、proactive source | C09/C12/C15 | `CANDIDATE` | Core `78e50d4d` + plugin `29919dc`；在 `b4a8626` 行为迁移上补齐 SQLite 首次 WAL 并发初始化，真实 Manager/stdio、exact source lease、typed empty fetch、candidate data 排除、进程内回滚与进程崩溃后重启迁移均通过，待 E2/E3 |
 | Feishu | channel | C14 | `CANDIDATE` | plugin `fc2b4ba` 已完成 pure-v3 exact channel binding、credential redaction、provider identity、reply-aware inbound、control、preview/final 与 cleanup；多行/reply `/stop` P1 已闭合，25 个 Feishu/真实 Manager tests、Pyright/contract/compileall/diff-check 与独立复审通过，待 E3 recording adapter 与受控 Feishu provider Gate |
 | Fitbit MCP | MCP、managed process、proactive source、mobile | C12/C13/C15/C17 | `CANDIDATE` | Core `78e50d4d` + plugin `f3fd6ee`；真实 formal monitor/MCP 与 candidate recording route 已验证只读 typed empty、写工具拒绝、exact Root 重建、敏感数据排除、显式 v2 数据迁移的进程内回滚与 Core 进程崩溃后重启恢复；40 个 Python、12 个面板测试、contract、Pyright、compileall、diff-check 与独立 review 通过，待 E2/E3 |
 | Steam MCP | Skill、MCP、proactive source | C09/C12/C15 | `CANDIDATE` | Core `78e50d4d` + plugin `2c492d7`；真实 stdio formal/candidate→promote、recording 零凭证/网络/DB、exact proactive catalog、显式 v2 数据迁移与 cleanup 已通过，待 E2/E3 |
@@ -216,13 +216,13 @@ GitHub Watcher 只以上述 canonical source exact head 进入最终 fleet lock�
 | 批次 | 对象 | 状态 |
 |---|---|---|
 | A | Default Memory legacy data name | `CANDIDATE`（Core `3f25f767` 已删除正式/candidate 对 `workspace/observe/recall_inspector.jsonl` 的读取与 hard-link；旧文件不删除，exact generation data root 与 discard write-set 由 51 个定向回归锁定，待 E1/E4） |
-| B | legacy assistant metadata slots | `OPEN` |
-| C | legacy Dashboard ABI | `OPEN` |
-| D | ToolHook ABI、catalog 与 traces | `OPEN` |
+| B | legacy assistant metadata slots | `CANDIDATE`（Core `695f35ac` 已删除 legacy assistant metadata slot 出口，待 E1/E4） |
+| C | legacy Dashboard ABI | `CANDIDATE`（Core `92ac1713` 已删除 v2 backend/import 路径，待 E1/E3/E4） |
+| D | ToolHook ABI、catalog 与 traces | `IMPLEMENTED`（Core `586eceaa` 已删除 Manager publication；普通 loop/subagent 与私有 proactive 内部 executor 夹层仍待物理删除） |
 | E | v2 static-active / stable-health exception | `OPEN` |
 | F | `PluginContext` | `OPEN` |
-| G | v2 doctor / class discovery | `OPEN` |
-| H | `Plugin` base、registry、Manager 固定能力方法 | `OPEN` |
+| G | v2 doctor / class discovery | `IMPLEMENTED`（Core `2228f26b` 已让 doctor 只接受 v3 namespace；Manager/install class discovery 待删除） |
+| H | `Plugin` base、registry、Manager 固定能力方法 | `IMPLEMENTED`（Core `28fc562e` 已删除 Manager 对外 proactive 列表；base/registry 与其他固定贡献待删除） |
 | I | RuntimeSnapshot v2 固定字段 | `OPEN` |
 | J | v2 lock、Gate 和 runtime 双路径 | `OPEN` |
 
