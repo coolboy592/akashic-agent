@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 import subprocess
-import sys
 import tomllib
 from pathlib import Path
 
@@ -42,20 +41,9 @@ def test_plugins_root_rejects_blank_environment(
         plugins_root()
 
 
-def test_install_git_plugin_uses_programmatic_declaration(tmp_path: Path) -> None:
+def test_install_git_plugin_uses_static_v3_manifest(tmp_path: Path) -> None:
     repo = tmp_path / "feed-mcp"
-    repo.mkdir()
-    (repo / "plugin.py").write_text(
-        "from agent.plugins import Plugin\n"
-        "class FeedPlugin(Plugin):\n"
-        "    name = 'feed'\n"
-        "    version = '1.0.0'\n"
-        "    @classmethod\n"
-        "    def skill_roots(cls): return ('skills',)\n",
-        encoding="utf-8",
-    )
-    (repo / "skills" / "feed-manage").mkdir(parents=True)
-    (repo / "skills" / "feed-manage" / "SKILL.md").write_text("skill", encoding="utf-8")
+    _write_v3_plugin(repo, name="feed")
     _commit(repo)
 
     home = tmp_path / "plugins-home"
@@ -82,21 +70,23 @@ def test_install_git_plugin_uses_programmatic_declaration(tmp_path: Path) -> Non
     assert not (pointer_state.parent / ".stable.json").exists()
     assert not (pointer_state.parent / ".latest.json").exists()
     assert (result.installed_path / "plugin.py").exists()
+    installed_manifest = result.installed_path / "akashic.plugin.toml"
+    assert installed_manifest.is_file()
+    assert (
+        tomllib.loads(installed_manifest.read_text(encoding="utf-8"))["name"] == "feed"
+    )
     assert (result.data_path / "state.json").exists()
     manifest = tomllib.loads((home / "manifest.toml").read_text(encoding="utf-8"))
     assert manifest == {"plugins": {"feed@lab": {"enabled": True}}}
 
 
-def test_install_git_plugin_accepts_v3_namespace_declaration(tmp_path: Path) -> None:
+def test_install_git_plugin_reads_static_v3_manifest(tmp_path: Path) -> None:
     repo = tmp_path / "citation"
-    repo.mkdir()
-    (repo / "plugin.py").write_text(
-        "api_version = 3\n"
-        "name = 'citation'\n"
-        "version = '2.0.0'\n"
-        "def apply(ctx, config):\n"
-        "    return None\n",
-        encoding="utf-8",
+    _write_v3_plugin(
+        repo,
+        name="citation",
+        version="2.0.0",
+        module_source="raise RuntimeError('must not import during install')\n",
     )
     _commit(repo)
 
@@ -110,6 +100,7 @@ def test_install_git_plugin_accepts_v3_namespace_declaration(tmp_path: Path) -> 
     assert result.plugin_name == "citation"
     assert result.plugin_version == "2.0.0"
     assert (result.installed_path / "plugin.py").is_file()
+    assert (result.installed_path / "akashic.plugin.toml").is_file()
 
 
 def test_install_git_plugin_prepares_declared_mcp_runtime(
@@ -120,14 +111,17 @@ def test_install_git_plugin_prepares_declared_mcp_runtime(
     (repo / "mcp").mkdir(parents=True)
     (repo / "mcp" / "run_mcp.py").write_text("print('ok')\n", encoding="utf-8")
     (repo / "mcp" / "requirements.txt").write_text("requests\n", encoding="utf-8")
-    (repo / "plugin.py").write_text(
-        "from agent.plugins import McpServerSpec, Plugin\n"
-        "class FeedPlugin(Plugin):\n"
-        "    name = 'feed'\n"
-        "    version = '1.0.0'\n"
-        "    @classmethod\n"
-        "    def mcp_servers(cls):\n"
-        "        return [McpServerSpec(name='feed', command=('python', 'mcp/run_mcp.py'))]\n",
+    _write_v3_plugin(repo, name="feed")
+    (repo / "akashic.plugin.toml").write_text(
+        (repo / "akashic.plugin.toml").read_text(encoding="utf-8")
+        + "\n"
+        + "[[python]]\n"
+        + 'requirements = "mcp/requirements.txt"\n'
+        + "\n"
+        + "[[mcp]]\n"
+        + 'name = "feed"\n'
+        + 'command = ["python", "mcp/run_mcp.py"]\n'
+        + 'cwd = "mcp"\n',
         encoding="utf-8",
     )
     _commit(repo)
@@ -148,7 +142,10 @@ def test_install_git_plugin_prepares_declared_mcp_runtime(
         plugins_home=tmp_path / "plugins-home",
     )
 
-    assert [label for label, _ in calls] == ["feed venv", "feed pip install"]
+    assert [label for label, _ in calls] == [
+        "feed python[0] venv",
+        "feed python[0] pip install",
+    ]
     assert all(
         cwd.name == "mcp"
         and cwd.is_relative_to(result.installed_path.parents[2])
@@ -163,9 +160,8 @@ def test_plugin_enable_disable_and_uninstall_preserve_data(tmp_path: Path) -> No
     workspace = tmp_path / "workspace"
     cache = home / "cache" / "github" / "fitbit" / "1.0.0"
     data = workspace / "plugin-data" / "fitbit-github"
-    cache.mkdir(parents=True)
+    _write_v3_plugin(cache, name="fitbit")
     data.mkdir(parents=True)
-    (cache / "plugin.py").write_text("", encoding="utf-8")
     state = data / "sleep-model.bin"
     state.write_bytes(b"model")
     (home / "manifest.toml").write_text(
@@ -244,16 +240,8 @@ def test_install_failure_restores_previous_cache_and_manifest(
     monkeypatch,
 ) -> None:
     repo = tmp_path / "feed"
-    repo.mkdir()
     plugin_path = repo / "plugin.py"
-    plugin_path.write_text(
-        "from agent.plugins import Plugin\n"
-        "class FeedPlugin(Plugin):\n"
-        "    name = 'feed'\n"
-        "    version = '1.0.0'\n"
-        "    marker = 'old'\n",
-        encoding="utf-8",
-    )
+    _write_v3_plugin(repo, name="feed", marker="old")
     _commit(repo)
     home = tmp_path / "plugins-home"
     first = install_git_plugin(
@@ -270,7 +258,7 @@ def test_install_failure_restores_previous_cache_and_manifest(
     )
     _commit(repo)
 
-    def fail_prepare(plugin_root: Path, servers) -> None:
+    def fail_prepare(plugin_root: Path, static_manifest: object) -> None:
         resolved = resolve_plugin_sources(
             [],
             installed_cache_root=home / "cache",
@@ -282,7 +270,7 @@ def test_install_failure_restores_previous_cache_and_manifest(
         ) == old_content
         raise RuntimeError(f"prepare failed: {plugin_root}")
 
-    monkeypatch.setattr(install_module, "_prepare_plugin_mcp_runtimes", fail_prepare)
+    monkeypatch.setattr(install_module, "_prepare_static_python_runtimes", fail_prepare)
     with pytest.raises(RuntimeError, match="prepare failed"):
         install_git_plugin(
             workspace=tmp_path / "workspace",
@@ -324,14 +312,7 @@ def test_install_failure_restores_previous_cache_and_manifest(
 
 def test_install_rejects_unsafe_path_metadata(tmp_path: Path) -> None:
     repo = tmp_path / "feed"
-    repo.mkdir()
-    (repo / "plugin.py").write_text(
-        "from agent.plugins import Plugin\n"
-        "class FeedPlugin(Plugin):\n"
-        "    name = '../outside'\n"
-        "    version = '1.0.0'\n",
-        encoding="utf-8",
-    )
+    _write_v3_plugin(repo, name="../outside")
     _commit(repo)
 
     with pytest.raises(ValueError, match="安全的单一路径段"):
@@ -342,7 +323,7 @@ def test_install_rejects_unsafe_path_metadata(tmp_path: Path) -> None:
             plugins_home=tmp_path / "plugins-home",
         )
 
-    with pytest.raises(ValueError, match="安全的单一路径段"):
+    with pytest.raises(ValueError, match="静态 manifest name 无效"):
         install_git_plugin(
             workspace=tmp_path / "workspace",
             source=str(repo),
@@ -353,16 +334,8 @@ def test_install_rejects_unsafe_path_metadata(tmp_path: Path) -> None:
 
 def test_install_can_stage_one_latest_without_changing_stable(tmp_path: Path) -> None:
     repo = tmp_path / "feed"
-    repo.mkdir()
     plugin_path = repo / "plugin.py"
-    plugin_path.write_text(
-        "from agent.plugins import Plugin\n"
-        "class FeedPlugin(Plugin):\n"
-        "    name = 'feed'\n"
-        "    version = '1.0.0'\n"
-        "    marker = 'stable'\n",
-        encoding="utf-8",
-    )
+    _write_v3_plugin(repo, name="feed", marker="stable")
     _commit(repo)
     home = tmp_path / "plugins-home"
     first = install_git_plugin(
@@ -408,14 +381,7 @@ def test_install_can_stage_one_latest_without_changing_stable(tmp_path: Path) ->
 
 def test_first_staged_install_has_no_stable_until_promotion(tmp_path: Path) -> None:
     repo = tmp_path / "feed"
-    repo.mkdir()
-    (repo / "plugin.py").write_text(
-        "from agent.plugins import Plugin\n"
-        "class FeedPlugin(Plugin):\n"
-        "    name = 'feed'\n"
-        "    version = '1.0.0'\n",
-        encoding="utf-8",
-    )
+    _write_v3_plugin(repo, name="feed")
     _commit(repo)
     home = tmp_path / "plugins-home"
 
@@ -458,16 +424,8 @@ def test_first_staged_install_has_no_stable_until_promotion(tmp_path: Path) -> N
 
 def test_default_update_keeps_immediate_stable_compatibility(tmp_path: Path) -> None:
     repo = tmp_path / "feed"
-    repo.mkdir()
     plugin_path = repo / "plugin.py"
-    plugin_path.write_text(
-        "from agent.plugins import Plugin\n"
-        "class FeedPlugin(Plugin):\n"
-        "    name = 'feed'\n"
-        "    version = '1.0.0'\n"
-        "    marker = 'v1'\n",
-        encoding="utf-8",
-    )
+    _write_v3_plugin(repo, name="feed", marker="v1")
     _commit(repo)
     home = tmp_path / "plugins-home"
     first = install_git_plugin(
@@ -497,14 +455,7 @@ def test_default_update_keeps_immediate_stable_compatibility(tmp_path: Path) -> 
 
 def test_install_rejects_visible_nonversion_cache_entry(tmp_path: Path) -> None:
     repo = tmp_path / "feed"
-    repo.mkdir()
-    (repo / "plugin.py").write_text(
-        "from agent.plugins import Plugin\n"
-        "class FeedPlugin(Plugin):\n"
-        "    name = 'feed'\n"
-        "    version = '1.0.0'\n",
-        encoding="utf-8",
-    )
+    _write_v3_plugin(repo, name="feed")
     _commit(repo)
     home = tmp_path / "plugins-home"
     invalid_entry = home / "cache" / "lab" / "feed" / "unexpected.txt"
@@ -525,16 +476,9 @@ def test_install_rejects_visible_nonversion_cache_entry(tmp_path: Path) -> None:
 
 def test_install_allows_internal_source_symlink(tmp_path: Path) -> None:
     repo = tmp_path / "feed"
-    repo.mkdir()
+    _write_v3_plugin(repo, name="feed")
     (repo / "helper.py").write_text("MARKER = 'inside'\n", encoding="utf-8")
     (repo / "linked_helper.py").symlink_to("helper.py")
-    (repo / "plugin.py").write_text(
-        "from agent.plugins import Plugin\n"
-        "class FeedPlugin(Plugin):\n"
-        "    name = 'feed'\n"
-        "    version = '1.0.0'\n",
-        encoding="utf-8",
-    )
     _commit(repo)
 
     result = install_git_plugin(
@@ -551,17 +495,10 @@ def test_install_allows_internal_source_symlink(tmp_path: Path) -> None:
 
 def test_install_rejects_source_symlink_escape(tmp_path: Path) -> None:
     repo = tmp_path / "feed"
-    repo.mkdir()
     outside = tmp_path / "outside.py"
     outside.write_text("MARKER = 'outside'\n", encoding="utf-8")
+    _write_v3_plugin(repo, name="feed")
     (repo / "linked_helper.py").symlink_to(outside)
-    (repo / "plugin.py").write_text(
-        "from agent.plugins import Plugin\n"
-        "class FeedPlugin(Plugin):\n"
-        "    name = 'feed'\n"
-        "    version = '1.0.0'\n",
-        encoding="utf-8",
-    )
     _commit(repo)
 
     with pytest.raises(ValueError, match="符号链接越界"):
@@ -573,47 +510,10 @@ def test_install_rejects_source_symlink_escape(tmp_path: Path) -> None:
         )
 
 
-def test_plugin_probe_cleans_imported_submodules(tmp_path: Path) -> None:
-    (tmp_path / "helper.py").write_text("MARKER = 'ok'\n", encoding="utf-8")
-    (tmp_path / "plugin.py").write_text(
-        "from .helper import MARKER\n"
-        "from agent.plugins import Plugin\n"
-        "class FeedPlugin(Plugin):\n"
-        "    name = 'feed'\n"
-        "    version = '1.0.0'\n"
-        "    marker = MARKER\n",
-        encoding="utf-8",
-    )
-
-    _ = install_module._load_plugin_class(tmp_path)
-
-    assert not any(name.startswith("akasic_plugin_install_") for name in sys.modules)
-
-
-def test_mcp_runtime_path_cannot_escape_plugin_root(tmp_path: Path) -> None:
-    plugin_root = tmp_path / "plugin"
-    plugin_root.mkdir()
-
-    with pytest.raises(ValueError, match="MCP cwd 越界"):
-        install_module._resolve_mcp_runtime_root(
-            plugin_root,
-            "../outside",
-            ["python", "mcp/run_mcp.py"],
-        )
-
-
 def test_install_accepts_branch_tag_and_commit_refs(tmp_path: Path) -> None:
     repo = tmp_path / "feed"
-    repo.mkdir()
     plugin_path = repo / "plugin.py"
-    plugin_path.write_text(
-        "from agent.plugins import Plugin\n"
-        "class FeedPlugin(Plugin):\n"
-        "    name = 'feed'\n"
-        "    version = '1.0.0'\n"
-        "    marker = 'initial'\n",
-        encoding="utf-8",
-    )
+    _write_v3_plugin(repo, name="feed", marker="initial")
     _commit(repo)
     initial_sha = _git_output(repo, "rev-parse", "HEAD")
     _git(repo, "branch", "release")
@@ -683,6 +583,40 @@ def test_uninstall_converges_when_cache_is_already_missing(tmp_path: Path) -> No
     assert tomllib.loads((home / "manifest.toml").read_text(encoding="utf-8")) == {
         "plugins": {}
     }
+
+
+def _write_v3_plugin(
+    root: Path,
+    *,
+    name: str,
+    version: str = "1.0.0",
+    marker: str | None = None,
+    module_source: str | None = None,
+) -> None:
+    """Create a static v3 artifact fixture with a matching entrypoint."""
+
+    # 1. Write an import-free entrypoint whose optional marker tracks source refs.
+    root.mkdir(parents=True, exist_ok=True)
+    if module_source is None:
+        lines = [
+            "api_version = 3",
+            f"name = {name!r}",
+            f"version = {version!r}",
+        ]
+        if marker is not None:
+            lines.append(f"marker = {marker!r}")
+        module_source = "\n".join(lines) + "\n"
+    (root / "plugin.py").write_text(module_source, encoding="utf-8")
+
+    # 2. Write the immutable static identity consumed by the installer.
+    (root / "akashic.plugin.toml").write_text(
+        "schema_version = 1\n"
+        f"name = {name!r}\n"
+        f"version = {version!r}\n"
+        "api_version = 3\n"
+        'entrypoint = "plugin.py"\n',
+        encoding="utf-8",
+    )
 
 
 def _commit(repo: Path) -> None:
