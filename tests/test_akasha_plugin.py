@@ -72,6 +72,11 @@ from plugins.akasha.infrastructure.sparse_index import (
     audit_source_embeddings,
     build_sparse_index,
 )
+from plugins.akasha.infrastructure.sparse_index.schema import (
+    INDEX_VERSION,
+    SCHEMA,
+    TOOL_CHAIN_PROJECTION_VERSION,
+)
 from plugins.akasha.memory_plugin import MemoryPlugin
 from plugins.akasha import plugin as akasha_plugin
 from plugins.akasha.plugin import (
@@ -3000,6 +3005,41 @@ def test_inspector_overview_is_empty_before_first_akasha_commit(tmp_path: Path) 
     assert reader.get_turn("missing") is None
     assert reader.for_assistant_message("fresh:empty", "missing") is None
     assert all(not path.exists() for path in sidecars)
+
+
+def test_inspector_accepts_valid_empty_sparse_projection_without_memory(
+    tmp_path: Path,
+) -> None:
+    _write_inspector_config(tmp_path)
+    reader = AkashaInspectorReader(
+        memory_root=tmp_path / "memory",
+        config=load_akasha_config(
+            builtin_plugin_data_dir("akasha", tmp_path) / "config.local.toml"
+        ),
+    )
+    reader.paths.index.parent.mkdir(parents=True, exist_ok=True)
+    with closing(sqlite3.connect(reader.paths.index)) as connection:
+        connection.executescript(SCHEMA)
+        connection.executemany(
+            "INSERT INTO metadata(key, value) VALUES (?, ?)",
+            (
+                ("index_version", INDEX_VERSION),
+                ("tool_chain_projection_version", TOOL_CHAIN_PROJECTION_VERSION),
+            ),
+        )
+        connection.commit()
+
+    assert reader.get_overview() == {
+        "available": True,
+        "total": 0,
+        "latest_at": None,
+        "earliest_at": None,
+    }
+    assert reader.list_turns() == ([], 0)
+    assert reader.latest_for_session("fresh:empty") is None
+    assert reader.get_turn("missing") is None
+    assert reader.for_assistant_message("fresh:empty", "missing") is None
+    assert not reader.paths.memory.exists()
 
 
 @pytest.mark.parametrize("present", ("memory", "index"))

@@ -77,9 +77,43 @@ class AkashaInspectorReader:
         self._dense_snapshot: _DenseSnapshot | None = None
 
     def _is_fresh_empty(self) -> bool:
-        """Return whether neither derived sidecar exists yet."""
+        """Return whether no learned state exists yet, allowing a valid empty index."""
 
-        return not self.paths.memory.exists() and not self.paths.index.exists()
+        if self.paths.memory.exists():
+            return False
+        if not self.paths.index.exists():
+            return True
+
+        # 1. Recognize the empty sparse projection emitted for a fresh session DB.
+        with closing(
+            sqlite3.connect(
+                f"file:{self.paths.index}?mode=ro",
+                uri=True,
+            )
+        ) as connection:
+            row = connection.execute(
+                "SELECT value FROM metadata WHERE key='index_version'"
+            ).fetchone()
+            if row is None or str(row[0]) != INDEX_VERSION:
+                return False
+            projection = connection.execute(
+                "SELECT value FROM metadata "
+                "WHERE key='tool_chain_projection_version'"
+            ).fetchone()
+            if projection is None or str(projection[0]) != (
+                TOOL_CHAIN_PROJECTION_VERSION
+            ):
+                return False
+            columns = {
+                str(item[1])
+                for item in connection.execute("PRAGMA table_info(sparse_turns)")
+            }
+            if "assistant_tool_chain_json" not in columns:
+                return False
+            count = connection.execute(
+                "SELECT COUNT(*) FROM sparse_turns"
+            ).fetchone()
+            return count is not None and int(count[0]) == 0
 
     def get_overview(self) -> dict[str, object]:
         """Return the number and time range of committed retrieval events."""
