@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import sys
 
 import pytest
 
@@ -30,7 +31,22 @@ def _clean_registry():
 def _plugin_dir(root: Path, name: str = "calendar") -> Path:
     plugin_dir = root / name
     plugin_dir.mkdir(parents=True)
-    (plugin_dir / "api.py").write_text("print('api')\n", encoding="utf-8")
+    (plugin_dir / "api.py").write_text(
+        "import http.server\n"
+        "import os\n"
+        "class Handler(http.server.BaseHTTPRequestHandler):\n"
+        "    def do_GET(self):\n"
+        "        self.send_response(200)\n"
+        "        self.end_headers()\n"
+        "    def log_message(self, format, *args):\n"
+        "        pass\n"
+        "server = http.server.ThreadingHTTPServer(\n"
+        "    ('127.0.0.1', int(os.environ['PORT'])),\n"
+        "    Handler,\n"
+        ")\n"
+        "server.serve_forever()\n",
+        encoding="utf-8",
+    )
     return plugin_dir
 
 
@@ -269,8 +285,38 @@ def _source(version: str) -> str:
 
 def _write_plugin(tmp_path: Path, version: str) -> Path:
     plugin_dir = _plugin_dir(tmp_path / "plugins")
-    (plugin_dir / "plugin.py").write_text(_source(version), encoding="utf-8")
+    _write_plugin_version(plugin_dir, version)
+    requirements = plugin_dir / "requirements.txt"
+    requirements.write_text("", encoding="utf-8")
+    interpreter = plugin_dir / ".venv" / "bin" / "python"
+    interpreter.parent.mkdir(parents=True)
+    interpreter.write_text(
+        f"#!/bin/sh\nexec {sys.executable} \"$@\"\n",
+        encoding="utf-8",
+    )
+    interpreter.chmod(0o755)
     return plugin_dir
+
+
+def _write_plugin_version(plugin_dir: Path, version: str) -> None:
+    (plugin_dir / "plugin.py").write_text(_source(version), encoding="utf-8")
+    (plugin_dir / "akashic.plugin.toml").write_text(
+        "schema_version = 1\n"
+        'name = "calendar"\n'
+        f'version = "{version}"\n'
+        "api_version = 3\n"
+        'entrypoint = "plugin.py"\n\n'
+        "[[python]]\n"
+        'requirements = "requirements.txt"\n\n'
+        "[[process]]\n"
+        'name = "calendar_api"\n'
+        'command = ["python", "api.py"]\n'
+        f'env = {{VERSION = "{version}"}}\n'
+        'port_env = "PORT"\n'
+        "formal_port = 18000\n"
+        'readiness_path = "/health"\n',
+        encoding="utf-8",
+    )
 
 
 @pytest.mark.asyncio
@@ -285,7 +331,7 @@ async def test_manager_keeps_process_registry_private_and_rebuilds_formal(
     stable_registry = stable.managed_process_registry
     assert stable_registry["calendar_api"].definition.env["VERSION"] == "1"
 
-    (plugin_dir / "plugin.py").write_text(_source("2"), encoding="utf-8")
+    _write_plugin_version(plugin_dir, "2")
     candidate = await manager.prepare_candidate("calendar")
     assert candidate is not None and candidate.runtime_snapshot is not None
     candidate_registry = candidate.runtime_snapshot.managed_process_registry
@@ -316,7 +362,7 @@ async def test_manager_rejects_process_registry_from_another_root(
     assert stable is not None and stable.managed_process_registry is not None
     stable_registry = stable.managed_process_registry
 
-    (plugin_dir / "plugin.py").write_text(_source("2"), encoding="utf-8")
+    _write_plugin_version(plugin_dir, "2")
     candidate = await manager.prepare_candidate("calendar")
     assert candidate is not None and candidate.runtime_snapshot is not None
 

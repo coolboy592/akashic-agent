@@ -441,6 +441,24 @@ async def test_installed_default_memory_candidate_preserves_static_projection(
         ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
     )
     shutil.copytree(stable_root, latest_root)
+    stable_manifest = stable_root / "akashic.plugin.toml"
+    stable_manifest.write_text(
+        "schema_version = 1\n"
+        'name = "default_memory"\n'
+        'version = "3.0.0"\n'
+        "api_version = 3\n"
+        'entrypoint = "plugin.py"\n',
+        encoding="utf-8",
+    )
+    latest_manifest = latest_root / "akashic.plugin.toml"
+    latest_manifest.write_text(
+        stable_manifest.read_text(encoding="utf-8").replace(
+            'version = "3.0.0"',
+            'version = "3.0.1"',
+            1,
+        ),
+        encoding="utf-8",
+    )
     latest_plugin = latest_root / "plugin.py"
     latest_plugin.write_text(
         latest_plugin.read_text(encoding="utf-8").replace(
