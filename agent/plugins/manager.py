@@ -2133,8 +2133,6 @@ class PluginManager:
     ) -> None:
         """完成插件终止、作用域清理和注册表卸载。"""
 
-        from agent.plugins.context import allow_plugin_cleanup_writes
-
         # 1. Host 必须在 exact Root/Health observer 仍存活时先回收进程。
         externally_cancelled = False
         if not skip_composition_runtime:
@@ -2156,35 +2154,10 @@ class PluginManager:
                 generation.runtime_snapshot
             )
 
-        # 3. 终止 lifecycle v2 对象，并在调用方取消后继续完成它
-        if generation.prepare_started:
-            terminator = getattr(generation.instance, "terminate", None)
-            if callable(terminator):
-                try:
-                    with allow_plugin_cleanup_writes(generation.generation_id):
-                        _, terminator_cancelled = await _complete_critical(
-                            cast(Callable[[], Awaitable[None]], terminator)()
-                        )
-                    externally_cancelled = (
-                        externally_cancelled or terminator_cancelled
-                    )
-                except (asyncio.CancelledError, Exception) as error:
-                    current = asyncio.current_task()
-                    externally_cancelled = (
-                        current is not None and current.cancelling() > 0
-                    )
-                    self._cleanup_failures.append(
-                        CleanupFailure(
-                            resource=f"plugin:{generation.plugin_id}:terminate",
-                            error=str(error) or type(error).__name__,
-                        )
-                    )
-
-        # 4. 收集作用域失败，确保外部取消不会截断资源清理
-        with allow_plugin_cleanup_writes(generation.generation_id):
-            cleanup_failures, cleanup_cancelled = await _complete_critical(
-                generation.scope.aclose()
-            )
+        # 3. 收集作用域失败，确保外部取消不会截断资源清理。
+        cleanup_failures, cleanup_cancelled = await _complete_critical(
+            generation.scope.aclose()
+        )
         self._cleanup_failures.extend(cleanup_failures)
         externally_cancelled = externally_cancelled or cleanup_cancelled
         if (
@@ -2198,7 +2171,7 @@ class PluginManager:
                 formal_effects=("generation_runtime_cleanup_pending",),
             )
 
-        # 5. 清理注册表和模块树
+        # 4. 清理注册表和模块树。
         _ = self._scopes.pop(generation.module_path, None)
         self._loaded.discard(generation.module_path)
         _ = self._active_plugins.pop(generation.module_path, None)
@@ -5039,7 +5012,6 @@ class PluginManager:
         try:
             self._import_plugin(mp, Path(module_path))
         except Exception as error:
-            logger.warning("插件 %s 导入失败: %s", mod["name"], error)
             error_text = str(error) or type(error).__name__
             self._record_failed_gate(
                 plugin_id=initial_plugin_id,
@@ -5051,7 +5023,9 @@ class PluginManager:
                 reload_tx_id,
                 error=f"import: {error_text}",
             )
-            return None
+            raise RuntimeError(
+                f"插件 {initial_plugin_id} 导入失败: {error_text}"
+            ) from error
         loaded_module = sys.modules.get(mp)
         if static_manifest is not None:
             try:
@@ -6718,8 +6692,6 @@ class PluginManager:
     async def terminate_all(self) -> None:
         """完成快照、插件生命周期和作用域资源的全量关闭。"""
 
-        from agent.plugins.context import allow_plugin_cleanup_writes
-
         # 1. 先收束正式 Channel owner，再允许对应插件 Root 进入 drain。
         externally_cancelled = False
         channel_runtime = self._active_channel_generation
@@ -6789,11 +6761,7 @@ class PluginManager:
                     if active_info is None
                     else self._active_generations.get(active_info.plugin_id)
                 )
-                writer_id = "" if generation is None else generation.generation_id
-                with allow_plugin_cleanup_writes(writer_id):
-                    cleanup_failures, cancelled = await _complete_critical(
-                        scope.aclose()
-                    )
+                cleanup_failures, cancelled = await _complete_critical(scope.aclose())
                 self._cleanup_failures.extend(cleanup_failures)
                 externally_cancelled = externally_cancelled or cancelled
 

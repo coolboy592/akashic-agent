@@ -53,12 +53,8 @@ from session.store import SessionStore
 
 @pytest.fixture(autouse=True)
 def _clean_registry():
-    plugin_registry._handlers._handlers.clear()
-    plugin_registry._classes.clear()
     plugin_registry._instances.clear()
     yield
-    plugin_registry._handlers._handlers.clear()
-    plugin_registry._classes.clear()
     plugin_registry._instances.clear()
 
 
@@ -143,7 +139,7 @@ async def test_builtin_v2_plugin_fails_without_generation_or_data(
     manager = _manager(tmp_path)
 
     # 2. v2 namespace 必须 fail-loud，且不留下正式 data 或 registry owner。
-    with pytest.raises(RuntimeError, match="只接受 api_version = 3"):
+    with pytest.raises(RuntimeError, match="legacy_probe 导入失败"):
         await manager.load_all()
     assert manager.current_snapshot is None
     assert manager.generation("legacy_probe") is None
@@ -153,10 +149,7 @@ async def test_builtin_v2_plugin_fails_without_generation_or_data(
         / "plugin-data"
         / "legacy_probe-builtin"
     ).exists()
-    assert not any(
-        module_path.startswith("akasic_plugin_")
-        for module_path in plugin_registry._classes
-    )
+    assert not plugin_registry._instances
     assert plugin_dir.exists()
 
 
