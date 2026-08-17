@@ -122,12 +122,12 @@ Gate 报告。分支名、PR 号和浮动 ref 不能代替 commit。
 | C18 | Core-private v3 generation metadata | `CANDIDATE` | `2d9fb408` 已通过独立 review；v3 stable load、candidate clone 与 formal rebuild 不再构造或读取 `PluginContext`，59 loader + 208 Manager/hot-reload 回归通过 | Core |
 | C19 | full-fleet Health/Incident/Topology inspection | `CANDIDATE` | stable lease 按插件投影 current Fiber/Health、累计与 bounded Incident、Topology；mixed active/inactive v3 + v2 inspection 与 kernel/protocol 回归通过，独立 review 的 inactive projection P1 已关闭 | 全量 runtime |
 | C20 | Proactive 私有兼容岛 | `CANDIDATE` | Core `1968e503` 已把 Default/Wake 六个内建 module 收进 Core-private catalog/Host；跨 publication tx reload/rollback、lexical symlink admission 与 kernel start failure 的 exact ownership 已闭合。独立复审无 P0/P1，主任务复跑 4 个关键 mutant，累计 private/Manager/hot-reload/ActivityHost 回归与 Pyright 0 通过，待 E3 fixed-clock/recording Gate | Default/Wake Proactive |
-| C21 | generation-scoped background job / LLM capability | `CANDIDATE` | Core `de08b698` + `467a4c93` 已完成 committed catalog、trigger/interval、exact LLM lease、cancel/drain、Emotion domain receipt 与 paired-document recovery；Emotion `d3a4c8c` 又把 `emotion_state`、projection 与 durable domain receipt 收进同一 SQLite transaction，并以真实 Manager 覆盖 precommit rollback、commit 后取消重入和 Core 进程崩溃重入。Core/插件定向回归、Pyright/contract/compileall/diff-check 通过，待 E1/E3 | Emotion |
+| C21 | generation-scoped background job / LLM capability | `CANDIDATE` | Core `de08b698` + `467a4c93` 已完成 committed catalog、trigger/interval、exact LLM lease、cancel/drain、Emotion domain receipt 与 paired-document recovery；Emotion `201ff1e` 把 `emotion_state`、projection 与 durable domain receipt 收进同一 SQLite transaction，去掉 external production 对 `proactive_v2` 的依赖，并以真实 Manager 覆盖 precommit rollback、commit 后取消重入和 Core 进程崩溃重入。Core/插件定向回归、Pyright/contract/compileall/diff-check 通过，待 E1/E3 | Emotion |
 | C22 | static v3 artifact manifest / install staging | `CANDIDATE` | 集成 head `3e1f5c10`（独立复审 head `b6967d13`）已在 import 前校验 identity/runtime/validation、custom entrypoint 与 C12/C13 descriptor，不成功 staging 不创建正式 data/artifact/pointer；Calendar `654d078d` 已由真实 Host 消费 exact staged `.venv/bin/python`，manifest/apply/runtime identity 一致且候选排除 credential/receipt；待全部 external v3 与最终 artifact Gate | Calendar MCP / 全部 external v3 |
 | C23 | Core-owned Channel attachment artifact / Session binding | `CANDIDATE` | `0bd2d928` 已完成 immutable opaque artifact、fixed-ID resumable Mobile import、SessionDB 原子 message binding、exact fd read lease、无自动 GC 与目录/SQLite 可恢复备份；Mobile 114、Bus/lifecycle/Host 124、最终 ownership 聚焦 201 tests、Basedpyright 0，独立 review 无 P0/P1；待 Feishu/QQ 与复制 workspace E3/E4 进入 `READY` | Feishu / QQBot / Core channels |
 | C24 | read-only existing Session projection | `CANDIDATE` | Core `cb2011b4` formal 只经 `get_existing` 返回 detached snapshot，candidate 同名 Service 调用即 fail-loud；Status Commands `eb245ad` 的真实 active compaction ledger 同时驱动 committed command 与 Mobile query，查询前后 `sessions.db*` 摘要不变。Core 38、插件 6、面板 7 tests、Pyright/contract/compileall/diff-check 通过；待 E3 复制 workspace | Status Commands |
 | C25 | explicit interaction undo coordinator | `CANDIDATE` | Core `b58b7905` + Plugin Undo `7b0e4cd` 已通过独立复审：destructive owner、latest interaction/active/pending-compaction fence、SQLite backup、Default Memory durable receipt、Akasha source gate、进程内取消与 Core 重启重放均闭合；`/undo` 已回显可恢复 backup 与强制存在的 compaction cursor receipt。Core 6、插件 Manager 4、既有 Memory/Akasha/SessionStore 回归与 Pyright/contract/compileall/diff-check 通过，待 E1/E3 copied-workspace Gate | Plugin Undo |
-| C26 | exact programmatic Turn / v3 Tool catalog | `CANDIDATE` | Core `7d68020a` + `2f1f304a` 已建立 Root-local Tool catalog、exact generation handler、invocation-scoped programmatic Turn port 与主服务/stdio 启动前 owner binding；整张 candidate snapshot 均不取得 Turn port且不发布 Tool，durable Session 只可由同一 plugin/job 跨 invocation 复用，`submitting/admitted` receipt 与 typed pre-admission/uncertain failure 防止失败、取消及进程崩溃后重复 Turn；post-persist start failure 会把 durable Turn 收束为 failed、释放 active owner 并保留 manual-reconcile receipt。312 个 Manager/hot-reload/runtime/job/tool 回归、BasedPyright/compileall/diff-check 通过，待 GitHub Watcher 迁移与 E3 controlled repository Gate | GitHub Watcher |
+| C26 | exact programmatic Turn / v3 Tool catalog | `CANDIDATE` | Core `7d68020a` + `2f1f304a` 已建立 Root-local Tool catalog、exact generation handler、invocation-scoped programmatic Turn port 与主服务/stdio 启动前 owner binding；整张 candidate snapshot 均不取得 Turn port且不发布 Tool，durable Session 只可由同一 plugin/job 跨 invocation 复用，`submitting/admitted` receipt 与 typed pre-admission/uncertain failure 防止失败、取消及进程崩溃后重复 Turn；post-persist start failure 会把 durable Turn 收束为 failed、释放 active owner 并保留 manual-reconcile receipt。GitHub Watcher `aea802c` 已纯 v3，exact Core Gate 完成初始正式 job 准入 Turn、candidate 零外部效果与晋升后 exact generation job 再准入 Turn；312 个 Core 回归、45 个插件测试、Pyright/compileall/diff-check 通过，待 E3 controlled repository Gate | GitHub Watcher |
 
 实现原则：C11～C17、C21～C22 只由表中的首个真实 consumer 拉动，不提前复制
 `commands()/mcp_servers()/managed_services()/channels()/jobs()/proactive_*()/mobile_ui()` 旧方法。
@@ -163,12 +163,12 @@ Gate 报告。分支名、PR 号和浮动 ref 不能代替 commit。
 | Default Memory | static Memory capability、result observer、Dashboard | `CANDIDATE` | E1 |
 | Calendar MCP | MCP、managed process、proactive source | `CANDIDATE` | E2/E3 |
 
-### 4.2 待迁移 external plugins
+### 4.2 External v3 candidates
 
 | 插件 | 当前 v2 能力 | 依赖 Core seam | 状态 | 最终组合批次 |
 |---|---|---|---|---|
-| Daynight Gate | proactive module / prompt gate | C15 | `CANDIDATE` | plugin `e5adbd2`；真实 Manager/ActivityHost exact lease、配置行为、dispose、contract 与 Pyright 已通过，待 E3 |
-| Emotion | Dashboard、mobile、Drift Skill、proactive module、job/LLM | C09/C15/C17/C21 | `CANDIDATE` | plugin `d3a4c8c`；candidate 不写正式数据，formal exact Root 冻结 UI/Skill/proactive/job，领域写集与 receipt 原子提交；真实 Manager 的进程内失败、取消与 Core 进程崩溃重入通过，待 E1/E3 |
+| Daynight Gate | proactive module / prompt gate | C15 | `CANDIDATE` | plugin `07c2bfe`；external production 已无 `proactive_v2` import，真实 Manager/ActivityHost exact lease、配置行为、dispose、contract 与 Pyright 已通过，待 E3 |
+| Emotion | Dashboard、mobile、Drift Skill、proactive module、job/LLM | C09/C15/C17/C21 | `CANDIDATE` | plugin `201ff1e`；external production 已无 `proactive_v2` import，candidate 不写正式数据，formal exact Root 冻结 UI/Skill/proactive/job，领域写集与 receipt 原子提交；真实 Manager 的进程内失败、取消与 Core 进程崩溃重入通过，待 E1/E3 |
 | Plugin Undo | command、显式 interaction 撤销 | C11/C25 | `CANDIDATE` | Core `b58b7905` + plugin `7b0e4cd` 已把 destructive owner 留在 Core；candidate 调用拒绝、formal `/undo`、backup/事务 fence、Memory/Akasha 恢复与 Core 重启重放均通过，用户响应可直接审阅 backup 与 cursor，待 E1/E3 copied-workspace Gate |
 | Observe | Dashboard、mobile、committed event observers | C02/C17 | `CANDIDATE` | plugin `bac337f` 已完成 pure-v3 typed committed observers、generation-owned workspace、Dashboard/Mobile exact binding、candidate discard/formal rebuild 与全局错误 hook 逆序清理；按插件 CI 入口复跑 15 tests 通过，独立实现复审无 P0/P1。待 E1 exact lock 与复制 workspace write-set Gate |
 | Setup Helper | command | C11 | `CANDIDATE` | Core `78e50d4d` + plugin `65770db`；`/chatid` 与 `/myid` 走 committed registry，在 Session/模型 admission 前短路，installed candidate→formal 晋升与 Root/validation cleanup 已通过，待 E3 |
@@ -202,11 +202,11 @@ dedupe、ack、cursor、hazard 和原数据库协议。
 
 | 项目 | 状态 | 解除阻塞条件 |
 |---|---|---|
-| canonical source 与公开凭据审计 | `CANDIDATE` | canonical repo 已确认为 `kachofugetsu09/github-watch`，候选 `3613956a`；tracked inventory 未发现 PEM/private key 或私有 artifact。最终 lock 仍须固定迁移后的新 head |
-| v3 迁移 | `OPEN` | 现有 `3613956a` 仍引用已移除的 `AGENT_INPUT/PLUGIN_TOOLS/TIMER_SERVICE`；改用 C06/C15 `BACKGROUND_JOBS`，并由首个真实 consumer补齐窄 Turn enqueue 与 v3 Tool catalog，不建立 GitHub 领域 Core Service |
-| 行为 Gate | `BLOCKED` | 当前 v3 适配完成后运行 controlled client + 专用远端测试仓库的只读/受控写 probe，candidate 不读取正式 PEM |
+| canonical source 与公开凭据审计 | `CANDIDATE` | canonical repo 已确认为 `kachofugetsu09/github-watch`，候选 `aea802c3dd37c25e8266bf720988b4661c267ca7`；tracked inventory 未发现 PEM/private key 或私有 artifact，待最终 fleet lock 固定 |
+| v3 迁移 | `CANDIDATE` | 纯 v3 `BACKGROUND_JOBS + TOOL_CATALOG + AFTER_TURN_COMMITTED`；candidate 不读 PEM/不建账本，formal invocation 才取得 programmatic Turn port 与插件数据 |
+| 行为 Gate | `CANDIDATE` | exact Core `00b13940` clean Gate 已证明初始/晋升后正式 job 各准入一个 Turn、candidate 零 external effect、Tool/listener/catalog 与 Root cleanup；待 E3 专用远端测试仓库的只读/受控写 probe |
 
-GitHub Watcher 在 canonical source 未确认前不计入“已完成”，也不允许通过复制 cache 制造候选。
+GitHub Watcher 只以上述 canonical source exact head 进入最终 fleet lock，不允许通过复制 cache 制造候选。
 
 ## 5. v2 删除账本
 
