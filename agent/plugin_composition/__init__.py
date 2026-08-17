@@ -53,6 +53,11 @@ from agent.plugin_composition.runtime_services import (
     MEMORY_RUNTIME,
     MemoryRuntimeInfo,
 )
+from agent.plugin_composition.session_read import (
+    SESSION_READ,
+    SessionReadService,
+    SessionReadSnapshot,
+)
 from agent.plugin_composition.mcp_slots import (
     MCP_SERVERS,
     EndpointEnv,
@@ -237,6 +242,9 @@ __all__ = [
     "ParallelEventKey",
     "QueuedReceipt",
     "RawInbound",
+    "SESSION_READ",
+    "SessionReadService",
+    "SessionReadSnapshot",
     "ServiceKey",
     "ServiceView",
     "SerialEventKey",

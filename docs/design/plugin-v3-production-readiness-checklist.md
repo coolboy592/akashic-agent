@@ -124,6 +124,7 @@ Gate 报告。分支名、PR 号和浮动 ref 不能代替 commit。
 | C21 | generation-scoped background job / LLM capability | `CANDIDATE` | Core `de08b698` + `467a4c93` 已完成 committed catalog、trigger/interval、exact LLM lease、cancel/drain、Emotion domain receipt 与 paired-document recovery；105 个 job/documents/ledger/activity/snapshot 回归、BasedPyright/compileall/diff-check、独立只读复审无 P0/P1。Emotion `3584b49` 的 candidate apply unit 与临时复制 artifact 的真实 Manager stable load 均未创建 `emotion.db`；formal snapshot 冻结 exact effect/lookup/documents identity，terminate 后 listener/effect 为零。插件其他能力仍待 C09/C15/C17 与 E1/E3 | Emotion |
 | C22 | static v3 artifact manifest / install staging | `CANDIDATE` | 集成 head `3e1f5c10`（独立复审 head `b6967d13`）已在 import 前校验 identity/runtime/validation、custom entrypoint 与 C12/C13 descriptor，不成功 staging 不创建正式 data/artifact/pointer；Calendar `654d078d` 已由真实 Host 消费 exact staged `.venv/bin/python`，manifest/apply/runtime identity 一致且候选排除 credential/receipt；待全部 external v3 与最终 artifact Gate | Calendar MCP / 全部 external v3 |
 | C23 | Core-owned Channel attachment artifact / Session binding | `CANDIDATE` | `0bd2d928` 已完成 immutable opaque artifact、fixed-ID resumable Mobile import、SessionDB 原子 message binding、exact fd read lease、无自动 GC 与目录/SQLite 可恢复备份；Mobile 114、Bus/lifecycle/Host 124、最终 ownership 聚焦 201 tests、Basedpyright 0，独立 review 无 P0/P1；待 Feishu/QQ 与复制 workspace E3/E4 进入 `READY` | Feishu / QQBot / Core channels |
+| C24 | read-only existing Session projection | `CANDIDATE` | formal 只经 `get_existing` 返回 detached snapshot；candidate 同名 Service 调用即 fail-loud，零 Session lookup/write；4 个 service/Manager tests 已通过，待 Status Commands committed command + Mobile query Gate | Status Commands |
 
 实现原则：C11～C17、C21～C22 只由表中的首个真实 consumer 拉动，不提前复制
 `commands()/mcp_servers()/managed_services()/channels()/jobs()/proactive_*()/mobile_ui()` 旧方法。
@@ -169,7 +170,7 @@ Gate 报告。分支名、PR 号和浮动 ref 不能代替 commit。
 | Plugin Undo | command、before-turn、显式 interaction 撤销 | C02/C11 | `OPEN` | E1/E3 |
 | Observe | Dashboard、mobile、committed event observers | C02/C17 | `OPEN` | E1 |
 | Setup Helper | lifecycle、command | C02/C11 | `OPEN` | E3 |
-| Status Commands | mobile、command、before-turn | C02/C11/C17 | `OPEN` | E3 |
+| Status Commands | mobile、command、只读 Session projection | C11/C17/C24 | `OPEN` | E3 |
 | Computer Use Linux | Skill、MCP | C09/C12 | `OPEN` | E2 |
 | Feed MCP | Skill、MCP、proactive source | C09/C12/C15 | `OPEN` | E2/E3 |
 | Feishu | channel | C14 | `OPEN` | E3 |

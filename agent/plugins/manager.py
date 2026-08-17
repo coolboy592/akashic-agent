@@ -30,6 +30,7 @@ from agent.plugin_composition import (
     MCP_SERVERS,
     MEMORY_RUNTIME,
     PROACTIVE_COMPONENTS,
+    SESSION_READ,
     BACKGROUND_JOBS,
     UI_SLOTS,
     CommandRegistry,
@@ -43,6 +44,7 @@ from agent.plugin_composition import (
     PluginProactiveComponents,
     PluginBackgroundJobs,
     PluginRuntime,
+    SessionReadService,
     resolve_mobile_ui_asset,
     ServiceView,
 )
@@ -6072,6 +6074,16 @@ class PluginManager:
             self._gate_results[generation.plugin_id] = gate
             raise _CandidateRejected(gate) from error
 
+    def _read_existing_session_compaction(self, session_key: str):
+        """读取同一 Session 的消息与 active compaction 语义。"""
+
+        session_manager = self._session_manager
+        if session_manager is None:
+            raise RuntimeError("Session Read Service 缺少 SessionManager")
+        session = session_manager.get_existing(session_key)
+        compaction = session_manager.control_store.get_active_compaction(session_key)
+        return session, compaction
+
     async def _resolve_composition_root(
         self,
         generations: dict[str, PluginGeneration],
@@ -6169,6 +6181,16 @@ class PluginManager:
                 for item in ordered
             ):
                 _ = await root.context.provide(UI_SLOTS, PluginUiSlots())
+            if self._session_manager is not None and any(
+                SESSION_READ in cast(ComposablePlugin, item.instance).inject
+                for item in ordered
+            ):
+                session_read = (
+                    SessionReadService(self._read_existing_session_compaction)
+                    if candidate_owner is None
+                    else SessionReadService.candidate_validation()
+                )
+                _ = await root.context.provide(SESSION_READ, session_read)
             memory_runtime = self._get_composition_memory_runtime()
             if memory_runtime is not None:
                 _ = await root.context.provide(
