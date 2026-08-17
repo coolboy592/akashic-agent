@@ -1,6 +1,6 @@
 # 插件 v3 Proactive / background job capability 任务合同
 
-- 状态：approved / ready for implementation
+- 状态：implemented / C21 candidate；C15 与外部 consumer 迁移继续
 - 日期：2026-08-16
 - 实现起点：`19f2cca2`（只有 legacy prepared catalogs，C15/C21 public registry 尚未实现）
 - 清单：C15、C21、C20 的前置
@@ -219,6 +219,8 @@ permit 并调用私有 commit，不需要已卸载插件 handler；它也必须�
 只有 commit/abort terminal receipt 与目录 fsync 完成后才可清理 intent。
 `abort_prepared()` 必须在同一 Core critical section 内查询 exact invocation 的 domain effect durable receipt 与 ledger phase；
 一旦 receipt 已存在或 phase 已是 documents，就拒绝 abort 并转交 forward recovery，不能写 aborted receipt 或删除 intent。
+本轮 crash recovery 只覆盖两类真实 owner：同进程 handler/provider/callback 失败或取消，以及进程崩溃后的启动恢复；
+不为断电、磁盘中途失效或任意指令断点另造状态机。
 
 Emotion 保留自己的 SQLite owner，但必须声明 `workspace_roots=("emotion",)` 并只从该窄 root 打开现有
 `emotion/emotion.db`。prompt projection 与 DB commit 拆成两阶段：projection 只形成 frame update/domain transaction；
