@@ -115,8 +115,10 @@ install、doctor、manifest/cache discovery 与 runtime admission 都抛明确�
    await private.close_components(tx.id, new_binding)         # cleanup/retry
    ```
 
-   prepare 的不可变 plan 固定 exact snapshot lease/catalog identity；后续调用携带同一个 transaction id 与 exact
-   plan/binding。adapter 不得 lookup current snapshot、不得创建/释放 snapshot lease，也不得独立 pause/drain/finalize/open。
+   prepare 的不可变 plan 固定 exact snapshot lease/catalog identity；target plan/binding 的后续调用携带同一个
+   transaction id 与 exact object。`old_binding` 保留其原 publication transaction id，跨 reload 的 stop/restore/close
+   只校验 adapter ownership 与 exact object，不把新的 publication transaction id 错当成旧 binding 身份。adapter 不得
+   lookup current snapshot、不得创建/释放 snapshot lease，也不得独立 pause/drain/finalize/open。
    所有 stop/restore/close 结果回到 ActivityHost journal。
 4. old turn/job 继续持有 old snapshot/handler 到 terminal；new admission 只见 new binding。
 5. start/cancel/restore/stop 失败保留 generation/runtime owner、Health/Incident 与 cleanup-pending retry；恢复 pointer
@@ -130,7 +132,8 @@ install、doctor、manifest/cache discovery 与 runtime admission 都抛明确�
 - admission：六个 entrypoint 都是纯 v3；production scan 不再发现其 v2 base/fixed methods/PluginContext；
 - candidate：runtime/timer/source/model/turn/sender 调用为 0，正式 DB/Markdown/plugin-data digest 不变；
 - stable：fixed clock 下 Default 与 Wake 各跑 normal/empty/skip/failure/cancel/restart，旧 state/schema 行为等价；
-- reload：old in-flight 完成，新 binding 才接新 tick；start failure 恢复旧 kernel，cleanup failure 可查询/retry；
+- reload：old in-flight 完成，新 binding 才接新 tick；start failure 恢复旧 exact admission/pointer，或清空 kernel/lease
+  并保持 fail-closed，cleanup failure 可查询/retry；
 - host：snapshot private catalog identity、family/order、C15 source projection、exact lease 与 ProactiveLoop adapter 全部
   可观察；删除旧 lists 后 Default/Wake normal path 仍执行；
 - deletion：C20 的两个私有岛 E3 只证明六个 in-tree module，不授权删除公共 v2 owner。只有其他 external proactive/job

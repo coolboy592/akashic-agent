@@ -606,10 +606,18 @@ class ProactiveLoop:
                 candidate_lease,
             )
         except BaseException:
-            await candidate_lease.release()
-            if old_kernel is not None and old_lease is not None:
-                await self._run_with_lease(old_lease, old_kernel.start)
-                self._kernel_started = True
+            # Candidate 启动失败时旧 Activity binding 已经退役；同时释放两张 lease，
+            # 保持无可运行 kernel，不能把旧对象错误配到新 snapshot。
+            try:
+                await candidate_lease.release()
+            finally:
+                try:
+                    if old_lease is not None:
+                        await old_lease.release()
+                finally:
+                    self._kernel_started = False
+                    self._active_snapshot_id = None
+                    self._active_kernel_lease = None
             raise
         if old_lease is not None:
             await old_lease.release()

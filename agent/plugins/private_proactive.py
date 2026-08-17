@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+import os
 import tomllib
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
@@ -299,14 +300,9 @@ def admit_private_proactive_module(module: ModuleType) -> PrivateProactiveMember
     root = private_proactive_root(name)
     entry = root / "plugin.py"
     imported = getattr(module, "__file__", None)
-    try:
-        imported_entry = (
-            None if not isinstance(imported, str) else Path(imported).resolve(strict=True)
-        )
-    except OSError as error:
-        raise ValueError(f"private proactive entry 来源不存在: {name}") from error
-    if imported_entry != entry:
-        raise ValueError(f"private proactive entry 来源不匹配: {name}")
+    if not isinstance(imported, str):
+        raise ValueError(f"private proactive entry 来源不存在: {name}")
+    _require_exact_entry_path(imported, entry, core_project_root())
     for export in definition.exports:
         value = getattr(module, export, None)
         if not callable(value) or getattr(value, "__module__", None) != module.__name__:
@@ -377,6 +373,33 @@ def _require_plain_path(path: Path, project_root: Path) -> None:
         raise ValueError(f"private proactive root 不是 exact canonical path: {path}")
     if not path.is_dir():
         raise ValueError(f"private proactive root 不是目录: {path}")
+
+
+def _require_exact_entry_path(
+    imported: str,
+    entry: Path,
+    project_root: Path,
+) -> None:
+    """Reject lexical aliases and symlink components for an admitted entry."""
+
+    imported_entry = Path(os.path.abspath(imported))
+    if imported_entry != entry:
+        raise ValueError(f"private proactive entry 来源不匹配: {imported}")
+    try:
+        relative = imported_entry.relative_to(project_root)
+    except ValueError as error:
+        raise ValueError(
+            f"private proactive entry 越过 Core source root: {imported_entry}"
+        ) from error
+    current = project_root
+    if current.is_symlink():
+        raise ValueError(f"Core source root 不得是 symlink: {current}")
+    for component in relative.parts:
+        current /= component
+        if current.is_symlink():
+            raise ValueError(f"private proactive entry path component 不得是 symlink: {current}")
+    if not imported_entry.is_file():
+        raise ValueError(f"private proactive entry 来源不存在: {imported_entry}")
 
 
 def _validate_package_manifest(

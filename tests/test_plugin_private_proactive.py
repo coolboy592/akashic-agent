@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import importlib.util
 from types import ModuleType
 
 import pytest
@@ -78,6 +79,23 @@ def test_external_same_name_and_reexport_are_rejected_before_registration() -> N
 
     with pytest.raises(ValueError, match="entry 来源|export 来源"):
         admit_private_proactive_module(fake)
+
+
+def test_symlink_entry_is_rejected_before_export_admission(tmp_path) -> None:
+    actual = _module("default_proactive")
+    target = tmp_path / "external" / "default_proactive" / "plugin.py"
+    target.parent.mkdir(parents=True)
+    target.symlink_to(actual.__file__)
+    spec = importlib.util.spec_from_file_location(
+        "external.default_proactive.plugin",
+        target,
+    )
+    assert spec is not None and spec.loader is not None
+    external = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(external)
+
+    with pytest.raises(ValueError, match="entry 来源不匹配|symlink"):
+        admit_private_proactive_module(external)
 
 
 @pytest.mark.parametrize("member", [item.member for item in PRIVATE_PROACTIVE_DEFINITIONS])

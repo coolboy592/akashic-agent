@@ -5900,6 +5900,54 @@ async def test_proactive_kernel_owns_snapshot_until_stopped(tmp_path: Path) -> N
     await manager.terminate_all()
 
 
+@pytest.mark.asyncio
+async def test_kernel_start_failure_releases_old_lease_and_stays_fail_closed(
+    tmp_path: Path,
+) -> None:
+    _write_plugin(
+        tmp_path / "plugins",
+        "snapshot_kernel_failure",
+        "from agent.plugins import Plugin\n"
+        "class SnapshotKernelFailurePlugin(Plugin):\n"
+        "    name = 'snapshot_kernel_failure'\n",
+    )
+    manager = _manager(tmp_path)
+    await manager.load_all()
+    snapshot = manager.current_snapshot
+    assert snapshot is not None
+
+    old_kernel = SimpleNamespace(stop=AsyncMock(), start=AsyncMock())
+    old_lease = manager.snapshot_store.lease()
+    loop = object.__new__(ProactiveLoop)
+    loop._kernel_started = True
+    loop._active_kernel_lease = old_lease
+    loop._active_snapshot_id = "old-snapshot-before-failed-reload"
+    loop._proactive_kernel = old_kernel
+
+    async def fail_start(_snapshot, _lease):
+        raise RuntimeError("candidate kernel start failed")
+
+    loop._build_and_start_kernel = fail_start
+    from agent.plugins.snapshot import bind_runtime_snapshot, reset_runtime_snapshot
+
+    source_lease = manager.snapshot_store.lease()
+    token = bind_runtime_snapshot(source_lease)
+    try:
+        with pytest.raises(RuntimeError, match="candidate kernel start failed"):
+            await loop._switch_snapshot(snapshot)
+    finally:
+        reset_runtime_snapshot(token)
+        await source_lease.release()
+
+    old_kernel.stop.assert_awaited_once()
+    old_kernel.start.assert_not_awaited()
+    assert loop._kernel_started is False
+    assert loop._active_snapshot_id is None
+    assert loop._active_kernel_lease is None
+    assert snapshot.lease_count == 0
+    await manager.terminate_all()
+
+
 def _snapshot_hook_source(version: str) -> str:
     return (
         "from agent.plugins import Plugin, on_tool_pre\n"

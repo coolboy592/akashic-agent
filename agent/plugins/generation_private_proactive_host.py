@@ -146,7 +146,7 @@ class PrivateProactiveHost:
     ) -> None:
         """Close old private admission after ActivityHost has drained callers."""
 
-        self._require_binding(transaction_id, old_binding)
+        self._require_binding(old_binding)
         old_binding.admission_open = False
         old_binding.stopped = True
 
@@ -226,7 +226,7 @@ class PrivateProactiveHost:
     ) -> None:
         """Open private admission synchronously at ActivityHost's pointer boundary."""
 
-        self._require_binding(transaction_id, binding)
+        self._require_transaction_binding(transaction_id, binding)
         if binding.closed:
             raise RuntimeError("private proactive binding 已关闭")
         binding.admission_open = True
@@ -243,7 +243,7 @@ class PrivateProactiveHost:
     def pause_components(self, binding: PrivateProactiveBinding) -> None:
         """Reject private execution while ActivityHost retains a failed transaction."""
 
-        self._require_binding(binding.transaction_id, binding)
+        self._require_transaction_binding(binding.transaction_id, binding)
         binding.admission_open = False
 
     async def restore_components(
@@ -253,7 +253,9 @@ class PrivateProactiveHost:
     ) -> None:
         """Restore the old private binding during the shared rollback path."""
 
-        self._require_binding(transaction_id, old_binding)
+        self._require_binding(old_binding)
+        if old_binding.closed:
+            raise RuntimeError("private proactive binding 已关闭")
         old_binding.stopped = False
         old_binding.admission_open = True
         self._active = old_binding
@@ -265,7 +267,7 @@ class PrivateProactiveHost:
     ) -> None:
         """Drop one closed binding without touching the ActivityHost lease."""
 
-        self._require_binding(transaction_id, binding)
+        self._require_binding(binding)
         if binding.closed:
             return
         binding.admission_open = False
@@ -326,13 +328,16 @@ class PrivateProactiveHost:
         if plan.transaction_id != transaction_id:
             raise RuntimeError("private proactive plan transaction 不匹配")
 
-    def _require_binding(
+    def _require_binding(self, binding: PrivateProactiveBinding) -> None:
+        if self._bindings.get(binding.snapshot_id) is not binding:
+            raise RuntimeError("private proactive binding 不属于当前 adapter")
+
+    def _require_transaction_binding(
         self,
         transaction_id: str,
         binding: PrivateProactiveBinding,
     ) -> None:
-        if self._bindings.get(binding.snapshot_id) is not binding:
-            raise RuntimeError("private proactive binding 不属于当前 adapter")
+        self._require_binding(binding)
         is_shutdown = transaction_id == "shutdown" or transaction_id.startswith(
             "shutdown:"
         )

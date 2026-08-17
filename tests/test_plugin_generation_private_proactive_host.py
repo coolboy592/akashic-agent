@@ -39,9 +39,13 @@ def _catalog(
     return registry.freeze()
 
 
-def _lease(*, catalog: PrivateProactiveCatalog | None) -> RuntimeSnapshotLease:
+def _lease(
+    *,
+    catalog: PrivateProactiveCatalog | None,
+    snapshot_id: str = "private-snapshot",
+) -> RuntimeSnapshotLease:
     snapshot = SimpleNamespace(
-        snapshot_id="private-snapshot",
+        snapshot_id=snapshot_id,
         proactive_component_catalog=None,
         background_job_catalog=None,
         private_proactive_catalog=catalog,
@@ -157,3 +161,56 @@ async def test_activity_host_shutdown_closes_private_binding_with_synthetic_id()
 
     assert child_binding.closed
     assert child.active is None
+
+
+@pytest.mark.asyncio
+async def test_reload_closes_previous_private_binding_across_transactions() -> None:
+    child = PrivateProactiveHost("default")
+    activity = ActivityHost((child,))
+
+    first = await activity.prepare_transaction(
+        _lease(catalog=_catalog(), snapshot_id="private-snapshot-v1")
+    )
+    await activity.pause_and_drain(first)
+    first_binding = await activity.materialize_closed(first)
+    first_private = cast(Any, first_binding.child_bindings["private_proactive"])
+    activity.finalize(first)
+    await activity.open(first)
+
+    second = await activity.prepare_transaction(
+        _lease(catalog=_catalog(), snapshot_id="private-snapshot-v2")
+    )
+    await activity.pause_and_drain(second)
+    second_binding = await activity.materialize_closed(second)
+    second_private = cast(Any, second_binding.child_bindings["private_proactive"])
+    activity.finalize(second)
+    await activity.open(second)
+
+    assert first_private.closed
+    assert child.active is second_private
+    await activity.close()
+
+
+@pytest.mark.asyncio
+async def test_reload_rollback_restores_previous_private_binding_across_transactions() -> None:
+    child = PrivateProactiveHost("default")
+    activity = ActivityHost((child,))
+
+    first = await activity.prepare_transaction(
+        _lease(catalog=_catalog(), snapshot_id="private-snapshot-v1")
+    )
+    await activity.pause_and_drain(first)
+    first_binding = await activity.materialize_closed(first)
+    first_private = cast(Any, first_binding.child_bindings["private_proactive"])
+    activity.finalize(first)
+    await activity.open(first)
+
+    second = await activity.prepare_transaction(
+        _lease(catalog=_catalog(), snapshot_id="private-snapshot-v2")
+    )
+    await activity.pause_and_drain(second)
+    await activity.rollback(second)
+
+    assert child.active is first_private
+    assert first_private.active
+    await activity.close()
