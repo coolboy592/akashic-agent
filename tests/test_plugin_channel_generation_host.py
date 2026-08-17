@@ -41,6 +41,7 @@ from agent.plugin_composition.channels import (
 )
 from agent.plugin_composition.model import CompositionError, ServiceKey
 from agent.plugins.channel_generation_host import (
+    ChannelBindingLease,
     ChannelGenerationHost,
     ChannelStartRecord,
     bind_channel_turn_binding,
@@ -1052,15 +1053,63 @@ async def test_exact_binding_lease_finishes_delivery_after_admission_closes() ->
         await direct.deliver(
             ProviderDeliveryRequest(direct.binding_token, "new", "u", "hi")
         )
+    delivery = asyncio.create_task(host.dispatch_outbound(envelope, owner))
+    await asyncio.sleep(0)
+    assert tuple(adapters.values())[0].deliveries == ["d1"]
+    await owner.aclose()
+    draining = asyncio.create_task(generation.drain())
+    await asyncio.sleep(0)
+    assert not draining.done()
     tuple(adapters.values())[0].release.set()
-
-    receipt = await host.dispatch_outbound(envelope, owner)
+    receipt = await delivery
+    await draining
 
     assert receipt.status is DeliveryStatus.DELIVERED
     assert tuple(adapters.values())[0].deliveries == ["d1"]
-    await owner.aclose()
-    await generation.drain()
     await generation.stop()
+
+
+@pytest.mark.asyncio
+async def test_retained_delivery_rejects_forged_or_stopping_binding() -> None:
+    snapshot, factories, adapters = await _make_snapshot()
+    host = _host()
+    generation = await host.start(snapshot, factories)
+    generation.open_admission()
+    source = _FakeSnapshotLease(snapshot)
+    owner = host.acquire_binding(cast(Any, source), "feishu")
+    envelope = OutboundEnvelope(
+        logical_delivery_id="d1",
+        delivery_id="d1",
+        attempt_sequence=1,
+        snapshot_id=snapshot.snapshot_id,
+        generation_id="gen-1",
+        binding_token=owner.binding_token,
+        channel="feishu",
+        recipient="u",
+        body="hi",
+        metadata={},
+    )
+    forged = ChannelBindingLease(
+        host,
+        (snapshot.snapshot_id, "feishu"),
+        _FakeSnapshotLease(snapshot),
+    )
+    generation.close_admission()
+    with pytest.raises(RuntimeError, match="Host 登记"):
+        await host.dispatch_outbound(envelope, forged)
+    assert tuple(adapters.values())[0].deliveries == []
+
+    stopping = asyncio.create_task(generation.stop())
+    for _ in range(20):
+        if host._binding((snapshot.snapshot_id, "feishu")).stopping:
+            break
+        await asyncio.sleep(0)
+    assert host._binding((snapshot.snapshot_id, "feishu")).stopping
+    assert not stopping.done()
+    with pytest.raises(RuntimeError, match="关闭"):
+        await host.dispatch_outbound(envelope, owner)
+    await owner.aclose()
+    await stopping
 
 
 @pytest.mark.asyncio

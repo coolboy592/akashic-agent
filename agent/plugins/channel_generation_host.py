@@ -352,7 +352,7 @@ class ChannelBindingLease:
                 recipient=envelope.recipient,
                 body=envelope.body,
             ),
-            retained_binding=True,
+            retained_binding=self,
         )
         return ChannelDeliveryReceipt(
             delivery_id=receipt.delivery_id,
@@ -389,7 +389,7 @@ class ChannelBindingLease:
 
     async def _close(self) -> None:
         if not self._binding_released:
-            self._host._release_binding_lease(self._key)
+            self._host._release_binding_lease(self)
             self._binding_released = True
         await self.snapshot_lease.release()
         self._closed = True
@@ -939,6 +939,7 @@ class ChannelGenerationHost:
         self._on_presentation_incident = on_presentation_incident
         self._presentation_incidents: list[tuple[str, str, str]] = []
         self._bindings: dict[tuple[str, str], _ChannelBindingState] = {}
+        self._binding_leases: set[ChannelBindingLease] = set()
         self._tombstones: dict[tuple[str, str], ChannelCleanupTombstone] = {}
         self._start_counts: dict[tuple[str, str], int] = {}
         self._locks: dict[str, asyncio.Lock] = {}
@@ -1285,7 +1286,9 @@ class ChannelGenerationHost:
         forked = snapshot_lease.fork()
         state.in_flight += 1
         state.drain_event.clear()
-        return ChannelBindingLease(self, key, forked)
+        binding = ChannelBindingLease(self, key, forked)
+        self._binding_leases.add(binding)
+        return binding
 
     async def dispatch_outbound(
         self,
@@ -1848,7 +1851,7 @@ class ChannelGenerationHost:
         key: tuple[str, str],
         request: ProviderDeliveryRequest,
         *,
-        retained_binding: bool = False,
+        retained_binding: ChannelBindingLease | None = None,
     ) -> ProviderDeliveryReceipt:
         """Deliver through a live binding or an exact lease admitted before close."""
 
@@ -1857,9 +1860,17 @@ class ChannelGenerationHost:
             raise TypeError("channel deliver 只接受 ProviderDeliveryRequest")
         if request.binding_token != state.binding_token:
             raise RuntimeError("channel delivery binding token 不匹配")
+        if retained_binding is not None:
+            if (
+                retained_binding not in self._binding_leases
+                or retained_binding._host is not self
+                or retained_binding._key != key
+                or not retained_binding.active
+            ):
+                raise RuntimeError("Channel binding lease 未由当前 Host 登记")
         if state.stopping or state.stopped:
             raise RuntimeError("channel admission 已关闭")
-        if not retained_binding and not state.admission_open:
+        if retained_binding is None and not state.admission_open:
             raise RuntimeError("channel admission 已关闭")
         state.in_flight += 1
         state.drain_event.clear()
@@ -1907,8 +1918,11 @@ class ChannelGenerationHost:
 
         self._release_in_flight(key)
 
-    def _release_binding_lease(self, key: tuple[str, str]) -> None:
-        self._release_in_flight(key)
+    def _release_binding_lease(self, binding: ChannelBindingLease) -> None:
+        if binding not in self._binding_leases:
+            raise RuntimeError("Channel binding lease 未由当前 Host 登记")
+        self._binding_leases.remove(binding)
+        self._release_in_flight(binding._key)
 
     def _release_in_flight(self, key: tuple[str, str]) -> None:
         state = self._binding(key)
