@@ -35,6 +35,13 @@ class JobOutcomePhase(StrEnum):
     DOCUMENTS = "documents"
 
 
+class ProgrammaticTurnState(StrEnum):
+    """Durable Turn admission state owned by one job invocation."""
+
+    SUBMITTING = "submitting"
+    ADMITTED = "admitted"
+
+
 # Short names keep the state contract easy to use from the host code.
 JobState = JobOutcomeState
 JobPhase = JobOutcomePhase
@@ -242,6 +249,8 @@ class JobOutcomeRecord:
     updated_at: str
     terminal_result_digest: str | None
     event_payload: Mapping[str, object] | None = None
+    programmatic_turn_state: ProgrammaticTurnState | None = None
+    programmatic_turn_id: str | None = None
 
     @property
     def trigger_identity(self) -> str:
@@ -410,7 +419,7 @@ class JobOutcomeLedger:
             if journal_mode.lower() != "wal":
                 raise RuntimeError(f"JobOutcomeLedger 必须使用 WAL: {journal_mode}")
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-            if version not in (0, 1, 2):
+            if version not in (0, 1, 2, 3):
                 raise RuntimeError(f"JobOutcomeLedger schema 版本不支持: {version}")
             connection.execute("BEGIN IMMEDIATE")
             try:
@@ -426,7 +435,15 @@ class JobOutcomeLedger:
                     connection.execute(
                         "ALTER TABLE job_outcomes ADD COLUMN event_payload_json TEXT"
                     )
-                connection.execute("PRAGMA user_version = 2")
+                if "programmatic_turn_state" not in columns:
+                    connection.execute(
+                        "ALTER TABLE job_outcomes ADD COLUMN programmatic_turn_state TEXT"
+                    )
+                if "programmatic_turn_id" not in columns:
+                    connection.execute(
+                        "ALTER TABLE job_outcomes ADD COLUMN programmatic_turn_id TEXT"
+                    )
+                connection.execute("PRAGMA user_version = 3")
             except BaseException:
                 connection.rollback()
                 raise
@@ -768,6 +785,96 @@ class JobOutcomeLedger:
                 raise RuntimeError("JobOutcomeLedger transition 未返回已更新记录")
             return self._record_from_row(updated_row)
 
+    def begin_programmatic_turn(self, invocation_id: str) -> JobOutcomeRecord:
+        """Persist the pre-admission boundary before calling ConversationRuntime."""
+
+        return self._update_programmatic_turn(
+            invocation_id,
+            expected=None,
+            state=ProgrammaticTurnState.SUBMITTING,
+            turn_id=None,
+        )
+
+    def commit_programmatic_turn(
+        self,
+        invocation_id: str,
+        turn_id: str,
+    ) -> JobOutcomeRecord:
+        """Persist the exact admitted Turn identity before returning to plugin code."""
+
+        return self._update_programmatic_turn(
+            invocation_id,
+            expected=ProgrammaticTurnState.SUBMITTING,
+            state=ProgrammaticTurnState.ADMITTED,
+            turn_id=_required_text(turn_id, "programmatic turn_id"),
+        )
+
+    def reset_programmatic_turn(self, invocation_id: str) -> JobOutcomeRecord:
+        """Clear a proven pre-admission failure so the handler may retry safely."""
+
+        return self._update_programmatic_turn(
+            invocation_id,
+            expected=ProgrammaticTurnState.SUBMITTING,
+            state=None,
+            turn_id=None,
+        )
+
+    def _update_programmatic_turn(
+        self,
+        invocation_id: str,
+        *,
+        expected: ProgrammaticTurnState | None,
+        state: ProgrammaticTurnState | None,
+        turn_id: str | None,
+    ) -> JobOutcomeRecord:
+        """Atomically update the only programmatic Turn receipt for an invocation."""
+
+        invocation_id = _required_text(invocation_id, "invocation_id")
+        with self._write_transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM job_outcomes WHERE invocation_id = ?",
+                (invocation_id,),
+            ).fetchone()
+            if row is None:
+                raise UnknownJobInvocation(invocation_id)
+            current = self._record_from_row(row)
+            if current.state is not JobOutcomeState.RUNNING:
+                raise JobOutcomeTransitionError(
+                    "programmatic Turn 只能由 running invocation 提交"
+                )
+            if current.programmatic_turn_state is not expected:
+                current_value = (
+                    None
+                    if current.programmatic_turn_state is None
+                    else current.programmatic_turn_state.value
+                )
+                expected_value = None if expected is None else expected.value
+                raise JobOutcomeTransitionError(
+                    "programmatic Turn admission 状态不匹配: "
+                    f"{current_value!r} != {expected_value!r}"
+                )
+            connection.execute(
+                """
+                UPDATE job_outcomes
+                SET programmatic_turn_state = ?, programmatic_turn_id = ?,
+                    updated_at = ?
+                WHERE invocation_id = ?
+                """,
+                (
+                    None if state is None else state.value,
+                    turn_id,
+                    _timestamp(None),
+                    invocation_id,
+                ),
+            )
+            updated = connection.execute(
+                "SELECT * FROM job_outcomes WHERE invocation_id = ?",
+                (invocation_id,),
+            ).fetchone()
+            if updated is None:
+                raise RuntimeError("programmatic Turn receipt 更新后丢失")
+            return self._record_from_row(updated)
+
     def list_pending(self) -> tuple[JobOutcomeRecord, ...]:
         """Read queued/running/retry-pending outcomes for restart recovery."""
 
@@ -818,6 +925,22 @@ class JobOutcomeLedger:
             attempt = int(row["attempt"])
         except (KeyError, TypeError, ValueError) as exc:
             raise RuntimeError("JobOutcomeLedger 存在损坏的 state/phase/attempt") from exc
+        turn_state_raw = row["programmatic_turn_state"]
+        try:
+            turn_state = (
+                None
+                if turn_state_raw is None
+                else ProgrammaticTurnState(str(turn_state_raw))
+            )
+        except ValueError as exc:
+            raise RuntimeError("JobOutcomeLedger programmatic Turn 状态损坏") from exc
+        turn_id = (
+            None
+            if row["programmatic_turn_id"] is None
+            else str(row["programmatic_turn_id"])
+        )
+        if (turn_state is ProgrammaticTurnState.ADMITTED) != (turn_id is not None):
+            raise RuntimeError("JobOutcomeLedger programmatic Turn receipt 不完整")
         record = JobOutcomeRecord(
             semantic_job_id=str(row["semantic_job_id"]),
             plugin_id=str(row["plugin_id"]),
@@ -847,6 +970,8 @@ class JobOutcomeLedger:
                 else str(row["terminal_result_digest"])
             ),
             event_payload=_decode_event_payload(row["event_payload_json"]),
+            programmatic_turn_state=turn_state,
+            programmatic_turn_id=turn_id,
         )
         try:
             JobOutcomeLedger._validate_outcome_fields(
@@ -1012,6 +1137,7 @@ __all__ = [
     "JobOutcomeRecord",
     "JobOutcomeState",
     "JobOutcomeTransitionError",
+    "ProgrammaticTurnState",
     "JobPhase",
     "JobState",
     "OUTCOMES_DB_FILENAME",

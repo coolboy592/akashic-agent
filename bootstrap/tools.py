@@ -177,7 +177,18 @@ class CoreRuntime:
         )
         if not callable(session_creator):
             raise RuntimeError("Core SessionManager 缺少 programmatic session creator")
-        bind(runtime, programmatic_session_creator=session_creator)
+        session_reader = getattr(
+            self.session_manager.control_store,
+            "get_session_meta",
+            None,
+        )
+        if not callable(session_reader):
+            raise RuntimeError("Core SessionManager 缺少 programmatic session reader")
+        bind(
+            runtime,
+            programmatic_session_creator=session_creator,
+            programmatic_session_reader=session_reader,
+        )
 
     async def start(self) -> None:
         """启动外部连接和插件扩展。"""

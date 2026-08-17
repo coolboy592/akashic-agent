@@ -46,9 +46,11 @@ def _definition(
             base_delay_seconds=1.0,
             max_delay_seconds=10.0,
         ),
-        documents_scope=("emotion",),
-        domain_effect="emotion.state",
-        domain_effect_lookup_export="lookup_emotion_effect",
+        documents_scope=() if programmatic_turns else ("emotion",),
+        domain_effect=None if programmatic_turns else "emotion.state",
+        domain_effect_lookup_export=(
+            None if programmatic_turns else "lookup_emotion_effect"
+        ),
         model_role="proactive.merge",
         programmatic_turns=programmatic_turns,
     )

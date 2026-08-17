@@ -128,6 +128,14 @@ class ProgrammaticTurnReceipt:
     turn_id: str
 
 
+class ProgrammaticTurnPreAdmissionError(RuntimeError):
+    """Report a failure proven to happen before Turn admission."""
+
+
+class ProgrammaticTurnUncertainError(RuntimeError):
+    """Report a failure after Turn admission may already have happened."""
+
+
 class ProgrammaticTurnPort(Protocol):
     """Expose only Core-owned programmatic Turn admission to one job."""
 
@@ -201,6 +209,10 @@ class BackgroundJobDefinition:
             _identifier(self.model_role, "model_role")
         if not isinstance(self.programmatic_turns, bool):
             raise TypeError("programmatic_turns 必须是 bool")
+        if self.programmatic_turns and (
+            self.documents_scope or self.domain_effect is not None
+        ):
+            raise ValueError("programmatic_turns 不能与 documents/domain effect 共用")
 
 
 @dataclass(frozen=True, slots=True)
@@ -613,7 +625,9 @@ __all__ = [
     "IntervalTrigger",
     "PluginBackgroundJobs",
     "ProgrammaticTurnPort",
+    "ProgrammaticTurnPreAdmissionError",
     "ProgrammaticTurnReceipt",
+    "ProgrammaticTurnUncertainError",
     "RetryPolicy",
     "_freeze_plugin_background_jobs",
 ]

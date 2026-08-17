@@ -103,7 +103,9 @@ from agent.plugin_composition.background_jobs import (
     IntervalTrigger,
     PluginBackgroundJobs,
     ProgrammaticTurnPort,
+    ProgrammaticTurnPreAdmissionError,
     ProgrammaticTurnReceipt,
+    ProgrammaticTurnUncertainError,
     RetryPolicy,
 )
 from agent.plugin_composition.tool_catalog import (
@@ -242,7 +244,9 @@ __all__ = [
     "PluginProactiveComponents",
     "PluginBackgroundJobs",
     "ProgrammaticTurnPort",
+    "ProgrammaticTurnPreAdmissionError",
     "ProgrammaticTurnReceipt",
+    "ProgrammaticTurnUncertainError",
     "PluginToolBinding",
     "PluginToolCatalog",
     "PluginToolDefinition",

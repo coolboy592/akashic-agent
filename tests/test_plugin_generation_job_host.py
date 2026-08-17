@@ -17,6 +17,8 @@ from agent.plugin_composition.background_jobs import (
     CoreEvent,
     CoreEventTrigger,
     IntervalTrigger,
+    ProgrammaticTurnUncertainError,
+    RetryPolicy,
 )
 from agent.plugin_composition.model import FiberState
 from agent.plugins.composable import ComposablePlugin
@@ -29,6 +31,7 @@ from agent.plugins.job_outcome_ledger import (
     JobOutcomeLedger,
     JobOutcomePhase,
     JobOutcomeState,
+    ProgrammaticTurnState,
 )
 from agent.plugins.proactive_documents import (
     PROACTIVE_CONTEXT,
@@ -133,8 +136,10 @@ def _fixture(
     programmatic_turns: bool = False,
     conversation_runtime: object | None = None,
     programmatic_session_creator: Any | None = None,
+    programmatic_session_reader: Any | None = None,
     conversation_runtime_binder: Any | None = None,
     validation_candidate_plugin_ids: frozenset[str] = frozenset(),
+    retry_policy: RetryPolicy | None = None,
 ):
     plugin_id = "emotion" if documents else "drift"
     plugin = _module(handler, name=plugin_id, domain_lookup=domain_lookup)
@@ -152,6 +157,7 @@ def _fixture(
             "lookup_emotion_effect" if documents else None
         ),
         programmatic_turns=programmatic_turns,
+        retry_policy=retry_policy or RetryPolicy(),
     )
     descriptor = BackgroundJobDescriptor(
         owner=plugin_id,
@@ -212,9 +218,16 @@ def _fixture(
     )
     if conversation_runtime is not None:
         if conversation_runtime_binder is None:
+            if programmatic_session_reader is None:
+                programmatic_session_reader = getattr(
+                    getattr(conversation_runtime, "_store", None),
+                    "get_session_meta",
+                    None,
+                )
             adapter.bind_conversation_runtime(
                 conversation_runtime,
                 programmatic_session_creator=programmatic_session_creator,
+                programmatic_session_reader=programmatic_session_reader,
             )
         else:
             conversation_runtime_binder(adapter, conversation_runtime)
@@ -259,6 +272,12 @@ class _ProgrammaticSessionStore:
         if key in self.sessions:
             raise RuntimeError(f"duplicate session: {key}")
         self.sessions[key] = dict(metadata)
+
+    def get_session_meta(self, key: str) -> dict[str, object] | None:
+        metadata = self.sessions.get(key)
+        if metadata is None:
+            return None
+        return {"key": key, "metadata": dict(metadata)}
 
 
 class _ProgrammaticTurnHandle:
@@ -930,6 +949,14 @@ async def test_programmatic_turn_port_rejects_reserved_metadata_and_foreign_sess
     tmp_path,
 ) -> None:
     conversation = _ProgrammaticConversationRuntime()
+    conversation.create_session(
+        key="programmatic:foreign",
+        metadata={
+            "programmatic": True,
+            "plugin_id": "other-plugin",
+            "job_name": "merge_pending",
+        },
+    )
     saved: list[Any] = []
 
     async def handler(ctx) -> None:
@@ -938,7 +965,7 @@ async def test_programmatic_turn_port_rejects_reserved_metadata_and_foreign_sess
         with pytest.raises(ValueError, match="不能覆盖 Core 字段"):
             await ctx.turns.create_session(metadata={"plugin_id": "forged"})
         session_id = await ctx.turns.create_session(metadata={})
-        with pytest.raises(RuntimeError, match="不属于当前 job port"):
+        with pytest.raises(RuntimeError, match="provenance 不匹配"):
             await ctx.turns.submit("programmatic:foreign", "no")
         handle = conversation.requests
         assert session_id.startswith("programmatic:")
@@ -956,6 +983,101 @@ async def test_programmatic_turn_port_rejects_reserved_metadata_and_foreign_sess
     await adapter.enqueue_event(runtime, _event("programmatic-validation"))
     await adapter.drain(runtime)
     assert store.leases == 1
+    await adapter.close_components("tx-1", runtime)
+    await target_lease.release()
+
+
+@pytest.mark.asyncio
+async def test_programmatic_turn_reuses_durable_session_across_invocations(
+    tmp_path,
+) -> None:
+    conversation = _ProgrammaticConversationRuntime()
+    session_ids: list[str] = []
+
+    async def handler(ctx) -> None:
+        assert ctx.turns is not None
+        if not session_ids:
+            session_ids.append(await ctx.turns.create_session(metadata={"source": "watch"}))
+            return
+        receipt = await ctx.turns.submit(session_ids[0], "second poll")
+        assert receipt.turn_id == "turn:1"
+
+    adapter, plan, target_lease, _store, ledger = _fixture(
+        tmp_path,
+        handler,
+        programmatic_turns=True,
+        conversation_runtime=conversation,
+        programmatic_session_creator=conversation.create_session,
+    )
+    runtime = await adapter.materialize_closed("tx-1", plan)
+    adapter.finalize_components("tx-1", runtime)
+    await adapter.enqueue_event(runtime, _event("create-programmatic-session"))
+    await adapter.drain(runtime)
+    await adapter.enqueue_event(runtime, _event("reuse-programmatic-session"))
+    await adapter.drain(runtime)
+
+    assert len(conversation.requests) == 1
+    request, _lease, handle = conversation.requests[0]
+    assert request.thread_id == session_ids[0]
+    reused = ledger.find_by_event(
+        plugin_id="drift",
+        job_name="merge_pending",
+        event_id="reuse-programmatic-session",
+    )
+    assert reused is not None
+    assert reused.programmatic_turn_state is ProgrammaticTurnState.ADMITTED
+    handle.complete()
+    await adapter.close_components("tx-1", runtime)
+    await target_lease.release()
+
+
+@pytest.mark.asyncio
+async def test_caught_uncertain_turn_receipt_still_fails_invocation_for_manual_reconcile(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    conversation = _ProgrammaticConversationRuntime()
+    caught: list[ProgrammaticTurnUncertainError] = []
+
+    async def handler(ctx) -> None:
+        assert ctx.turns is not None
+        session_id = await ctx.turns.create_session(metadata={})
+        try:
+            await ctx.turns.submit(session_id, "uncertain receipt")
+        except ProgrammaticTurnUncertainError as error:
+            caught.append(error)
+
+    adapter, plan, target_lease, _store, ledger = _fixture(
+        tmp_path,
+        handler,
+        programmatic_turns=True,
+        conversation_runtime=conversation,
+        programmatic_session_creator=conversation.create_session,
+        retry_policy=RetryPolicy(max_attempts=2),
+    )
+
+    def fail_commit(_invocation_id: str, _turn_id: str):
+        raise OSError("receipt database unavailable")
+
+    monkeypatch.setattr(ledger, "commit_programmatic_turn", fail_commit)
+    runtime = await adapter.materialize_closed("tx-1", plan)
+    adapter.finalize_components("tx-1", runtime)
+    await adapter.enqueue_event(runtime, _event("uncertain-receipt"))
+    await adapter.drain(runtime)
+
+    outcome = ledger.find_by_event(
+        plugin_id="drift",
+        job_name="merge_pending",
+        event_id="uncertain-receipt",
+    )
+    assert len(caught) == 1
+    assert len(conversation.requests) == 1
+    assert outcome is not None
+    assert outcome.state is JobOutcomeState.FAILED
+    assert outcome.attempt == 1
+    assert outcome.programmatic_turn_state is ProgrammaticTurnState.SUBMITTING
+    assert outcome.error is not None and "manual reconcile" in outcome.error
+    conversation.requests[0][2].complete()
     await adapter.close_components("tx-1", runtime)
     await target_lease.release()
 
@@ -982,7 +1104,9 @@ async def test_programmatic_turn_port_is_none_for_ordinary_job(tmp_path) -> None
 
 
 @pytest.mark.asyncio
-async def test_programmatic_turn_port_is_not_exposed_to_candidate_job(tmp_path) -> None:
+async def test_programmatic_turn_port_is_not_exposed_anywhere_in_candidate_snapshot(
+    tmp_path,
+) -> None:
     captured: list[Any] = []
 
     async def handler(ctx) -> None:
@@ -992,13 +1116,115 @@ async def test_programmatic_turn_port_is_not_exposed_to_candidate_job(tmp_path) 
         tmp_path,
         handler,
         programmatic_turns=True,
-        validation_candidate_plugin_ids=frozenset({"drift"}),
+        validation_candidate_plugin_ids=frozenset({"other-plugin"}),
     )
     runtime = await adapter.materialize_closed("tx-1", plan)
     adapter.finalize_components("tx-1", runtime)
     await adapter.enqueue_event(runtime, _event("candidate-job"))
     await adapter.drain(runtime)
     assert captured == [None]
+    assert store.leases == 1
+    await adapter.close_components("tx-1", runtime)
+    await target_lease.release()
+
+
+@pytest.mark.asyncio
+async def test_programmatic_turn_admission_forbids_handler_retry(tmp_path) -> None:
+    conversation = _ProgrammaticConversationRuntime()
+
+    async def handler(ctx) -> None:
+        assert ctx.turns is not None
+        session_id = await ctx.turns.create_session(metadata={})
+        _ = await ctx.turns.submit(session_id, "admit once")
+        raise RuntimeError("failure after admission")
+
+    adapter, plan, target_lease, _store, ledger = _fixture(
+        tmp_path,
+        handler,
+        programmatic_turns=True,
+        conversation_runtime=conversation,
+        programmatic_session_creator=conversation.create_session,
+        retry_policy=RetryPolicy(max_attempts=2),
+    )
+    runtime = await adapter.materialize_closed("tx-1", plan)
+    adapter.finalize_components("tx-1", runtime)
+    await adapter.enqueue_event(runtime, _event("admitted-no-retry"))
+    await adapter.drain(runtime)
+
+    outcome = ledger.find_by_event(
+        plugin_id="drift",
+        job_name="merge_pending",
+        event_id="admitted-no-retry",
+    )
+    assert len(conversation.requests) == 1
+    assert outcome is not None
+    assert outcome.state is JobOutcomeState.FAILED
+    assert outcome.attempt == 1
+    assert outcome.programmatic_turn_id == "turn:1"
+    assert outcome.error is not None and "manual reconcile" in outcome.error
+    conversation.requests[0][2].complete()
+    await adapter.close_components("tx-1", runtime)
+    await target_lease.release()
+
+
+@pytest.mark.asyncio
+async def test_programmatic_turn_repeated_cancel_finishes_admission_and_receipt(
+    tmp_path,
+) -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class BlockingConversation(_ProgrammaticConversationRuntime):
+        async def start_turn(self, request, *, runtime_snapshot_lease):
+            started.set()
+            await release.wait()
+            return await super().start_turn(
+                request,
+                runtime_snapshot_lease=runtime_snapshot_lease,
+            )
+
+    conversation = BlockingConversation()
+    submit_tasks: list[asyncio.Task[Any]] = []
+
+    async def handler(ctx) -> None:
+        assert ctx.turns is not None
+        session_id = await ctx.turns.create_session(metadata={})
+        task = asyncio.create_task(ctx.turns.submit(session_id, "cancel twice"))
+        submit_tasks.append(task)
+        await task
+
+    adapter, plan, target_lease, store, ledger = _fixture(
+        tmp_path,
+        handler,
+        programmatic_turns=True,
+        conversation_runtime=conversation,
+        programmatic_session_creator=conversation.create_session,
+    )
+    runtime = await adapter.materialize_closed("tx-1", plan)
+    adapter.finalize_components("tx-1", runtime)
+    await adapter.enqueue_event(runtime, _event("cancelled-admission"))
+    await started.wait()
+    submit_tasks[0].cancel()
+    await asyncio.sleep(0)
+    submit_tasks[0].cancel()
+    release.set()
+    await adapter.drain(runtime)
+
+    outcome = ledger.find_by_event(
+        plugin_id="drift",
+        job_name="merge_pending",
+        event_id="cancelled-admission",
+    )
+    assert len(conversation.requests) == 1
+    assert outcome is not None
+    assert outcome.state is JobOutcomeState.FAILED
+    assert outcome.programmatic_turn_id == "turn:1"
+    assert store.leases == 2
+    conversation.requests[0][2].complete()
+    for _ in range(100):
+        if store.leases == 1:
+            break
+        await asyncio.sleep(0)
     assert store.leases == 1
     await adapter.close_components("tx-1", runtime)
     await target_lease.release()
@@ -1366,6 +1592,59 @@ async def test_restart_requeues_exact_queued_interval_once(tmp_path) -> None:
     assert outcome.state is JobOutcomeState.SUCCEEDED
     assert outcome.interval_bucket == bucket
 
+    await adapter.close_components("tx-1", runtime)
+    await target_lease.release()
+
+
+@pytest.mark.asyncio
+async def test_process_restart_marks_submitting_programmatic_turn_for_reconcile(
+    tmp_path,
+) -> None:
+    calls: list[object] = []
+    path = tmp_path / "restart-programmatic.sqlite"
+    conversation = _ProgrammaticConversationRuntime()
+
+    async def handler(ctx) -> None:
+        calls.append(ctx)
+
+    _first, first_plan, first_lease, _store, first_ledger = _fixture(
+        tmp_path,
+        handler,
+        ledger_path=path,
+        programmatic_turns=True,
+        conversation_runtime=conversation,
+        programmatic_session_creator=conversation.create_session,
+    )
+    event = _event("restart-programmatic")
+    invocation_id = "restart-programmatic-invocation"
+    _ = first_ledger.admit(
+        _pending_identity(first_plan, invocation_id=invocation_id, event=event)
+    )
+    _ = first_ledger.transition(
+        invocation_id,
+        JobOutcomeState.RUNNING,
+        model_generation_id="model-restart",
+    )
+    _ = first_ledger.begin_programmatic_turn(invocation_id)
+    await first_lease.release()
+
+    adapter, plan, target_lease, _store, ledger = _fixture(
+        tmp_path,
+        handler,
+        ledger_path=path,
+        programmatic_turns=True,
+        conversation_runtime=conversation,
+        programmatic_session_creator=conversation.create_session,
+    )
+    runtime = await adapter.materialize_closed("tx-1", plan)
+    await adapter.open(runtime)
+
+    recovered = ledger.require(invocation_id)
+    assert calls == []
+    assert recovered.state is JobOutcomeState.FAILED
+    assert recovered.programmatic_turn_state is ProgrammaticTurnState.SUBMITTING
+    assert recovered.error is not None and "manual reconcile" in recovered.error
+    assert any("manual reconcile" in report for report in adapter.recovery_reports)
     await adapter.close_components("tx-1", runtime)
     await target_lease.release()
 

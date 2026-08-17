@@ -55,18 +55,27 @@ class ProgrammaticTurnReceipt:
 ```
 
 - port 由 `GenerationJobHost` 在实际执行 job 时按 exact snapshot lease 构造；插件 `apply()`、
-  candidate Root 和普通 listener 均拿不到它；
+  candidate Root 和普通 listener 均拿不到它；只要整张 snapshot 含任一 validation candidate，
+  其中所有 job（包括未变化的 stable job）都只能看到 `turns=None`；
 - bootstrap 必须在 `PluginManager.load_all()` 打开 Background Job admission 前绑定唯一
   `ConversationRuntime` owner；声明了该能力但 owner 未绑定时，stable boot 在 job publication 前
   fail-loud，不能等到第一次 interval 才失败；
 - `create_session` 只创建 `programmatic:*` Session，不接受插件指定物理 key；metadata 必须是
   JSON object，插件不得覆盖 Core 保留字段；Core 追加插件、job、generation 与外部 event
   identity；
-- `submit` 只接受由同一 port 创建或已证明属于该插件的 Session，返回已持久化的 `turn_id`；
-- 调用返回只代表 Turn admission，不等待回复。admission 之前失败可按插件 ledger 重试；
-  admission 结果不确定时必须进入 `manual_reconcile`，禁止自动重复 Turn；
+- `submit` 接受同一 invocation 创建的 Session，也允许后续 invocation 复用 durable Session；后者必须由
+  Core Session owner 证明 `programmatic=True` 且 `plugin_id/job_name` 与当前 exact binding 相同，插件
+  不能查询或复用别人的 Session；
+- 调用返回只代表 Turn admission，不等待回复。Core 只把已经证明未取得 Turn handle 的错误转换为
+  `ProgrammaticTurnPreAdmissionError`，插件可按自己的 event ledger 重试；已经取得 handle、但 durable
+  receipt 未确认时抛 `ProgrammaticTurnUncertainError` 并进入 `manual_reconcile`，禁止自动重复 Turn；
 - job 的 snapshot lease 覆盖 create/submit；取消时 Core 完成 admission 临界段后再恢复
   `CancelledError`，不能出现已提交 Turn 但插件误判为未提交。
+
+Core 的 `JobOutcomeLedger` 在调用 `ConversationRuntime` 前写 `submitting`，取得 handle 后写
+`admitted + turn_id`。同进程 handler 后续失败或取消、以及进程崩溃后发现任一 admission 状态时，
+都不得重跑 handler；记录转为带 `manual reconcile` 原因的失败事实。只有明确未取得 Turn handle
+的异常才能清除 `submitting` 并沿既有 retry policy 重试。
 
 Session 与 Turn 的权威 owner 仍是现有 Control/Session runtime。该 port 不新增第二份消息、
 Session 或 Turn 模型，也不允许删除、编辑或任意查询 Session。

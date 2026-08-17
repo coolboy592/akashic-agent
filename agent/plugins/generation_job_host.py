@@ -34,7 +34,9 @@ from agent.plugin_composition.background_jobs import (
     CoreEventTrigger,
     IntervalTrigger,
     ProgrammaticTurnPort,
+    ProgrammaticTurnPreAdmissionError,
     ProgrammaticTurnReceipt,
+    ProgrammaticTurnUncertainError,
 )
 from agent.plugins.composable import ComposablePlugin
 from agent.plugins.job_outcome_ledger import (
@@ -43,6 +45,7 @@ from agent.plugins.job_outcome_ledger import (
     JobOutcomePhase,
     JobOutcomeRecord,
     JobOutcomeState,
+    ProgrammaticTurnState,
 )
 from agent.plugins.proactive_documents import (
     DomainEffectLookup,
@@ -532,10 +535,14 @@ class _ProgrammaticTurnPort:
         runtime: object,
         request: _JobRequest,
         session_creator: Callable[..., object],
+        session_reader: Callable[[str], object],
+        ledger: JobOutcomeLedger,
     ) -> None:
         self._runtime = runtime
         self._request = request
         self._session_creator = session_creator
+        self._session_reader = session_reader
+        self._ledger = ledger
         self._invocation_token: object | None = None
         self._sessions: dict[str, dict[str, object]] = {}
         self._turn_tasks: set[asyncio.Task[None]] = set()
@@ -554,9 +561,14 @@ class _ProgrammaticTurnPort:
         self._require_live()
         payload = _programmatic_session_metadata(self._request, metadata)
         key = "programmatic:" + secrets.token_hex(16)
-        result = self._session_creator(key=key, metadata=payload)
-        if inspect.isawaitable(result):
-            await result
+        try:
+            result = self._session_creator(key=key, metadata=payload)
+            if inspect.isawaitable(result):
+                await result
+        except BaseException as error:
+            raise ProgrammaticTurnPreAdmissionError(
+                "programmatic session 未完成持久化"
+            ) from error
         self._sessions[key] = payload
         return key
 
@@ -570,36 +582,91 @@ class _ProgrammaticTurnPort:
         self._require_live()
         if not isinstance(session_id, str) or not session_id:
             raise ValueError("programmatic session_id 必须是非空字符串")
-        if session_id not in self._sessions:
-            raise RuntimeError("programmatic Turn session 不属于当前 job port")
+        metadata = await self._require_owned_session(session_id)
         if not isinstance(content, str):
             raise TypeError("programmatic Turn content 必须是字符串")
         start_turn = getattr(self._runtime, "start_turn", None)
         if not callable(start_turn):
             raise RuntimeError("ConversationRuntime 缺少 start_turn")
         lease = self._request.snapshot_lease.fork()
-        metadata = dict(self._sessions[session_id])
-        task = asyncio.create_task(
-            self._admit(start_turn, session_id, content, metadata, lease),
-            name=f"programmatic_turn_admission:{session_id}",
-        )
         try:
-            handle = await asyncio.shield(task)
-        except asyncio.CancelledError:
-            # Admission is a Core critical section: finish it before restoring cancellation.
-            try:
-                handle = await task
-            except BaseException:
-                await lease.release()
-                raise
-            self._retain_turn_lease(handle, lease, session_id)
-            raise
-        except BaseException:
+            self._ledger.begin_programmatic_turn(self._request.invocation_id)
+        except BaseException as error:
             await lease.release()
-            raise
+            raise ProgrammaticTurnPreAdmissionError(
+                "programmatic Turn 无法建立 durable admission boundary"
+            ) from error
+        try:
+            task = asyncio.create_task(
+                self._admit(start_turn, session_id, content, metadata, lease),
+                name=f"programmatic_turn_admission:{session_id}",
+            )
+        except BaseException as error:
+            self._ledger.reset_programmatic_turn(self._request.invocation_id)
+            await lease.release()
+            raise ProgrammaticTurnPreAdmissionError(
+                "programmatic Turn admission task 未创建"
+            ) from error
+        cancelled = False
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                cancelled = True
+        try:
+            handle = task.result()
+        except BaseException as error:
+            self._ledger.reset_programmatic_turn(self._request.invocation_id)
+            await lease.release()
+            raise ProgrammaticTurnPreAdmissionError(
+                "programmatic Turn 在取得 receipt 前失败"
+            ) from error
         self._retain_turn_lease(handle, lease, session_id)
-        turn_id = _turn_handle_id(handle)
+        try:
+            turn_id = _turn_handle_id(handle)
+            self._ledger.commit_programmatic_turn(
+                self._request.invocation_id,
+                turn_id,
+            )
+        except BaseException as error:
+            raise ProgrammaticTurnUncertainError(
+                "programmatic Turn 已取得 handle，但 durable receipt 未确认"
+            ) from error
+        if cancelled:
+            raise asyncio.CancelledError
         return ProgrammaticTurnReceipt(session_id=session_id, turn_id=turn_id)
+
+    async def _require_owned_session(self, session_id: str) -> dict[str, object]:
+        """Accept a local session or verify one durable session owned by this plugin job."""
+
+        if session_id in self._sessions:
+            return dict(self._sessions[session_id])
+        try:
+            result = self._session_reader(session_id)
+            if inspect.isawaitable(result):
+                result = await result
+        except BaseException as error:
+            raise ProgrammaticTurnPreAdmissionError(
+                "programmatic Turn session provenance 无法读取"
+            ) from error
+        if not isinstance(result, Mapping):
+            raise ProgrammaticTurnPreAdmissionError(
+                "programmatic Turn session 不存在或不属于当前插件"
+            )
+        metadata = result.get("metadata")
+        if not isinstance(metadata, Mapping):
+            raise ProgrammaticTurnPreAdmissionError(
+                "programmatic Turn session 缺少 Core provenance"
+            )
+        if (
+            metadata.get("programmatic") is not True
+            or metadata.get("plugin_id") != self._request.job.binding.plugin_id
+            or metadata.get("job_name") != self._request.job.binding.name
+        ):
+            raise ProgrammaticTurnPreAdmissionError(
+                "programmatic Turn session provenance 不匹配"
+            )
+        return dict(metadata)
 
     async def _admit(
         self,
@@ -851,6 +918,7 @@ class BackgroundJobActivityAdapter:
         interval_poll_seconds: float = 0.05,
         conversation_runtime: object | None = None,
         programmatic_session_creator: Callable[..., object] | None = None,
+        programmatic_session_reader: Callable[[str], object] | None = None,
     ) -> None:
         if ledger is not None and ledger_path is not None:
             raise TypeError("ledger 不能与 ledger_path 同时提供")
@@ -871,6 +939,7 @@ class BackgroundJobActivityAdapter:
         self._workspace = None if workspace is None else Path(workspace).resolve()
         self._conversation_runtime: object | None = None
         self._programmatic_session_creator: Callable[..., object] | None = None
+        self._programmatic_session_reader: Callable[[str], object] | None = None
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._invocation_id_factory = invocation_id_factory or (
             lambda: "invocation-" + secrets.token_hex(16)
@@ -885,6 +954,7 @@ class BackgroundJobActivityAdapter:
             self.bind_conversation_runtime(
                 conversation_runtime,
                 programmatic_session_creator=programmatic_session_creator,
+                programmatic_session_reader=programmatic_session_reader,
             )
 
     @property
@@ -904,6 +974,7 @@ class BackgroundJobActivityAdapter:
         runtime: object,
         *,
         programmatic_session_creator: Callable[..., object] | None = None,
+        programmatic_session_reader: Callable[[str], object] | None = None,
     ) -> None:
         """Bind the unique Core ConversationRuntime before job admission opens."""
 
@@ -915,12 +986,21 @@ class BackgroundJobActivityAdapter:
                     or programmatic_session_creator
                     is self._programmatic_session_creator
                 )
+                and (
+                    programmatic_session_reader is None
+                    or programmatic_session_reader is self._programmatic_session_reader
+                )
             ):
                 if (
                     self._programmatic_session_creator is None
                     and programmatic_session_creator is not None
                 ):
                     self._programmatic_session_creator = programmatic_session_creator
+                if (
+                    self._programmatic_session_reader is None
+                    and programmatic_session_reader is not None
+                ):
+                    self._programmatic_session_reader = programmatic_session_reader
                 return
             raise RuntimeError("BackgroundJob ConversationRuntime owner 已绑定")
         if not callable(getattr(runtime, "start_turn", None)):
@@ -929,8 +1009,13 @@ class BackgroundJobActivityAdapter:
             programmatic_session_creator
         ):
             raise TypeError("BackgroundJob programmatic session creator 必须可调用")
+        if programmatic_session_reader is not None and not callable(
+            programmatic_session_reader
+        ):
+            raise TypeError("BackgroundJob programmatic session reader 必须可调用")
         self._conversation_runtime = runtime
         self._programmatic_session_creator = programmatic_session_creator
+        self._programmatic_session_reader = programmatic_session_reader
 
     @property
     def handler_resolution_count(self) -> int:
@@ -979,16 +1064,17 @@ class BackgroundJobActivityAdapter:
         if store is None:
             raise RuntimeError("BackgroundJob 需要 RuntimeSnapshotStore")
         bindings = () if catalog is None else tuple(catalog.values())
-        candidate_plugin_ids = target_lease.validation_candidate_plugin_ids
+        candidate_snapshot = bool(target_lease.validation_candidate_plugin_ids)
         if (
             any(
                 binding.definition.programmatic_turns
-                and binding.plugin_id not in candidate_plugin_ids
                 for binding in bindings
             )
+            and not candidate_snapshot
             and (
                 self._conversation_runtime is None
                 or self._programmatic_session_creator is None
+                or self._programmatic_session_reader is None
             )
         ):
             raise RuntimeError(
@@ -1029,12 +1115,11 @@ class BackgroundJobActivityAdapter:
         try:
             if any(
                 binding.definition.programmatic_turns
-                and binding.plugin_id
-                not in plan.target_lease.validation_candidate_plugin_ids
                 for binding in plan.bindings
-            ) and (
+            ) and not plan.target_lease.validation_candidate_plugin_ids and (
                 self._conversation_runtime is None
                 or self._programmatic_session_creator is None
+                or self._programmatic_session_reader is None
             ):
                 raise RuntimeError(
                     "BackgroundJob programmatic_turns 缺少 ConversationRuntime owner 或 SessionStore creator"
@@ -1473,6 +1558,15 @@ class BackgroundJobActivityAdapter:
                         "exact identity mismatch: " + ", ".join(mismatches),
                     )
                     continue
+                if record.programmatic_turn_state is not None:
+                    detail = _programmatic_turn_reconcile_error(record)
+                    self._transition_outcome(
+                        record.invocation_id,
+                        JobOutcomeState.FAILED,
+                        error=detail,
+                    )
+                    _report_recovery(runtime, record, detail)
+                    continue
                 if await self._recover_document_record(job, record):
                     continue
                 if record.state is not JobOutcomeState.QUEUED:
@@ -1655,13 +1749,12 @@ class BackgroundJobActivityAdapter:
 
         job = request.job
         turns = None
-        is_candidate = (
-            job.binding.plugin_id in request.snapshot_lease.validation_candidate_plugin_ids
-        )
+        is_candidate = bool(request.snapshot_lease.validation_candidate_plugin_ids)
         if job.binding.definition.programmatic_turns and not is_candidate:
             if (
                 self._conversation_runtime is None
                 or self._programmatic_session_creator is None
+                or self._programmatic_session_reader is None
             ):
                 raise RuntimeError(
                     "BackgroundJob programmatic_turns 缺少 ConversationRuntime owner 或 SessionStore creator"
@@ -1670,6 +1763,8 @@ class BackgroundJobActivityAdapter:
                 self._conversation_runtime,
                 request,
                 self._programmatic_session_creator,
+                self._programmatic_session_reader,
+                self._require_ledger(),
             )
         effect_id = job.binding.definition.domain_effect
         lookup = job.domain_effect_lookup
@@ -1824,6 +1919,17 @@ class BackgroundJobActivityAdapter:
                                 )
                                 raise
                             current = ledger.get(request.invocation_id)
+                            if (
+                                current is not None
+                                and not current.terminal
+                                and current.programmatic_turn_state is not None
+                            ):
+                                self._transition_outcome(
+                                    request.invocation_id,
+                                    JobOutcomeState.FAILED,
+                                    error=_programmatic_turn_reconcile_error(current),
+                                )
+                                raise
                             if current is not None and not current.terminal:
                                 self._transition_outcome(
                                     request.invocation_id,
@@ -1845,6 +1951,13 @@ class BackgroundJobActivityAdapter:
                             current = ledger.get(request.invocation_id)
                             if current is None or current.terminal:
                                 raise
+                            if current.programmatic_turn_state is not None:
+                                self._transition_outcome(
+                                    request.invocation_id,
+                                    JobOutcomeState.FAILED,
+                                    error=_programmatic_turn_reconcile_error(current),
+                                )
+                                return
                             retry_policy = request.job.binding.definition.retry_policy
                             if current.attempt < retry_policy.max_attempts:
                                 phase = (
@@ -1882,6 +1995,18 @@ class BackgroundJobActivityAdapter:
                     finally:
                         llm.invalidate()
                         _CURRENT_INVOCATION_TOKEN.reset(invocation_token)
+                    current = ledger.get(request.invocation_id)
+                    if (
+                        current is not None
+                        and current.programmatic_turn_state
+                        is ProgrammaticTurnState.SUBMITTING
+                    ):
+                        self._transition_outcome(
+                            request.invocation_id,
+                            JobOutcomeState.FAILED,
+                            error=_programmatic_turn_reconcile_error(current),
+                        )
+                        return
                     digest = hashlib.sha256(repr(result).encode("utf-8")).hexdigest()
                     self._transition_outcome(
                         request.invocation_id,
@@ -2404,6 +2529,20 @@ def _programmatic_session_metadata(
         }
     )
     return payload
+
+
+def _programmatic_turn_reconcile_error(record: JobOutcomeRecord) -> str:
+    """Describe a durable Turn boundary that forbids automatic handler replay."""
+
+    state = record.programmatic_turn_state
+    if state is None:
+        raise RuntimeError("programmatic Turn reconcile 缺少 admission state")
+    if state is ProgrammaticTurnState.ADMITTED:
+        return (
+            "programmatic Turn 已提交，禁止自动重跑；manual reconcile turn_id="
+            f"{record.programmatic_turn_id}"
+        )
+    return "programmatic Turn 提交结果不确定，禁止自动重跑；manual reconcile"
 
 
 def _validate_json_value(value: object, path: str) -> None:

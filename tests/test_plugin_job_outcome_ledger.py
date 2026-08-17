@@ -16,6 +16,7 @@ from agent.plugins.job_outcome_ledger import (
     JobOutcomePhase,
     JobOutcomeState,
     JobOutcomeTransitionError,
+    ProgrammaticTurnState,
 )
 
 
@@ -88,6 +89,24 @@ def test_admission_persists_exact_identity_and_deduplicates_event(tmp_path: Path
         "plugin-api-v3",
     )
     ledger.integrity_check()
+
+
+def test_programmatic_turn_receipt_survives_process_reopen(tmp_path: Path) -> None:
+    path = tmp_path / "outcomes.sqlite"
+    ledger = JobOutcomeLedger(path)
+    admitted = ledger.admit(_identity())
+    _ = ledger.transition(admitted.invocation_id, JobOutcomeState.RUNNING)
+    submitting = ledger.begin_programmatic_turn(admitted.invocation_id)
+    assert submitting.programmatic_turn_state is ProgrammaticTurnState.SUBMITTING
+    ledger.close()
+
+    reopened = JobOutcomeLedger(path)
+    retained = reopened.require(admitted.invocation_id)
+    assert retained.programmatic_turn_state is ProgrammaticTurnState.SUBMITTING
+    assert retained.programmatic_turn_id is None
+    committed = reopened.commit_programmatic_turn(admitted.invocation_id, "turn-1")
+    assert committed.programmatic_turn_state is ProgrammaticTurnState.ADMITTED
+    assert committed.programmatic_turn_id == "turn-1"
 
 
 def test_invocation_id_cannot_be_reused_for_another_event(tmp_path: Path) -> None:
@@ -297,6 +316,8 @@ def test_schema_migrates_old_outcome_table_without_payload_column(tmp_path: Path
     ledger.close()
     with closing(sqlite3.connect(path)) as connection:
         connection.execute("ALTER TABLE job_outcomes DROP COLUMN event_payload_json")
+        connection.execute("ALTER TABLE job_outcomes DROP COLUMN programmatic_turn_state")
+        connection.execute("ALTER TABLE job_outcomes DROP COLUMN programmatic_turn_id")
         connection.execute("PRAGMA user_version = 1")
         connection.commit()
 
@@ -308,7 +329,9 @@ def test_schema_migrates_old_outcome_table_without_payload_column(tmp_path: Path
         }
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
     assert "event_payload_json" in columns
-    assert version == 2
+    assert "programmatic_turn_state" in columns
+    assert "programmatic_turn_id" in columns
+    assert version == 3
     assert migrated.list_all() == ()
 
 
