@@ -11,8 +11,6 @@ from typing import Protocol, cast
 
 from agent.plugin_composition import (
     MobileUiBinding,
-    MobileUiDescriptor,
-    MobileUiQueryHandler,
     MobileUiRpcInvalidRequest,
 )
 from agent.plugins.generation import MobileUiAsset, PluginGeneration
@@ -230,55 +228,16 @@ class PluginMobileUiProvider:
         snapshot: RuntimeSnapshot,
         generation: PluginGeneration,
     ) -> MobileUiBinding | None:
-        """Resolve v3 handlers from this snapshot, or use the frozen v2 triple."""
+        """Resolve a live Mobile UI handler from this snapshot's exact Root registry."""
 
-        # 1. v3 handlers live only in the exact composition Root registry.
-        registry = getattr(snapshot, "mobile_ui_registry", None)
-        if registry is not None:
-            binding = registry.binding(generation.plugin_id)
-            if binding is not None:
-                if _has_legacy_mobile_ui_contribution(generation):
-                    raise RuntimeError(
-                        "插件同时存在 v2 与 v3 Mobile UI contribution: "
-                        f"{generation.plugin_id}"
-                    )
-                if not binding.is_live():
-                    return None
-                return None if not binding.available() else binding
-
-        # 2. v2 remains a frozen compatibility triple until its consumer moves.
-        contributions = generation.contributions
-        asset = getattr(contributions, "mobile_ui_asset", None)
-        query = getattr(contributions, "mobile_ui_query", None)
-        available = getattr(contributions, "mobile_ui_available", None)
-        legacy_snapshot_shape = not hasattr(
-            contributions,
-            "mobile_ui_query",
-        ) and not hasattr(contributions, "mobile_ui_available")
-        # 仅兼容缺少三元组字段的旧快照；当前 contribution 缺字段视为损坏。
-        if asset is not None and legacy_snapshot_shape:
-            query = getattr(generation.instance, "mobile_ui_query", None)
-            available = getattr(generation.instance, "mobile_ui_available", None)
-        if asset is None:
-            if query is not None or available is not None:
-                raise RuntimeError(
-                    "插件 v2 Mobile UI contribution 状态不一致: "
-                    f"{generation.plugin_id}"
-                )
+        # 1. Only the immutable registry from this exact snapshot Root owns handlers.
+        registry = snapshot.mobile_ui_registry
+        if registry is None:
             return None
-        if query is None or available is None:
-            raise RuntimeError(
-                "插件 v2 Mobile UI contribution 缺少 handler: "
-                f"{generation.plugin_id}"
-            )
-        if not available():
+        binding = registry.binding(generation.plugin_id)
+        if binding is None or not binding.is_live():
             return None
-        return MobileUiBinding(
-            descriptor=_legacy_descriptor(generation.plugin_id, asset),
-            asset=asset,
-            query=cast(MobileUiQueryHandler, query),
-            available=available,
-        )
+        return None if not binding.available() else binding
 
     @staticmethod
     def _catalog_items(snapshot: RuntimeSnapshot) -> list[dict[str, object]]:
@@ -335,31 +294,6 @@ class MobileUiQueryOverloaded(RuntimeError):
 
 class MobileUiRpcExecutionError(RuntimeError):
     pass
-
-
-def _has_legacy_mobile_ui_contribution(generation: PluginGeneration) -> bool:
-    contributions = generation.contributions
-    return (
-        getattr(contributions, "mobile_ui_asset", None) is not None
-        or getattr(contributions, "mobile_ui_query", None) is not None
-        or getattr(contributions, "mobile_ui_available", None) is not None
-    )
-
-
-def _legacy_descriptor(
-    plugin_id: str,
-    asset: MobileUiAsset,
-) -> MobileUiDescriptor:
-    return MobileUiDescriptor(
-        owner=plugin_id,
-        module_sha256=asset.module_sha256,
-        module_bytes=asset.module_bytes,
-        stylesheet_sha256=asset.stylesheet_sha256,
-        stylesheet_bytes=asset.stylesheet_bytes,
-        navigation_label=asset.navigation_label,
-        navigation_description=asset.navigation_description,
-        slots=asset.slots,
-    )
 
 
 def _normalize_rpc_result(
