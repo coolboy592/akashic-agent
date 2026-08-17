@@ -1025,7 +1025,7 @@ def test_init_workspace_respects_force_for_text_assets(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_start_channels_wires_telegram_qq_and_plugin(
+async def test_start_channels_wires_telegram_qq_and_extra_channel(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -1151,7 +1151,7 @@ async def test_start_channels_wires_telegram_qq_and_plugin(
         ),
         mobile_command_catalog_provider=lambda: (("mobile_only", "仅 mobile"),),
         interrupt_controller=cast(Any, controller),
-        plugin_channels=[cast(Any, _PluginChannel())],
+        extra_channels=[cast(Any, _PluginChannel())],
     )
     try:
         await host.start_all()

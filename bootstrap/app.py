@@ -500,18 +500,16 @@ class AppRuntime:
                     self.mobile_gateway_runtime.channel.bind_mobile_ui_provider(
                         plugin_ui_provider
                     )
-            # V2_REMOVAL(channel-capability-v2)：ChannelHost 改从 committed stable v3 channel
-            # capability 绑定后删除 Manager.channels 投影；candidate 不得经 bootstrap 提前发布。
-            plugin_channels = list(plugin_manager.channels) if plugin_manager else []
+            extra_channels = []
             if self.mobile_gateway_runtime is not None:
-                plugin_channels.append(self.mobile_gateway_runtime.channel)
+                extra_channels.append(self.mobile_gateway_runtime.channel)
             if self.config.channels.chat.enabled:
                 from infra.channels.web_chat_channel import WebChatChannel
 
                 self.web_chat_channel = WebChatChannel(
                     channel_name=self.config.channels.chat.channel_name,
                 )
-                plugin_channels.append(self.web_chat_channel)
+                extra_channels.append(self.web_chat_channel)
             self.channel_host = await start_channels(
                 self.config,
                 bus=self.bus,
@@ -530,26 +528,12 @@ class AppRuntime:
                     else None
                 ),
                 interrupt_controller=self.conversation_runtime,
-                plugin_channels=plugin_channels,
+                extra_channels=extra_channels,
             )
             await self.channel_host.start_all()
             if self.readiness is not None:
                 self.readiness.mark_stage("channels.ready")
             if plugin_manager is not None:
-                # V2_REMOVAL(channel-capability-v2)：stable v3 channel catalog 接管 generation
-                # binding、drain 与 endpoint swap 后，删除 PluginContributions.channels 回读。
-                channel_bindings = (
-                    {
-                        plugin_id: generation.contributions.channels
-                        for plugin_id, generation in plugin_manager.current_snapshot.generations.items()
-                    }
-                    if plugin_manager.current_snapshot is not None
-                    else {}
-                )
-                self.channel_host.bind_plugin_channels(channel_bindings)
-                plugin_manager.bind_channel_switcher(
-                    self.channel_host.swap_plugin_channels
-                )
                 plugin_manager.bind_endpoint_switcher(self._swap_plugin_endpoints)
 
             self.tasks = [
@@ -1154,17 +1138,8 @@ class AppRuntime:
     ) -> None:
         assert self.channel_host is not None
         assert self.plugin_service_host is not None
-        swap = (
-            self.channel_host.prepare_plugin_swap(
-                plugin_id,
-                old_channels,
-                new_channels,
-            )
-            if old_channels != new_channels
-            else None
-        )
-        if swap is not None:
-            await self.channel_host.stop_plugin_swap(swap)
+        if old_channels or new_channels:
+            raise RuntimeError("v3 endpoint transaction 不接受 legacy Channel")
         services_switched = False
         commands_switched = False
         try:
@@ -1181,8 +1156,6 @@ class AppRuntime:
                     new_commands,
                 )
                 commands_switched = True
-            if swap is not None:
-                await self.channel_host.start_plugin_swap(swap)
         except BaseException as error:
             command_restore_error: BaseException | None = None
             if commands_switched:
@@ -1203,30 +1176,19 @@ class AppRuntime:
                     )
                 except BaseException as restore_error:
                     service_restore_error = restore_error
-            channel_restore_error: BaseException | None = None
-            if swap is not None:
-                try:
-                    await self.channel_host.restore_plugin_swap(swap)
-                except BaseException as restore_error:
-                    channel_restore_error = restore_error
             if (
                 command_restore_error is not None
                 or service_restore_error is not None
-                or channel_restore_error is not None
             ):
                 details: list[str] = []
                 if command_restore_error is not None:
                     details.append(f"command catalog: {command_restore_error}")
                 if service_restore_error is not None:
                     details.append(f"managed service: {service_restore_error}")
-                if channel_restore_error is not None:
-                    details.append(f"Channel: {channel_restore_error}")
                 raise RuntimeError(
                     "插件旧端点恢复失败: " + "; ".join(details)
                 ) from error
             raise
-        if swap is not None:
-            self.channel_host.commit_plugin_swap(swap)
 
 
 def build_app_runtime(

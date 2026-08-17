@@ -30,7 +30,7 @@ async def start_channels(
         [], tuple[tuple[str, str], ...]
     ] | None = None,
     interrupt_controller: InterruptController | None = None,
-    plugin_channels: list[Channel] | None = None,
+    extra_channels: list[Channel] | None = None,
 ) -> ChannelHost:
     attachment_store = AttachmentStore(session_manager.workspace / "uploads")
 
@@ -80,7 +80,7 @@ async def start_channels(
             interrupt_controller=interrupt_controller,
         ))
 
-    for channel in plugin_channels or []:
+    for channel in extra_channels or []:
         host.add(channel)
 
     return host
