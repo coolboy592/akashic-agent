@@ -1188,7 +1188,11 @@ async def test_active_plugins_excludes_inactive_memory_plugin(
         plugin_dirs=[Path(__file__).parents[1] / "plugins"],
         event_bus=bus,
         workspace=tmp_path,
-        memory_engine=SimpleNamespace(describe=lambda: SimpleNamespace(name="akasha")),
+        memory_engine=SimpleNamespace(
+            describe=lambda: SimpleNamespace(name="akasha"),
+            take_turn_user_metadata=lambda _turn_id: {},
+            wait_active_recall=lambda _session_key, _turn_id: None,
+        ),
         installed_cache_root=tmp_path / ".akashic-plugin" / "cache",
     )
     await mgr.load_all()
