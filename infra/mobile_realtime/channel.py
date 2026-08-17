@@ -502,7 +502,7 @@ class MobileRealtimeChannel:
         device_id: str,
         frame: GenericCommand,
     ) -> CommandReply:
-        """执行不写 command receipt 的 Mobile Plugin UI v2 临时请求。"""
+        """执行不写 command receipt 的 committed Mobile Plugin UI 请求。"""
 
         try:
             if frame.type == "plugin.ui.catalog":
@@ -1107,7 +1107,7 @@ class MobileRealtimeChannel:
         return CommandReply(type="command.list.ok", payload={"items": items})
 
     def _plugin_ui_catalog(self, device_id: str, frame: GenericCommand) -> CommandReply:
-        """返回不含源码的 Mobile Plugin UI v2 catalog。"""
+        """返回不含源码的 committed Mobile Plugin UI catalog。"""
 
         _expect_keys(frame.payload, {"subscribe", "if_revision"})
         subscribe = frame.payload.get("subscribe", False)

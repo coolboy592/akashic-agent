@@ -31,7 +31,7 @@ def emit_composition_lifecycle(
 ) -> None:
     """Emit one synchronous lifecycle event from the request's frozen Root."""
 
-    # 1. Bootstrap and legacy snapshots without a composition Root stay unchanged.
+    # 1. Bootstrap snapshots without a composition Root have no plugin listeners.
     snapshot = get_lifecycle_runtime_snapshot()
     if snapshot is None or snapshot.composition_root is None:
         return
@@ -46,7 +46,7 @@ async def run_composition_lifecycle(
 ) -> None:
     """Run one lifecycle seam from the request's frozen composition Root."""
 
-    # 1. Bootstrap and legacy snapshots without a composition Root stay unchanged.
+    # 1. Bootstrap snapshots without a composition Root have no plugin listeners.
     snapshot = get_lifecycle_runtime_snapshot()
     if snapshot is None or snapshot.composition_root is None:
         return
@@ -66,7 +66,7 @@ async def observe_composition_event(
 ) -> None:
     """Observe one settled fact from the request's frozen composition Root."""
 
-    # 1. Bootstrap and legacy snapshots without a composition Root stay unchanged.
+    # 1. Bootstrap snapshots without a composition Root have no plugin listeners.
     snapshot = get_lifecycle_runtime_snapshot()
     if snapshot is None or snapshot.composition_root is None:
         return
@@ -77,7 +77,7 @@ async def observe_composition_event(
 
 
 async def observe_composition_domain_event(event: object) -> None:
-    """Bridge one legacy domain event to its request-bound ObserveEventKey."""
+    """Bridge one domain event to its request-bound ObserveEventKey."""
 
     # 1. Resolve only the three domain facts that have a stable v3 Observe seam.
     from agent.turn_events.observe import (

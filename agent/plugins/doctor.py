@@ -172,7 +172,7 @@ def _find_plugin_roots(
 
 
 def _plugin_root_has_entrypoint(root: Path) -> bool:
-    """Recognize legacy plugin.py and static-manifest custom entrypoints."""
+    """Recognize builtin plugin.py and static-manifest custom entrypoints."""
 
     manifest_path = root / "akashic.plugin.toml"
     if manifest_path.exists() or manifest_path.is_symlink():

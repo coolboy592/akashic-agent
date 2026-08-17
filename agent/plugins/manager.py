@@ -6185,7 +6185,7 @@ class _CandidateRejected(Exception):
 
 
 class _StablePluginFailed(Exception):
-    """标识一个可以排除后重试的 legacy stable 参与者。"""
+    """标识一个可以排除后重试的 stable boot 参与者。"""
 
     def __init__(
         self,
@@ -6554,7 +6554,7 @@ def _discard_generation_candidate_pointer(generation: PluginGeneration) -> None:
 def _installed_candidate_base_from_root(plugin_dir: Path) -> Path | None:
     """Resolve the candidate pointer owner for an exact installed latest root."""
 
-    # 1. Legacy installs and stable==latest keep immediate publish compatibility.
+    # 1. 首次安装与 stable==latest 没有独立 candidate publication。
     plugin_base = _installed_artifact_base_from_root(plugin_dir)
     stable = read_pointer(plugin_base, "stable")
     latest = read_pointer(plugin_base, "latest")
