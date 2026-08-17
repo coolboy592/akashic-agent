@@ -181,10 +181,9 @@ def _disable_candidate_side_effect_tools(
         disabled = set()
     for plugin_id in candidate_plugin_ids:
         generation = generations[plugin_id]
-        plugin_name = str(getattr(generation.instance, "name", plugin_id))
         disabled |= tools.get_non_read_only_source_tool_names(
             "plugin",
-            plugin_name,
+            plugin_id,
         )
         for server_name in generation.contributions.mcp_servers:
             disabled |= tools.get_non_read_only_source_tool_names(

@@ -34,6 +34,7 @@ from agent.plugin_composition import (
     PROACTIVE_COMPONENTS,
     SESSION_READ,
     BACKGROUND_JOBS,
+    TOOL_CATALOG,
     UI_SLOTS,
     CommandRegistry,
     CompositionRoot,
@@ -47,6 +48,9 @@ from agent.plugin_composition import (
     PluginCommands,
     PluginProactiveComponents,
     PluginBackgroundJobs,
+    PluginToolBinding,
+    PluginToolCatalog,
+    PluginTools,
     PluginRuntime,
     SessionReadService,
     resolve_mobile_ui_asset,
@@ -3144,6 +3148,7 @@ class PluginManager:
             snapshot.tool_registry = self._compile_snapshot_tools(
                 generations,
                 self._active_workspace_mcp,
+                snapshot.plugin_tool_catalog,
             )
             snapshot.tool_hooks = self._compile_snapshot_tool_hooks(generations)
             self._validate_snapshot_command_claims(snapshot)
@@ -4047,9 +4052,8 @@ class PluginManager:
         registry = ready.snapshot.tool_registry
         if registry is None:
             raise RuntimeError("candidate RuntimeSnapshot 缺少 ToolRegistry")
-        plugin_name = str(getattr(generation.instance, "name", plugin_id))
         owned_tools = registry.get_source_tool_names(
-            "plugin", plugin_name, risk="read-only"
+            "plugin", plugin_id, risk="read-only"
         )
         for server_name in generation.contributions.mcp_servers:
             owned_tools.update(
@@ -5274,6 +5278,7 @@ class PluginManager:
         proactive_source_count_before = len(self._proactive_sources)
         job_count_before = len(self._jobs)
         channel_count_before = len(self._channels)
+        created_activation_data_dir = False
         self._generation_sequence += 1
         generation_sequence = self._generation_sequence
         module_path = mod["module_path"].strip()
@@ -5513,6 +5518,7 @@ class PluginManager:
             )
             return None
         if not stage_stable and activate:
+            created_activation_data_dir = not data_dir.exists()
             ensure_workspace_plugin_data_dir(data_dir, self._workspace)
         scope = PluginScope(plugin_id)
         if not isinstance(instance, ComposablePlugin):
@@ -5567,7 +5573,9 @@ class PluginManager:
                         )
                     )
             self._cleanup_failures.extend(await scope.aclose())
-            if generation is not None and generation.boot_created_data_dir:
+            if created_activation_data_dir:
+                _remove_validation_data_dir(data_dir)
+            elif generation is not None and generation.boot_created_data_dir:
                 _remove_validation_data_dir(generation.data_dir)
                 generation.boot_created_data_dir = False
             self._remove_module_tree(mp)
@@ -6028,6 +6036,7 @@ class PluginManager:
             snapshot.tool_registry = self._compile_snapshot_tools(
                 generations,
                 self._active_workspace_mcp,
+                snapshot.plugin_tool_catalog,
             )
             snapshot.tool_hooks = self._compile_snapshot_tool_hooks(generations)
             self._validate_snapshot_command_claims(snapshot)
@@ -6146,6 +6155,14 @@ class PluginManager:
                 _ = await root.context.provide(
                     BACKGROUND_JOBS,
                     PluginBackgroundJobs(root.instance_token),
+                )
+            if any(
+                TOOL_CATALOG in cast(ComposablePlugin, item.instance).inject
+                for item in ordered
+            ):
+                _ = await root.context.provide(
+                    TOOL_CATALOG,
+                    PluginTools(root.instance_token),
                 )
             if any(
                 UI_SLOTS in cast(ComposablePlugin, item.instance).inject
@@ -6841,6 +6858,7 @@ class PluginManager:
         snapshot.tool_registry = self._compile_snapshot_tools(
             dict(snapshot.generations),
             snapshot.workspace_mcp_generation,
+            snapshot.plugin_tool_catalog,
         )
         for generation in sorted(
             snapshot.generations.values(),
@@ -6875,6 +6893,7 @@ class PluginManager:
         self,
         generations: dict[str, PluginGeneration],
         workspace_mcp: WorkspaceMcpGeneration | None = None,
+        plugin_tools: PluginToolCatalog | None = None,
     ) -> Any:
         if self._tool_registry is None:
             return None
@@ -6893,11 +6912,6 @@ class PluginManager:
             excluded_sources=plugin_mcp_sources | workspace_mcp_sources,
         )
         for generation in sorted(generations.values(), key=lambda item: item.plugin_id):
-            plugin_name = getattr(
-                generation.instance,
-                "name",
-                generation.plugin_id,
-            )
             for md in plugin_registry.get_handlers_by_module_path(
                 generation.module_path
             ):
@@ -6912,7 +6926,7 @@ class PluginManager:
                     always_on=bool(md.tool_always_on),
                     search_hint=md.tool_search_hint,
                     source_type="plugin",
-                    source_name=plugin_name,
+                    source_name=generation.plugin_id,
                 )
             if generation.mcp_catalog is None:
                 continue
@@ -6937,6 +6951,26 @@ class PluginManager:
                         source_type="mcp",
                         source_name=server.name,
                     )
+        if plugin_tools is not None:
+            for binding in plugin_tools.values():
+                if registry.has_tool(binding.descriptor.name):
+                    raise RuntimeError(
+                        f"插件工具名称重复: {binding.descriptor.name}"
+                    )
+                registry.register(
+                    _build_v3_plugin_tool(
+                        generations,
+                        plugin_tools,
+                        binding,
+                    ),
+                    risk=binding.descriptor.risk,
+                    always_on=binding.descriptor.always_on,
+                    preloadable=binding.descriptor.preloadable,
+                    requires_turn_search=binding.descriptor.requires_turn_search,
+                    search_hint=binding.descriptor.search_hint,
+                    source_type="plugin",
+                    source_name=binding.plugin_id,
+                )
         if workspace_mcp is not None:
             for server in workspace_mcp.catalog.servers.values():
                 for tool in server.tools:
@@ -6976,6 +7010,7 @@ class PluginManager:
         snapshot.tool_registry = self._compile_snapshot_tools(
             self._active_generations,
             generation,
+            snapshot.plugin_tool_catalog,
         )
         snapshot.tool_hooks = self._compile_snapshot_tool_hooks(
             self._active_generations
@@ -8700,6 +8735,8 @@ def _replace_snapshot_payload(
         "private_proactive_catalog_identity",
         "background_job_catalog",
         "background_job_catalog_identity",
+        "plugin_tool_catalog",
+        "plugin_tool_catalog_identity",
         "composition_root",
         "composition_topology",
         "composition_active_plugin_ids",
@@ -8923,6 +8960,101 @@ def _build_plugin_tool(instance: Any, metadata: Any) -> Any:
             "parameters": metadata.tool_schema
             or {"type": "object", "properties": {}, "required": []},
             "execute": _make_execute(bound),
+        },
+    )
+    return tool_class()
+
+
+def _build_v3_plugin_tool(
+    generations: Mapping[str, PluginGeneration],
+    catalog: PluginToolCatalog,
+    binding: PluginToolBinding,
+) -> Any:
+    """Build one Tool adapter fenced to its exact committed snapshot catalog."""
+
+    from agent.plugin_composition.tool_catalog import _thaw_json
+    from agent.tools.base import (
+        Tool as AgentTool,
+        ToolExecutionContext,
+        ToolResult,
+        get_current_tool_context,
+    )
+
+    # 1. Resolve and validate the handler at snapshot compilation time.
+    generation = generations.get(binding.plugin_id)
+    if (
+        generation is None
+        or generation.generation_id != binding.generation_id
+        or not isinstance(generation.instance, ComposablePlugin)
+    ):
+        raise RuntimeError(
+            "plugin Tool handler 不属于 exact generation: "
+            f"{binding.plugin_id}:{binding.generation_id}"
+        )
+    handler: object = generation.instance.module
+    for segment in binding.descriptor.handler_export.replace(":", ".").split("."):
+        handler = getattr(handler, segment, None)
+        if handler is None:
+            break
+    if not inspect.iscoroutinefunction(handler):
+        raise RuntimeError(
+            f"plugin Tool handler 必须是 async function: {binding.descriptor.name}"
+        )
+    signature = inspect.signature(handler)
+    parameters = tuple(signature.parameters.values())
+    positional = {
+        inspect.Parameter.POSITIONAL_ONLY,
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+    }
+    if (
+        len(parameters) != 2
+        or tuple(item.name for item in parameters) != ("context", "arguments")
+        or any(item.kind not in positional for item in parameters)
+        or any(item.default is not inspect.Parameter.empty for item in parameters)
+    ):
+        raise RuntimeError(
+            "plugin Tool handler 签名必须是 async (context, arguments): "
+            f"{binding.descriptor.name}"
+        )
+
+    # 2. Execute only through the exact live catalog bound by ToolRegistry.
+    async def execute(self: Any, **kwargs: Any) -> str | ToolResult:
+        snapshot = get_current_runtime_snapshot()
+        if snapshot is None or snapshot.plugin_tool_catalog is not catalog:
+            raise RuntimeError(
+                f"plugin Tool 缺少 exact RuntimeSnapshot: {binding.descriptor.name}"
+            )
+        current = catalog.get(binding.descriptor.name)
+        if current is not binding or not binding.is_live():
+            raise RuntimeError(
+                f"plugin Tool binding 已失效: {binding.descriptor.name}"
+            )
+        context = get_current_tool_context()
+        if not isinstance(context, ToolExecutionContext):
+            raise RuntimeError(
+                f"plugin Tool 缺少 ToolExecutionContext: {binding.descriptor.name}"
+            )
+        result = await handler(
+            context,
+            MappingProxyType(dict(kwargs)),
+        )
+        if not isinstance(result, (str, ToolResult)):
+            raise RuntimeError(
+                f"plugin Tool handler 返回值无效: {binding.descriptor.name}"
+            )
+        return result
+
+    tool_class = type(
+        f"V3PluginTool_{binding.descriptor.name}",
+        (AgentTool,),
+        {
+            "name": binding.descriptor.name,
+            "description": binding.descriptor.description,
+            "parameters": cast(
+                dict[str, Any],
+                _thaw_json(binding.descriptor.parameters),
+            ),
+            "execute": execute,
         },
     )
     return tool_class()

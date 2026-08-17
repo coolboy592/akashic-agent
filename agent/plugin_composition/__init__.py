@@ -104,6 +104,15 @@ from agent.plugin_composition.background_jobs import (
     PluginBackgroundJobs,
     RetryPolicy,
 )
+from agent.plugin_composition.tool_catalog import (
+    TOOL_CATALOG,
+    PluginToolBinding,
+    PluginToolCatalog,
+    PluginToolDefinition,
+    PluginToolDescriptor,
+    PluginTools,
+    ToolRisk,
+)
 from agent.plugin_composition.channels import (
     CHANNELS,
     ChannelAdapter,
@@ -211,6 +220,7 @@ __all__ = [
     "MCP_SERVERS",
     "PROACTIVE_COMPONENTS",
     "BACKGROUND_JOBS",
+    "TOOL_CATALOG",
     "MemoryRuntimeInfo",
     "MemoryTurnRuntime",
     "EndpointEnv",
@@ -229,6 +239,11 @@ __all__ = [
     "PluginCommands",
     "PluginProactiveComponents",
     "PluginBackgroundJobs",
+    "PluginToolBinding",
+    "PluginToolCatalog",
+    "PluginToolDefinition",
+    "PluginToolDescriptor",
+    "PluginTools",
     "PluginUiSlots",
     "resolve_mobile_ui_asset",
     "PluginRuntime",
@@ -250,6 +265,7 @@ __all__ = [
     "CoreEventTrigger",
     "IntervalTrigger",
     "RetryPolicy",
+    "ToolRisk",
     "PushToolRequest",
     "ParallelEventKey",
     "QueuedReceipt",

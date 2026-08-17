@@ -21,6 +21,7 @@ from agent.plugin_composition import (
     CHANNELS,
     COMMANDS,
     BACKGROUND_JOBS,
+    TOOL_CATALOG,
     MANAGED_PROCESSES,
     MCP_SERVERS,
     PROACTIVE_COMPONENTS,
@@ -52,6 +53,10 @@ from agent.plugin_composition.proactive import (
 from agent.plugin_composition.background_jobs import (
     BackgroundJobCatalog,
     _freeze_plugin_background_jobs,
+)
+from agent.plugin_composition.tool_catalog import (
+    PluginToolCatalog,
+    _freeze_plugin_tools,
 )
 from bus.event_bus import Handler
 from infra.channels.contract import Channel
@@ -110,6 +115,8 @@ class RuntimeSnapshot:
     private_proactive_catalog_identity: str | None = None
     background_job_catalog: BackgroundJobCatalog | None = None
     background_job_catalog_identity: str | None = None
+    plugin_tool_catalog: PluginToolCatalog | None = None
+    plugin_tool_catalog_identity: str | None = None
     tool_registry: ToolRegistry | None = None
     plugin_skill_index: SkillIndex | None = None
     command_registry: CommandRegistry | None = None
@@ -302,6 +309,7 @@ class RuntimeSnapshotCompiler:
         managed_process_registry: ManagedProcessRegistry | None = None
         proactive_component_catalog: ProactiveCatalog | None = None
         background_job_catalog: BackgroundJobCatalog | None = None
+        plugin_tool_catalog: PluginToolCatalog | None = None
         if composition_root is not None:
             receipt = composition_root.receipt()
             if require_composition_ready and not receipt.ready:
@@ -528,6 +536,21 @@ class RuntimeSnapshotCompiler:
                     jobs,
                 )
                 identity += f"|background-jobs-v3:{background_job_catalog.identity}"
+            plugin_tools = composition_root.context.get(TOOL_CATALOG)
+            if plugin_tools is not None:
+                plugin_tool_catalog = _freeze_plugin_tools(
+                    plugin_tools,
+                    composition_root.instance_token,
+                    {
+                        generation.plugin_id: generation.generation_id
+                        for generation in ordered
+                    },
+                )
+                self._validate_plugin_tool_catalog(
+                    plugin_tool_catalog,
+                    generations,
+                )
+                identity += f"|plugin-tools-v3:{plugin_tool_catalog.identity}"
         snapshot_id = hashlib.sha256(identity.encode()).hexdigest()[:16]
         return RuntimeSnapshot(
             snapshot_id=snapshot_id,
@@ -585,6 +608,10 @@ class RuntimeSnapshotCompiler:
                 None
                 if background_job_catalog is None
                 else background_job_catalog.identity
+            ),
+            plugin_tool_catalog=plugin_tool_catalog,
+            plugin_tool_catalog_identity=(
+                None if plugin_tool_catalog is None else plugin_tool_catalog.identity
             ),
             plugin_skill_index=(
                 catalog_owner.skill_catalog.normal_plugins
@@ -753,6 +780,24 @@ class RuntimeSnapshotCompiler:
                 "RuntimeSnapshot v2/v3 background job 名称冲突: "
                 + ", ".join(sorted(collisions))
             )
+
+    @staticmethod
+    def _validate_plugin_tool_catalog(
+        catalog: PluginToolCatalog,
+        generations: Mapping[str, PluginGeneration],
+    ) -> None:
+        """Validate every Tool binding against its exact generation."""
+
+        for binding in catalog.values():
+            generation = generations.get(binding.plugin_id)
+            if (
+                generation is None
+                or generation.generation_id != binding.generation_id
+            ):
+                raise RuntimeError(
+                    "RuntimeSnapshot plugin Tool 不属于 exact generation: "
+                    f"{binding.plugin_id}:{binding.generation_id}"
+                )
 
     @staticmethod
     def _compile_jobs(
@@ -1591,6 +1636,8 @@ class RuntimeSnapshotStore:
                 or snapshot.private_proactive_catalog_identity is not None
                 or snapshot.background_job_catalog is not None
                 or snapshot.background_job_catalog_identity is not None
+                or snapshot.plugin_tool_catalog is not None
+                or snapshot.plugin_tool_catalog_identity is not None
             ):
                 raise RuntimeError(
                     "RuntimeSnapshot composition identity 缺少 Root Context"
@@ -1708,6 +1755,25 @@ class RuntimeSnapshotStore:
         ):
             raise RuntimeError(
                 "RuntimeSnapshot background job catalog 不属于 exact Root"
+            )
+        if (
+            snapshot.plugin_tool_catalog_identity
+            != (
+                None
+                if snapshot.plugin_tool_catalog is None
+                else snapshot.plugin_tool_catalog.identity
+            )
+        ):
+            raise RuntimeError(
+                "RuntimeSnapshot plugin Tool catalog 在编译后发生变化"
+            )
+        if (
+            snapshot.plugin_tool_catalog is not None
+            and snapshot.plugin_tool_catalog.root_instance_token
+            is not root.instance_token
+        ):
+            raise RuntimeError(
+                "RuntimeSnapshot plugin Tool catalog 不属于 exact Root"
             )
         topology = snapshot.composition_topology
         if topology is None:
