@@ -17,6 +17,7 @@
 │  turn.after_reasoning.preprocess ──▶ Citation ──▶ Meme                    │
 │  turn.after_reasoning.cleanup    ──▶ Citation final cleanup               │
 │                                     │                                     │
+│                                     ├─ persist_user_metadata              │
 │                                     └─ persist_assistant_metadata         │
 │                                                                           │
 │  declared workspace root: memes                                           │
@@ -48,14 +49,22 @@ authoritative_state_owner: "SessionStore owns persisted assistant rows; each plu
 client_only_alternative: "Not applicable; these are server lifecycle and generation publication boundaries."
 ```
 
-## 3. Assistant metadata 合同
+## 3. Message metadata 合同
+
+- `AfterReasoningCtx.persist_user_metadata` 是当前 Turn 的 user message 扩展字段出口。插件只声明
+  待随本 Turn 的 user pending row 一次提交的字段，不获得 Session、SessionStore、SQL 或删除权限。
+  message identity、输入正文、附件、显示正文、LLM 投影、控制 Turn 与其他 Core persistence 字段
+  只能由 Core 写入；插件写入时 fail-loud。v3 字段与迁移期 `persist:user:*` legacy slot 重名时
+  fail-loud。
 
 - `AfterReasoningCtx.persist_assistant_metadata` 是当前 Turn 的可写字典。插件只声明待随最终
   assistant message 一次提交的扩展字段，不获得 SessionStore、SQL 或删除权限。
 - `after_reasoning.seal_metadata` 是唯一 merge/validation owner：它把 v3 字典与 legacy slot
   合并为一次不可再改写的 commit input，与固定字段、退役字段或两套插件出口重名时
   fail-loud。该 slot 是 Core-private commit input，不是插件可写 export。
-- user/assistant message 在 seal 前只构造成 pending rows，不挂入 Session；原 Phase DAG 中
+- user metadata 在 pending user row 构造前完成 merge/validation；assistant metadata 由
+  `after_reasoning.seal_metadata` 冻结。user/assistant message 在 seal 前只构造成 pending rows，
+  不挂入 Session；原 Phase DAG 中
   依赖 `persist_user` 的 late legacy writer/observer 继续运行且 writer 无需新增 `produces`
   声明。`_PersistAssistantMessageModule` 只 materialize assistant pending row；
   `SessionManager.append_messages()` 在同一无 await 临界段完成 SessionStore 原子 append、稳定
@@ -63,8 +72,8 @@ client_only_alternative: "Not applicable; these are server lifecycle and generat
   单独留下 metadata 或半条 Turn。
 - 正常变化只有新 assistant row 随 Turn 追加；本 seam 不更新或删除旧 message。取消、失败
   与 session append 的恢复语义保持现状。
-- v2 phase slot 继续存在到 Citation/Meme 差分 Gate 通过；最终 v2 删除 PR 再移除 legacy
-  `persist:assistant:*` 插件出口。
+- v2 phase slot 继续存在到对应插件差分 Gate 通过；最终 v2 删除 PR 再移除 legacy
+  `persist:user:*` 与 `persist:assistant:*` 插件出口。
 
 ## 4. 声明式 workspace root 合同
 
@@ -95,8 +104,8 @@ client_only_alternative: "Not applicable; these are server lifecycle and generat
 
 ## 6. 验证
 
-- metadata：插件字段随同一 assistant row 持久化；固定/退役/legacy 重名均 fail-loud；失败
-  不产生部分 message 或第二次提交。
+- metadata：插件字段随同一 user/assistant row 持久化；固定/退役/legacy 重名均 fail-loud；
+  SessionStore append 失败或取消时不产生部分 message、孤立 metadata 或第二次提交。
 - workspace root：声明校验、stable 路径、candidate copy、同代 Dashboard 路径、candidate
   写后 discard 正式目录逐字节不变、formal promotion 使用正式路径、Root drain 后无 binding。
 - lifecycle：精确 Citation/Meme provider commits 下，真实 Manager snapshot lease 驱动 Prompt

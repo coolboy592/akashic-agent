@@ -118,6 +118,23 @@ _USER_FIXED_FIELDS = {
     "reply_role",
     "reply_preview",
 }
+_USER_CORE_METADATA_FIELDS = frozenset(
+    _USER_FIXED_FIELDS
+    | {
+        "role",
+        "content",
+        "id",
+        "seq",
+        "turn_input_ordinal",
+        "control_turn_id",
+        "skip_post_memory",
+        "attachment_ids",
+        "display_content",
+        "client_created_at",
+        "llm_user_content",
+        "llm_context_frame",
+    }
+)
 
 
 class _BuildAfterReasoningCtxModule:
@@ -223,7 +240,7 @@ class _PersistUserMessageModule:
         llm_context_frame = ctx.context_retry.get("llm_context_frame")
         if isinstance(llm_context_frame, str) and llm_context_frame.strip():
             user_kwargs["llm_context_frame"] = llm_context_frame
-        shared_user_kwargs = _collect_persist_user_slots(frame.slots)
+        shared_user_kwargs = _collect_persist_user_metadata(ctx, frame.slots)
         control_turn_id = str(msg.metadata.get("control_turn_id") or "")
         persisted_users: list[dict[str, Any]] = []
         for index, turn_input in enumerate(_turn_user_inputs(msg)):
@@ -623,6 +640,29 @@ def _collect_persist_user_slots(slots: dict[str, object]) -> dict[str, object]:
         _PERSIST_USER_PREFIX,
         reserved=_USER_FIXED_FIELDS,
     )
+
+
+def _collect_persist_user_metadata(
+    ctx: AfterReasoningCtx,
+    slots: dict[str, object],
+) -> dict[str, object]:
+    """Merge v3 user metadata with legacy slots before pending rows are built."""
+
+    # 1. Message identity and Core persistence fields are not plugin-owned.
+    metadata = dict(ctx.persist_user_metadata)
+    forbidden = set(metadata) & _USER_CORE_METADATA_FIELDS
+    if forbidden:
+        fields = ", ".join(sorted(forbidden))
+        raise ValueError(f"user plugin metadata 字段不可写: {fields}")
+
+    # 2. During migration, a v3 value cannot silently replace a legacy slot.
+    legacy = _collect_persist_user_slots(slots)
+    duplicated = set(metadata) & set(legacy)
+    if duplicated:
+        fields = ", ".join(sorted(duplicated))
+        raise ValueError(f"user plugin metadata 字段重复: {fields}")
+    metadata.update(legacy)
+    return metadata
 
 
 def _append_media(target: list[str], exports: dict[str, object]) -> None:

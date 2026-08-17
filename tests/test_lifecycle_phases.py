@@ -57,6 +57,7 @@ from agent.lifecycle.types import (
 from agent.lifecycle.phases.after_reasoning import (
     AfterReasoningFrame,
     _collect_persist_assistant_metadata,
+    _collect_persist_user_metadata,
     default_after_reasoning_modules,
 )
 from agent.lifecycle.phases.after_step import (
@@ -1557,6 +1558,9 @@ async def test_after_reasoning_collects_persist_and_outbound_slots():
 
         async def run(self, frame: AfterReasoningFrame) -> AfterReasoningFrame:
             ctx = cast(AfterReasoningCtx, frame.slots["reasoning:ctx"])
+            ctx.persist_user_metadata["akasha_reinforce"] = {
+                "target_message_ids": ["message-1"]
+            }
             ctx.persist_assistant_metadata["citation_ids"] = ["mem_1"]
             frame.slots["persist:user:user_flag"] = "u"
             frame.slots["persist:assistant:assistant_flag"] = "a"
@@ -1605,6 +1609,9 @@ async def test_after_reasoning_collects_persist_and_outbound_slots():
     result = await phase.run(AfterReasoningInput(state=state, turn_result=turn_result))
 
     assert session.messages[0]["user_flag"] == "u"
+    assert session.messages[0]["akasha_reinforce"] == {
+        "target_message_ids": ["message-1"]
+    }
     assert session.messages[0]["client_message_id"] == "01ARZ3NDEKTSV4RRFFQ69G5FAV"
     assert session.messages[1]["assistant_flag"] == "a"
     assert session.messages[1]["citation_ids"] == ["mem_1"]
@@ -1636,6 +1643,25 @@ def test_after_reasoning_rejects_fixed_assistant_metadata_field() -> None:
 
     with pytest.raises(ValueError, match="metadata 字段不可写: tools_used"):
         _ = _collect_persist_assistant_metadata(ctx, {})
+
+
+def test_after_reasoning_rejects_core_owned_user_metadata_field() -> None:
+    ctx = _assistant_metadata_ctx()
+    ctx.persist_user_metadata["control_turn_id"] = "spoof"
+
+    with pytest.raises(ValueError, match="user plugin metadata 字段不可写"):
+        _ = _collect_persist_user_metadata(ctx, {})
+
+
+def test_after_reasoning_rejects_v3_and_legacy_user_metadata_collision() -> None:
+    ctx = _assistant_metadata_ctx()
+    ctx.persist_user_metadata["akasha_reinforce"] = {"source": "v3"}
+
+    with pytest.raises(ValueError, match="user plugin metadata 字段重复"):
+        _ = _collect_persist_user_metadata(
+            ctx,
+            {"persist:user:akasha_reinforce": {"source": "v2"}},
+        )
 
 
 def test_after_reasoning_rejects_v3_and_legacy_metadata_collision() -> None:
