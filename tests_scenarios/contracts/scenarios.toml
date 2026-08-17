@@ -279,10 +279,11 @@ command = [
   "pytest",
   "-q",
   "tests/semantic/test_contract_oracles.py::test_plugin_publication_oracle_rejects_early_switch_mutant",
+  "tests/test_plugin_composition_lifecycle.py",
   "tests/test_plugin_hot_reload.py",
   "tests/test_plugin_install.py",
 ]
-observes = ["candidate_generation", "active_generation", "rollback"]
+observes = ["candidate_generation", "active_generation", "turn_committed_event_position", "rollback"]
 mutants = ["candidate_visible_before_activation", "plugin_uninstall_deletes_data"]
 
 [scenarios.plugin_uninstall_drain_finality]

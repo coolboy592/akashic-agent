@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import TypeVar
 
 from agent.lifecycle.types import AfterReasoningCtx, BeforeTurnCtx, PromptRenderCtx
-from agent.plugin_composition import CompositionError, SerialEventKey
+from agent.plugin_composition import CompositionError, EmitEventKey, SerialEventKey
 from agent.plugins.snapshot import get_lifecycle_runtime_snapshot
 
 P = TypeVar("P")
@@ -18,6 +18,21 @@ AFTER_REASONING_PREPROCESS_EVENT = SerialEventKey[AfterReasoningCtx, object](
 AFTER_REASONING_CLEANUP_EVENT = SerialEventKey[AfterReasoningCtx, object](
     "turn.after_reasoning.cleanup"
 )
+
+
+def emit_composition_lifecycle(
+    key: EmitEventKey[P],
+    payload: P,
+) -> None:
+    """Emit one synchronous lifecycle event from the request's frozen Root."""
+
+    # 1. Bootstrap and legacy snapshots without a composition Root stay unchanged.
+    snapshot = get_lifecycle_runtime_snapshot()
+    if snapshot is None or snapshot.composition_root is None:
+        return
+
+    # 2. The frozen Root owns listener order and propagates failures immediately.
+    snapshot.composition_root.context.emit(key, payload)
 
 
 async def run_composition_lifecycle(
