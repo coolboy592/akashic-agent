@@ -559,21 +559,42 @@ class _ProactiveDeclarations:
 
         return registration, cleanup
 
-    def freeze(self, root_instance_token: object) -> ProactiveCatalog:
+    def freeze(
+        self,
+        root_instance_token: object,
+        generation_ids: Mapping[str, str] | None = None,
+    ) -> ProactiveCatalog:
         if self._frozen is not None:
             if self._frozen.root_instance_token is not root_instance_token:
                 raise RuntimeError("proactive catalog 属于另一棵 Root")
+            if generation_ids is not None and any(
+                generation_ids.get(binding.owner) != binding.generation_id
+                for binding in (
+                    *self._frozen.sources.values(),
+                    *self._frozen.modules.values(),
+                )
+            ):
+                raise RuntimeError("proactive catalog generation identity 已冻结")
             return self._frozen
         sources: dict[str, ProactiveSourceBinding] = {}
         modules: dict[str, ProactiveModuleBinding] = {}
         for registration in sorted(self._registrations.values(), key=lambda item: item.token):
             if registration.health is None:
                 raise RuntimeError("proactive component 缺少 required Health")
+            generation_id = (
+                registration.generation_id
+                if generation_ids is None
+                else generation_ids.get(registration.owner)
+            )
+            if generation_id is None:
+                raise RuntimeError(
+                    f"proactive component owner 不属于 generations: {registration.owner}"
+                )
             if isinstance(registration.definition, ProactiveSourceDefinition):
                 assert isinstance(registration.descriptor, ProactiveSourceDescriptor)
                 binding = ProactiveSourceBinding(
                     descriptor=registration.descriptor,
-                    generation_id=registration.generation_id,
+                    generation_id=generation_id,
                     definition=registration.definition,
                     owner_fiber=registration.owner_fiber,
                     activation_token=registration.activation_token,
@@ -584,7 +605,7 @@ class _ProactiveDeclarations:
                 assert isinstance(registration.descriptor, ProactiveModuleDescriptor)
                 binding = ProactiveModuleBinding(
                     descriptor=registration.descriptor,
-                    generation_id=registration.generation_id,
+                    generation_id=generation_id,
                     definition=registration.definition,
                     owner_fiber=registration.owner_fiber,
                     activation_token=registration.activation_token,
@@ -625,6 +646,7 @@ class PluginProactiveComponents:
 def _freeze_plugin_proactive_components(
     value: object,
     root_instance_token: object,
+    generation_ids: Mapping[str, str] | None = None,
 ) -> ProactiveCatalog:
     """Freeze the exact Core-created proactive registration facade."""
 
@@ -632,7 +654,7 @@ def _freeze_plugin_proactive_components(
         raise RuntimeError("RuntimeSnapshot proactive Service 类型无效")
     if value._root_instance_token is not root_instance_token:
         raise RuntimeError("RuntimeSnapshot proactive Service 不属于 exact Root")
-    return value._declarations.freeze(root_instance_token)
+    return value._declarations.freeze(root_instance_token, generation_ids)
 
 
 def _normalize_definition(

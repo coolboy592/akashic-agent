@@ -21,6 +21,7 @@ from agent.plugin_composition import (
     COMMANDS,
     MANAGED_PROCESSES,
     MCP_SERVERS,
+    PROACTIVE_COMPONENTS,
     CommandRegistry,
     CompositionError,
     CompositionRoot,
@@ -41,6 +42,10 @@ from agent.plugin_composition.mcp_slots import (
 from agent.plugin_composition.process_slots import (
     ManagedProcessRegistry,
     _freeze_plugin_managed_processes,
+)
+from agent.plugin_composition.proactive import (
+    ProactiveCatalog,
+    _freeze_plugin_proactive_components,
 )
 from bus.event_bus import Handler
 from infra.channels.contract import Channel
@@ -93,6 +98,8 @@ class RuntimeSnapshot:
     mcp_server_registry_identity: str | None = None
     managed_process_registry: ManagedProcessRegistry | None = None
     managed_process_registry_identity: str | None = None
+    proactive_component_catalog: ProactiveCatalog | None = None
+    proactive_component_catalog_identity: str | None = None
     tool_registry: ToolRegistry | None = None
     plugin_skill_index: SkillIndex | None = None
     command_registry: CommandRegistry | None = None
@@ -269,6 +276,7 @@ class RuntimeSnapshotCompiler:
         channel_registry: ChannelRegistrySnapshot | None = None
         mcp_server_registry: McpServerRegistry | None = None
         managed_process_registry: ManagedProcessRegistry | None = None
+        proactive_component_catalog: ProactiveCatalog | None = None
         if composition_root is not None:
             receipt = composition_root.receipt()
             if require_composition_ready and not receipt.ready:
@@ -459,6 +467,24 @@ class RuntimeSnapshotCompiler:
                             )
                 mcp_server_registry = frozen_mcp
                 identity += f"|mcp-v3:{frozen_mcp.identity}"
+            proactive_components = composition_root.context.get(PROACTIVE_COMPONENTS)
+            if proactive_components is not None:
+                proactive_component_catalog = _freeze_plugin_proactive_components(
+                    proactive_components,
+                    composition_root.instance_token,
+                    {
+                        generation.plugin_id: generation.generation_id
+                        for generation in ordered
+                    },
+                )
+                self._validate_proactive_component_catalog(
+                    proactive_component_catalog,
+                    generations,
+                    mcp_server_registry,
+                )
+                identity += (
+                    f"|proactive-components-v3:{proactive_component_catalog.identity}"
+                )
         snapshot_id = hashlib.sha256(identity.encode()).hexdigest()[:16]
         return RuntimeSnapshot(
             snapshot_id=snapshot_id,
@@ -499,6 +525,12 @@ class RuntimeSnapshotCompiler:
                 if managed_process_registry is None
                 else managed_process_registry.identity
             ),
+            proactive_component_catalog=proactive_component_catalog,
+            proactive_component_catalog_identity=(
+                None
+                if proactive_component_catalog is None
+                else proactive_component_catalog.identity
+            ),
             plugin_skill_index=(
                 catalog_owner.skill_catalog.normal_plugins
                 if catalog_owner is not None and catalog_owner.skill_catalog is not None
@@ -537,6 +569,72 @@ class RuntimeSnapshotCompiler:
         ]
         ordered = cast(list[_SnapshotModuleOrder], topo_sort_modules(bindings))
         return tuple(binding.module for binding in ordered)
+
+    @staticmethod
+    def _validate_proactive_component_catalog(
+        catalog: ProactiveCatalog,
+        generations: Mapping[str, PluginGeneration],
+        mcp_registry: McpServerRegistry | None,
+    ) -> None:
+        """Validate exact generation routes without executing a source or module."""
+
+        # 1. Every binding belongs to the generation compiled into this snapshot.
+        for binding in (*catalog.sources.values(), *catalog.modules.values()):
+            generation = generations.get(binding.owner)
+            if (
+                generation is None
+                or generation.generation_id != binding.generation_id
+            ):
+                raise RuntimeError(
+                    "RuntimeSnapshot proactive binding 不属于 exact generation: "
+                    f"{binding.owner}:{binding.generation_id}"
+                )
+
+        # 2. Source tools reference the same owner's committed MCP contract.
+        for binding in catalog.sources.values():
+            descriptor = binding.descriptor
+            server = None if mcp_registry is None else mcp_registry.get(
+                descriptor.mcp_server
+            )
+            if server is None or server.descriptor.owner != descriptor.owner:
+                raise RuntimeError(
+                    "RuntimeSnapshot proactive source 缺少同 owner MCP server: "
+                    f"{descriptor.owner}:{descriptor.name} -> {descriptor.mcp_server}"
+                )
+            required = set(server.descriptor.required_tools)
+            if descriptor.fetch_tool not in required:
+                raise RuntimeError(
+                    "RuntimeSnapshot proactive fetch tool 不在 MCP contract: "
+                    f"{descriptor.owner}:{descriptor.fetch_tool}"
+                )
+            if descriptor.ack_tool:
+                if descriptor.ack_tool not in required:
+                    raise RuntimeError(
+                        "RuntimeSnapshot proactive ack tool 不在 MCP contract: "
+                        f"{descriptor.owner}:{descriptor.ack_tool}"
+                    )
+                if descriptor.ack_tool in server.descriptor.candidate_read_only_tools:
+                    raise RuntimeError(
+                        "RuntimeSnapshot proactive ack tool 不得进入 candidate allowlist: "
+                        f"{descriptor.owner}:{descriptor.ack_tool}"
+                    )
+
+        # 3. Frame lifecycle is Core-owned and produced capabilities are unique.
+        produced: dict[str, str] = {}
+        for binding in catalog.modules.values():
+            descriptor = binding.descriptor
+            if descriptor.lifecycle_id != "default.proactive.frame.v1":
+                raise RuntimeError(
+                    "RuntimeSnapshot proactive lifecycle 未注册: "
+                    f"{descriptor.lifecycle_id}"
+                )
+            for capability in descriptor.produces:
+                previous = produced.setdefault(capability, descriptor.slot)
+                if previous != descriptor.slot:
+                    raise RuntimeError(
+                        "RuntimeSnapshot proactive capability producer 冲突: "
+                        f"{capability} ({previous}, {descriptor.slot})"
+                    )
 
     @staticmethod
     def _compile_jobs(
@@ -1350,6 +1448,8 @@ class RuntimeSnapshotStore:
                 or snapshot.mcp_server_registry_identity is not None
                 or snapshot.managed_process_registry is not None
                 or snapshot.managed_process_registry_identity is not None
+                or snapshot.proactive_component_catalog is not None
+                or snapshot.proactive_component_catalog_identity is not None
             ):
                 raise RuntimeError(
                     "RuntimeSnapshot composition identity 缺少 Root Context"
@@ -1412,6 +1512,25 @@ class RuntimeSnapshotStore:
         ):
             raise RuntimeError(
                 "RuntimeSnapshot managed process registry 不属于 exact Root"
+            )
+        if (
+            snapshot.proactive_component_catalog_identity
+            != (
+                None
+                if snapshot.proactive_component_catalog is None
+                else snapshot.proactive_component_catalog.identity
+            )
+        ):
+            raise RuntimeError(
+                "RuntimeSnapshot proactive catalog 在编译后发生变化"
+            )
+        if (
+            snapshot.proactive_component_catalog is not None
+            and snapshot.proactive_component_catalog.root_instance_token
+            is not root.instance_token
+        ):
+            raise RuntimeError(
+                "RuntimeSnapshot proactive catalog 不属于 exact Root"
             )
         topology = snapshot.composition_topology
         if topology is None:
