@@ -334,10 +334,11 @@ def _run_inside() -> dict[str, object]:
     )
     persisted = _assert_messages(messages, session_id)
     media = cast(list[object], final.get("media"))
-    media_path = str(media[0])
-    media_bytes = _http_bytes(
-        f"{base_url}/api/chat/media?" + urlencode({"path": media_path})
+    descriptor = _assert_artifact_descriptor(
+        media[0],
+        expected_filename="001.png",
     )
+    media_bytes = _http_bytes(f"{base_url}{descriptor['url']}")
     if media_bytes != b"\x89PNG\r\n\x1a\n":
         raise GateFailure("WebUI media API 未返回 exact fixture bytes")
     dashboard = cast(
@@ -490,9 +491,7 @@ def _receive_final(
         media = frame.get("media")
         if not isinstance(media, list) or len(media) != 1:
             raise GateFailure(f"WebUI final media 错误: {frame}")
-        expected = "/sandbox/workspace/memes/shy/001.png"
-        if str(media[0]) != expected:
-            raise GateFailure(f"WebUI final media 路径错误: {media}")
+        _assert_artifact_descriptor(media[0], expected_filename="001.png")
         return frame
     raise GateFailure("WebUI 未在 deadline 内返回 message.final")
 
@@ -514,9 +513,55 @@ def _assert_messages(
         raise GateFailure(f"持久 assistant 正文错误: {assistant}")
     if assistant.get("cited_memory_ids") != ["mem_1"]:
         raise GateFailure(f"持久 citation metadata 错误: {assistant}")
-    if assistant.get("media") != ["/sandbox/workspace/memes/shy/001.png"]:
-        raise GateFailure(f"持久 Meme media 错误: {assistant}")
+    attachment_ids = assistant.get("attachment_ids")
+    attachments = assistant.get("attachments")
+    if (
+        not isinstance(attachment_ids, list)
+        or len(attachment_ids) != 1
+        or not isinstance(attachment_ids[0], str)
+        or not isinstance(attachments, list)
+        or len(attachments) != 1
+    ):
+        raise GateFailure(f"持久 Meme attachment 错误: {assistant}")
+    descriptor = _assert_artifact_descriptor(
+        attachments[0],
+        expected_filename="001.png",
+    )
+    if descriptor["artifact_id"] != attachment_ids[0]:
+        raise GateFailure(f"持久 Meme attachment identity 漂移: {assistant}")
     return items
+
+
+def _assert_artifact_descriptor(
+    value: object,
+    *,
+    expected_filename: str,
+) -> dict[str, object]:
+    """验证 Web 只公开 opaque artifact descriptor，不泄露正式路径。"""
+
+    if not isinstance(value, dict):
+        raise GateFailure(f"Web artifact descriptor 类型错误: {value!r}")
+    descriptor = cast(dict[str, object], value)
+    artifact_id = descriptor.get("artifact_id")
+    if not isinstance(artifact_id, str) or not artifact_id:
+        raise GateFailure(f"Web artifact identity 缺失: {descriptor}")
+    if descriptor.get("kind") != "image":
+        raise GateFailure(f"Web artifact kind 错误: {descriptor}")
+    if descriptor.get("filename") != expected_filename:
+        raise GateFailure(f"Web artifact filename 错误: {descriptor}")
+    if descriptor.get("media_type") != "image/png":
+        raise GateFailure(f"Web artifact media_type 错误: {descriptor}")
+    if descriptor.get("size_bytes") != 8:
+        raise GateFailure(f"Web artifact size 错误: {descriptor}")
+    sha256 = descriptor.get("sha256")
+    expected_sha256 = hashlib.sha256(b"\x89PNG\r\n\x1a\n").hexdigest()
+    if sha256 != expected_sha256:
+        raise GateFailure(f"Web artifact sha256 错误: {descriptor}")
+    if descriptor.get("url") != f"/api/chat/artifacts/{artifact_id}":
+        raise GateFailure(f"Web artifact URL 错误: {descriptor}")
+    if "/sandbox/" in json.dumps(descriptor, ensure_ascii=False):
+        raise GateFailure(f"Web artifact descriptor 泄露正式路径: {descriptor}")
+    return descriptor
 
 
 def _assert_dashboard(payload: dict[str, object]) -> None:

@@ -384,16 +384,16 @@ class PassiveMessageWorker:
             terminal = self._terminal_outbound(legacy_view, result)
             terminal_message = channel_message_from_outbound(terminal)
             attachment_store = self._attachment_store
+            if terminal_message.attachments and terminal_message.attachment_refs:
+                raise RuntimeError("Channel terminal 不得同时携带 path 与 opaque refs")
             if terminal_message.attachments and attachment_store is None:
                 raise RuntimeError("PassiveWorker Channel attachment store 尚未绑定")
-            attachment_refs = (
-                await import_channel_attachments(
+            attachment_refs = terminal_message.attachment_refs
+            if terminal_message.attachments:
+                attachment_refs = await import_channel_attachments(
                     cast("ChannelAttachmentArtifactStore", attachment_store),
                     terminal_message.attachments,
                 )
-                if terminal_message.attachments
-                else ()
-            )
             delivery_id = result.id
             receipt = await self._bus.publish_channel_outbound_awaited(
                 OutboundEnvelope(
@@ -882,6 +882,7 @@ class PassiveMessageWorker:
             )
             data = assistant.data
             metadata = dict(cast(dict[str, Any], data.get("metadata", {})))
+            attachment_refs = self._terminal_attachment_refs(data)
             if verified_cmid:
                 metadata["client_message_id"] = verified_cmid
             elif item.channel == "mobile" and item.handoff_id is not None:
@@ -897,6 +898,7 @@ class PassiveMessageWorker:
                 thinking=cast(str | None, data.get("thinking")),
                 reply_to=cast(str | None, data.get("replyTo")),
                 media=list(cast(list[str], data.get("media", []))),
+                attachment_refs=attachment_refs,
                 metadata=metadata,
                 control_turn_id=result.interaction_id,
                 execution_attempt_id=result.id,
@@ -932,6 +934,33 @@ class PassiveMessageWorker:
             metadata=metadata,
             terminal_status=terminal_status,
         )
+
+    def _terminal_attachment_refs(
+        self,
+        assistant_data: dict[str, Any],
+    ) -> tuple[AttachmentRef, ...]:
+        """把 durable control-turn attachment identity 还原为终态投递引用。"""
+
+        # 1. Control turns persist opaque identities, never live artifact paths.
+        raw_ids = assistant_data.get("attachmentIds")
+        if raw_ids is None:
+            return ()
+        if not isinstance(raw_ids, list) or not all(
+            isinstance(item, str) and item for item in raw_ids
+        ):
+            raise ValueError("assistant attachmentIds 必须是非空字符串数组")
+        artifact_ids = tuple(cast(list[str], raw_ids))
+        if len(set(artifact_ids)) != len(artifact_ids):
+            raise ValueError("assistant attachmentIds 不得重复")
+
+        # 2. The Core artifact owner must reconstruct the exact immutable refs.
+        store = self._attachment_store
+        if store is None:
+            raise RuntimeError("PassiveWorker attachment store 尚未绑定")
+        refs = store.resolve_refs(artifact_ids)
+        if tuple(ref.artifact_id for ref in refs) != artifact_ids:
+            raise RuntimeError("assistant attachmentIds 无法解析为 exact artifacts")
+        return refs
 
     async def _complete_message(self, item: InboundMessage) -> None:
         """完成 durable inbound 确认，并恰一次释放 mobile session admission。"""

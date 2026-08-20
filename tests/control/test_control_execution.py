@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from agent.control.models import TurnItemKind, TurnRequest
+from agent.plugin_composition.channels import AttachmentKind, AttachmentRef
 from agent.control.runtime import ConversationRuntime
 from agent.looping.core import AgentLoop
 from agent.looping.session_lane import SessionLaneRegistry
@@ -20,6 +21,62 @@ from bus.event_bus import EventBus
 from bus.events import OutboundMessage, TurnDisposition
 from bus.events_lifecycle import ToolCallCompleted, ToolCallStarted, TurnCommitted
 from session.store import SessionStore
+
+
+@pytest.mark.asyncio
+async def test_control_turn_persists_outbound_attachment_identity() -> None:
+    bus = EventBus()
+    ref = AttachmentRef(
+        artifact_id="artifact-terminal",
+        kind=AttachmentKind.IMAGE,
+        filename="result.png",
+        media_type="image/png",
+        size_bytes=3,
+        sha256="a" * 64,
+    )
+
+    class _Loop:
+        async def process_direct_message(
+            self,
+            _content: str,
+            **kwargs: object,
+        ) -> OutboundMessage:
+            turn_id = str(kwargs["turn_id"])
+            await bus.fanout(
+                TurnCommitted(
+                    session_key="web:artifact",
+                    channel="web",
+                    chat_id="artifact",
+                    input_message="hello",
+                    persisted_user_message="hello",
+                    assistant_response="answer",
+                    tools_used=[],
+                    turn_id=turn_id,
+                )
+            )
+            return OutboundMessage(
+                "web",
+                "artifact",
+                "answer",
+                attachment_refs=(ref,),
+            )
+
+    request = TurnRequest(
+        "web:artifact",
+        "hello",
+        {
+            "turnId": "turn-artifact",
+            "channel": "web",
+            "chatId": "artifact",
+            "_controlItemEvent": lambda _method, _item: None,
+            "_controlTurnInputSource": object(),
+        },
+    )
+    result = await execute_control_turn(cast(Any, _Loop()), bus, request)
+
+    assert result.assistant_data["media"] == []
+    assert result.assistant_data["attachmentIds"] == ["artifact-terminal"]
+    await bus.aclose()
 
 
 @pytest.mark.asyncio

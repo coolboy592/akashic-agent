@@ -434,7 +434,7 @@ def _assert_topology(topology: object) -> None:
     fibers = {item.name: item for item in getattr(topology, "fibers")}
     if listeners != EXPECTED_LISTENERS:
         raise RuntimeError(f"passive v3 listener 顺序错误: {listeners}")
-    if services != ("citation.protocol",):
+    if services != ("citation.protocol", "core.commands"):
         raise RuntimeError(f"passive v3 service 集合错误: {services}")
     if set(fibers) != set(EXPECTED_PLUGIN_IDS):
         raise RuntimeError(f"passive v3 Fiber 集合错误: {tuple(fibers)}")

@@ -812,6 +812,61 @@ def test_chat_messages_default_to_latest_turn_order(tmp_path: Path) -> None:
     }
 
 
+def test_chat_messages_project_durable_artifacts_without_paths(tmp_path: Path) -> None:
+    ref = AttachmentRef(
+        artifact_id="artifact-history",
+        kind=V3AttachmentKind.IMAGE,
+        filename="001.png",
+        media_type="image/png",
+        size_bytes=3,
+        sha256="a" * 64,
+    )
+
+    class _ArtifactStore:
+        def resolve_refs(
+            self,
+            artifact_ids: tuple[str, ...],
+        ) -> tuple[AttachmentRef, ...]:
+            assert artifact_ids == (ref.artifact_id,)
+            return (ref,)
+
+    channel = WebChatChannel()
+    session_manager = _SessionManager()
+    session_manager._store.list_chat_history_page = lambda **_kwargs: (
+        [
+            {"id": "m0", "seq": 0, "role": "user", "content": "问题"},
+            {
+                "id": "m1",
+                "seq": 1,
+                "role": "assistant",
+                "content": "答复",
+                "attachment_ids": [ref.artifact_id],
+            },
+        ],
+        2,
+        False,
+    )
+    channel._ctx = cast(Any, SimpleNamespace(session_manager=session_manager))
+    channel._artifact_store = cast(Any, _ArtifactStore())
+    app = create_chat_app(workspace=tmp_path, channel=channel)
+
+    with TestClient(app) as client:
+        payload = client.get("/api/chat/sessions/web:abc/messages").json()
+
+    assistant = payload["items"][1]
+    assert assistant["attachment_ids"] == [ref.artifact_id]
+    assert assistant["attachments"] == [{
+        "artifact_id": ref.artifact_id,
+        "kind": "image",
+        "filename": "001.png",
+        "media_type": "image/png",
+        "size_bytes": 3,
+        "sha256": "a" * 64,
+        "url": f"/api/chat/artifacts/{ref.artifact_id}",
+    }]
+    assert "/sandbox/" not in str(assistant)
+
+
 @pytest.mark.asyncio
 async def test_web_message_push_image_only_broadcasts_realtime_frame(tmp_path: Path) -> None:
     session_manager = _SessionManager()

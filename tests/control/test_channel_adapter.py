@@ -12,6 +12,8 @@ from agent.control.models import TurnRequest, TurnStatus
 from agent.control.ports import ControlExecutionResult
 from agent.control.runtime import ConversationRuntime
 from agent.plugin_composition.channels import (
+    AttachmentKind,
+    AttachmentRef,
     ChannelDeliveryReceipt,
     DeliveryStatus as ChannelDeliveryStatus,
 )
@@ -58,6 +60,7 @@ class _Bus:
                 thinking=message.thinking,
                 reply_to=message.reply_to,
                 media=[attachment.source for attachment in message.attachments],
+                attachment_refs=message.attachment_refs,
                 metadata=dict(message.metadata),
                 session_message_id=message.session_message_id,
                 control_turn_id=message.control_turn_id,
@@ -332,6 +335,22 @@ async def test_channel_adapter_preserves_full_outbound_projection(
     tmp_path: Path,
 ) -> None:
     store = SessionStore(tmp_path / "sessions.db")
+    ref = AttachmentRef(
+        artifact_id="artifact-terminal",
+        kind=AttachmentKind.IMAGE,
+        filename="result.png",
+        media_type="image/png",
+        size_bytes=3,
+        sha256="a" * 64,
+    )
+
+    class _ArtifactStore:
+        def resolve_refs(
+            self,
+            artifact_ids: tuple[str, ...],
+        ) -> tuple[AttachmentRef, ...]:
+            assert artifact_ids == (ref.artifact_id,)
+            return (ref,)
 
     async def execute(_request: TurnRequest) -> ControlExecutionResult:
         return ControlExecutionResult(
@@ -340,6 +359,7 @@ async def test_channel_adapter_preserves_full_outbound_projection(
                 "thinking": "reasoning",
                 "replyTo": "message-1",
                 "media": ["image.png"],
+                "attachmentIds": [ref.artifact_id],
                 "metadata": {"render": "card"},
                 "sessionMessageId": "telegram:42:2",
             },
@@ -351,6 +371,7 @@ async def test_channel_adapter_preserves_full_outbound_projection(
         cast(Any, bus),
         runtime,
         cast(Any, object()),
+        attachment_store=cast(Any, _ArtifactStore()),
         channel_dispatcher=bus.dispatch_channel,
     )
     inbound = InboundMessage("telegram", "user", "42", "hello")
@@ -364,6 +385,7 @@ async def test_channel_adapter_preserves_full_outbound_projection(
             thinking="reasoning",
             reply_to="message-1",
             media=["image.png"],
+            attachment_refs=(ref,),
             metadata={"render": "card"},
             session_message_id="telegram:42:2",
         )

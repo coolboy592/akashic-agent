@@ -49,7 +49,16 @@ def test_passive_webui_report_oracle_accepts_synthetic_pass(tmp_path: Path) -> N
                 {
                     "role": "assistant",
                     "cited_memory_ids": ["mem_1"],
-                    "media": ["/sandbox/workspace/memes/shy/001.png"],
+                    "attachment_ids": ["artifact-meme"],
+                    "attachments": [{
+                        "artifact_id": "artifact-meme",
+                        "kind": "image",
+                        "filename": "001.png",
+                        "media_type": "image/png",
+                        "size_bytes": 8,
+                        "sha256": "4c4b6a3be1314ab86138bef4314dde022e600960d8689a2c8f8631802d20dab6",
+                        "url": "/api/chat/artifacts/artifact-meme",
+                    }],
                 },
             ],
         },

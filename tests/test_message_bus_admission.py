@@ -13,6 +13,7 @@ from typing import Any, cast
 import pytest
 
 from agent.control.models import TurnRequest, TurnStatus
+from agent.control.ports import ControlExecutionResult
 from agent.control.runtime import ConversationRuntime
 from agent.plugin_composition.channels import (
     AttachmentKind,
@@ -1469,12 +1470,15 @@ async def test_v3_channel_worker_projects_and_closes_attachment_lease(
     )
     seen_paths: list[str] = []
 
-    async def execute(request: TurnRequest) -> str:
+    async def execute(request: TurnRequest) -> ControlExecutionResult:
         media = cast(list[str], request.metadata["media"])
         assert len(media) == 1
         assert Path(media[0]).read_bytes() == b"attachment-body"
         seen_paths.extend(media)
-        return "ok"
+        return ControlExecutionResult(
+            "ok",
+            assistant_data={"attachmentIds": [ref.artifact_id]},
+        )
 
     runtime = ConversationRuntime(store, execute)
     bus = MessageBus()
@@ -1483,6 +1487,7 @@ async def test_v3_channel_worker_projects_and_closes_attachment_lease(
         envelope: OutboundEnvelope,
         _binding: object,
     ) -> ChannelDeliveryReceipt:
+        assert envelope.attachments == (ref,)
         return ChannelDeliveryReceipt(
             envelope.delivery_id,
             DeliveryStatus.DELIVERED,

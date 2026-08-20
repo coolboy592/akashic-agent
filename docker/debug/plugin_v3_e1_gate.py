@@ -236,12 +236,31 @@ def _validate_passive_assistant(report: dict[str, object]) -> dict[str, object]:
         raise E1GateError("passive WebUI assistant message role 错误")
     if assistant.get("cited_memory_ids") != ["mem_1"]:
         raise E1GateError("passive WebUI assistant citation metadata 缺失")
-    expected_media = ["/sandbox/workspace/memes/shy/001.png"]
-    if assistant.get("media") != expected_media:
-        raise E1GateError("passive WebUI assistant media 不符合 fixture")
+    attachment_ids = assistant.get("attachment_ids")
+    attachments = assistant.get("attachments")
+    if (
+        not isinstance(attachment_ids, list)
+        or len(attachment_ids) != 1
+        or not isinstance(attachment_ids[0], str)
+        or not isinstance(attachments, list)
+        or len(attachments) != 1
+        or not isinstance(attachments[0], dict)
+    ):
+        raise E1GateError("passive WebUI assistant attachment 不符合 fixture")
+    descriptor = cast(dict[str, object], attachments[0])
+    if (
+        descriptor.get("artifact_id") != attachment_ids[0]
+        or descriptor.get("kind") != "image"
+        or descriptor.get("filename") != "001.png"
+        or descriptor.get("media_type") != "image/png"
+        or descriptor.get("url")
+        != f"/api/chat/artifacts/{attachment_ids[0]}"
+    ):
+        raise E1GateError("passive WebUI assistant artifact descriptor 漂移")
     return {
         "cited_memory_ids": assistant["cited_memory_ids"],
-        "media": assistant["media"],
+        "attachment_ids": attachment_ids,
+        "attachments": attachments,
     }
 
 

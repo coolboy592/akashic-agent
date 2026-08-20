@@ -10,6 +10,17 @@ import pytest
 from docker.debug import plugin_passive_webui_v3_e2e as gate
 
 
+ARTIFACT_DESCRIPTOR: dict[str, object] = {
+    "artifact_id": "artifact-meme",
+    "kind": "image",
+    "filename": "001.png",
+    "media_type": "image/png",
+    "size_bytes": 8,
+    "sha256": "4c4b6a3be1314ab86138bef4314dde022e600960d8689a2c8f8631802d20dab6",
+    "url": "/api/chat/artifacts/artifact-meme",
+}
+
+
 def test_gate_freezes_exact_pure_v3_scenario() -> None:
     lock = gate._load_final_sources()  # pyright: ignore[reportPrivateUsage]
     fleet = {
@@ -66,7 +77,8 @@ def test_message_oracle_requires_citation_and_meme_persistence() -> None:
                 "role": "assistant",
                 "content": "答复正文",
                 "cited_memory_ids": ["mem_1"],
-                "media": ["/sandbox/workspace/memes/shy/001.png"],
+                "attachment_ids": ["artifact-meme"],
+                "attachments": [dict(ARTIFACT_DESCRIPTOR)],
             },
         ],
     }
@@ -94,7 +106,8 @@ def test_message_oracle_rejects_cross_session_assistant() -> None:
                 "role": "assistant",
                 "content": "答复正文",
                 "cited_memory_ids": ["mem_1"],
-                "media": ["/sandbox/workspace/memes/shy/001.png"],
+                "attachment_ids": ["artifact-meme"],
+                "attachments": [dict(ARTIFACT_DESCRIPTOR)],
             },
         ],
     }
@@ -112,7 +125,7 @@ def test_final_frame_must_belong_to_created_session() -> None:
                     "type": "message.final",
                     "session_id": "web:other",
                     "content": "答复正文",
-                    "media": ["/sandbox/workspace/memes/shy/001.png"],
+                    "media": [dict(ARTIFACT_DESCRIPTOR)],
                 }
             )
 
