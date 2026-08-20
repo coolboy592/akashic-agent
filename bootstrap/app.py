@@ -456,6 +456,9 @@ class AppRuntime:
                 self.web_chat_channel = WebChatChannel(
                     channel_name=self.config.channels.chat.channel_name,
                 )
+                self.web_chat_channel.bind_artifact_store(
+                    channel_attachment_store
+                )
                 extra_channels.append(self.web_chat_channel)
             self.channel_host = await start_channels(
                 self.config,
