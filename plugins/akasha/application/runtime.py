@@ -21,6 +21,7 @@ from ..infrastructure.lease import WriterLease
 from ..infrastructure.persistence import (
     load_memory_state,
     memory_turn_count,
+    sha256_file,
     write_memory_database,
 )
 from ..infrastructure.sparse_index import (
@@ -383,7 +384,7 @@ class OnlineMemoryRuntime:
             self.memory_path,
             turns=prefix,
             config=self.config,
-            source_index_sha256=None,
+            source_index_sha256=sha256_file(self.index_path),
         )
         cycle = MemoryCycle.restore(
             config=self.config,

@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import math
+import os
 import sqlite3
 import struct
 import threading
@@ -3216,6 +3217,77 @@ def test_online_runtime_keeps_previous_sidecar_when_version_rebuild_fails(
     assert hashlib.sha256(sessions_path.read_bytes()).hexdigest() == source_sha
     assert hashlib.sha256(index_path.read_bytes()).hexdigest() == index_sha
     assert not memory_path.exists()
+
+
+def test_online_runtime_rebuilds_pair_after_crash_between_sidecar_replaces(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Boot rejects a new index paired with the previous memory snapshot."""
+
+    # 1. Publish one valid pair, then change its canonical source in place.
+    sessions_path = tmp_path / "sessions.db"
+    index_path = tmp_path / "memory" / "akasha-v2-index.db"
+    memory_path = tmp_path / "memory" / "akasha.db"
+    _create_sessions(sessions_path)
+    _append_turn(
+        sessions_path,
+        sequence=0,
+        user="alpha request",
+        assistant="beta reply",
+        started=datetime(2026, 8, 5, tzinfo=timezone.utc),
+        with_embeddings=True,
+    )
+    runtime = OnlineMemoryRuntime(
+        sessions_path=sessions_path,
+        index_path=index_path,
+        memory_path=memory_path,
+        embedding_model="embedding-model",
+        embedding_dimension=2,
+        config=MemoryConfig(),
+    )
+    with closing(sqlite3.connect(sessions_path)) as connection, connection:
+        connection.execute(
+            "UPDATE messages SET content = ? WHERE id = ?",
+            ("replacement request", "message:0"),
+        )
+
+    # 2. Crash after publishing the rebuilt index but before its memory pair.
+    real_replace = os.replace
+
+    def fail_memory_publication(source: Path, destination: Path) -> None:
+        if Path(destination) == memory_path:
+            raise OSError("injected crash between sidecar replaces")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(os, "replace", fail_memory_publication)
+    with pytest.raises(OSError, match="between sidecar replaces"):
+        runtime.rebuild_from_source()
+    runtime.close()
+    monkeypatch.setattr(os, "replace", real_replace)
+    mixed_index_sha = hashlib.sha256(index_path.read_bytes()).hexdigest()
+    with closing(sqlite3.connect(memory_path)) as connection:
+        stale_memory_sha = connection.execute(
+            "SELECT value FROM metadata WHERE key = 'source_index_sha256'"
+        ).fetchone()
+    assert stale_memory_sha != (mixed_index_sha,)
+
+    # 3. The next boot detects the mixed pair and deterministically republishes it.
+    recovered = OnlineMemoryRuntime(
+        sessions_path=sessions_path,
+        index_path=index_path,
+        memory_path=memory_path,
+        embedding_model="embedding-model",
+        embedding_dimension=2,
+        config=MemoryConfig(),
+    )
+    recovered.close()
+    final_index_sha = hashlib.sha256(index_path.read_bytes()).hexdigest()
+    with closing(sqlite3.connect(memory_path)) as connection:
+        recovered_memory_sha = connection.execute(
+            "SELECT value FROM metadata WHERE key = 'source_index_sha256'"
+        ).fetchone()
+    assert recovered_memory_sha == (final_index_sha,)
 
 
 @pytest.mark.parametrize(
