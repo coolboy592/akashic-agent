@@ -14,6 +14,10 @@ from agent.looping.core import AgentLoop, _supports_stream_events
 from agent.looping.interrupt import TurnInterruptState
 from agent.lifecycle.facade import TurnLifecycle
 from agent.looping.ports import AgentLoopConfig, AgentLoopDeps, MemoryServices
+from agent.plugin_composition.channels import (
+    ChannelDeliveryReceipt,
+    DeliveryStatus as ChannelDeliveryStatus,
+)
 from agent.looping.session_lane import SessionLaneRegistry
 from agent.persona import reset_veda
 from agent.provider import LLMResponse
@@ -134,6 +138,15 @@ class _MandatoryCompactionRuntime:
 
     async def commit_checkpoint(self, *args, **kwargs):
         raise AssertionError("test compaction gate unexpectedly attempted a commit")
+
+
+class _TestOutboundPort:
+    async def dispatch(self, _outbound: object) -> ChannelDeliveryReceipt:
+        return ChannelDeliveryReceipt(
+            delivery_id="test-delivery",
+            status=ChannelDeliveryStatus.DELIVERED,
+        )
+
 
 def test_stream_events_support_realtime_private_channels():
     assert _supports_stream_events("telegram", "123")
@@ -354,6 +367,64 @@ async def test_process_direct_waits_for_the_same_session_lane():
 
 
 @pytest.mark.asyncio
+async def test_process_direct_waits_for_explicit_busy_session_lane():
+    loop = object.__new__(AgentLoop)
+    loop._session_lanes = SessionLaneRegistry()
+    loop._runtime_snapshot_store = None
+    events: list[str] = []
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+
+    async def _process(
+        msg: InboundMessage,
+        session_key: str | None = None,
+        busy_session_key: str | None = None,
+        dispatch_outbound: bool = True,
+    ) -> OutboundMessage:
+        _ = busy_session_key, dispatch_outbound
+        key = session_key or msg.session_key
+        events.append(f"start:{key}")
+        if key == "cli:1":
+            first_started.set()
+            await release_first.wait()
+        events.append(f"end:{key}")
+        return OutboundMessage(msg.channel, msg.chat_id, key)
+
+    loop._process = _process
+    passive_task = asyncio.create_task(
+        AgentLoop._process_with_runtime_admission(
+            loop,
+            InboundMessage("cli", "u", "1", "hello"),
+        )
+    )
+    await first_started.wait()
+    direct_task = asyncio.create_task(
+        AgentLoop.process_direct(
+            loop,
+            content="scheduled",
+            session_key="scheduler:job",
+            busy_session_key="cli:1",
+            channel="cli",
+            chat_id="1",
+        )
+    )
+
+    await asyncio.sleep(0.01)
+    assert events == ["start:cli:1"]
+    assert not direct_task.done()
+    release_first.set()
+    await asyncio.gather(passive_task, direct_task)
+
+    assert events == [
+        "start:cli:1",
+        "end:cli:1",
+        "start:scheduler:job",
+        "end:scheduler:job",
+    ]
+    assert loop._session_lanes._states == {}
+
+
+@pytest.mark.asyncio
 async def test_cancelled_session_lane_waiter_does_not_block_reentry():
     lanes = SessionLaneRegistry()
     first_entered = asyncio.Event()
@@ -511,6 +582,7 @@ def _make_loop(
             workspace=tmp_path,
             memory_services=MemoryServices(engine=cast(Any, _FakeMemoryEngine())),
             retrieval_pipeline=retrieval_pipeline,
+            outbound_port=cast(Any, _TestOutboundPort()),
         ),
         AgentLoopConfig(),
     )

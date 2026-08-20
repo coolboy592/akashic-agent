@@ -7,7 +7,10 @@ from uuid import uuid4
 
 from agent.turns.outbound import OutboundDispatch, OutboundPort
 from agent.turns.result import TurnResult, TurnSideEffect
-from bus.events import DeliveryStatus
+from agent.plugin_composition.channels import (
+    ChannelDeliveryReceipt,
+    DeliveryStatus as ChannelDeliveryStatus,
+)
 
 if TYPE_CHECKING:
     from agent.core.runtime_support import SessionLike
@@ -61,18 +64,22 @@ class TurnOrchestrator:
                     control_turn_id=control_turn_id,
                 )
             )
+            if not isinstance(receipt, ChannelDeliveryReceipt):
+                raise TypeError(
+                    "proactive outbound 必须返回 ChannelDeliveryReceipt"
+                )
         except Exception as e:
             logger.exception("proactive outbound dispatch failed: %s", e)
 
         # 3. 只有用户真正收到后，才把 proactive 消息写入可见会话历史。
-        sent = receipt is not None and receipt.status is DeliveryStatus.SUCCESS
+        sent = receipt is not None and receipt.status is ChannelDeliveryStatus.DELIVERED
         if sent:
             assert receipt is not None
             session = self._session.session_manager.get_or_create(session_key)
             self._persist_proactive_session(
                 session=session,
                 content=content,
-                media=list(receipt.canonical_media),
+                media=list(result.outbound.media or []),
                 result=result,
                 delivery_id=delivery_id,
                 control_turn_id=control_turn_id,

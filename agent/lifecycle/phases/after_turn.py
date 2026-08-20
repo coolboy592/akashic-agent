@@ -359,6 +359,7 @@ class _DispatchOutboundModule:
                     chat_id=outbound.chat_id,
                     content=outbound.content,
                     thinking=outbound.thinking,
+                    reply_to=outbound.reply_to,
                     metadata=outbound.metadata,
                     media=outbound.media,
                     session_message_id=outbound.session_message_id,

@@ -7,10 +7,13 @@ from unittest.mock import AsyncMock
 import pytest
 
 from agent.looping.ports import SessionServices
+from agent.plugin_composition.channels import (
+    ChannelDeliveryReceipt,
+    DeliveryStatus as ChannelDeliveryStatus,
+)
 from agent.turns.orchestrator import TurnOrchestrator, TurnOrchestratorDeps
 from agent.turns.outbound import OutboundDispatch, PushToolOutboundPort
 from agent.turns.result import TurnOutbound, TurnResult, TurnTrace
-from bus.events import DeliveryReceipt, DeliveryStatus
 
 
 class _DummySession:
@@ -40,9 +43,12 @@ async def test_orchestrator_skip_runs_side_effects_without_dispatch():
             order.append("side_effect")
 
     class _Outbound:
-        async def dispatch(self, outbound: OutboundDispatch) -> DeliveryReceipt:
+        async def dispatch(self, outbound: OutboundDispatch) -> ChannelDeliveryReceipt:
             order.append("dispatch")
-            return DeliveryReceipt(DeliveryStatus.SUCCESS)
+            return ChannelDeliveryReceipt(
+                delivery_id="delivery-skip",
+                status=ChannelDeliveryStatus.DELIVERED,
+            )
 
     orchestrator = TurnOrchestrator(
         TurnOrchestratorDeps(
@@ -84,7 +90,7 @@ async def test_orchestrator_proactive_reply_persists_dispatches_and_runs_success
             order.append(self._name)
 
     class _Outbound:
-        async def dispatch(self, outbound: OutboundDispatch) -> DeliveryReceipt:
+        async def dispatch(self, outbound: OutboundDispatch) -> ChannelDeliveryReceipt:
             order.append("dispatch")
             assert outbound.content == "hello"
             delivery_id = outbound.metadata["delivery_id"]
@@ -93,7 +99,10 @@ async def test_orchestrator_proactive_reply_persists_dispatches_and_runs_success
             assert outbound.control_turn_id is not None
             assert outbound.control_turn_id.startswith("turn:")
             dispatched_delivery_ids.append(delivery_id)
-            return DeliveryReceipt(DeliveryStatus.SUCCESS)
+            return ChannelDeliveryReceipt(
+                delivery_id=delivery_id,
+                status=ChannelDeliveryStatus.DELIVERED,
+            )
 
     presence = SimpleNamespace(record_proactive_sent=lambda _key: order.append("presence"))
     session_manager = SimpleNamespace(
@@ -145,7 +154,12 @@ async def test_orchestrator_failed_dispatch_does_not_persist_proactive_message()
         append_messages=AsyncMock(return_value=None),
     )
     outbound = SimpleNamespace(
-        dispatch=AsyncMock(return_value=DeliveryReceipt(DeliveryStatus.FAILED))
+        dispatch=AsyncMock(
+            return_value=ChannelDeliveryReceipt(
+                delivery_id="delivery-failed",
+                status=ChannelDeliveryStatus.REJECTED,
+            )
+        )
     )
     orchestrator = TurnOrchestrator(
         TurnOrchestratorDeps(
@@ -181,9 +195,10 @@ async def test_orchestrator_partial_dispatch_does_not_persist_proactive_message(
     )
     outbound = SimpleNamespace(
         dispatch=AsyncMock(
-            return_value=DeliveryReceipt(
-                DeliveryStatus.PARTIAL,
-                detail="attachment unavailable",
+            return_value=ChannelDeliveryReceipt(
+                delivery_id="delivery-rejected",
+                status=ChannelDeliveryStatus.REJECTED,
+                error="attachment unavailable",
             )
         )
     )
@@ -237,7 +252,10 @@ async def test_push_outbound_port_propagates_unexpected_tool_error():
 async def test_push_outbound_port_forwards_internal_metadata():
     push_tool = SimpleNamespace(
         dispatch=AsyncMock(
-            return_value=DeliveryReceipt(DeliveryStatus.SUCCESS)
+            return_value=ChannelDeliveryReceipt(
+                delivery_id="delivery-1",
+                status=ChannelDeliveryStatus.DELIVERED,
+            )
         )
     )
     port = PushToolOutboundPort(push_tool)
@@ -251,7 +269,7 @@ async def test_push_outbound_port_forwards_internal_metadata():
         )
     )
 
-    assert sent.status is DeliveryStatus.SUCCESS
+    assert sent.status is ChannelDeliveryStatus.DELIVERED
     pushed = push_tool.dispatch.await_args.args[0]
     assert pushed.channel == "mobile"
     assert pushed.chat_id == "123"
@@ -315,11 +333,11 @@ async def test_orchestrator_proactive_reply_dispatches_media():
     dispatched: list[OutboundDispatch] = []
 
     class _Outbound:
-        async def dispatch(self, outbound: OutboundDispatch) -> DeliveryReceipt:
+        async def dispatch(self, outbound: OutboundDispatch) -> ChannelDeliveryReceipt:
             dispatched.append(outbound)
-            return DeliveryReceipt(
-                DeliveryStatus.SUCCESS,
-                canonical_media=("/stable/meme.png",),
+            return ChannelDeliveryReceipt(
+                delivery_id="delivery-media",
+                status=ChannelDeliveryStatus.DELIVERED,
             )
 
     session_manager = SimpleNamespace(
@@ -349,4 +367,4 @@ async def test_orchestrator_proactive_reply_dispatches_media():
 
     assert sent is True
     assert dispatched[0].media == ["/tmp/meme.png"]
-    assert session.messages[0]["media"] == ["/stable/meme.png"]
+    assert session.messages[0]["media"] == ["/tmp/meme.png"]

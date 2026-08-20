@@ -43,6 +43,7 @@ from agent.scheduler import SchedulerService
 from agent.tools.base import ToolExecutionContext, get_current_tool_context
 from agent.tools.message_push import MessagePushTool
 from agent.tools.registry import ToolRegistry
+from agent.turns.outbound import OutboundPort, PushToolOutboundPort
 from bootstrap.toolsets.meta import build_readonly_tools
 from bootstrap.toolsets.protocol import ToolsetDeps
 from bootstrap.toolsets.schedule import build_scheduler
@@ -491,6 +492,7 @@ def _build_loop_deps(
     processing_state: ProcessingState,
     event_bus: EventBus,
     memory_runtime: MemoryRuntime,
+    outbound_port: OutboundPort | None = None,
 ) -> AgentLoopDeps:
     """将已构造的 runtime 资源装配成 AgentLoop 依赖。"""
 
@@ -540,6 +542,7 @@ def _build_loop_deps(
         llm_services=llm_services,
         memory_services=memory_services,
         session_services=session_services,
+        outbound_port=outbound_port,
     )
 
 def build_core_runtime(
@@ -602,6 +605,7 @@ def build_core_runtime(
         processing_state=processing_state,
         event_bus=event_bus,
         memory_runtime=memory_runtime,
+        outbound_port=PushToolOutboundPort(push_tool, commit_role="passive"),
     )
     loop = AgentLoop(
         loop_deps,

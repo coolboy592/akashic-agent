@@ -14,7 +14,11 @@ from unittest.mock import AsyncMock, MagicMock, Mock
 import pytest
 
 from agent.context import ContextBuilder
-from agent.plugin_composition.channels import AttachmentKind
+from agent.plugin_composition.channels import (
+    AttachmentKind,
+    ChannelDeliveryReceipt,
+    DeliveryStatus as ChannelDeliveryStatus,
+)
 from agent.control.context import running_turn_id
 from agent.core.passive_support import build_context_hint_message
 from agent.core.passive_turn import (
@@ -31,8 +35,6 @@ from agent.lifecycle.phase import Phase
 from agent.tools.registry import ToolRegistry
 from bus.event_bus import EventBus
 from bus.events import (
-    DeliveryReceipt,
-    DeliveryStatus,
     InboundMessage,
     OutboundMessage,
 )
@@ -86,8 +88,7 @@ from agent.lifecycle.phases.prompt_render import (
 )
 from agent.prompting import PromptSectionRender
 from agent.persona import reset_veda
-from agent.turns.outbound import BusOutboundPort, OutboundDispatch, OutboundPort
-from bus.queue import MessageBus
+from agent.turns.outbound import OutboundDispatch, OutboundPort
 from session.manager import SessionManager, logical_history_unit_ranges
 
 _now = datetime.now()
@@ -162,8 +163,11 @@ class _MemoryStatusPluginModule:
 
 
 class _DummyOutbound:
-    async def dispatch(self, outbound: OutboundDispatch) -> DeliveryReceipt:
-        return DeliveryReceipt(DeliveryStatus.SUCCESS)
+    async def dispatch(self, outbound: OutboundDispatch) -> ChannelDeliveryReceipt:
+        return ChannelDeliveryReceipt(
+            delivery_id="test-delivery",
+            status=ChannelDeliveryStatus.DELIVERED,
+        )
 
 
 class _KVCachePluginModule:
@@ -2433,7 +2437,14 @@ def _after_turn_phase(
     return phase, state, session
 
 
-async def _run_after_turn(phase: Phase, state: TurnState) -> None:
+async def _run_after_turn(
+    phase: Phase,
+    state: TurnState,
+    *,
+    reply_to: str | None = None,
+    media: list[str] | None = None,
+    session_message_id: str | None = None,
+) -> None:
     session = cast(_DummySession, state.session)
     msg = state.msg
     await phase.run(
@@ -2443,6 +2454,9 @@ async def _run_after_turn(phase: Phase, state: TurnState) -> None:
                 channel=msg.channel,
                 chat_id=msg.chat_id,
                 content="reply",
+                reply_to=reply_to,
+                media=list(media or []),
+                session_message_id=session_message_id,
                 control_turn_id=str(msg.metadata.get("control_turn_id") or ""),
             ),
             ctx=AfterReasoningCtx(
@@ -2650,12 +2664,21 @@ async def test_after_turn_fanout_returns_after_observer_error(
 
 
 @pytest.mark.asyncio
-async def test_after_turn_dispatch_forwards_control_turn_id_to_bus() -> None:
-    """正常 final 的 after_turn dispatch 把 outbound.control_turn_id 原样传给
-    BusOutboundPort，出站消息携带当前 running turn id，不依赖 channel fallback。"""
+async def test_after_turn_dispatch_forwards_typed_identity_to_channel_port() -> None:
+    """after_turn 将 control/reply/session/media 身份完整交给 typed Channel port。"""
 
-    bus = MessageBus()
-    outbound_port = BusOutboundPort(bus)
+    bus = EventBus()
+    dispatched: list[OutboundDispatch] = []
+
+    class _RecordingOutbound:
+        async def dispatch(self, outbound: OutboundDispatch) -> ChannelDeliveryReceipt:
+            dispatched.append(outbound)
+            return ChannelDeliveryReceipt(
+                delivery_id="delivery-final",
+                status=ChannelDeliveryStatus.DELIVERED,
+            )
+
+    outbound_port = _RecordingOutbound()
     turn_id = "turn:final"
     client_message_id = "cm:01"
     session = _DummySession("telegram:123")
@@ -2682,10 +2705,20 @@ async def test_after_turn_dispatch_forwards_control_turn_id_to_bus() -> None:
         turn_id=turn_id,
         client_message_id=client_message_id,
     ):
-        await _run_after_turn(phase, state)
+        await _run_after_turn(
+            phase,
+            state,
+            reply_to="message-1",
+            media=["/tmp/image.png"],
+            session_message_id="telegram:123:2",
+        )
 
-    outbound_message = await bus._outbound.get()
+    assert len(dispatched) == 1
+    outbound_message = dispatched[0]
     assert outbound_message.control_turn_id == turn_id
+    assert outbound_message.reply_to == "message-1"
+    assert outbound_message.session_message_id == "telegram:123:2"
+    assert outbound_message.media == ["/tmp/image.png"]
     assert outbound_message.content == "reply"
     assert outbound_message.channel == msg.channel
     assert outbound_message.chat_id == msg.chat_id

@@ -39,7 +39,7 @@ from agent.model_runtime.session_selection import (
 )
 from agent.retrieval.default_pipeline import DefaultMemoryRetrievalPipeline
 from agent.retrieval.protocol import MemoryRetrievalPipeline
-from agent.turns.outbound import BusOutboundPort
+from agent.turns.outbound import OutboundDispatch
 from agent.plugin_composition.channels import InboundEnvelope, InboundOwner
 
 # 为保持兼容重新导出：现有调用方从 core.py 导入这些名称。
@@ -222,6 +222,7 @@ class AgentLoop:
         self._session_lanes = SessionLaneRegistry()
         self._runtime_snapshot_store: RuntimeSnapshotStore | None = None
         self._plugin_rollout_fact_provider: Callable[[], str] | None = None
+        self._outbound_port = deps.outbound_port
 
         # ── 中断控制面（纯内存态） ──
         self._active_tasks: dict[str, asyncio.Task[OutboundMessage]] = {}
@@ -433,7 +434,7 @@ class AgentLoop:
                 tools=deps.tools,
                 reasoner=self._reasoner,
                 event_bus=self._event_bus,
-                outbound_port=BusOutboundPort(self.bus),
+                outbound_port=deps.outbound_port,
             )
         )
 
@@ -538,8 +539,13 @@ class AgentLoop:
                 #    channel 按当前 active turn fallback（迟到错误会归到别的
                 #    active turn）。
                 logger.error(f"处理消息出错: {e}", exc_info=True)
-                await self.bus.publish_outbound(
-                    OutboundMessage(
+                outbound_port = getattr(self, "_outbound_port", None)
+                if outbound_port is None:
+                    raise RuntimeError(
+                        "AgentLoop passive committed Channel outbound port 未绑定"
+                    ) from e
+                await outbound_port.dispatch(
+                    OutboundDispatch(
                         channel=item.channel,
                         chat_id=item.chat_id,
                         content=f"出错：{e}",
@@ -975,7 +981,8 @@ class AgentLoop:
         execution_turn_id: str | None = None,
     ) -> OutboundMessage:
         key = session_key or msg.session_key
-        async with self._session_lanes.hold(key):
+        lane_key = busy_session_key or key
+        async with self._session_lanes.hold(lane_key):
             store = self._runtime_snapshot_store
             # 只有入站边界已确定的权威 ID 才显式传给 _process；直接调用/内部
             # 工作项为 None 时保持原有 metadata 派生语义（兼容外部直连 _process）。

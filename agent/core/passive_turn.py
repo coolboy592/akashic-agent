@@ -61,10 +61,9 @@ from agent.tools.events import ToolExecutionRequest, ToolExecutionResult
 from agent.tools.executor import ToolExecutor
 from agent.tools.registry import begin_turn_search_scope, end_turn_search_scope
 from agent.turns.outbound import OutboundDispatch, OutboundPort
+from agent.plugin_composition.channels import ChannelDeliveryReceipt
 from bus.event_bus import EventBus
 from bus.events import (
-    DeliveryReceipt,
-    DeliveryStatus,
     InboundMessage,
     OutboundMessage,
     TurnDisposition,
@@ -265,11 +264,9 @@ def _disabled_tools_from_msg(msg: object) -> set[str]:
 
 
 class _NoopOutboundPort:
-    async def dispatch(self, outbound: OutboundDispatch) -> DeliveryReceipt:
-        return DeliveryReceipt(
-            DeliveryStatus.FAILED,
-            detail="未配置出站投递端口",
-        )
+    async def dispatch(self, outbound: OutboundDispatch) -> ChannelDeliveryReceipt:
+        _ = outbound
+        raise RuntimeError("PassiveTurnPipeline committed Channel outbound port 未绑定")
 
 
 @dataclass
@@ -779,6 +776,7 @@ class PassiveTurnPipeline:
                     chat_id=outbound.chat_id,
                     content=outbound.content,
                     thinking=outbound.thinking,
+                    reply_to=outbound.reply_to,
                     metadata=outbound.metadata,
                     media=outbound.media,
                     session_message_id=outbound.session_message_id,

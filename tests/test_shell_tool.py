@@ -442,6 +442,9 @@ async def test_agent_loop_turn_end_terminates_owner_shell() -> None:
     loop._llm_services = SimpleNamespace(provider=object())
     loop._processing_state = None
     loop._interrupt_states = {}
+    loop._passive_pipeline = SimpleNamespace(
+        run_command=AsyncMock(return_value=None)
+    )
     loop._resume_interrupted_message = AsyncMock(
         side_effect=lambda message, _key: (message, False)
     )
@@ -452,8 +455,10 @@ async def test_agent_loop_turn_end_terminates_owner_shell() -> None:
         _key: str,
         *,
         dispatch_outbound: bool,
+        command_admitted: bool,
     ) -> OutboundMessage:
         assert dispatch_outbound is False
+        assert command_admitted is True
         opened = _decode(
             await shell.execute(
                 command="sleep 30",
@@ -493,6 +498,9 @@ async def test_agent_loop_preserves_turn_failure_when_shell_cleanup_fails(
     loop._llm_services = SimpleNamespace(provider=object())
     loop._processing_state = None
     loop._interrupt_states = {}
+    loop._passive_pipeline = SimpleNamespace(
+        run_command=AsyncMock(return_value=None)
+    )
     loop._resume_interrupted_message = AsyncMock(
         side_effect=lambda message, _key: (message, False)
     )
@@ -531,6 +539,9 @@ async def test_agent_loop_returns_completed_reply_when_shell_cleanup_fails(
     loop._llm_services = SimpleNamespace(provider=object())
     loop._processing_state = None
     loop._interrupt_states = {}
+    loop._passive_pipeline = SimpleNamespace(
+        run_command=AsyncMock(return_value=None)
+    )
     loop._resume_interrupted_message = AsyncMock(
         side_effect=lambda message, _key: (message, False)
     )

@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any, cast
+from uuid import uuid4
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -27,16 +28,19 @@ from agent.looping.ports import (
     LLMConfig,
     MemoryServices,
 )
+from agent.persona import reset_veda
 from agent.provider import LLMResponse
 from agent.retrieval.protocol import RetrievalRequest, RetrievalResult
 from agent.tools.message_push import MessagePushTool
 from agent.tools.registry import ToolRegistry
-from agent.turns.outbound import BusOutboundPort, OutboundDispatch, PushToolOutboundPort
+from agent.turns.outbound import OutboundDispatch, PushToolOutboundPort
 from bootstrap.tools import build_core_runtime
+from agent.plugin_composition.channels import (
+    ChannelDeliveryReceipt,
+    DeliveryStatus as ChannelDeliveryStatus,
+)
 from bus.events import (
     ChannelMessage,
-    DeliveryReceipt,
-    DeliveryStatus,
     InboundMessage,
     OutboundMessage,
 )
@@ -213,12 +217,18 @@ class RaceHarness:
         self.timeout = timeout
         self._tmpdir = TemporaryDirectory(prefix="akashic-race-")
         self._config_explicit = config_path is not None
+        self._workspace_explicit = workspace is not None
         self.workspace = workspace or Path(self._tmpdir.name) / "workspace"
         self.config_path = config_path or Path(self._tmpdir.name) / "config.toml"
+        if not self._workspace_explicit:
+            _ = reset_veda(self.workspace)
         self.bus = MessageBus()
         self.push_tool = MessagePushTool(chat_lane=self.bus.chat_lane)
         self.push_port = PushToolOutboundPort(self.push_tool)
-        self.bus_port = BusOutboundPort(self.bus)
+        self.passive_port = PushToolOutboundPort(
+            self.push_tool,
+            commit_role="passive",
+        )
         self.records: list[SendRecord] = []
         self._seq = 0
         self._blocked: dict[str, asyncio.Event] = {}
@@ -287,12 +297,31 @@ class RaceHarness:
         async def _text(chat_id: str, message: str) -> None:
             await self._send_text_for(channel, chat_id, message)
 
-        async def _deliver(message: ChannelMessage) -> DeliveryReceipt:
-            await _text(message.chat_id, message.content)
-            return DeliveryReceipt(DeliveryStatus.SUCCESS)
+        async def _deliver(
+            message: ChannelMessage,
+            passive: bool,
+        ) -> ChannelDeliveryReceipt:
+            async def send() -> None:
+                await _text(message.chat_id, message.content)
 
-        push_tool.register_channel(channel, deliver=_deliver)
-        bus.subscribe_outbound(channel, self._send_outbound)
+            if passive:
+                await bus.chat_lane.run_passive(
+                    message.channel,
+                    message.chat_id,
+                    send,
+                )
+            else:
+                await bus.chat_lane.run_non_passive(
+                    message.channel,
+                    message.chat_id,
+                    send,
+                )
+            return ChannelDeliveryReceipt(
+                delivery_id=uuid4().hex,
+                status=ChannelDeliveryStatus.DELIVERED,
+            )
+
+        push_tool.bind_v3_channel_dispatcher(_deliver)
 
     async def start(self) -> None:
         self._dispatch_task = asyncio.create_task(self.bus.dispatch_outbound())
@@ -327,6 +356,7 @@ class RaceHarness:
                 ),
                 retrieval_pipeline=_NoopRetrieval(),
                 reasoner=reasoner,
+                outbound_port=self.passive_port,
             ),
             AgentLoopConfig(
                 llm=LLMConfig(
@@ -374,7 +404,7 @@ class RaceHarness:
 
     async def passive_once(self, reply: str) -> None:
         item = await asyncio.wait_for(self.bus.consume_inbound(), timeout=self.timeout)
-        _ = await self.bus_port.dispatch(
+        _ = await self.passive_port.dispatch(
             OutboundDispatch(
                 channel=item.channel,
                 chat_id=item.chat_id,
@@ -384,13 +414,14 @@ class RaceHarness:
         await self.bus.complete_inbound(item)
 
     async def non_passive(self, message: str, chat_id: str = CHAT) -> bool:
-        return await self.push_port.dispatch(
+        receipt = await self.push_port.dispatch(
             OutboundDispatch(
                 channel=CHANNEL,
                 chat_id=chat_id,
                 content=message,
             )
         )
+        return receipt.status is ChannelDeliveryStatus.DELIVERED
 
     async def _send_text_for(self, channel: str, chat_id: str, message: str) -> None:
         await self._record("start", channel, chat_id, message)
@@ -668,7 +699,6 @@ async def scenario_config_runtime_llm(harness: RaceHarness) -> None:
     try:
         harness.workspace.mkdir(parents=True, exist_ok=True)
         core = build_core_runtime(config, harness.workspace, resources)
-        harness.register_runtime_channel(channel, core.bus, core.push_tool)
         await core.start()
         loop_task = asyncio.create_task(core.loop.run())
         dispatch_task = asyncio.create_task(core.bus.dispatch_outbound())

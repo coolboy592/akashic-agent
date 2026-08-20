@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     from agent.core.runtime_support import ToolDiscoveryState
     from agent.provider import LLMProvider
     from agent.retrieval.protocol import MemoryRetrievalPipeline
+    from agent.turns.outbound import OutboundPort
     from agent.tools.registry import ToolRegistry
     from bus.event_bus import EventBus
     from bus.processing import ProcessingState
@@ -81,6 +82,7 @@ class AgentLoopDeps:
     session_services: SessionServices | None = None
     tool_discovery: "ToolDiscoveryState | None" = None
     reasoner: "Reasoner | None" = None
+    outbound_port: "OutboundPort | None" = None
 
 @dataclass
 class AgentLoopConfig:
