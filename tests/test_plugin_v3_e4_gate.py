@@ -165,6 +165,37 @@ def test_tree_summary_and_artifact_pointer_inventory(tmp_path: Path) -> None:
     assert gate._tree_summary(root)["digest"] != before
 
 
+def test_plugin_data_inventory_ignores_only_sqlite_runtime_sidecars(
+    tmp_path: Path,
+) -> None:
+    plugin_data = tmp_path / "plugin-data"
+    state = plugin_data / "github-watch-github" / "events.sqlite3"
+    state.parent.mkdir(parents=True)
+    state.write_bytes(b"SQLite format 3\x00authoritative")
+    before = gate._artifact_inventory(plugin_data, exclude_sqlite_sidecars=True)
+
+    (state.parent / "events.sqlite3-wal").write_bytes(b"runtime-wal")
+    (state.parent / "events.sqlite3-shm").write_bytes(b"runtime-shm")
+    after_sidecars = gate._artifact_inventory(
+        plugin_data, exclude_sqlite_sidecars=True
+    )
+    assert after_sidecars == before
+
+    unrelated = state.parent / "audit-wal"
+    unrelated.write_bytes(b"plugin-owned")
+    after_unrelated = gate._artifact_inventory(
+        plugin_data, exclude_sqlite_sidecars=True
+    )
+    assert after_unrelated["tree_digest"] != before["tree_digest"]
+    unrelated.unlink()
+
+    state.write_bytes(b"SQLite format 3\x00changed")
+    after_database = gate._artifact_inventory(
+        plugin_data, exclude_sqlite_sidecars=True
+    )
+    assert after_database["tree_digest"] != before["tree_digest"]
+
+
 def test_workspace_summary_uses_rehearsal_runtime_exclusions(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()

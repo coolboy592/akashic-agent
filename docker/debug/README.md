@@ -269,7 +269,9 @@ E1 覆盖 Default Memory/Akasha、Citation/Meme、Observe、Emotion、Proactive 
 Plugin Undo；E2 覆盖 Shell 三件与 MCP/process 插件；E3 覆盖 Channel、Command、
 Proactive source/job 与 GitHub Watcher。E4 不重复逐插件运行，而是从同一 Core head
 的 E1～E3 报告建立覆盖集，再在复制 workspace 中验证 SQLite 完整性、messages
-只追加、plugin-data/artifact/pointer 不变和进程内失败/子进程崩溃恢复。
+只追加、plugin-data 权威文件与 artifact/pointer 不变，以及进程内失败/子进程崩溃恢复。
+SQLite 在线备份可能在只读源旁创建或触碰 `-wal`/`-shm`/`-journal` 运行 sidecar；
+E4 不把这些可重建 sidecar 计入 plugin-data 身份，但仍逐字节固定主数据库和其他文件。
 
 报告中任何 `blocked`、不同 Core head、非 exact lock、未覆盖 fleet 或 cleanup 残留都会令
 最终 rehearsal 非零退出。正式 workspace 备份和 hua-home 切换不属于这些 Gate

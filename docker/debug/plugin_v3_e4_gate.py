@@ -41,6 +41,7 @@ DEFAULT_TMP_ROOT = Path("/home/huashen/.cache/akashic-gate-tmp")
 
 GATE_VERSION = 1
 SCENARIO_PROFILE = "plugin-v3-e4-copied-workspace-rehearsal-v1"
+SQLITE_HEADER = b"SQLite format 3\x00"
 E2_PROFILE = "plugin-v3-e2-shell-v1"
 E3_PROFILE = "plugin-v3-e3-fleet-channel-proactive-v3"
 PASSIVE_PROFILE = "citation-meme-webui-v3-v1"
@@ -107,8 +108,37 @@ def _digest_records(records: list[dict[str, object]]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _is_sqlite_runtime_sidecar(path: Path) -> bool:
+    """只在相邻主文件确为 SQLite 时识别它的运行 sidecar。"""
+
+    # 1. 后缀条目必须是实体普通文件。
+    if path.is_symlink() or not path.is_file():
+        return False
+    suffix = next(
+        (
+            candidate
+            for candidate in ("-wal", "-shm", "-journal")
+            if path.name.endswith(candidate)
+        ),
+        None,
+    )
+    if suffix is None:
+        return False
+
+    # 2. 同名主文件必须携带 SQLite 文件头，避免排除插件自有普通文件。
+    database = path.with_name(path.name[: -len(suffix)])
+    if database.is_symlink() or not database.is_file():
+        return False
+    with database.open("rb") as stream:
+        return stream.read(len(SQLITE_HEADER)) == SQLITE_HEADER
+
+
 def _tree_summary(
-    root: Path, *, include_entries: bool = False, exclude_workspace_runtime: bool = False
+    root: Path,
+    *,
+    include_entries: bool = False,
+    exclude_workspace_runtime: bool = False,
+    exclude_sqlite_sidecars: bool = False,
 ) -> dict[str, object]:
     """Summarize a tree without following symlinks or exposing file contents."""
 
@@ -124,6 +154,8 @@ def _tree_summary(
     def visit(directory: Path) -> None:
         for child in sorted(directory.iterdir(), key=lambda item: item.name):
             relative = child.relative_to(root).as_posix()
+            if exclude_sqlite_sidecars and _is_sqlite_runtime_sidecar(child):
+                continue
             if exclude_workspace_runtime and excluded_reason(
                 Path(relative), is_symlink=child.is_symlink()
             ) is not None:
@@ -162,10 +194,16 @@ def _tree_summary(
     }
 
 
-def _artifact_inventory(root: Path) -> dict[str, object]:
+def _artifact_inventory(
+    root: Path, *, exclude_sqlite_sidecars: bool = False
+) -> dict[str, object]:
     """Inventory artifact and pointer files by digest, never by contents."""
 
-    summary = _tree_summary(root, include_entries=True)
+    summary = _tree_summary(
+        root,
+        include_entries=True,
+        exclude_sqlite_sidecars=exclude_sqlite_sidecars,
+    )
     entries = cast(list[dict[str, object]], summary.get("entries", []))
     artifacts: list[dict[str, object]] = []
     pointers: list[dict[str, object]] = []
@@ -620,7 +658,9 @@ async def _run_runtime(args: argparse.Namespace, report: dict[str, object]) -> N
         "workspace": _tree_summary(source_workspace, exclude_workspace_runtime=True),
         "config": _tree_summary(source_config),
         "plugin_home": _tree_summary(plugin_home),
-        "plugin_data": _artifact_inventory(source_workspace / "plugin-data"),
+        "plugin_data": _artifact_inventory(
+            source_workspace / "plugin-data", exclude_sqlite_sidecars=True
+        ),
         "artifact_pointer": _artifact_inventory(plugin_home),
     }
     source_db_before = _sqlite_snapshot(source_workspace / "sessions.db")
@@ -643,7 +683,9 @@ async def _run_runtime(args: argparse.Namespace, report: dict[str, object]) -> N
         report["rehearsal_copy"] = {
             "status": "passed", "manifest": str(manifest), "target": str(target),
             "workspace": _tree_summary(copied_workspace),
-            "plugin_data": _artifact_inventory(copied_workspace / "plugin-data"),
+            "plugin_data": _artifact_inventory(
+                copied_workspace / "plugin-data", exclude_sqlite_sidecars=True
+            ),
             "artifact_pointer": before_artifact,
         }
         report["builtin_e1_data_read_boot"] = await _run_builtin_boot(copied_workspace)
@@ -657,7 +699,9 @@ async def _run_runtime(args: argparse.Namespace, report: dict[str, object]) -> N
         if before_artifact != copied_artifact_after:
             raise GateFailure("copied artifact/pointer inventory 在生命周期中发生变化")
         report["artifact_pointer_after"] = copied_artifact_after
-        report["plugin_data_after"] = _artifact_inventory(copied_workspace / "plugin-data")
+        report["plugin_data_after"] = _artifact_inventory(
+            copied_workspace / "plugin-data", exclude_sqlite_sidecars=True
+        )
         report["graceful_stop_cleanup"] = {
             "status": "passed", "runtime_directories_removed_with_rehearsal": True,
         }
@@ -665,7 +709,9 @@ async def _run_runtime(args: argparse.Namespace, report: dict[str, object]) -> N
         "workspace": _tree_summary(source_workspace, exclude_workspace_runtime=True),
         "config": _tree_summary(source_config),
         "plugin_home": _tree_summary(plugin_home),
-        "plugin_data": _artifact_inventory(source_workspace / "plugin-data"),
+        "plugin_data": _artifact_inventory(
+            source_workspace / "plugin-data", exclude_sqlite_sidecars=True
+        ),
         "artifact_pointer": _artifact_inventory(plugin_home),
     }
     source_db_after = _sqlite_snapshot(source_workspace / "sessions.db")
