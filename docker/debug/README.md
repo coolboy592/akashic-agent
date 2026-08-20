@@ -153,7 +153,7 @@ workspace 手工 TOML、watcher/admin 和独立热重载路径已删除；Gate �
 
 ```bash
 python docker/debug/plugin_v3_fleet_gate.py
-python docker/debug/plugin_v3_tool_composition_gate.py
+python docker/debug/plugin_composition_v3_gate.py --require-clean-core
 python docker/debug/restart_probe.py --soak
 ```
 

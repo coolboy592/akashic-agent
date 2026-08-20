@@ -61,8 +61,6 @@ from agent.plugins.generation_proactive_bridge import (  # noqa: E402
 )
 from bus.events import (  # noqa: E402
     ChannelMessage as BusChannelMessage,
-    DeliveryReceipt as BusDeliveryReceipt,
-    DeliveryStatus as BusDeliveryStatus,
 )
 from session.manager import SessionManager  # noqa: E402
 
@@ -1419,18 +1417,7 @@ async def _run_proactive_tick(
 
     delivered: list[dict[str, str]] = []
     push = MessagePushTool()
-
-    async def deliver(message: BusChannelMessage) -> BusDeliveryReceipt:
-        delivered.append(
-            {
-                "channel": message.channel,
-                "chat_id": message.chat_id,
-                "content": message.content,
-            }
-        )
-        return BusDeliveryReceipt(BusDeliveryStatus.SUCCESS)
-
-    registration = push.register_channel("recording", deliver=deliver)
+    push.bind_v3_channel_dispatcher(_build_recording_dispatcher(delivered))
     state = ProactiveStateStore(state_path)
     loop = ProactiveLoop(
         session_manager=sessions,
@@ -1472,9 +1459,38 @@ async def _run_proactive_tick(
                 await loop._stop_active_kernel()
         finally:
             loop.close()
-            registration.close()
             state.close()
     return result
+
+
+def _build_recording_dispatcher(
+    delivered: list[dict[str, str]],
+) -> Callable[[BusChannelMessage, bool], Awaitable[ChannelDeliveryReceipt]]:
+    """为私有 proactive probe 绑定 typed recording sink。"""
+
+    async def dispatch(
+        message: BusChannelMessage,
+        _passive: bool,
+    ) -> ChannelDeliveryReceipt:
+        if message.channel != "recording":
+            raise GateFailure(
+                f"proactive recording 收到未知 channel: {message.channel!r}"
+            )
+        delivery_id = f"e3-proactive-delivery-{len(delivered) + 1}"
+        delivered.append(
+            {
+                "channel": message.channel,
+                "chat_id": message.chat_id,
+                "content": message.content,
+            }
+        )
+        return ChannelDeliveryReceipt(
+            delivery_id=delivery_id,
+            status=DeliveryStatus.DELIVERED,
+            provider_ids=("recording",),
+        )
+
+    return dispatch
 
 
 def _read_proactive_tick(path: Path) -> dict[str, object]:

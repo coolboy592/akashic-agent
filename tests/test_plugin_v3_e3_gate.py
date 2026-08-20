@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import importlib.util
+import inspect
 import json
 import sys
 from pathlib import Path
@@ -236,6 +238,40 @@ def test_recording_factory_preserves_delivery_identity_and_unknown_status() -> N
         "delivery-1",
         "delivery-2",
     ]
+
+
+def test_recording_sink_uses_typed_v3_dispatcher() -> None:
+    delivered: list[dict[str, str]] = []
+    push = gate.MessagePushTool()
+    push.bind_v3_channel_dispatcher(gate._build_recording_dispatcher(delivered))
+
+    result = json.loads(
+        asyncio.run(
+            push.execute(
+                target_channel="recording",
+                target_chat_id="operator",
+                message="deterministic",
+            )
+        )
+    )
+
+    assert result == {
+        "delivery_id": "e3-proactive-delivery-1",
+        "status": "delivered",
+        "retryable": False,
+        "provider_ids": ["recording"],
+        "error": None,
+    }
+    assert delivered == [
+        {
+            "channel": "recording",
+            "chat_id": "operator",
+            "content": "deterministic",
+        }
+    ]
+    source = inspect.getsource(gate._run_proactive_tick)
+    assert "bind_v3_channel_dispatcher" in source
+    assert "register_channel" not in source
 
 
 def test_prepare_channel_checkouts_adds_only_temp_python_marker(
