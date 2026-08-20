@@ -20,6 +20,7 @@ from agent.plugins.manager import PluginManager
 from bootstrap.core_channel_adapter import (
     CoreLegacyChannelAdapter,
     LEGACY_ATTACHMENT_METADATA_KEY,
+    LEGACY_REPLY_TO_METADATA_KEY,
     map_legacy_delivery_receipt,
     build_core_channel_definition,
 )
@@ -82,7 +83,8 @@ async def test_legacy_adapter_preserves_existing_attachment_delivery() -> None:
         metadata={
             LEGACY_ATTACHMENT_METADATA_KEY: (
                 {"kind": "file", "source": "/tmp/report.pdf", "filename": "report.pdf"},
-            )
+            ),
+            LEGACY_REPLY_TO_METADATA_KEY: "message-1",
         },
     )
 
@@ -93,6 +95,7 @@ async def test_legacy_adapter_preserves_existing_attachment_delivery() -> None:
     assert channel.received[0].attachments == (
         ChannelAttachment(AttachmentKind.FILE, "/tmp/report.pdf", "report.pdf"),
     )
+    assert channel.received[0].reply_to == "message-1"
     assert (await adapter.stop()).resources_closed is True
 
 

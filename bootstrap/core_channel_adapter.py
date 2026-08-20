@@ -26,6 +26,7 @@ from bus.events import (
 
 LEGACY_ATTACHMENT_METADATA_KEY = "_core_legacy_attachments"
 LEGACY_THINKING_METADATA_KEY = "_core_legacy_thinking"
+LEGACY_REPLY_TO_METADATA_KEY = "_core_legacy_reply_to"
 LEGACY_SESSION_MESSAGE_ID_METADATA_KEY = "_core_legacy_session_message_id"
 LEGACY_CONTROL_TURN_ID_METADATA_KEY = "_core_legacy_control_turn_id"
 LEGACY_EXECUTION_ATTEMPT_ID_METADATA_KEY = "_core_legacy_execution_attempt_id"
@@ -53,6 +54,7 @@ class CoreLegacyChannelAdapter:
         metadata = dict(request_metadata(request))
         attachments = _decode_legacy_attachments(metadata.pop(LEGACY_ATTACHMENT_METADATA_KEY, ()))
         thinking = _pop_optional_text(metadata, LEGACY_THINKING_METADATA_KEY)
+        reply_to = _pop_optional_text(metadata, LEGACY_REPLY_TO_METADATA_KEY)
         session_message_id = _pop_optional_text(
             metadata,
             LEGACY_SESSION_MESSAGE_ID_METADATA_KEY,
@@ -72,6 +74,7 @@ class CoreLegacyChannelAdapter:
             content=request.body,
             attachments=attachments,
             thinking=thinking,
+            reply_to=reply_to,
             metadata=metadata,
             session_message_id=session_message_id,
             control_turn_id=control_turn_id,
@@ -176,6 +179,7 @@ def encode_legacy_channel_message(message: ChannelMessage) -> dict[str, object]:
             message.attachments
         )
     _set_optional_metadata(metadata, LEGACY_THINKING_METADATA_KEY, message.thinking)
+    _set_optional_metadata(metadata, LEGACY_REPLY_TO_METADATA_KEY, message.reply_to)
     _set_optional_metadata(
         metadata,
         LEGACY_SESSION_MESSAGE_ID_METADATA_KEY,
@@ -253,6 +257,7 @@ __all__ = [
     "LEGACY_ATTACHMENT_METADATA_KEY",
     "LEGACY_CONTROL_TURN_ID_METADATA_KEY",
     "LEGACY_EXECUTION_ATTEMPT_ID_METADATA_KEY",
+    "LEGACY_REPLY_TO_METADATA_KEY",
     "LEGACY_SESSION_MESSAGE_ID_METADATA_KEY",
     "LEGACY_TERMINAL_STATUS_METADATA_KEY",
     "LEGACY_THINKING_METADATA_KEY",

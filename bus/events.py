@@ -56,6 +56,7 @@ class ChannelMessage:
     content: str
     attachments: tuple[ChannelAttachment, ...] = ()
     thinking: str | None = None
+    reply_to: str | None = None
     metadata: dict[str, object] = field(default_factory=dict[str, object])
     session_message_id: str | None = None
     control_turn_id: str | None = None
@@ -156,6 +157,7 @@ def channel_message_from_outbound(
             ChannelAttachment(media_kind, source) for source in message.media
         ),
         thinking=message.thinking,
+        reply_to=message.reply_to,
         metadata=dict(message.metadata),
         session_message_id=message.session_message_id,
         control_turn_id=message.control_turn_id,
