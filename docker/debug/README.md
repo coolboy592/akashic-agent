@@ -112,9 +112,10 @@ failure，并检查 RSS、fd、线程与 DB 非终态阈值。
 每次运行的证据位于
 `docker/debug/reports/programmatic-control/<run-id>/`。
 
-## Akasha V2 在线与重放等价 Gate
+## Akasha memory engine 在线与重放等价 Gate
 
-Akasha 专用 Gate 复用同一个只读 runtime 容器，但开启 `memory.engine = "akasha"`。
+这个名字保留历史脚本路径，但验证对象是 Core memory-engine factory，不是已经删除的
+v2 Plugin ABI。Gate 复用同一个只读 runtime 容器，并开启 `memory.engine = "akasha"`。
 scripted model-gate 只控制模型回复和 `recall_memory` 工具选择；embedding 使用显式
 `--source-config` 中的真实 provider。配置及凭据只进入权限为 `0600` 的唯一 `/tmp`
 sandbox，运行结束后删除，不写日志和报告。
