@@ -206,10 +206,10 @@ def _channel_plugin_source(
     block_deliver: bool = False,
 ) -> str:
     delivery_body = (
-        "        DELIVERY_ENTERED.set()\n"
-        "        await asyncio.Event().wait()\n"
+        "            DELIVERY_ENTERED.set()\n"
+        "            await asyncio.Event().wait()\n"
         if block_deliver
-        else "        return ProviderDeliveryReceipt(request.delivery_id, DeliveryStatus.DELIVERED)\n"
+        else "            return ProviderDeliveryReceipt(request.delivery_id, DeliveryStatus.DELIVERED)\n"
     )
     return (
         "import asyncio\n"
@@ -239,14 +239,38 @@ def _channel_plugin_source(
         "class Adapter:\n"
         "    def __init__(self, context):\n"
         "        self.context = context\n"
+        "        self.ports = None\n"
+        "        self.admission_open = False\n"
+        "        self._in_flight = 0\n"
+        "        self._drained = asyncio.Event()\n"
+        "        self._drained.set()\n"
         f"        self.fail_start = {fail_start!r}\n"
         f"        self.fail_stop = {fail_stop!r}\n"
+        "    def attach_runtime(self, ports):\n"
+        "        if self.admission_open: raise RuntimeError('channel admission already open')\n"
+        "        if ports.binding_token != self.context.binding_token: raise RuntimeError('channel binding mismatch')\n"
+        "        if ports.ingress is None: raise RuntimeError('channel ingress missing')\n"
+        "        self.ports = ports\n"
+        "    def open_admission(self):\n"
+        "        if self.ports is None: raise RuntimeError('channel runtime not attached')\n"
+        "        self.admission_open = True\n"
+        "    def close_admission(self):\n"
+        "        self.admission_open = False\n"
         "    async def start(self):\n"
         "        if self.fail_start: raise RuntimeError('channel start failed')\n"
+        "        if self.ports is None: raise RuntimeError('channel runtime not attached')\n"
         "        return ChannelReady(self.context.binding_token)\n"
         "    async def deliver(self, request):\n"
+        "        self._in_flight += 1\n"
+        "        self._drained.clear()\n"
+        "        try:\n"
         + delivery_body
-        + "    async def stop(self):\n"
+        + "        finally:\n"
+        "            self._in_flight -= 1\n"
+        "            if self._in_flight == 0: self._drained.set()\n"
+        "    async def stop(self):\n"
+        "        self.close_admission()\n"
+        "        await self._drained.wait()\n"
         "        if self.fail_stop: raise RuntimeError('channel stop failed')\n"
         "        return StopReceipt(self.context.binding_token, True)\n"
         "def build_adapter(context): return Adapter(context)\n"
@@ -453,6 +477,11 @@ async def test_v3_channel_manager_binds_core_attachment_ports(
         assert context is not None
         assert context.attachment_import is not None
         assert context.attachment_read is not None
+        adapter = state.adapter
+        assert adapter is not None
+        assert adapter.ports.binding_token == state.binding_token
+        assert adapter.ports.ingress is context.ingress
+        assert adapter.admission_open is True
 
         ref = await context.attachment_import.import_bytes(
             b"manager-bound attachment",

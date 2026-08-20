@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import importlib
 import logging
 import sys
 import types
+from concurrent.futures import Future
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,8 +24,14 @@ from bus.events_lifecycle import (
     ToolCallStarted,
     TurnStarted,
 )
-from infra.channels.base import AttachmentStore
 from infra.channels.contract import ChannelContext
+from agent.plugin_composition import (
+    AttachmentKind,
+    AttachmentRef,
+    ChannelFactoryContext,
+    RawInbound,
+)
+from agent.plugin_composition.channels import ChannelRuntimePorts
 
 
 class _Bus:
@@ -89,6 +97,80 @@ def _passive_channel_message(message: OutboundMessage):
     projected = channel_message_from_outbound(message)
     projected.metadata["_channel_commit_role"] = "passive"
     return projected
+
+
+class _V3Ingress:
+    """Record only the frozen Core ingress objects accepted by a native channel."""
+
+    def __init__(self) -> None:
+        self.messages: list[RawInbound] = []
+
+    async def admit(self, raw: RawInbound) -> bool:
+        self.messages.append(raw)
+        return True
+
+
+class _V3AttachmentImport:
+    """Return opaque attachment refs instead of a legacy temporary path."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[bytes, AttachmentKind, str | None, str | None]] = []
+
+    async def import_bytes(
+        self,
+        data: bytes,
+        *,
+        kind: AttachmentKind,
+        filename: str | None,
+        media_type: str | None,
+    ) -> AttachmentRef:
+        self.calls.append((data, kind, filename, media_type))
+        artifact_id = f"inbound-{len(self.calls)}"
+        return AttachmentRef(
+            artifact_id=artifact_id,
+            kind=kind,
+            filename=filename or artifact_id,
+            media_type=media_type or "application/octet-stream",
+            size_bytes=len(data),
+            sha256=hashlib.sha256(data).hexdigest(),
+        )
+
+
+class _NoAttachmentRead:
+    async def acquire(self, _ref: AttachmentRef) -> object:
+        raise AssertionError("本测试不通过 native adapter 读取 outbound attachment")
+
+
+async def _attach_native_v3_runtime(channel: object, *, binding_token: str):
+    """Attach one exact Core ingress and leave admission closed for the caller."""
+
+    ingress = _V3Ingress()
+    attachment_import = _V3AttachmentImport()
+    context = ChannelFactoryContext(
+        snapshot_id="test-snapshot",
+        generation_id="test-generation",
+        binding_token=binding_token,
+        config={},
+        credentials={},
+        provider_client_factory=SimpleNamespace(),
+        ingress=ingress,
+        identity=None,
+        attachment_import=attachment_import,
+        attachment_read=_NoAttachmentRead(),
+    )
+    adapter = channel.build_v3_adapter(context)
+    adapter.attach_runtime(
+        ChannelRuntimePorts(
+            snapshot_id=context.snapshot_id,
+            generation_id=context.generation_id,
+            binding_token=context.binding_token,
+            ingress=context.ingress,
+            identity=context.identity,
+            attachment_import=context.attachment_import,
+        )
+    )
+    assert (await adapter.start()).binding_token == binding_token
+    return adapter, ingress, attachment_import
 
 
 def _import_telegram_channel(monkeypatch: pytest.MonkeyPatch):
@@ -414,6 +496,10 @@ async def test_telegram_channel_paths(monkeypatch: pytest.MonkeyPatch, tmp_path:
     monkeypatch.setattr(mod, "send_stream_markdown", AsyncMock())
     monkeypatch.setattr(mod, "send_thinking_block", AsyncMock())
     await channel.start()
+    adapter, ingress, attachment_import = await _attach_native_v3_runtime(
+        channel,
+        binding_token="telegram-test-binding",
+    )
     assert len(channel._app.handlers) == 5
     assert [cmd.command for cmd in channel._app.bot.set_my_commands.await_args.args[0]] == [
         "memorystatus",
@@ -427,18 +513,22 @@ async def test_telegram_channel_paths(monkeypatch: pytest.MonkeyPatch, tmp_path:
     ]
 
     class _File:
-        def __init__(self, suffix):
-            self.suffix = suffix
+        def __init__(self, payload: bytes):
+            self.payload = payload
 
-        async def download_to_drive(self, path):
-            Path(path).write_text("x", encoding="utf-8")
+        async def download_as_bytearray(self) -> bytearray:
+            return bytearray(self.payload)
 
     channel._app.bot.get_file = AsyncMock(
-        side_effect=[_File(".jpg"), _File(".txt"), _File(".jpg"), _File(".txt"), _File(".md")]
+        side_effect=[_File(b"reply-photo"), _File(b"reply-document"), _File(b"photo"), _File(b"reply-photo-2"), _File(b"document")]
     )
     context = SimpleNamespace(bot=channel._app.bot)
     reply_photo = [SimpleNamespace(file_id="p1")]
-    reply_doc = SimpleNamespace(file_id="d1", file_name="note.txt")
+    reply_doc = SimpleNamespace(
+        file_id="d1",
+        file_name="note.txt",
+        mime_type="text/plain",
+    )
     reply_user = SimpleNamespace(id=2, username="other")
     reply_msg = SimpleNamespace(
         text="原消息",
@@ -459,10 +549,16 @@ async def test_telegram_channel_paths(monkeypatch: pytest.MonkeyPatch, tmp_path:
         effective_chat=SimpleNamespace(id=123),
         effective_user=SimpleNamespace(id=1, username="Alice"),
     )
-    await channel._on_message(update, context)
-    assert len(bus.inbound) == 1
-    assert bus.inbound[0].metadata["reply_to_sender"] == "@other"
-    assert len(bus.inbound[0].media) == 2
+    pending_message = asyncio.create_task(channel._on_message(update, context))
+    await asyncio.sleep(0)
+    assert ingress.messages == []
+    adapter.open_admission()
+    await pending_message
+    assert len(ingress.messages) == 1
+    first = ingress.messages[0].message
+    assert first.metadata["reply_to_sender"] == "@other"
+    assert len(first.attachments) == 2
+    assert all(isinstance(ref, AttachmentRef) for ref in first.attachments)
 
     stop_update = SimpleNamespace(
         effective_message=SimpleNamespace(text="/stop", message_id=99),
@@ -475,7 +571,7 @@ async def test_telegram_channel_paths(monkeypatch: pytest.MonkeyPatch, tmp_path:
         sender="1",
         command="/stop",
     )
-    assert len(bus.inbound) == 1
+    assert len(ingress.messages) == 1
 
     status_update = SimpleNamespace(
         effective_message=SimpleNamespace(text="/memorystatus", message_id=100),
@@ -483,9 +579,9 @@ async def test_telegram_channel_paths(monkeypatch: pytest.MonkeyPatch, tmp_path:
         effective_user=SimpleNamespace(id=1, username="Alice"),
     )
     await channel._on_command(status_update, context)
-    assert len(bus.inbound) == 2
-    assert bus.inbound[1].content == "/memorystatus"
-    assert bus.inbound[1].metadata["username"] == "Alice"
+    assert len(ingress.messages) == 2
+    assert ingress.messages[1].message.content == "/memorystatus"
+    assert ingress.messages[1].message.metadata["username"] == "Alice"
 
     kvcache_update = SimpleNamespace(
         effective_message=SimpleNamespace(text="/kvcache 5", message_id=101),
@@ -493,9 +589,9 @@ async def test_telegram_channel_paths(monkeypatch: pytest.MonkeyPatch, tmp_path:
         effective_user=SimpleNamespace(id=1, username="Alice"),
     )
     await channel._on_command(kvcache_update, context)
-    assert len(bus.inbound) == 3
-    assert bus.inbound[2].content == "/kvcache 5"
-    assert bus.inbound[2].metadata["username"] == "Alice"
+    assert len(ingress.messages) == 3
+    assert ingress.messages[2].message.content == "/kvcache 5"
+    assert ingress.messages[2].message.metadata["username"] == "Alice"
 
     photo_update = SimpleNamespace(
         effective_message=SimpleNamespace(
@@ -518,6 +614,7 @@ async def test_telegram_channel_paths(monkeypatch: pytest.MonkeyPatch, tmp_path:
     doc_update = SimpleNamespace(
         effective_message=SimpleNamespace(
             document=SimpleNamespace(file_id="doc1", file_name="a.md", mime_type="text/plain"),
+            message_id=3,
             caption="",
             reply_to_message=None,
         ),
@@ -525,8 +622,10 @@ async def test_telegram_channel_paths(monkeypatch: pytest.MonkeyPatch, tmp_path:
         effective_user=SimpleNamespace(id=1, username="Alice"),
     )
     await channel._on_document(doc_update, context)
-    assert len(bus.inbound) == 5
-    assert bus.inbound[-1].metadata["document_filename"] == "a.md"
+    assert len(ingress.messages) == 5
+    assert ingress.messages[-1].message.metadata["document_filename"] == "a.md"
+    assert len(attachment_import.calls) == 5
+    assert bus.inbound == []
 
     assert channel._resolve_chat_id("123") == "123"
     await channel._identity_index.remember("alice", "456")
@@ -722,6 +821,8 @@ async def test_telegram_channel_paths(monkeypatch: pytest.MonkeyPatch, tmp_path:
     if created:
         await asyncio.gather(*created)
     channel._on_polling_error(mod.TelegramError("warn"))
+    adapter.close_admission()
+    assert (await adapter.stop()).resources_closed is True
     await channel.stop()
 
     merged, meta = mod._build_inbound_text_with_reply("hi", None)
@@ -968,11 +1069,34 @@ async def test_qq_channel_paths(monkeypatch: pytest.MonkeyPatch, tmp_path: Path)
     real_create_task = asyncio.create_task
 
     def _run_coroutine_threadsafe(coro, loop):
-        scheduled.append(real_create_task(coro))
-        return SimpleNamespace(result=lambda timeout=None: True)
+        _ = loop
+        if getattr(getattr(coro, "cr_code", None), "co_name", None) == "_execute_mock_call":
+            coro.close()
+            completed = Future()
+            completed.set_result(True)
+            return completed
+        task = real_create_task(coro)
+        scheduled.append(task)
+        completed = Future()
+
+        def settle(result_task):
+            if result_task.cancelled():
+                completed.cancel()
+                return
+            try:
+                completed.set_result(result_task.result())
+            except BaseException as error:
+                completed.set_exception(error)
+
+        task.add_done_callback(settle)
+        return completed
 
     monkeypatch.setattr(mod.asyncio, "run_coroutine_threadsafe", _run_coroutine_threadsafe)
     await channel.start()
+    adapter, ingress, attachment_import = await _attach_native_v3_runtime(
+        channel,
+        binding_token="qq-test-binding",
+    )
 
     async def _drain(coro):
         return await coro
@@ -980,15 +1104,34 @@ async def test_qq_channel_paths(monkeypatch: pytest.MonkeyPatch, tmp_path: Path)
     channel._run_on_bot_loop = AsyncMock(side_effect=_drain)
 
     await channel._bot.startup_handler(SimpleNamespace())
-    await channel._bot.private_handler(SimpleNamespace(user_id="1", raw_message="hi [CQ:image,url=http://x/a.jpg]"))
-    await channel._bot.group_handler(SimpleNamespace(group_id="100", user_id="1", raw_message="hello"))
+    await channel._bot.private_handler(
+        SimpleNamespace(
+            user_id="1",
+            raw_message="hi [CQ:image,url=http://x/a.jpg]",
+            message_id="private-1",
+        )
+    )
+    await asyncio.sleep(0)
+    assert ingress.messages == []
+    adapter.open_admission()
+    await channel._bot.group_handler(
+        SimpleNamespace(
+            group_id="100",
+            user_id="1",
+            raw_message="hello",
+            message_id="group-1",
+        )
+    )
     await channel._bot.private_handler(SimpleNamespace(user_id="1", raw_message="/stop"))
     await channel._bot.group_handler(SimpleNamespace(group_id="100", user_id="1", raw_message="/stop"))
     if scheduled:
         await asyncio.gather(*scheduled)
-    assert len(bus.inbound) == 2
-    assert bus.inbound[0].metadata["chat_type"] == "private"
-    assert bus.inbound[1].metadata["chat_type"] == "group"
+    assert len(ingress.messages) == 2
+    assert ingress.messages[0].message.metadata["chat_type"] == "private"
+    assert ingress.messages[1].message.metadata["chat_type"] == "group"
+    assert ingress.messages[0].message.attachments[0].artifact_id == "inbound-1"
+    assert attachment_import.calls[0][0] == b"img"
+    assert bus.inbound == []
     assert channel._interrupt_controller.request_interrupt.call_count == 2
 
     channel._run_on_bot_loop = AsyncMock(side_effect=_drain)
@@ -1013,19 +1156,13 @@ async def test_qq_channel_paths(monkeypatch: pytest.MonkeyPatch, tmp_path: Path)
     with pytest.raises(ValueError, match="QQ 图片不能超过"):
         mod._local_to_base64(str(oversized))
 
-    test_attachments = mod.AttachmentStore(tmp_path / "uploads")
-    paths = await mod._download_to_temp(
-        ["http://x/a.png", "http://x/b.png"],
-        requester,
-        test_attachments,
-    )
-    assert len(paths) == 1
-
     channel._bot_loop = None
     pending = asyncio.sleep(0)
     with pytest.raises(RuntimeError):
         await mod.QQChannel._run_on_bot_loop(channel, pending)
     pending.close()
+    adapter.close_admission()
+    assert (await adapter.stop()).resources_closed is True
     await channel.stop()
 
 
