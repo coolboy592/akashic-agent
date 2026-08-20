@@ -18,6 +18,10 @@ _SPEC.loader.exec_module(gate)
 
 
 _LEGACY_V2_CONSUMER_MARKERS = (
+    "CoreLegacyChannelAdapter",
+    "_core_legacy_",
+    "encode_legacy_channel_message",
+    "map_legacy_delivery_receipt",
     "PluginContext",
     "from agent.plugins import Plugin",
     "from agent.plugins.base import Plugin",
