@@ -244,6 +244,7 @@ command = [
   "-m",
   "pytest",
   "-q",
+  "--basetemp=/sandbox/pytest-mcp-call-finality",
   "tests/semantic/test_contract_oracles.py",
   "tests/test_plugin_composition_mcp_slots.py::test_mcp_registry_freezes_descriptor_health_and_cleanup",
   "tests/test_plugin_composition_mcp_slots.py::test_static_manifest_is_admission_source_and_reconciles_mcp_root",
