@@ -95,15 +95,19 @@ async def test_gateway_atomically_publishes_proactive_attachment(
         local_media_paths=(source,),
     )
     try:
-        resolved = await runtime.publish_event_with_outbound_attachments(
-            candidates=candidates,
-            session_id="mobile:session-1",
-            payload_builder=lambda records: {
-                "content": "报告",
-                "attachments": [attachment_descriptor(record) for record in records],
-                "metadata": {"source": "message_push"},
-                "delivery_id": "delivery-1",
-            },
+        resolved, recipient_count = (
+            await runtime.publish_event_with_outbound_attachments_result(
+                candidates=candidates,
+                session_id="mobile:session-1",
+                payload_builder=lambda records: {
+                    "content": "报告",
+                    "attachments": [
+                        attachment_descriptor(record) for record in records
+                    ],
+                    "metadata": {"source": "message_push"},
+                    "delivery_id": "delivery-1",
+                },
+            )
         )
 
         replay = runtime.storage.read_durable_events(
@@ -112,6 +116,7 @@ async def test_gateway_atomically_publishes_proactive_attachment(
             limit=10,
         )
         assert len(resolved) == 1
+        assert recipient_count == 1
         assert runtime.storage.read_attachment(resolved[0].attachment_id) == resolved[0]
         assert len(replay) == 1
         envelope = json.loads(replay[0].envelope_json)
@@ -154,6 +159,53 @@ async def test_gateway_rejects_attachment_commit_after_last_device_disappears(
             )
     finally:
         service.cleanup_outbound_candidates(candidates)
+        runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_gateway_publish_event_reports_zero_after_device_race(
+    tmp_path: Path,
+) -> None:
+    runtime, _keyset = build_mobile_gateway_runtime(
+        _config(),
+        tmp_path,
+        master_keys=_EphemeralMasterKeys(),
+    )
+    device_id = uuid4().hex
+    runtime.storage.register_device(
+        DeviceRecord(
+            device_id=device_id,
+            public_key="test-public-key",
+            display_name="Pixel",
+            created_at=datetime.now(timezone.utc),
+            revoked_at=None,
+            capabilities=(),
+        )
+    )
+    original_list_active_devices = runtime.storage.list_active_devices
+    calls = 0
+
+    def list_active_devices_with_race() -> tuple[DeviceRecord, ...]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return original_list_active_devices()
+        return ()
+
+    runtime.storage.list_active_devices = (  # type: ignore[method-assign]
+        list_active_devices_with_race
+    )
+    try:
+        assert runtime.storage.list_active_devices()
+        recipient_count = await runtime.publish_event(
+            event_type="message.proactive",
+            session_id="mobile:race",
+            payload={"content": "race"},
+        )
+        assert recipient_count == 0
+        assert calls == 2
+        assert runtime.storage.count_durable_events(device_id) == 0
+    finally:
         runtime.close()
 
 

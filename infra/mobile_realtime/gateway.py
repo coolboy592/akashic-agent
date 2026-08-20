@@ -970,7 +970,7 @@ class MobileGatewayRuntime:
         device_id: str | None = None,
         connection_epoch: int | None = None,
         required_capability: str | None = None,
-    ) -> None:
+    ) -> int:
         """把 P0 事件写入每个设备 inbox，并向在线连接即时投递。
 
         指定 required_capability 时只向声明了该能力的设备入箱；旧客户端
@@ -996,11 +996,11 @@ class MobileGatewayRuntime:
                         connection is None
                         or connection.connection_epoch != connection_epoch
                     ):
-                        return
+                        return 0
                 if required_capability is not None:
                     device = self.storage.read_device(device_id)
                     if device is None or required_capability not in device.capabilities:
-                        return
+                        return 0
                 target_device_ids = (device_id,)
             else:
                 if connection_epoch is not None:
@@ -1053,6 +1053,7 @@ class MobileGatewayRuntime:
                     continue
                 connection.pending_events.append(event)
                 self._schedule_delivery_locked(target_device_id, connection)
+            return len(events)
 
     async def refresh_device_capabilities(
         self,
@@ -1077,6 +1078,24 @@ class MobileGatewayRuntime:
     ) -> tuple[AttachmentRecord, ...]:
         """原子提交附件和 proactive durable event，再排队在线投递。"""
 
+        resolved, _recipient_count = (
+            await self.publish_event_with_outbound_attachments_result(
+                candidates=candidates,
+                payload_builder=payload_builder,
+                session_id=session_id,
+            )
+        )
+        return resolved
+
+    async def publish_event_with_outbound_attachments_result(
+        self,
+        *,
+        candidates: tuple[AttachmentRecord, ...],
+        payload_builder: Callable[[tuple[AttachmentRecord, ...]], dict[str, object]],
+        session_id: str,
+    ) -> tuple[tuple[AttachmentRecord, ...], int]:
+        """原子提交附件事件，并返回提交到 inbox 的真实设备数。"""
+
         event_id = _new_ulid()
         # 1. delivery lock 内用一个 SQLite 事务提交附件与全部 inbox 行
         async with self._delivery_lock:
@@ -1099,7 +1118,7 @@ class MobileGatewayRuntime:
 
             # 2. 数据库提交已是送达事实；在线队列只优化即时可见性
             self._queue_committed_events_locked(events)
-        return resolved
+        return resolved, len(events)
 
     def _queue_committed_events_locked(
         self,

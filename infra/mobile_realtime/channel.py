@@ -7,7 +7,7 @@ import logging
 import re
 import sqlite3
 from collections import defaultdict
-from collections.abc import AsyncGenerator, Iterator, Mapping
+from collections.abc import AsyncGenerator, Awaitable, Iterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
@@ -110,6 +110,36 @@ class MobileCommandError(ValueError):
     def __init__(self, code: str, message: str) -> None:
         super().__init__(message)
         self.code = code
+
+
+@dataclass(frozen=True, slots=True)
+class _CriticalAwaitResult:
+    value: object | None
+    cancelled: bool
+    error: BaseException | None
+
+
+async def _complete_critical(awaitable: Awaitable[object]) -> _CriticalAwaitResult:
+    """完成不可中断的持久化步骤，并保留外层取消状态。"""
+
+    task = asyncio.ensure_future(awaitable)
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+        except BaseException:
+            if not task.done():
+                raise
+    try:
+        return _CriticalAwaitResult(task.result(), cancelled, None)
+    except BaseException as error:
+        return _CriticalAwaitResult(None, cancelled, error)
+
+
+class _NoMobileRecipients(RuntimeError):
+    """表示终态事件未能写入任何设备 inbox。"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -806,7 +836,7 @@ class MobileRealtimeChannel:
         }
         if delivery_id is not None:
             payload["delivery_id"] = delivery_id
-        await self._runtime.publish_event(
+        _ = await self._runtime.publish_event(
             event_type="message.proactive",
             session_id=session_id,
             payload=payload,
@@ -847,13 +877,7 @@ class MobileRealtimeChannel:
                 request.attachments,
                 attachment_read,
             )
-        except (
-            AttachmentRequestError,
-            AttachmentStateError,
-            OSError,
-            TypeError,
-            ValueError,
-        ) as error:
+        except Exception as error:
             return ProviderDeliveryReceipt(
                 request.delivery_id,
                 ProviderDeliveryStatus.REJECTED,
@@ -908,31 +932,36 @@ class MobileRealtimeChannel:
                     error="mobile proactive delivery_id 无效",
                 )
             payload["delivery_id"] = delivery_id
-        try:
-            candidates = (
-                await asyncio.to_thread(
-                    self._require_attachments().snapshot_outbound_ref_batch,
-                    session_id=session_id,
-                    attachments=attachment_bytes,
-                )
-                if attachment_bytes
-                else ()
+        candidates: tuple[AttachmentRecord, ...] = ()
+        snapshot_result = await _complete_critical(
+            asyncio.to_thread(
+                self._require_attachments().snapshot_outbound_ref_batch,
+                session_id=session_id,
+                attachments=attachment_bytes,
             )
-        except (
-            AttachmentRequestError,
-            AttachmentStateError,
-            OSError,
-            TypeError,
-            ValueError,
-        ) as error:
+            if attachment_bytes
+            else asyncio.sleep(0, result=()),
+        )
+        if snapshot_result.error is not None:
+            if isinstance(snapshot_result.error, asyncio.CancelledError):
+                raise snapshot_result.error
             return ProviderDeliveryReceipt(
                 request.delivery_id,
                 ProviderDeliveryStatus.REJECTED,
-                error=str(error),
+                error=str(snapshot_result.error),
             )
-        try:
-            if attachment_bytes:
-                _ = await self._runtime.publish_event_with_outbound_attachments(
+        candidates = cast(
+            tuple[AttachmentRecord, ...],
+            snapshot_result.value,
+        )
+        if snapshot_result.cancelled:
+            if candidates:
+                self._require_attachments().cleanup_outbound_candidates(candidates)
+            raise asyncio.CancelledError
+
+        publish_result = await _complete_critical(
+            (
+                self._runtime.publish_event_with_outbound_attachments_result(
                     candidates=candidates,
                     session_id=session_id,
                     payload_builder=lambda records: self._v3_attachment_payload(
@@ -940,15 +969,35 @@ class MobileRealtimeChannel:
                         records,
                     ),
                 )
-            else:
-                await self._runtime.publish_event(
+                if attachment_bytes
+                else self._runtime.publish_event(
                     event_type="message.proactive",
                     session_id=session_id,
                     payload=payload,
                 )
-        except asyncio.CancelledError:
-            raise
-        except BaseException as error:
+            )
+        )
+        if publish_result.error is not None:
+            error = publish_result.error
+            if isinstance(
+                error,
+                (
+                    AttachmentRequestError,
+                    AttachmentStateError,
+                    MobileStorageError,
+                    TypeError,
+                    ValueError,
+                ),
+            ):
+                if candidates:
+                    self._require_attachments().cleanup_outbound_candidates(candidates)
+                if publish_result.cancelled:
+                    raise asyncio.CancelledError
+                return ProviderDeliveryReceipt(
+                    request.delivery_id,
+                    ProviderDeliveryStatus.REJECTED,
+                    error=str(error),
+                )
             # The provider may have committed before reporting an unexpected error;
             # do not delete candidates and turn an unknown effect into a false retry.
             logger.error(
@@ -957,10 +1006,47 @@ class MobileRealtimeChannel:
                 error,
                 exc_info=True,
             )
+            if publish_result.cancelled:
+                raise asyncio.CancelledError
             return ProviderDeliveryReceipt(
                 request.delivery_id,
                 ProviderDeliveryStatus.UNKNOWN,
                 error=str(error),
+            )
+        if publish_result.cancelled:
+            # The critical task completed first; its durable effect is retained.
+            raise asyncio.CancelledError
+
+        publish_value = publish_result.value
+        if attachment_bytes:
+            if (
+                not isinstance(publish_value, tuple)
+                or len(cast(tuple[object, ...], publish_value)) != 2
+            ):
+                return ProviderDeliveryReceipt(
+                    request.delivery_id,
+                    ProviderDeliveryStatus.UNKNOWN,
+                    error="Mobile 附件原子发布未返回 recipient count",
+                )
+            _resolved, recipient_count = cast(
+                tuple[object, object],
+                publish_value,
+            )
+        else:
+            recipient_count = publish_value
+        if isinstance(recipient_count, bool) or not isinstance(recipient_count, int):
+            return ProviderDeliveryReceipt(
+                request.delivery_id,
+                ProviderDeliveryStatus.UNKNOWN,
+                error="Mobile durable publish 未返回有效 recipient count",
+            )
+        if recipient_count <= 0:
+            if candidates:
+                self._require_attachments().cleanup_outbound_candidates(candidates)
+            return ProviderDeliveryReceipt(
+                request.delivery_id,
+                ProviderDeliveryStatus.REJECTED,
+                error="Mobile durable event 没有提交给任何目标设备",
             )
         return ProviderDeliveryReceipt(
             request.delivery_id,
@@ -985,25 +1071,29 @@ class MobileRealtimeChannel:
         try:
             records: tuple[AttachmentRecord, ...] = ()
             if attachment_bytes:
-                try:
-                    records = await asyncio.to_thread(
+                registration_result = await _complete_critical(
+                    asyncio.to_thread(
                         self._require_attachments().register_outbound_ref_batch,
                         session_id=session_id,
                         attachments=attachment_bytes,
                         message_id=request.session_message_id,
                     )
-                except (
-                    AttachmentRequestError,
-                    AttachmentStateError,
-                    OSError,
-                    TypeError,
-                    ValueError,
-                ) as error:
+                )
+                if registration_result.error is not None:
+                    error = registration_result.error
+                    if isinstance(error, asyncio.CancelledError):
+                        raise error
                     return ProviderDeliveryReceipt(
                         request.delivery_id,
                         ProviderDeliveryStatus.REJECTED,
                         error=str(error),
                     )
+                records = cast(
+                    tuple[AttachmentRecord, ...],
+                    registration_result.value,
+                )
+                if registration_result.cancelled:
+                    raise asyncio.CancelledError
             message = ChannelMessage(
                 channel=self.name,
                 chat_id=request.recipient,
@@ -1030,9 +1120,18 @@ class MobileRealtimeChannel:
                     else None
                 ),
             )
-            receipt = await self._deliver_passive_message(message)
+            receipt = await self._deliver_passive_message(
+                message,
+                require_recipient=True,
+            )
         except asyncio.CancelledError:
             raise
+        except _NoMobileRecipients as error:
+            return ProviderDeliveryReceipt(
+                request.delivery_id,
+                ProviderDeliveryStatus.REJECTED,
+                error=str(error),
+            )
         except BaseException as error:
             logger.error(
                 "mobile v3 passive effect unknown: delivery_id=%s error=%s",
@@ -1071,9 +1170,16 @@ class MobileRealtimeChannel:
         try:
             for ref in refs:
                 lease = await attachment_read.acquire(ref)
-                if not callable(getattr(lease, "read_bytes", None)):
+                if not callable(getattr(lease, "read_bytes", None)) or not callable(
+                    getattr(lease, "aclose", None)
+                ):
                     raise TypeError("Mobile v3 attachment lease 无效")
-                leases.append(cast(AttachmentReadLease, lease))
+                typed_lease = cast(AttachmentReadLease, lease)
+                leases.append(typed_lease)
+                if getattr(lease, "ref", None) != ref:
+                    raise AttachmentStateError(
+                        "Mobile v3 attachment lease.ref 与请求 ref 不一致"
+                    )
             result: list[tuple[AttachmentRef, bytes]] = []
             max_bytes = self._runtime.config.max_attachment_mb * 1024 * 1024
             for ref, lease in zip(refs, leases, strict=True):
@@ -1136,7 +1242,7 @@ class MobileRealtimeChannel:
             }
             if delivery_id is not None:
                 payload["delivery_id"] = delivery_id
-            await self._runtime.publish_event(
+            _ = await self._runtime.publish_event(
                 event_type="message.proactive",
                 session_id=session_id,
                 payload=payload,
@@ -1642,7 +1748,7 @@ class MobileRealtimeChannel:
         except (AttachmentRequestError, AttachmentStateError) as error:
             raise MobileCommandError("attachment_chunk_rejected", str(error)) from error
         if should_report:
-            await self._runtime.publish_event(
+            _ = await self._runtime.publish_event(
                 event_type="attachment.progress",
                 device_id=device_id,
                 session_id=record.session_id,
@@ -1700,7 +1806,7 @@ class MobileRealtimeChannel:
             raise MobileCommandError(
                 "attachment_finish_rejected", str(error)
             ) from error
-        await self._runtime.publish_event(
+        _ = await self._runtime.publish_event(
             event_type="attachment.ready",
             device_id=device_id,
             session_id=session_id,
@@ -1801,7 +1907,7 @@ class MobileRealtimeChannel:
             )
 
         # 3. 索引也走 durable event，断线后仍会重放
-        await self._runtime.publish_event(
+        _ = await self._runtime.publish_event(
             event_type="session.list",
             device_id=device_id,
             payload={"items": cast(list[object], items)},
@@ -1815,7 +1921,7 @@ class MobileRealtimeChannel:
     ) -> CommandReply:
         _expect_keys(frame.payload, set())
         session_id = self._require_mobile_session(frame.session_id)
-        await self._runtime.publish_event(
+        _ = await self._runtime.publish_event(
             event_type="session.updated",
             session_id=session_id,
             payload={"session_id": session_id, "state": "opened"},
@@ -1894,7 +2000,7 @@ class MobileRealtimeChannel:
             page_payload,
             allow_content_refs=query["content_ref_version"] == 1,
         )
-        await self._runtime.publish_event(
+        _ = await self._runtime.publish_event(
             event_type="history.page",
             session_id=session_id,
             device_id=device_id,
@@ -2250,7 +2356,7 @@ class MobileRealtimeChannel:
         self._turn_started_at[process_key] = monotonic()
         # 同一 key 的旧终态墓碑（同 turn_id 重试）不得压制新一轮增量。
         _ = self._turn_terminals.pop(process_key, None)
-        await self._runtime.publish_event(
+        _ = await self._runtime.publish_event(
             event_type="turn.started",
             session_id=event.session_key,
             turn_id=turn_id,
@@ -2471,7 +2577,7 @@ class MobileRealtimeChannel:
             state.next_ordinal += 1
             block_id = f"tool:{event.call_id}"
             state.tool_blocks[event.call_id] = (block_id, ordinal, monotonic())
-            await self._runtime.publish_event(
+            _ = await self._runtime.publish_event(
                 event_type="react.tool.started",
                 session_id=session_id,
                 turn_id=turn_id,
@@ -2508,7 +2614,7 @@ class MobileRealtimeChannel:
                     f"mobile tool completed 缺少 started: {event.call_id}"
                 )
             block_id, ordinal, started_at = block
-            await self._runtime.publish_event(
+            _ = await self._runtime.publish_event(
                 event_type="react.tool.completed",
                 session_id=session_id,
                 turn_id=turn_id,
@@ -2546,7 +2652,7 @@ class MobileRealtimeChannel:
                 )
                 return
             _ = await self._flush_batch_locked(session_id, turn_id)
-            await self._runtime.publish_event(
+            _ = await self._runtime.publish_event(
                 event_type="turn.output.completed",
                 session_id=session_id,
                 turn_id=turn_id,
@@ -2633,6 +2739,8 @@ class MobileRealtimeChannel:
     async def _deliver_passive_message(
         self,
         message: ChannelMessage,
+        *,
+        require_recipient: bool = False,
     ) -> DeliveryReceipt:
         """提交已持久化 Turn 的 Mobile final 投影。"""
 
@@ -2679,6 +2787,7 @@ class MobileRealtimeChannel:
                 turn_id=turn_id,
                 event_type="turn.interrupted",
                 payload=payload,
+                require_recipient=require_recipient,
             )
             if published:
                 turn_milestone(
@@ -2774,6 +2883,7 @@ class MobileRealtimeChannel:
                 turn_id,
                 event_type="message.final",
                 payload=final_payload,
+                require_recipient=require_recipient,
             )
             if not published:
                 # 4. 其他 owner 已先收口；终态不重复发布。
@@ -3074,7 +3184,7 @@ class MobileRealtimeChannel:
                     raise AssertionError("thinking delta block 缺少 ordinal")
                 payload["block_id"] = block_id
                 payload["ordinal"] = ordinal
-            await self._runtime.publish_event(
+            _ = await self._runtime.publish_event(
                 event_type=event_type,
                 session_id=session_id,
                 turn_id=turn_id,
@@ -3150,6 +3260,7 @@ class MobileRealtimeChannel:
         event_type: str,
         payload: dict[str, object],
         device_id: str | None = None,
+        require_recipient: bool = False,
     ) -> bool:
         """每 turn 唯一 owner 的终态收口：flush → publish → 成功后 closed → cleanup。"""
 
@@ -3176,6 +3287,7 @@ class MobileRealtimeChannel:
                 event_type=event_type,
                 payload=payload,
                 device_id=device_id,
+                require_recipient=require_recipient,
             )
         if published:
             self._clear_turn_maps(session_id, turn_id)
@@ -3189,6 +3301,7 @@ class MobileRealtimeChannel:
         event_type: str,
         payload: dict[str, object],
         device_id: str | None = None,
+        require_recipient: bool = False,
     ) -> bool:
         """锁内收口：flush 已接受 delta → durable publish → 成功后才提交墓碑。"""
 
@@ -3201,20 +3314,26 @@ class MobileRealtimeChannel:
         _ = await self._flush_batch_locked(session_id, turn_id)
         # 3. durable 终态发布：await 成功返回前没有任何已提交 closed 墓碑。
         if device_id is None:
-            await self._runtime.publish_event(
+            recipient_count = await self._runtime.publish_event(
                 event_type=event_type,
                 session_id=session_id,
                 turn_id=turn_id,
                 payload=payload,
             )
         else:
-            await self._runtime.publish_event(
+            recipient_count = await self._runtime.publish_event(
                 event_type=event_type,
                 session_id=session_id,
                 turn_id=turn_id,
                 payload=payload,
                 device_id=device_id,
             )
+        if require_recipient and (
+            isinstance(recipient_count, bool)
+            or not isinstance(recipient_count, int)
+            or recipient_count <= 0
+        ):
+            raise _NoMobileRecipients("Mobile terminal 没有提交给任何目标设备")
         # 4. publish 确认成功后才在同一锁内提交终态墓碑（有界 256）。
         if len(self._turn_terminals) >= _MAX_DELTA_BATCHES:
             _ = self._turn_terminals.pop(next(iter(self._turn_terminals)))

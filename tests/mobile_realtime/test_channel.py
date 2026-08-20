@@ -20,6 +20,7 @@ from agent.control.models import TurnRecord, TurnStatus
 from agent.plugin_composition.channels import (
     AttachmentKind as V3AttachmentKind,
     AttachmentRef,
+    ChannelCommitRole,
     ChannelFactoryContext,
     DeliveryStatus as V3DeliveryStatus,
     ProviderDeliveryRequest,
@@ -57,6 +58,7 @@ from infra.mobile_realtime.remote_media import RemoteMediaError, RemoteMediaSnap
 from infra.mobile_realtime.storage import (
     AttachmentRecord,
     DeviceRecord,
+    MobileStorageError,
     MobileRealtimeStorage,
 )
 from session.manager import SessionManager
@@ -68,8 +70,15 @@ class _Runtime:
         self.config = MobileRealtimeConfig(max_attachment_mb=50)
         self.events: list[dict[str, object]] = []
 
-    async def publish_event(self, **event: object) -> None:
+    def _recipient_count(self) -> int:
+        list_active_devices = getattr(self.storage, "list_active_devices", None)
+        if not callable(list_active_devices):
+            return 1
+        return len(list_active_devices())
+
+    async def publish_event(self, **event: object) -> int:
         self.events.append(dict(event))
+        return self._recipient_count()
 
     async def publish_connection_control(self, **control: object) -> None:
         self.events.append(dict(control))
@@ -81,6 +90,22 @@ class _Runtime:
         payload_builder: Any,
         session_id: str,
     ) -> tuple[AttachmentRecord, ...]:
+        resolved, _recipient_count = (
+            await self.publish_event_with_outbound_attachments_result(
+                candidates=candidates,
+                payload_builder=payload_builder,
+                session_id=session_id,
+            )
+        )
+        return resolved
+
+    async def publish_event_with_outbound_attachments_result(
+        self,
+        *,
+        candidates: tuple[AttachmentRecord, ...],
+        payload_builder: Any,
+        session_id: str,
+    ) -> tuple[tuple[AttachmentRecord, ...], int]:
         event_id = gateway_module._new_ulid()
         resolved, events = self.storage.commit_outbound_event(
             candidates,
@@ -98,7 +123,7 @@ class _Runtime:
             created_at=datetime.now(timezone.utc),
         )
         self.events.append({"durable": events})
-        return resolved
+        return resolved, len(events)
 
     async def refresh_device_capabilities(
         self,
@@ -117,11 +142,12 @@ class _GatedPublishRuntime(_Runtime):
         self.delta_publish_started = asyncio.Event()
         self.delta_publish_release = asyncio.Event()
 
-    async def publish_event(self, **event: object) -> None:
+    async def publish_event(self, **event: object) -> int:
         self.events.append(dict(event))
         if event.get("event_type") == "react.thinking.delta":
             self.delta_publish_started.set()
             await self.delta_publish_release.wait()
+        return self._recipient_count()
 
 
 class _FinalGatedRuntime(_Runtime):
@@ -132,11 +158,12 @@ class _FinalGatedRuntime(_Runtime):
         self.final_started = asyncio.Event()
         self.final_release = asyncio.Event()
 
-    async def publish_event(self, **event: object) -> None:
+    async def publish_event(self, **event: object) -> int:
         self.events.append(dict(event))
         if event.get("event_type") == "message.final":
             self.final_started.set()
             await self.final_release.wait()
+        return self._recipient_count()
 
 
 class _FailOnceTerminalRuntime(_Runtime):
@@ -152,12 +179,13 @@ class _FailOnceTerminalRuntime(_Runtime):
         self.fail_type = fail_type
         self.terminal_attempts = 0
 
-    async def publish_event(self, **event: object) -> None:
+    async def publish_event(self, **event: object) -> int:
         if event.get("event_type") == self.fail_type:
             self.terminal_attempts += 1
             if self.terminal_attempts == 1:
                 raise OSError("inbox write failed")
         self.events.append(dict(event))
+        return self._recipient_count()
 
 
 class _GatedFailOnceTerminalRuntime(_FailOnceTerminalRuntime):
@@ -173,7 +201,7 @@ class _GatedFailOnceTerminalRuntime(_FailOnceTerminalRuntime):
         self.terminal_started = asyncio.Event()
         self.terminal_release = asyncio.Event()
 
-    async def publish_event(self, **event: object) -> None:
+    async def publish_event(self, **event: object) -> int:
         if event.get("event_type") == self.fail_type:
             self.terminal_attempts += 1
             if self.terminal_attempts == 1:
@@ -181,6 +209,7 @@ class _GatedFailOnceTerminalRuntime(_FailOnceTerminalRuntime):
                 await self.terminal_release.wait()
                 raise OSError("inbox write failed")
         self.events.append(dict(event))
+        return self._recipient_count()
 
 
 class _FailDeltaRuntime(_Runtime):
@@ -191,12 +220,13 @@ class _FailDeltaRuntime(_Runtime):
         self.fail_at = fail_at
         self.delta_attempts = 0
 
-    async def publish_event(self, **event: object) -> None:
+    async def publish_event(self, **event: object) -> int:
         if event.get("event_type") in {"answer.delta", "react.thinking.delta"}:
             self.delta_attempts += 1
             if self.delta_attempts == self.fail_at:
                 raise OSError("delta publish failed")
         self.events.append(dict(event))
+        return self._recipient_count()
 
 
 class _Bus:
@@ -271,12 +301,18 @@ async def _started_native_mobile_channel(
     tmp_path: Path,
     *,
     active_device: bool = True,
+    runtime: Any | None = None,
 ) -> tuple[MobileRealtimeChannel, MobileRealtimeStorage, SessionManager]:
-    storage = MobileRealtimeStorage(tmp_path / "mobile.db")
+    if runtime is None:
+        storage = MobileRealtimeStorage(tmp_path / "mobile.db")
+    else:
+        storage = cast(MobileRealtimeStorage, runtime.storage)
     if active_device:
         _register_device(storage, "device-1")
     manager = SessionManager(tmp_path / "workspace")
-    channel = MobileRealtimeChannel(cast(MobileGatewayRuntime, _Runtime(storage)))
+    channel = MobileRealtimeChannel(
+        cast(MobileGatewayRuntime, runtime or _Runtime(storage))
+    )
     await channel.start(
         cast(
             Any,
@@ -306,6 +342,17 @@ def _native_context(
         ingress=None,
         identity=None,
         attachment_read=read_port,
+    )
+
+
+def _native_ref(data: bytes, *, artifact_id: str = "core-artifact-1") -> AttachmentRef:
+    return AttachmentRef(
+        artifact_id=artifact_id,
+        kind=V3AttachmentKind.FILE,
+        filename="report.txt",
+        media_type="text/plain",
+        size_bytes=len(data),
+        sha256=hashlib.sha256(data).hexdigest(),
     )
 
 
@@ -410,13 +457,15 @@ async def test_native_v3_mobile_adapter_reports_unknown_if_durable_call_raises(
     tmp_path: Path,
 ) -> None:
     class _FailingRuntime(_Runtime):
-        async def publish_event(self, **_event: object) -> None:
+        async def publish_event(self, **_event: object) -> int:
             raise OSError("durable write outcome unknown")
 
     storage = MobileRealtimeStorage(tmp_path / "mobile.db")
     _register_device(storage, "device-1")
     manager = SessionManager(tmp_path / "workspace")
-    channel = MobileRealtimeChannel(cast(MobileGatewayRuntime, _FailingRuntime(storage)))
+    channel = MobileRealtimeChannel(
+        cast(MobileGatewayRuntime, _FailingRuntime(storage))
+    )
     await channel.start(
         cast(
             Any,
@@ -441,6 +490,298 @@ async def test_native_v3_mobile_adapter_reports_unknown_if_durable_call_raises(
         )
     )
     assert receipt.status is V3DeliveryStatus.UNKNOWN
+    await adapter.stop()
+    await channel.stop()
+    manager.close()
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_native_v3_mobile_adapter_rejects_mismatched_lease_ref(
+    tmp_path: Path,
+) -> None:
+    channel, storage, manager = await _started_native_mobile_channel(tmp_path)
+    data = b"lease-identity"
+    requested = _native_ref(data)
+    mismatched = _native_ref(data, artifact_id="different-artifact")
+
+    class _MismatchedReadPort(_ReadPort):
+        async def acquire(self, _ref: AttachmentRef) -> _ReadLease:
+            lease = _ReadLease(mismatched, data)
+            self.leases.append(lease)
+            return lease
+
+    read_port = _MismatchedReadPort({requested.artifact_id: data})
+    adapter = channel.build_v3_adapter(_native_context(read_port))
+    await adapter.start()
+    receipt = await adapter.deliver(
+        ProviderDeliveryRequest(
+            binding_token="binding-1",
+            delivery_id="delivery-mismatched-lease",
+            recipient=f"mobile:{uuid4()}",
+            body="should reject",
+            attachments=(requested,),
+        )
+    )
+    assert receipt.status is V3DeliveryStatus.REJECTED
+    assert receipt.error is not None and "lease.ref" in receipt.error
+    assert read_port.leases and all(lease.closed for lease in read_port.leases)
+    assert storage.count_durable_events("device-1") == 0
+    await adapter.stop()
+    await channel.stop()
+    manager.close()
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_native_v3_mobile_adapter_rejects_provider_read_failure(
+    tmp_path: Path,
+) -> None:
+    channel, storage, manager = await _started_native_mobile_channel(tmp_path)
+    requested = _native_ref(b"read-failure")
+
+    class _FailingReadPort:
+        async def acquire(self, _ref: AttachmentRef) -> _ReadLease:
+            raise RuntimeError("artifact provider unavailable")
+
+    adapter = channel.build_v3_adapter(_native_context(cast(Any, _FailingReadPort())))
+    await adapter.start()
+    receipt = await adapter.deliver(
+        ProviderDeliveryRequest(
+            binding_token="binding-1",
+            delivery_id="delivery-read-failure",
+            recipient=f"mobile:{uuid4()}",
+            body="should reject",
+            attachments=(requested,),
+        )
+    )
+    assert receipt.status is V3DeliveryStatus.REJECTED
+    assert receipt.error is not None and "provider unavailable" in receipt.error
+    assert storage.count_durable_events("device-1") == 0
+    await adapter.stop()
+    await channel.stop()
+    manager.close()
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_native_v3_mobile_adapter_propagates_provider_read_cancel(
+    tmp_path: Path,
+) -> None:
+    channel, storage, manager = await _started_native_mobile_channel(tmp_path)
+    data = b"read-cancel"
+    requested = _native_ref(data)
+
+    class _CancelledReadLease(_ReadLease):
+        async def read_bytes(self, *, max_bytes: int) -> bytes:
+            raise asyncio.CancelledError
+
+    class _CancelledReadPort:
+        def __init__(self) -> None:
+            self.lease: _CancelledReadLease | None = None
+
+        async def acquire(self, ref: AttachmentRef) -> _CancelledReadLease:
+            self.lease = _CancelledReadLease(ref, data)
+            return self.lease
+
+    read_port = _CancelledReadPort()
+    adapter = channel.build_v3_adapter(_native_context(cast(Any, read_port)))
+    await adapter.start()
+    with pytest.raises(asyncio.CancelledError):
+        await adapter.deliver(
+            ProviderDeliveryRequest(
+                binding_token="binding-1",
+                delivery_id="delivery-read-cancel",
+                recipient=f"mobile:{uuid4()}",
+                body="cancel",
+                attachments=(requested,),
+            )
+        )
+    assert read_port.lease is not None and read_port.lease.closed
+    assert storage.count_durable_events("device-1") == 0
+    await adapter.stop()
+    await channel.stop()
+    manager.close()
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_native_v3_mobile_adapter_rejects_when_device_revoked_before_commit(
+    tmp_path: Path,
+) -> None:
+    channel, storage, manager = await _started_native_mobile_channel(tmp_path)
+    original_list_active_devices = storage.list_active_devices
+    calls = 0
+
+    def list_active_devices_with_race() -> tuple[DeviceRecord, ...]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return original_list_active_devices()
+        return ()
+
+    storage.list_active_devices = (  # type: ignore[method-assign]
+        list_active_devices_with_race
+    )
+    adapter = channel.build_v3_adapter(_native_context())
+    await adapter.start()
+    receipt = await adapter.deliver(
+        ProviderDeliveryRequest(
+            binding_token="binding-1",
+            delivery_id="delivery-device-race",
+            recipient=f"mobile:{uuid4()}",
+            body="no zero-recipient success",
+        )
+    )
+    assert receipt.status is V3DeliveryStatus.REJECTED
+    assert calls == 2
+    assert storage.count_durable_events("device-1") == 0
+    await adapter.stop()
+    await channel.stop()
+    manager.close()
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_native_v3_mobile_passive_rejects_terminal_after_device_race(
+    tmp_path: Path,
+) -> None:
+    channel, storage, manager = await _started_native_mobile_channel(tmp_path)
+    original_list_active_devices = storage.list_active_devices
+    calls = 0
+
+    def list_active_devices_with_race() -> tuple[DeviceRecord, ...]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return original_list_active_devices()
+        return ()
+
+    storage.list_active_devices = (  # type: ignore[method-assign]
+        list_active_devices_with_race
+    )
+    adapter = channel.build_v3_adapter(_native_context())
+    await adapter.start()
+    receipt = await adapter.deliver(
+        ProviderDeliveryRequest(
+            binding_token="binding-1",
+            delivery_id="delivery-passive-device-race",
+            recipient=f"mobile:{uuid4()}",
+            body="passive no recipient",
+            commit_role=ChannelCommitRole.PASSIVE,
+            control_turn_id="turn:passive-race",
+        )
+    )
+    assert receipt.status is V3DeliveryStatus.REJECTED
+    assert calls == 2
+    assert storage.count_durable_events("device-1") == 0
+    await adapter.stop()
+    await channel.stop()
+    manager.close()
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_native_v3_mobile_adapter_cleans_candidates_on_cancelled_precommit(
+    tmp_path: Path,
+) -> None:
+    data = b"cancelled-before-commit"
+    requested = _native_ref(data)
+
+    class _PrecommitFailRuntime(_Runtime):
+        def __init__(self, storage: MobileRealtimeStorage) -> None:
+            super().__init__(storage)
+            self.publish_started = asyncio.Event()
+            self.publish_release = asyncio.Event()
+
+        async def publish_event_with_outbound_attachments_result(
+            self,
+            **_kwargs: object,
+        ) -> tuple[tuple[AttachmentRecord, ...], int]:
+            self.publish_started.set()
+            await self.publish_release.wait()
+            raise MobileStorageError("durable event 没有可提交的目标设备")
+
+    runtime = _PrecommitFailRuntime(
+        MobileRealtimeStorage(tmp_path / "mobile.db")
+    )
+    channel, storage, manager = await _started_native_mobile_channel(
+        tmp_path,
+        runtime=runtime,
+    )
+    read_port = _ReadPort({requested.artifact_id: data})
+    adapter = channel.build_v3_adapter(_native_context(read_port))
+    await adapter.start()
+    delivery = asyncio.create_task(
+        adapter.deliver(
+            ProviderDeliveryRequest(
+                binding_token="binding-1",
+                delivery_id="delivery-cancelled-precommit",
+                recipient=f"mobile:{uuid4()}",
+                body="cancel",
+                attachments=(requested,),
+            )
+        )
+    )
+    await runtime.publish_started.wait()
+    delivery.cancel()
+    runtime.publish_release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await delivery
+    assert not [path for path in (tmp_path / "uploads").rglob("*") if path.is_file()]
+    assert storage.count_durable_events("device-1") == 0
+    await adapter.stop()
+    await channel.stop()
+    manager.close()
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_native_v3_mobile_adapter_retains_candidates_after_unknown_effect(
+    tmp_path: Path,
+) -> None:
+    data = b"unknown-after-commit"
+    requested = _native_ref(data)
+
+    class _CommitThenRaiseRuntime(_Runtime):
+        async def publish_event_with_outbound_attachments_result(
+            self,
+            **kwargs: object,
+        ) -> tuple[tuple[AttachmentRecord, ...], int]:
+            _resolved, _count = (
+                await super().publish_event_with_outbound_attachments_result(
+                    candidates=cast(
+                        tuple[AttachmentRecord, ...],
+                        kwargs["candidates"],
+                    ),
+                    payload_builder=cast(Any, kwargs["payload_builder"]),
+                    session_id=cast(str, kwargs["session_id"]),
+                )
+            )
+            raise RuntimeError("commit acknowledgement lost")
+
+    runtime = _CommitThenRaiseRuntime(
+        MobileRealtimeStorage(tmp_path / "mobile.db")
+    )
+    channel, storage, manager = await _started_native_mobile_channel(
+        tmp_path,
+        runtime=runtime,
+    )
+    read_port = _ReadPort({requested.artifact_id: data})
+    adapter = channel.build_v3_adapter(_native_context(read_port))
+    await adapter.start()
+    receipt = await adapter.deliver(
+        ProviderDeliveryRequest(
+            binding_token="binding-1",
+            delivery_id="delivery-unknown-after-commit",
+            recipient=f"mobile:{uuid4()}",
+            body="unknown",
+            attachments=(requested,),
+        )
+    )
+    assert receipt.status is V3DeliveryStatus.UNKNOWN
+    assert storage.count_durable_events("device-1") == 1
+    assert [path for path in (tmp_path / "uploads").rglob("*") if path.is_file()]
     await adapter.stop()
     await channel.stop()
     manager.close()
