@@ -42,7 +42,7 @@ DEFAULT_TMP_ROOT = Path("/home/huashen/.cache/akashic-gate-tmp")
 GATE_VERSION = 1
 SCENARIO_PROFILE = "plugin-v3-e4-copied-workspace-rehearsal-v1"
 E2_PROFILE = "plugin-v3-e2-shell-v1"
-E3_PROFILE = "plugin-v3-e3-channel-message-push-passive-webui-v1"
+E3_PROFILE = "plugin-v3-e3-fleet-channel-proactive-v2"
 PASSIVE_PROFILE = "citation-meme-webui-v3-v1"
 E1_SCENARIOS = ("runtime_boot_default", "runtime_boot_akasha")
 E1_RUNTIME_ENGINES = ("default", "akasha")
@@ -54,7 +54,22 @@ E2_PLUGINS = {
     "shell_restore", "shell_safety", "tool_loop_guard", "calendar-mcp",
     "feed-mcp", "fitbit-mcp", "steam-mcp",
 }
-E3_PLUGINS = {"feishu", "qqbot", "citation", "meme"}
+E3_PLUGINS = {
+    "setup_helper",
+    "status_commands",
+    "daynight_gate",
+    "emotion",
+    "calendar-mcp",
+    "feed-mcp",
+    "fitbit-mcp",
+    "steam-mcp",
+    "huayue-skills",
+    "github_watch",
+    "feishu",
+    "qqbot",
+    "citation",
+    "meme",
+}
 
 
 class GateBlocked(RuntimeError):
