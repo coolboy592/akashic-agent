@@ -146,11 +146,11 @@ Core 是受支持 API 的 owner，不是 Python 安全沙箱。同 UID 的恶意
 fleet lock 中 20 个 external 插件与 8 个 in-tree 实现；Computer Use Linux、Context Pressure
 已退出目标，GitHub Watcher 已进入 fleet。逐插件状态只读生产替代清单。
 
-仓库当前跟踪 29 个插件实现：21 个 external lock 插件加 8 个 in-tree 插件。已有 6 个纯 v3
-候选，占 `6/29 = 20.7%`；剩余 23 个。数字只表示“存在已评审候选”，不表示 PR 已合并或
+仓库当时跟踪 29 个插件实现：21 个 external lock 插件加 8 个 in-tree 插件。当时已有 6 个纯 v3
+候选，占 `6/29 = 20.7%`；其余 23 个尚待迁移。数字只表示“存在已评审候选”，不表示 PR 已合并或
 运行环境已切换。
 
-| 维度 | 当前状态 |
+| 维度 | 当时状态 |
 |---|---|
 | Tool/被动回复试点 | 6/6 候选已实现并有行为 Gate |
 | 全插件实现 | 6/29 有纯 v3 候选；23 个待迁移 |
@@ -237,12 +237,12 @@ private proactive 边界以生产替代清单为准。
 ### 5.2 In-tree 插件：7 个
 
 `akasha`、`default_proactive`、`drift_flow`、`proactive_flow`、`wake_drift_flow`、
-`wake_proactive`、`wake_proactive_flow` 尚未迁移。它们涉及 memory/proactive/wake 生命周期，
+`wake_proactive`、`wake_proactive_flow` 当时尚未迁移。它们涉及 memory/proactive/wake 生命周期，
 应在 external lifecycle 与 process seam 稳定后迁移，避免为旧领域方法复制一套 v3 Manager。
 
 ### 5.3 GitHub Watcher
 
-当前公开 lock、`akashic-plugins` 组织和本轮可访问的 canonical source 中没有可锁定的
+当时公开 lock、`akashic-plugins` 组织和本轮可访问的 canonical source 中没有可锁定的
 GitHub Watcher。因此它不计入 29 个实现，也不能声称已经迁移。后续必须先定位 canonical
 repository、确认凭证边界、公开性与真实 installed artifact，再加入 exact-commit Gate。
 插件继续拥有自己的 GitHub client；Core 只应提供接入 loop、data root、Health/Incident 和
