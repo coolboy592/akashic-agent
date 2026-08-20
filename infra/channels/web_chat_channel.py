@@ -6,7 +6,7 @@ import mimetypes
 import os
 from datetime import datetime, timezone
 from pathlib import Path
-from collections.abc import AsyncIterable
+from collections.abc import AsyncIterable, Mapping
 from typing import Any, cast
 from uuid import uuid4
 
@@ -203,10 +203,18 @@ class WebChatChannel:
         self._artifact_store: ChannelAttachmentArtifactStore | None = None
         self._connections: dict[str, set[WebSocket]] = {}
         self._active_turn_ids: dict[str, str] = {}
+        self._pending_terminal: dict[str, dict[str, Any]] = {}
         self._media_paths: set[str] = set()
         self._connection_lock = asyncio.Lock()
         self._events_bound = False
         self._v3_adapters: dict[str, WebNativeChannelAdapter] = {}
+
+    @staticmethod
+    def _socket_id(websocket: WebSocket) -> str:
+        return f"ws-{id(websocket):x}"
+
+    def _connection_count(self, session_key: str) -> int:
+        return len(self._connections.get(session_key, set()))
 
     async def start(self, ctx: ChannelContext) -> None:
         self._ctx = ctx
@@ -292,6 +300,8 @@ class WebChatChannel:
                 await socket.close()
 
     async def handle_websocket(self, websocket: WebSocket) -> None:
+        socket_id = self._socket_id(websocket)
+        logger.info("[web_chat] websocket opened id=%s", socket_id)
         await websocket.accept()
         session_keys: set[str] = set()
         try:
@@ -306,10 +316,16 @@ class WebChatChannel:
                 )
                 if session_key:
                     session_keys.add(session_key)
-        except WebSocketDisconnect:
-            pass
+        except WebSocketDisconnect as error:
+            logger.info(
+                "[web_chat] websocket disconnect id=%s code=%s reason=%s",
+                socket_id,
+                error.code,
+                error.reason,
+            )
         finally:
             await self._remove_connection(websocket, session_keys)
+            logger.info("[web_chat] websocket closed id=%s", socket_id)
 
     def save_upload(self, data: bytes, filename: str) -> dict[str, Any]:
         if len(data) > MAX_UPLOAD_BYTES:
@@ -530,25 +546,37 @@ class WebChatChannel:
         passive = metadata.pop("_channel_commit_role", None) == "passive"
         if not passive:
             metadata.setdefault("source", "message_push")
-        delivered = await self._broadcast(session_key, {
+        frame: dict[str, Any] = {
             "type": "message.final",
             "session_id": session_key,
             "turn_id": message.control_turn_id or self._current_turn_id(session_key),
             "content": message.content,
             "thinking": message.thinking or "",
             "media": media,
-            "duration_ms": metadata.get("turn_duration_ms"),
             "metadata": metadata,
-        })
+        }
+        duration = metadata.get("turn_duration_ms")
+        if isinstance(duration, (int, float)) and not isinstance(duration, bool):
+            frame["duration_ms"] = duration
+        delivered = await self._broadcast(session_key, frame)
+        if delivered > 0:
+            self._pending_terminal.pop(session_key, None)
+            return DeliveryReceipt(
+                DeliveryStatus.SUCCESS,
+                canonical_media=tuple(media),
+            )
+        if message.control_turn_id:
+            self._pending_terminal[session_key] = frame
+            return DeliveryReceipt(
+                DeliveryStatus.SUCCESS,
+                canonical_media=tuple(media),
+            )
         if delivered == 0:
             return DeliveryReceipt(
                 DeliveryStatus.FAILED,
                 detail="Web 会话没有可用连接",
             )
-        return DeliveryReceipt(
-            DeliveryStatus.SUCCESS,
-            canonical_media=tuple(media),
-        )
+        raise RuntimeError("Web legacy delivery 状态无效")
 
     async def deliver_v3(
         self,
@@ -561,14 +589,6 @@ class WebChatChannel:
         if not isinstance(request, ProviderDeliveryRequest):
             raise TypeError("Web native deliver 只接受 ProviderDeliveryRequest")
         session_key = self._session_key(request.recipient)
-        async with self._connection_lock:
-            has_socket = bool(self._connections.get(session_key))
-        if not has_socket:
-            return ProviderDeliveryReceipt(
-                request.delivery_id,
-                V3DeliveryStatus.REJECTED,
-                error="Web 会话没有可用连接",
-            )
 
         leases: list[AttachmentReadLease] = []
         result: ProviderDeliveryReceipt | None = None
@@ -587,7 +607,7 @@ class WebChatChannel:
                         leases.append(lease)
 
             if result is None:
-                metadata = dict(request.metadata)
+                metadata = cast(dict[str, Any], _thaw_json(request.metadata))
                 metadata.pop("_channel_commit_role", None)
                 if request.commit_role.value != "passive":
                     metadata.setdefault("source", "message_push")
@@ -621,12 +641,20 @@ class WebChatChannel:
                         error="Web WebSocket frame 发送状态未知",
                     )
                 elif delivered == 0:
-                    result = ProviderDeliveryReceipt(
-                        request.delivery_id,
-                        V3DeliveryStatus.REJECTED,
-                        error="Web 会话没有可用连接",
-                    )
+                    if request.control_turn_id is not None:
+                        self._pending_terminal[session_key] = frame
+                        result = ProviderDeliveryReceipt(
+                            request.delivery_id,
+                            V3DeliveryStatus.DELIVERED,
+                        )
+                    else:
+                        result = ProviderDeliveryReceipt(
+                            request.delivery_id,
+                            V3DeliveryStatus.REJECTED,
+                            error="Web 会话没有可用连接",
+                        )
                 else:
+                    self._pending_terminal.pop(session_key, None)
                     result = ProviderDeliveryReceipt(
                         request.delivery_id,
                         V3DeliveryStatus.DELIVERED,
@@ -707,6 +735,8 @@ class WebChatChannel:
             return ""
         if frame_type == "session.create":
             return await self._create_session(websocket, request_id)
+        if frame_type == "session.attach":
+            return await self._attach_session(websocket, request_id, payload)
         if frame_type == "message.send":
             return await self._send_user_message(websocket, request_id, payload)
         if frame_type == "turn.stop":
@@ -726,6 +756,25 @@ class WebChatChannel:
             "request_id": request_id,
             "session_id": session_key,
         })
+        return session_key
+
+    async def _attach_session(
+        self,
+        websocket: WebSocket,
+        request_id: str,
+        payload: dict[str, Any],
+    ) -> str:
+        """把当前 socket 绑定到已知 Web Session，并补投积压终态。"""
+
+        try:
+            session_key = self._normalize_session_id(payload.get("session_id"))
+        except ValueError as error:
+            await self._send_error(websocket, request_id, str(error))
+            return ""
+        if not session_key:
+            await self._send_error(websocket, request_id, "session_id 缺失或无效")
+            return ""
+        await self._add_connection(session_key, websocket)
         return session_key
 
     async def _send_user_message(
@@ -928,7 +977,9 @@ class WebChatChannel:
     async def _on_turn_started(self, event: TurnStarted) -> None:
         if event.channel != self.name:
             return
-        turn_id = self._turn_id(event.session_key, event.timestamp.timestamp())
+        turn_id = event.control_turn_id or event.turn_id
+        if not turn_id:
+            raise RuntimeError("Web TurnStarted 缺少 Server 权威 turn_id")
         self._active_turn_ids[event.session_key] = turn_id
         await self._broadcast(event.session_key, {
             "type": "turn.started",
@@ -986,7 +1037,7 @@ class WebChatChannel:
         await self._broadcast(event.session_key, {
             "type": "turn.output.completed",
             "session_id": event.session_key,
-            "turn_id": event.turn_id or self._current_turn_id(event.session_key),
+            "turn_id": self._current_turn_id(event.session_key),
             "client_message_id": event.client_message_id,
         })
 
@@ -995,7 +1046,25 @@ class WebChatChannel:
             sockets = self._connections.setdefault(session_key, set())
             added = websocket not in sockets
             sockets.add(websocket)
-            return added
+        await self._refill_terminal(session_key, websocket)
+        return added
+
+    async def _refill_terminal(self, session_key: str, websocket: WebSocket) -> None:
+        """新连接绑定后补投一个已完成但尚未送达的终态帧。"""
+
+        frame = self._pending_terminal.get(session_key)
+        if frame is None:
+            return
+        try:
+            await websocket.send_json(frame)
+        except Exception as error:
+            logger.warning(
+                "[web_chat] 终态帧补投失败，保留待下次连接 session=%s err=%r",
+                session_key,
+                error,
+            )
+            return
+        self._pending_terminal.pop(session_key, None)
 
     async def _remove_connection_attempt(
         self,
@@ -1120,6 +1189,16 @@ def _normalize_v3_content(value: str) -> str:
         "\u2028" if ord(char) in {10, 13} else " " if ord(char) < 32 else char
         for char in value
     )
+
+
+def _thaw_json(value: object) -> object:
+    """把 Core 冻结的 JSON 投影为 WebSocket 可序列化对象。"""
+
+    if isinstance(value, Mapping):
+        return {str(key): _thaw_json(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw_json(item) for item in value]
+    return value
 
 
 def _normalize_web_request_id(value: object) -> str:

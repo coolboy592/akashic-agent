@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -25,6 +26,7 @@ from agent.plugin_composition.channels import (
 from agent.plugins.manager import PluginManager
 from bus.events import AttachmentKind, ChannelAttachment, ChannelMessage
 from bus.event_bus import EventBus
+from bus.events_lifecycle import StreamDeltaReady, TurnOutputCompleted, TurnStarted
 from bus.queue import MessageBus
 from infra.channels.base import AttachmentStore
 from infra.channels.web_chat_channel import UploadTooLargeError, WebChatChannel
@@ -197,12 +199,15 @@ class _SessionStore:
     def list_sessions_for_dashboard(self, **_: Any) -> tuple[list[dict[str, Any]], int]:
         return [], 0
 
-    def list_messages_for_dashboard(self, **kwargs: Any) -> tuple[list[dict[str, Any]], int]:
+    def list_chat_history_page(
+        self,
+        **kwargs: Any,
+    ) -> tuple[list[dict[str, Any]], int, bool]:
         self.calls.append(kwargs)
         return [
-            {"id": "m0", "role": "user", "content": "用户问题"},
-            {"id": "m1", "role": "assistant", "content": "助手回答"},
-        ], 2
+            {"id": "m0", "seq": 8, "role": "user", "content": "用户问题"},
+            {"id": "m1", "seq": 9, "role": "assistant", "content": "助手回答"},
+        ], 12, True
 
 
 class _PluginUiProvider:
@@ -787,7 +792,7 @@ def test_chat_media_reads_registered_outbound_file(tmp_path: Path) -> None:
     assert response.content == b"image"
 
 
-def test_chat_messages_default_to_turn_order(tmp_path: Path) -> None:
+def test_chat_messages_default_to_latest_turn_order(tmp_path: Path) -> None:
     channel = WebChatChannel()
     session_manager = _SessionManager()
     channel._ctx = cast(Any, SimpleNamespace(session_manager=session_manager))
@@ -798,8 +803,13 @@ def test_chat_messages_default_to_turn_order(tmp_path: Path) -> None:
 
     payload = response.json()
     assert [item["role"] for item in payload["items"]] == ["user", "assistant"]
-    assert session_manager._store.calls[0]["sort_by"] == "seq"
-    assert session_manager._store.calls[0]["sort_order"] == "asc"
+    assert payload["has_more"] is True
+    assert payload["before_seq"] == 8
+    assert session_manager._store.calls[0] == {
+        "session_key": "web:abc",
+        "page_size": 50,
+        "before_seq": None,
+    }
 
 
 @pytest.mark.asyncio
@@ -886,7 +896,10 @@ async def test_web_v3_native_delivery_projects_opaque_artifacts_and_semantics() 
             recipient="abc",
             body="answer",
             attachments=(ref,),
-            metadata={"turn_duration_ms": 17, "render": "card"},
+            metadata=cast(Any, {
+                "turn_duration_ms": 17,
+                "render": {"kind": "card", "citations": ["mem_1"]},
+            }),
             thinking="reasoning",
             reply_to="user-1",
             session_message_id="assistant-1",
@@ -914,7 +927,7 @@ async def test_web_v3_native_delivery_projects_opaque_artifacts_and_semantics() 
         }],
         "metadata": {
             "turn_duration_ms": 17,
-            "render": "card",
+            "render": {"kind": "card", "citations": ["mem_1"]},
             "source": "message_push",
         },
         "reply_to": "user-1",
@@ -941,6 +954,106 @@ async def test_web_v3_native_delivery_rejects_without_socket() -> None:
 
     assert receipt.status is V3DeliveryStatus.REJECTED
     assert receipt.error == "Web 会话没有可用连接"
+
+
+@pytest.mark.asyncio
+async def test_web_v3_terminal_without_socket_refills_after_session_attach() -> None:
+    channel = WebChatChannel()
+    adapter = channel.build_v3_adapter(_v3_context())
+    await adapter.start()
+
+    receipt = await adapter.deliver(
+        ProviderDeliveryRequest(
+            binding_token="binding-1",
+            delivery_id="delivery-1",
+            recipient="abc",
+            body="answer",
+            metadata=cast(Any, {
+                "turn_duration_ms": None,
+                "nested": {"ids": ["mem_1"]},
+            }),
+            control_turn_id="turn-1",
+        )
+    )
+    socket = _WebSocket()
+    await channel._attach_session(
+        cast(Any, socket),
+        "attach-1",
+        {"session_id": "web:abc"},
+    )
+
+    assert receipt.status is V3DeliveryStatus.DELIVERED
+    assert socket.frames == [{
+        "type": "message.final",
+        "session_id": "web:abc",
+        "turn_id": "turn-1",
+        "content": "answer",
+        "thinking": "",
+        "media": [],
+        "metadata": {
+            "turn_duration_ms": None,
+            "nested": {"ids": ["mem_1"]},
+            "source": "message_push",
+        },
+        "control_turn_id": "turn-1",
+    }]
+    assert "duration_ms" not in socket.frames[0]
+    assert "web:abc" not in channel._pending_terminal
+
+
+@pytest.mark.asyncio
+async def test_web_turn_lifecycle_projects_server_owned_turn_id() -> None:
+    channel = WebChatChannel()
+    socket = _WebSocket()
+    channel._connections["web:abc"] = {cast(Any, socket)}
+
+    await channel._on_turn_started(TurnStarted(
+        session_key="web:abc",
+        channel="web",
+        chat_id="abc",
+        content="question",
+        timestamp=datetime.now(UTC),
+        turn_id="attempt-1",
+        control_turn_id="turn:server-owner",
+        client_message_id="client-1",
+    ))
+    await channel._on_stream_delta(StreamDeltaReady(
+        session_key="web:abc",
+        channel="web",
+        chat_id="abc",
+        turn_id="attempt-1",
+        content_delta="answer",
+    ))
+    await channel._on_output_completed(TurnOutputCompleted(
+        session_key="web:abc",
+        channel="web",
+        chat_id="abc",
+        turn_id="attempt-1",
+        client_message_id="client-1",
+    ))
+
+    assert [frame["type"] for frame in socket.frames] == [
+        "turn.started",
+        "answer.delta",
+        "turn.output.completed",
+    ]
+    assert {frame["turn_id"] for frame in socket.frames} == {
+        "turn:server-owner"
+    }
+
+
+@pytest.mark.asyncio
+async def test_web_turn_started_rejects_missing_server_turn_id() -> None:
+    channel = WebChatChannel()
+
+    with pytest.raises(RuntimeError, match="缺少 Server 权威 turn_id"):
+        await channel._on_turn_started(TurnStarted(
+            session_key="web:abc",
+            channel="web",
+            chat_id="abc",
+            content="question",
+            timestamp=datetime.now(UTC),
+        ))
 
 
 @pytest.mark.asyncio

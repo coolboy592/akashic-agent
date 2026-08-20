@@ -1,6 +1,6 @@
 """SQLite schema for the derived sparse turn index."""
 
-INDEX_VERSION = "9"
+INDEX_VERSION = "10"
 TOOL_CHAIN_PROJECTION_VERSION = "1"
 
 SCHEMA = """

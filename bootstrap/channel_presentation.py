@@ -122,6 +122,8 @@ class ChannelTurnPresentationBridge:
             return None
         if binding.channel_name != channel:
             raise RuntimeError("turn event channel 与 exact Channel binding 不一致")
+        if binding.turn_stream is None:
+            return None
         return binding
 
     def _next(self, binding_token: str, turn_id: str) -> int:

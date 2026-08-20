@@ -326,7 +326,7 @@ def _load_canonical_turns(
     # 3. Establish one deterministic global causal order.
     turns.sort(
         key=lambda turn: (
-            _parse_time(turn.started_at),
+            _parse_time(turn.committed_at),
             turn.session_key.encode("utf-8"),
             turn.user_seq,
             turn.turn_id.encode("utf-8"),
@@ -397,6 +397,12 @@ def _eligible_pairs(
         for turn_id in explicit_order:
             turn_messages = explicit[turn_id]
             users = [row for row in turn_messages if row["role"] == "user"]
+            if not users and all(
+                row["role"] == "assistant"
+                and _message_extra(row).get("proactive") is True
+                for row in turn_messages
+            ):
+                continue
             assistants = [
                 row
                 for row in turn_messages
@@ -938,7 +944,7 @@ def _select_new_turns(
         return turns
     last_indexed = max(
         (
-            _parse_time(row["started_at"]),
+            _parse_time(row["committed_at"]),
             row["session_key"].encode("utf-8"),
             row["user_seq"],
             row["turn_id"].encode("utf-8"),
@@ -950,7 +956,7 @@ def _select_new_turns(
         turn.turn_id
         for turn in new_turns
         if (
-            _parse_time(turn.started_at),
+            _parse_time(turn.committed_at),
             turn.session_key.encode("utf-8"),
             turn.user_seq,
             turn.turn_id.encode("utf-8"),

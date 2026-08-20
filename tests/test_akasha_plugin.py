@@ -2187,7 +2187,13 @@ def test_sparse_builder_groups_explicit_multi_user_turn(tmp_path: Path) -> None:
                 0,
                 "assistant",
                 "proactive",
-                json.dumps({"proactive": True, "delivery_id": "delivery-1"}),
+                json.dumps(
+                    {
+                        "proactive": True,
+                        "delivery_id": "delivery-1",
+                        "control_turn_id": "proactive-turn",
+                    }
+                ),
                 started.isoformat(),
             ),
         )
@@ -2233,6 +2239,146 @@ def test_sparse_builder_groups_explicit_multi_user_turn(tmp_path: Path) -> None:
     assert dense is not None and dense[0] == "u1"
     user_dense = struct.unpack("<2f", dense[1])
     assert user_dense == pytest.approx((2 / math.sqrt(5), 1 / math.sqrt(5)))
+
+
+def test_sparse_builder_appends_resumed_turn_by_terminal_commit_time(
+    tmp_path: Path,
+) -> None:
+    """跨天恢复的 Turn 按最终提交时间追加，不按首个输入时间倒插。"""
+
+    # 1. 先建立已有高水位，再补入一个更早开始但更晚完成的 interaction。
+    sessions = tmp_path / "sessions.db"
+    index = tmp_path / "index.db"
+    _create_sessions(sessions)
+    existing_started = datetime(2026, 8, 15, tzinfo=timezone.utc)
+    _append_turn(
+        sessions,
+        sequence=0,
+        user="existing",
+        assistant="existing answer",
+        started=existing_started,
+        session_key="test:existing",
+        with_embeddings=True,
+    )
+    config = BuildConfig(
+        embedding_model="embedding-model",
+        embedding_dimension=2,
+    )
+    build_sparse_index(sessions, index, config)
+
+    resumed_started = datetime(2026, 8, 12, tzinfo=timezone.utc)
+    resumed_at = datetime(2026, 8, 16, tzinfo=timezone.utc)
+    rows = (
+        (
+            "resume:u1",
+            0,
+            "user",
+            "old input",
+            {"control_turn_id": "turn:resume", "turn_input_ordinal": 0},
+            resumed_started,
+        ),
+        (
+            "resume:u2",
+            1,
+            "user",
+            "current input",
+            {"control_turn_id": "turn:resume", "turn_input_ordinal": 1},
+            resumed_at,
+        ),
+        (
+            "resume:a1",
+            2,
+            "assistant",
+            "final answer",
+            {
+                "control_turn_id": "turn:resume",
+                "turn_terminal": True,
+                "turn_input_count": 2,
+            },
+            resumed_at + timedelta(seconds=10),
+        ),
+    )
+    with closing(sqlite3.connect(sessions)) as connection, connection:
+        connection.execute(
+            "INSERT INTO sessions VALUES ('test:resume', ?, ?, 0, NULL)",
+            (resumed_started.isoformat(), resumed_at.isoformat()),
+        )
+        for message_id, seq, role, content, extra, timestamp in rows:
+            connection.execute(
+                "INSERT INTO messages VALUES (?, 'test:resume', ?, ?, ?, NULL, ?, ?)",
+                (
+                    message_id,
+                    seq,
+                    role,
+                    content,
+                    json.dumps(extra),
+                    timestamp.isoformat(),
+                ),
+            )
+            connection.execute(
+                "INSERT INTO message_embeddings VALUES (?, ?, 'embedding-model', ?, 2, ?, ?)",
+                (
+                    message_id,
+                    hashlib.sha256(content.encode()).hexdigest(),
+                    sqlite3.Binary(struct.pack("<2f", 1.0, 0.0)),
+                    timestamp.isoformat(),
+                    timestamp.isoformat(),
+                ),
+            )
+
+    # 2. 增量与 replay 都把恢复 Turn 放在最终提交位置。
+    result = build_sparse_index(sessions, index, config)
+    turns = load_turns(index)
+
+    assert result.indexed_turns == 1
+    assert [turn.turn_id for turn in turns] == [
+        "test:existing:0::test:existing:1",
+        "resume:u1::resume:a1",
+    ]
+    assert turns[1].started_at == resumed_started.isoformat()
+    assert turns[1].committed_at == (resumed_at + timedelta(seconds=10)).isoformat()
+    assert turns[1].inter_gap_seconds == pytest.approx(86400.0)
+
+
+def test_sparse_builder_rejects_orphan_message_push_turn(tmp_path: Path) -> None:
+    """不能把工具使用记录误当成合法的主动 Turn 身份。"""
+
+    # 1. 构造只有 message_push 执行证据、没有 proactive 身份的孤儿 Turn。
+    sessions = tmp_path / "sessions.db"
+    index = tmp_path / "index.db"
+    _create_sessions(sessions)
+    started = datetime(2026, 8, 6, tzinfo=timezone.utc)
+    with closing(sqlite3.connect(sessions)) as connection, connection:
+        connection.execute(
+            "INSERT INTO sessions VALUES ('test:one', ?, ?, 0, NULL)",
+            (started.isoformat(), started.isoformat()),
+        )
+        connection.execute(
+            "INSERT INTO messages VALUES (?, 'test:one', 0, ?, ?, NULL, ?, ?)",
+            (
+                "a1",
+                "assistant",
+                "orphan outbound",
+                json.dumps(
+                    {
+                        "control_turn_id": "orphan-turn",
+                        "tools_used": ["message_push"],
+                    }
+                ),
+                started.isoformat(),
+            ),
+        )
+
+    # 2. 普通孤儿 Turn 仍由 replay 边界明确拒绝。
+    with pytest.raises(ValueError, match="同 turn transcript 结构无效: orphan-turn"):
+        build_sparse_index(
+            sessions,
+            index,
+            BuildConfig(
+                embedding_model="embedding-model",
+                embedding_dimension=2,
+            ),
+        )
 
 
 def _seed_two_explicit_akasha_turns(workspace: Path) -> datetime:
@@ -2959,7 +3105,7 @@ def test_rebuild_akasha_sidecars_backs_up_and_publishes_verified_pair(
     with closing(sqlite3.connect(index_path)) as connection:
         assert connection.execute(
             "SELECT value FROM metadata WHERE key = 'index_version'"
-        ).fetchone() == ("9",)
+        ).fetchone() == ("10",)
         assert connection.execute("SELECT COUNT(*) FROM sparse_turns").fetchone() == (
             1,
         )
@@ -2970,7 +3116,7 @@ def test_rebuild_akasha_sidecars_backs_up_and_publishes_verified_pair(
     manifest = json.loads((backup_dir / "manifest.json").read_text(encoding="utf-8"))
     assert rebuilt
     assert graph_path.is_file()
-    assert manifest["indexVersion"] == "9"
+    assert manifest["indexVersion"] == "10"
     assert manifest["candidateMemorySha256"]
     assert hashlib.sha256(sessions_path.read_bytes()).hexdigest() == source_sha
 

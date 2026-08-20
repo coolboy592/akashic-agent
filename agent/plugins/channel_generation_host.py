@@ -335,6 +335,10 @@ class ChannelBindingLease:
         return self._host._binding(self._key).binding_token
 
     @property
+    def turn_stream(self) -> TurnStreamPort | None:
+        return self._host._binding(self._key).turn_stream_port
+
+    @property
     def active(self) -> bool:
         return not self._closed
 
