@@ -236,6 +236,7 @@ class _Bus:
     def __init__(self) -> None:
         self.inbound: list[object] = []
         self.pending_handoff = False
+        self.order: list[str] = []
 
     async def publish_inbound(self, message: object) -> None:
         self.inbound.append(message)
@@ -256,8 +257,18 @@ class _Bus:
         channel._open_v3_inbound()
 
     async def admit(self, raw: RawInbound) -> bool:
+        self.order.append("admit")
         self.inbound.append(raw)
         return True
+
+    async def reserve_mobile_channel_handoff(self, raw: RawInbound) -> bool:
+        assert raw.message.metadata.get("mobile_v3_handoff") is True
+        self.order.append("reserve")
+        return True
+
+    async def defer_mobile_channel_handoff(self, handoff_id: str) -> None:
+        assert handoff_id
+        self.pending_handoff = True
 
     def has_pending_mobile_handoff(
         self,
@@ -274,6 +285,25 @@ class _FailingBus(_Bus):
 
     async def admit(self, raw: RawInbound) -> bool:
         raise RuntimeError("bus unavailable")
+
+
+class _GatedReserveBus(_Bus):
+    def __init__(self) -> None:
+        super().__init__()
+        self.reserve_started = asyncio.Event()
+        self.reserve_release = asyncio.Event()
+
+    async def reserve_mobile_channel_handoff(self, raw: RawInbound) -> bool:
+        self.order.append("reserve")
+        self.reserve_started.set()
+        await self.reserve_release.wait()
+        return True
+
+
+class _RejectingIngressBus(_Bus):
+    async def admit(self, raw: RawInbound) -> bool:
+        self.order.append("admit-rejected")
+        return False
 
 
 class _EventBus:
@@ -436,6 +466,108 @@ async def test_mobile_message_send_uses_exact_v3_ingress_without_legacy_bus(
     assert raw.message.channel == "mobile"
     assert raw.message.metadata["session_key_override"] == session_id
     assert raw.message.metadata["mobile_v3_handoff"] is True
+    manager.close()
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_mobile_captured_callback_blocks_drain_through_preprocessing(
+    tmp_path: Path,
+) -> None:
+    storage = MobileRealtimeStorage(tmp_path / "mobile.db")
+    device_id = uuid4().hex
+    _register_device(storage, device_id)
+    channel = MobileRealtimeChannel(cast(MobileGatewayRuntime, _Runtime(storage)))
+    bus = _GatedReserveBus()
+    manager = SessionManager(tmp_path / "workspace")
+    await channel.start(
+        cast(
+            Any,
+            SimpleNamespace(
+                bus=bus,
+                session_manager=manager,
+                event_bus=_EventBus(),
+                push_tool=_PushTool(),
+                interrupt_controller=None,
+                attachment_store=AttachmentStore(tmp_path / "uploads"),
+            ),
+        )
+    )
+    session_id = f"mobile:{uuid4()}"
+    sending = asyncio.create_task(
+        channel.handle_command(
+            device_id=device_id,
+            frame=_message_frame(
+                frame_id="01ARZ3NDEKTSV4RRFFQ69G5FAA",
+                session_id=session_id,
+            ),
+        )
+    )
+    await bus.reserve_started.wait()
+    channel._close_v3_inbound()
+    draining = asyncio.create_task(channel._drain_v3_inbound())
+    await asyncio.sleep(0)
+    assert not draining.done()
+
+    with pytest.raises(RuntimeError, match="admission 已关闭"):
+        await channel.handle_command(
+            device_id=device_id,
+            frame=_message_frame(
+                frame_id="01ARZ3NDEKTSV4RRFFQ69G5FAB",
+                session_id=f"mobile:{uuid4()}",
+            ),
+        )
+    bus.reserve_release.set()
+    reply = await sending
+    await draining
+
+    assert reply.type == "message.send.ok"
+    assert bus.order == ["reserve", "admit"]
+    await channel.stop()
+    manager.close()
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_mobile_exact_ingress_false_never_commits_success_receipt(
+    tmp_path: Path,
+) -> None:
+    storage = MobileRealtimeStorage(tmp_path / "mobile.db")
+    device_id = uuid4().hex
+    _register_device(storage, device_id)
+    channel = MobileRealtimeChannel(cast(MobileGatewayRuntime, _Runtime(storage)))
+    bus = _RejectingIngressBus()
+    manager = SessionManager(tmp_path / "workspace")
+    await channel.start(
+        cast(
+            Any,
+            SimpleNamespace(
+                bus=bus,
+                session_manager=manager,
+                event_bus=_EventBus(),
+                push_tool=_PushTool(),
+                interrupt_controller=None,
+                attachment_store=AttachmentStore(tmp_path / "uploads"),
+            ),
+        )
+    )
+    frame = _message_frame(
+        frame_id="01ARZ3NDEKTSV4RRFFQ69G5FAC",
+        session_id=f"mobile:{uuid4()}",
+    )
+
+    with pytest.raises(RuntimeError, match="captured binding fence"):
+        await channel.handle_command(device_id=device_id, frame=frame)
+
+    receipt = storage._db.execute(
+        "SELECT status, reply_type FROM mobile_command_receipts "
+        "WHERE device_id = ? AND command_id = ?",
+        (device_id, frame.id),
+    ).fetchone()
+    assert receipt is not None
+    assert tuple(receipt) == ("processing", None)
+    assert bus.order == ["reserve", "admit-rejected"]
+    await channel.stop()
     manager.close()
     storage.close()
 
@@ -1634,6 +1766,13 @@ async def test_mobile_message_adopts_finalized_upload_before_bus_admission(
         workspace=workspace,
         session_store=manager.control_store,
     )
+    original_adopt = artifact_store.adopt_file_with_artifact_id
+
+    async def recorded_adopt(*args: object, **kwargs: object) -> AttachmentRef:
+        bus.order.append("artifact")
+        return await original_adopt(*args, **kwargs)  # type: ignore[arg-type]
+
+    artifact_store.adopt_file_with_artifact_id = recorded_adopt  # type: ignore[method-assign]
     channel.bind_channel_attachment_store(artifact_store)
     await channel.start(
         cast(
@@ -1670,6 +1809,7 @@ async def test_mobile_message_adopts_finalized_upload_before_bus_admission(
     )
     assert imported[0].phase == "artifact_committed"
     assert imported[0].artifact_id == artifact_ids[0]
+    assert bus.order == ["reserve", "artifact", "admit"]
 
     # 1. artifact read lease 可读，且只暴露进程内 fd 路径。
     ref = artifact_store.resolve_refs(tuple(artifact_ids))[0]

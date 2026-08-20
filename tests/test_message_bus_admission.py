@@ -665,14 +665,18 @@ async def test_v3_channel_inbound_transfers_bus_lane_loop_and_closes_once() -> N
 async def test_v3_mobile_inbound_reserves_before_bus_queue_and_deletes_after_terminal(
     tmp_path: Path,
 ) -> None:
-    store = SessionStore(tmp_path / "sessions.db")
+    manager = SessionManager(tmp_path / "workspace")
+    session_key = "mobile:chat-1"
+    manager.save(manager.get_or_create(session_key))
+    store = manager.control_store
     bus = MessageBus()
     bus.bind_durable_inbound_store(store)
+    bus.bind_mobile_session_admission_owner(manager)
     envelope, lease = _v3_inbound(
         channel="mobile",
         message_id="client-message-1",
         metadata={
-            "session_key_override": "mobile:chat-1",
+            "session_key_override": session_key,
             "client_message_id": "client-message-1",
             "mobile_v3_handoff": True,
             "mobile_handoff_id": "handoff-1",
@@ -683,36 +687,48 @@ async def test_v3_mobile_inbound_reserves_before_bus_queue_and_deletes_after_ter
     assert [row["handoff_id"] for row in store.list_inbound_handoffs()] == [
         "handoff-1"
     ]
+    with pytest.raises(SessionAdmissionConflictError):
+        manager.delete_session_with_audit(session_key)
     assert await bus.consume_inbound() is envelope
     envelope.handoff(InboundOwner.LANE, InboundOwner.LOOP)
     await bus.complete_inbound(envelope)
 
     assert store.list_inbound_handoffs() == []
     assert lease.closed == 1
-    store.close()
+    manager.close()
 
 
 @pytest.mark.asyncio
 async def test_v3_mobile_handoff_recovers_through_current_exact_binding(
     tmp_path: Path,
 ) -> None:
-    store = SessionStore(tmp_path / "sessions.db")
+    workspace = tmp_path / "workspace"
+    manager = SessionManager(workspace)
+    session_key = "mobile:chat-2"
+    manager.save(manager.get_or_create(session_key))
+    store = manager.control_store
     original = MessageBus()
     original.bind_durable_inbound_store(store)
+    original.bind_mobile_session_admission_owner(manager)
     envelope, _ = _v3_inbound(
         channel="mobile",
         message_id="client-message-2",
         metadata={
-            "session_key_override": "mobile:chat-2",
+            "session_key_override": session_key,
             "client_message_id": "client-message-2",
             "mobile_v3_handoff": True,
             "mobile_handoff_id": "handoff-2",
         },
     )
     await original.publish_channel_inbound(envelope)
+    manager.close()
 
+    restarted_manager = SessionManager(workspace)
+    restarted_manager.clear_stale_admissions()
+    store = restarted_manager.control_store
     restarted = MessageBus()
     restarted.bind_durable_inbound_store(store)
+    restarted.bind_mobile_session_admission_owner(restarted_manager)
     recovered_leases: list[_InboundLease] = []
 
     async def recover(raw: object) -> bool:
@@ -740,21 +756,80 @@ async def test_v3_mobile_handoff_recovers_through_current_exact_binding(
 
     assert store.list_inbound_handoffs() == []
     assert recovered_leases[0].closed == 1
-    store.close()
+    restarted_manager.close()
+
+
+@pytest.mark.asyncio
+async def test_v3_mobile_restart_missing_session_keeps_visible_handoff(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    manager = SessionManager(workspace)
+    session_key = "mobile:deleted-before-recovery"
+    manager.save(manager.get_or_create(session_key))
+    original = MessageBus()
+    original.bind_durable_inbound_store(manager.control_store)
+    original.bind_mobile_session_admission_owner(manager)
+    envelope, _ = _v3_inbound(
+        channel="mobile",
+        message_id="client-deleted-before-recovery",
+        metadata={
+            "session_key_override": session_key,
+            "client_message_id": "client-deleted-before-recovery",
+            "mobile_v3_handoff": True,
+            "mobile_handoff_id": "handoff-deleted-before-recovery",
+        },
+    )
+    await original.publish_channel_inbound(envelope)
+    manager.close()
+
+    restarted_manager = SessionManager(workspace)
+    restarted_manager.clear_stale_admissions()
+    assert restarted_manager.delete_session(session_key) is True
+    restarted = MessageBus()
+    restarted.bind_durable_inbound_store(restarted_manager.control_store)
+    restarted.bind_mobile_session_admission_owner(restarted_manager)
+
+    async def recover(raw: RawInbound) -> bool:
+        lease = _InboundLease(channel="mobile")
+        recovered = InboundEnvelope(
+            message_id=raw.message_id,
+            snapshot_id=lease.snapshot_id,
+            generation_id=lease.generation_id,
+            binding_token=lease.binding_token,
+            message=raw.message,
+            lease=lease,
+        )
+        await restarted.publish_channel_inbound(recovered)
+        return True
+
+    restarted.bind_mobile_channel_inbound_recoverer(recover)
+    with pytest.raises(KeyError, match="session 不存在"):
+        await restarted.recover_durable_inbounds()
+
+    assert [
+        row["handoff_id"]
+        for row in restarted_manager.control_store.list_inbound_handoffs()
+    ] == ["handoff-deleted-before-recovery"]
+    restarted_manager.close()
 
 
 @pytest.mark.asyncio
 async def test_v3_mobile_bus_close_retains_durable_handoff_for_next_boot(
     tmp_path: Path,
 ) -> None:
-    store = SessionStore(tmp_path / "sessions.db")
+    manager = SessionManager(tmp_path / "workspace")
+    session_key = "mobile:chat-3"
+    manager.save(manager.get_or_create(session_key))
+    store = manager.control_store
     bus = MessageBus()
     bus.bind_durable_inbound_store(store)
+    bus.bind_mobile_session_admission_owner(manager)
     envelope, lease = _v3_inbound(
         channel="mobile",
         message_id="client-message-3",
         metadata={
-            "session_key_override": "mobile:chat-3",
+            "session_key_override": session_key,
             "client_message_id": "client-message-3",
             "mobile_v3_handoff": True,
             "mobile_handoff_id": "handoff-3",
@@ -769,7 +844,245 @@ async def test_v3_mobile_bus_close_retains_durable_handoff_for_next_boot(
     assert [row["handoff_id"] for row in store.list_inbound_handoffs()] == [
         "handoff-3"
     ]
-    store.close()
+    manager.close()
+
+
+@pytest.mark.asyncio
+async def test_v3_mobile_same_process_recovery_does_not_duplicate_live_owner(
+    tmp_path: Path,
+) -> None:
+    manager = SessionManager(tmp_path / "workspace")
+    session_key = "mobile:same-process"
+    manager.save(manager.get_or_create(session_key))
+    bus = MessageBus()
+    bus.bind_durable_inbound_store(manager.control_store)
+    bus.bind_mobile_session_admission_owner(manager)
+    recovered = 0
+
+    async def recover(_raw: RawInbound) -> bool:
+        nonlocal recovered
+        recovered += 1
+        return True
+
+    bus.bind_mobile_channel_inbound_recoverer(recover)
+    envelope, _ = _v3_inbound(
+        channel="mobile",
+        message_id="client-same-process",
+        metadata={
+            "session_key_override": session_key,
+            "client_message_id": "client-same-process",
+            "mobile_v3_handoff": True,
+            "mobile_handoff_id": "handoff-same-process",
+        },
+    )
+    await bus.publish_channel_inbound(envelope)
+
+    await bus.recover_durable_inbounds()
+
+    assert recovered == 0
+    assert bus.inbound_size == 1
+    await bus.aclose()
+    manager.close()
+
+
+@pytest.mark.asyncio
+async def test_v3_mobile_reserve_loses_session_before_lock_without_orphan_row(
+    tmp_path: Path,
+) -> None:
+    manager = SessionManager(tmp_path / "workspace")
+    session_key = "mobile:delete-before-reserve"
+    manager.save(manager.get_or_create(session_key))
+    bus = MessageBus()
+    bus.bind_durable_inbound_store(manager.control_store)
+    bus.bind_mobile_session_admission_owner(manager)
+    envelope, _ = _v3_inbound(
+        channel="mobile",
+        message_id="client-delete-before-reserve",
+        metadata={
+            "session_key_override": session_key,
+            "client_message_id": "client-delete-before-reserve",
+            "mobile_v3_handoff": True,
+            "mobile_handoff_id": "handoff-delete-before-reserve",
+        },
+    )
+    raw = RawInbound(
+        message_id=envelope.message_id,
+        provider_identity=envelope.sender,
+        recipient=envelope.chat_id,
+        message=envelope.message,
+    )
+    await bus._durable_handoff_lock.acquire()
+    reserving = asyncio.create_task(bus.reserve_mobile_channel_handoff(raw))
+    await asyncio.sleep(0)
+    assert not reserving.done()
+    assert manager.delete_session(session_key) is True
+    bus._durable_handoff_lock.release()
+
+    with pytest.raises(KeyError, match="session 不存在"):
+        await reserving
+    assert manager.control_store.list_inbound_handoffs() == []
+    assert (
+        manager.control_store._conn.execute(
+            "SELECT 1 FROM session_admissions WHERE session_key = ?",
+            (session_key,),
+        ).fetchone()
+        is None
+    )
+    await bus.aclose()
+    manager.close()
+
+
+@pytest.mark.asyncio
+async def test_v3_mobile_delete_retry_retains_exact_and_session_owners(
+    tmp_path: Path,
+) -> None:
+    manager = SessionManager(tmp_path / "workspace")
+    session_key = "mobile:delete-retry"
+    manager.save(manager.get_or_create(session_key))
+    store = manager.control_store
+    bus = MessageBus()
+    bus.bind_durable_inbound_store(store)
+    bus.bind_mobile_session_admission_owner(manager)
+    envelope, lease = _v3_inbound(
+        channel="mobile",
+        message_id="client-delete-retry",
+        metadata={
+            "session_key_override": session_key,
+            "client_message_id": "client-delete-retry",
+            "mobile_v3_handoff": True,
+            "mobile_handoff_id": "handoff-delete-retry",
+        },
+    )
+    await bus.publish_channel_inbound(envelope)
+    assert await bus.consume_inbound() is envelope
+    envelope.handoff(InboundOwner.LANE, InboundOwner.LOOP)
+    original_complete = store.complete_inbound_handoff
+    attempts = 0
+
+    def fail_once(handoff_id: str) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError("delete busy")
+        original_complete(handoff_id)
+
+    store.complete_inbound_handoff = fail_once  # type: ignore[method-assign]
+    with pytest.raises(OSError, match="delete busy"):
+        await bus.complete_inbound(envelope)
+
+    assert lease.closed == 0
+    with pytest.raises(SessionAdmissionConflictError):
+        manager.delete_session_with_audit(session_key)
+    await asyncio.wait_for(lease.closed_event.wait(), timeout=2)
+    cleanup_tasks = tuple(bus._inbound_cleanup_tasks.values())
+    if cleanup_tasks:
+        await asyncio.gather(*cleanup_tasks)
+    assert store.list_inbound_handoffs() == []
+    assert attempts == 2
+    assert (
+        store._conn.execute(
+            "SELECT 1 FROM session_admissions WHERE session_key = ?",
+            (session_key,),
+        ).fetchone()
+        is None
+    )
+    await bus.aclose()
+    manager.close()
+
+
+@pytest.mark.asyncio
+async def test_v3_mobile_delete_failure_then_bus_close_keeps_durable_row(
+    tmp_path: Path,
+) -> None:
+    manager = SessionManager(tmp_path / "workspace")
+    session_key = "mobile:delete-close"
+    manager.save(manager.get_or_create(session_key))
+    store = manager.control_store
+    bus = MessageBus()
+    bus.bind_durable_inbound_store(store)
+    bus.bind_mobile_session_admission_owner(manager)
+    envelope, lease = _v3_inbound(
+        channel="mobile",
+        message_id="client-delete-close",
+        metadata={
+            "session_key_override": session_key,
+            "client_message_id": "client-delete-close",
+            "mobile_v3_handoff": True,
+            "mobile_handoff_id": "handoff-delete-close",
+        },
+    )
+    await bus.publish_channel_inbound(envelope)
+    assert await bus.consume_inbound() is envelope
+    envelope.handoff(InboundOwner.LANE, InboundOwner.LOOP)
+
+    def always_fail(_handoff_id: str) -> None:
+        raise OSError("delete unavailable")
+
+    store.complete_inbound_handoff = always_fail  # type: ignore[method-assign]
+    with pytest.raises(OSError, match="delete unavailable"):
+        await bus.complete_inbound(envelope)
+    await bus.aclose()
+
+    assert lease.closed == 1
+    assert [row["handoff_id"] for row in store.list_inbound_handoffs()] == [
+        "handoff-delete-close"
+    ]
+    assert (
+        store._conn.execute(
+            "SELECT 1 FROM session_admissions WHERE session_key = ?",
+            (session_key,),
+        ).fetchone()
+        is None
+    )
+    manager.close()
+
+
+@pytest.mark.asyncio
+async def test_v3_mobile_completion_cancellation_waits_for_exact_cleanup(
+    tmp_path: Path,
+) -> None:
+    manager = SessionManager(tmp_path / "workspace")
+    session_key = "mobile:cancel-cleanup"
+    manager.save(manager.get_or_create(session_key))
+    store = manager.control_store
+    bus = MessageBus()
+    bus.bind_durable_inbound_store(store)
+    bus.bind_mobile_session_admission_owner(manager)
+    close_gate = asyncio.Event()
+    envelope, lease = _v3_inbound(
+        close_gate,
+        channel="mobile",
+        message_id="client-cancel-cleanup",
+        metadata={
+            "session_key_override": session_key,
+            "client_message_id": "client-cancel-cleanup",
+            "mobile_v3_handoff": True,
+            "mobile_handoff_id": "handoff-cancel-cleanup",
+        },
+    )
+    await bus.publish_channel_inbound(envelope)
+    assert await bus.consume_inbound() is envelope
+    envelope.handoff(InboundOwner.LANE, InboundOwner.LOOP)
+    completing = asyncio.create_task(bus.complete_inbound(envelope))
+    await lease.close_started.wait()
+    completing.cancel()
+    await asyncio.sleep(0)
+    assert not completing.done()
+    close_gate.set()
+    with pytest.raises(asyncio.CancelledError):
+        await completing
+
+    assert store.list_inbound_handoffs() == []
+    assert lease.closed == 1
+    assert (
+        store._conn.execute(
+            "SELECT 1 FROM session_admissions WHERE session_key = ?",
+            (session_key,),
+        ).fetchone()
+        is None
+    )
+    await bus.aclose()
+    manager.close()
 
 
 @pytest.mark.asyncio

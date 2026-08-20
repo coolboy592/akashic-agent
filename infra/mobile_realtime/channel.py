@@ -96,6 +96,7 @@ from infra.mobile_realtime.storage import (
     AttachmentStateError,
     CommandReceipt,
     CommandReceiptCapacityError,
+    MobileAttachmentImportRecord,
     MobileStorageError,
 )
 
@@ -222,6 +223,21 @@ class _MobileInboundRuntime:
             raise RuntimeError("Mobile v3 ingress admission 已关闭")
         return ports
 
+    def capture(self) -> tuple[ChannelRuntimePorts, asyncio.Task[object]]:
+        """Pin the formal binding and callback task before any durable preprocessing."""
+
+        ports = self._ports
+        task = asyncio.current_task()
+        if not self._open or ports is None or ports.ingress is None:
+            raise RuntimeError("Mobile v3 ingress admission 已关闭")
+        if task is None:
+            raise RuntimeError("Mobile v3 ingress callback 缺少 asyncio task owner")
+        self._tasks.add(task)
+        return ports, task
+
+    def release_capture(self, task: asyncio.Task[object]) -> None:
+        self._tasks.discard(task)
+
     async def admit(
         self,
         raw: RawInbound,
@@ -229,16 +245,9 @@ class _MobileInboundRuntime:
         ports: ChannelRuntimePorts | None = None,
     ) -> bool:
         active = ports or await self.wait_open()
-        if not self._open or self._ports is not active or active.ingress is None:
-            return False
-        task = asyncio.current_task()
-        if task is not None:
-            self._tasks.add(task)
-        try:
-            return await active.ingress.admit(raw)
-        finally:
-            if task is not None:
-                self._tasks.discard(task)
+        if active.ingress is None:
+            raise RuntimeError("Mobile v3 ingress 缺少 Core ingress")
+        return await active.ingress.admit(raw)
 
     async def wait_quiescent(self) -> None:
         current = asyncio.current_task()
@@ -491,6 +500,7 @@ class MobileRealtimeChannel:
             max_attachment_bytes=self._runtime.config.max_attachment_mb * 1024 * 1024,
         )
         self._reconcile_committed_attachment_imports()
+        await self._resume_prepared_attachment_imports()
         _ = ctx.event_bus.on(TurnStarted, self._on_turn_started)
         _ = ctx.event_bus.on(StreamDeltaReady, self._on_stream_delta)
         _ = ctx.event_bus.on(ToolCallStarted, self._on_tool_call_started)
@@ -975,7 +985,11 @@ class MobileRealtimeChannel:
             raise RuntimeError("v3 Mobile handoff channel 不一致")
         if raw.message.metadata.get("mobile_v3_handoff") is not True:
             raise RuntimeError("v3 Mobile handoff 缺少 exact marker")
-        return await self._v3_inbound_runtime.admit(raw)
+        ports, task = self._v3_inbound_runtime.capture()
+        try:
+            return await self._v3_inbound_runtime.admit(raw, ports=ports)
+        finally:
+            self._v3_inbound_runtime.release_capture(task)
 
     async def deliver_v3(
         self,
@@ -2204,106 +2218,173 @@ class MobileRealtimeChannel:
         frame: MessageSendCommand,
         session_id: str,
     ) -> CommandReply:
-        ports = await self._v3_inbound_runtime.wait_open()
-        ctx = self._require_ctx()
-        claimed_session = self._runtime.storage.has_session_claim(session_id)
-        if claimed_session and not ctx.session_manager.session_exists(session_id):
-            raise MobileCommandError(
-                "session_not_found",
-                "会话已从电脑端删除，请在手机上新建会话后继续",
-            )
+        ports, callback_task = self._v3_inbound_runtime.capture()
+        ctx: ChannelContext | None = None
+        reserved_handoff_id: str | None = None
         try:
-            media = self._require_attachments().resolve_uploads(
+            ctx = self._require_ctx()
+            claimed_session = self._runtime.storage.has_session_claim(session_id)
+            if claimed_session and not ctx.session_manager.session_exists(session_id):
+                raise MobileCommandError(
+                    "session_not_found",
+                    "会话已从电脑端删除，请在手机上新建会话后继续",
+                )
+            try:
+                _ = self._require_attachments().resolve_uploads(
+                    device_id=device_id,
+                    session_id=session_id,
+                    attachment_ids=list(frame.payload.media_refs),
+                )
+            except (AttachmentRequestError, AttachmentStateError) as error:
+                raise MobileCommandError("attachment_not_ready", str(error)) from error
+            reply = self._resolve_reply(session_id, frame.payload.reply_to)
+            inbound_content = frame.payload.text
+            metadata: dict[str, object] = {
+                "client_request_id": frame.id,
+                "client_message_id": frame.payload.client_message_id,
+                "client_created_at": frame.payload.client_created_at,
+                "device_id": device_id,
+                "require_existing_session": True,
+                "session_key_override": session_id,
+                "mobile_v3_handoff": True,
+                "mobile_handoff_id": uuid4().hex,
+            }
+            if frame.payload.model_runtime_id is not None:
+                metadata["model_runtime_id"] = frame.payload.model_runtime_id
+                metadata["model_reasoning_effort"] = (
+                    frame.payload.model_reasoning_effort or ""
+                )
+            if reply is not None:
+                metadata.update(
+                    {
+                        "display_content": frame.payload.text,
+                        "reply_to_message_id": reply.message_id,
+                        "reply_role": reply.role,
+                        "reply_preview": reply.preview,
+                    }
+                )
+                inbound_content = build_reply_inbound_text(
+                    frame.payload.text,
+                    reply.content,
+                    sender_label="你" if reply.role == "user" else "Akashic",
+                )
+            self._runtime.storage.claim_session(
                 device_id=device_id,
                 session_id=session_id,
-                attachment_ids=list(frame.payload.media_refs),
+                created_at=_utc_now(),
             )
-        except (AttachmentRequestError, AttachmentStateError) as error:
-            raise MobileCommandError("attachment_not_ready", str(error)) from error
-        reply = self._resolve_reply(session_id, frame.payload.reply_to)
-        inbound_content = frame.payload.text
-        metadata: dict[str, object] = {
-            "client_request_id": frame.id,
-            "client_message_id": frame.payload.client_message_id,
-            "client_created_at": frame.payload.client_created_at,
-            "device_id": device_id,
-            "require_existing_session": True,
-            "session_key_override": session_id,
-            "mobile_v3_handoff": True,
-            "mobile_handoff_id": uuid4().hex,
-        }
-        refs: tuple[AttachmentRef, ...] = ()
-        if frame.payload.media_refs:
-            refs = await self._import_message_attachments(
+            if not claimed_session:
+                _ = ctx.session_manager.get_or_create(session_id)
+            refs = self._prepare_message_attachment_refs(
                 device_id=device_id,
                 session_id=session_id,
                 client_message_id=frame.payload.client_message_id,
                 attachment_ids=tuple(frame.payload.media_refs),
             )
-            metadata["attachment_ids"] = [ref.artifact_id for ref in refs]
-            media = []
-        if frame.payload.model_runtime_id is not None:
-            metadata["model_runtime_id"] = frame.payload.model_runtime_id
-            metadata["model_reasoning_effort"] = (
-                frame.payload.model_reasoning_effort or ""
+            if refs:
+                metadata["attachment_ids"] = [ref.artifact_id for ref in refs]
+            raw = RawInbound(
+                message_id=frame.payload.client_message_id,
+                provider_identity=f"device:{device_id}",
+                recipient=self._chat_id(session_id),
+                message=ChannelInboundMessage(
+                    channel=self.name,
+                    sender=f"device:{device_id}",
+                    chat_id=self._chat_id(session_id),
+                    content=_normalize_v3_content(inbound_content),
+                    timestamp=datetime.now(timezone.utc),
+                    metadata=cast(Any, metadata),
+                    attachments=refs,
+                ),
             )
-        if reply is not None:
-            metadata.update(
-                {
-                    "display_content": frame.payload.text,
-                    "reply_to_message_id": reply.message_id,
-                    "reply_role": reply.role,
-                    "reply_preview": reply.preview,
-                }
+            reserved = await ctx.bus.reserve_mobile_channel_handoff(raw)
+            if not reserved:
+                raise RuntimeError("Mobile exact handoff reserve 被 durable fence 拒绝")
+            reserved_handoff_id = cast(str, metadata["mobile_handoff_id"])
+            if refs:
+                committed = await self._import_message_attachments(
+                    device_id=device_id,
+                    session_id=session_id,
+                    client_message_id=frame.payload.client_message_id,
+                    attachment_ids=tuple(frame.payload.media_refs),
+                )
+                if committed != refs:
+                    raise RuntimeError("Mobile attachment ref 在 handoff reserve 后漂移")
+            accepted = await self._v3_inbound_runtime.admit(raw, ports=ports)
+            if not accepted:
+                raise RuntimeError("Mobile exact ingress 违反 captured binding fence")
+            reserved_handoff_id = None
+
+            # 3. 时间链：入站消息被总线接受并返回 ACK
+            received_at = self._send_received_at.get(
+                (session_id, frame.payload.client_message_id)
             )
-            inbound_content = build_reply_inbound_text(
-                frame.payload.text,
-                reply.content,
-                sender_label="你" if reply.role == "user" else "Akashic",
+            turn_milestone(
+                logger,
+                "tl:send.ack",
+                session_id=session_id,
+                client_message_id=frame.payload.client_message_id,
+                duration_ms=(
+                    (monotonic() - received_at) * 1_000
+                    if received_at is not None
+                    else None
+                ),
             )
-        self._runtime.storage.claim_session(
+            return CommandReply(
+                type="message.send.ok",
+                session_id=session_id,
+                payload={
+                    "accepted": True,
+                    "client_message_id": frame.payload.client_message_id,
+                },
+            )
+        except BaseException:
+            if ctx is not None and reserved_handoff_id is not None:
+                await ctx.bus.defer_mobile_channel_handoff(reserved_handoff_id)
+            raise
+        finally:
+            self._v3_inbound_runtime.release_capture(callback_task)
+
+    def _prepare_message_attachment_refs(
+        self,
+        *,
+        device_id: str,
+        session_id: str,
+        client_message_id: str,
+        attachment_ids: tuple[str, ...],
+    ) -> tuple[AttachmentRef, ...]:
+        """Freeze opaque Core refs before the durable handoff is reserved."""
+
+        mappings = self._runtime.storage.prepare_attachment_imports(
             device_id=device_id,
             session_id=session_id,
-            created_at=_utc_now(),
+            client_message_id=client_message_id,
+            attachment_ids=attachment_ids,
         )
-        if not claimed_session:
-            _ = ctx.session_manager.get_or_create(session_id)
-        raw = RawInbound(
-            message_id=frame.payload.client_message_id,
-            provider_identity=f"device:{device_id}",
-            recipient=self._chat_id(session_id),
-            message=ChannelInboundMessage(
-                channel=self.name,
-                sender=f"device:{device_id}",
-                chat_id=self._chat_id(session_id),
-                content=_normalize_v3_content(inbound_content),
-                timestamp=datetime.now(timezone.utc),
-                metadata=cast(Any, metadata),
-                attachments=refs,
-            ),
-        )
-        _ = await self._v3_inbound_runtime.admit(raw, ports=ports)
-        # 3. 时间链：入站消息被总线接受并返回 ACK
-        received_at = self._send_received_at.get(
-            (session_id, frame.payload.client_message_id)
-        )
-        turn_milestone(
-            logger,
-            "tl:send.ack",
-            session_id=session_id,
-            client_message_id=frame.payload.client_message_id,
-            duration_ms=(
-                (monotonic() - received_at) * 1_000 if received_at is not None else None
-            ),
-        )
-        return CommandReply(
-            type="message.send.ok",
-            session_id=session_id,
-            payload={
-                "accepted": True,
-                "client_message_id": frame.payload.client_message_id,
-            },
-        )
+        refs: list[AttachmentRef] = []
+        for mapping in mappings:
+            record = self._runtime.storage.read_attachment(
+                mapping.mobile_attachment_id
+            )
+            if record is None:
+                raise AttachmentStateError(
+                    f"Mobile finalized attachment 丢失: {mapping.mobile_attachment_id}"
+                )
+            refs.append(
+                AttachmentRef(
+                    artifact_id=mapping.artifact_id,
+                    kind=(
+                        AttachmentKind.IMAGE
+                        if record.content_type.startswith("image/")
+                        else AttachmentKind.FILE
+                    ),
+                    filename=record.filename,
+                    media_type=record.content_type,
+                    size_bytes=record.size_bytes,
+                    sha256=record.sha256,
+                )
+            )
+        return tuple(refs)
 
     async def _import_message_attachments(
         self,
@@ -2877,6 +2958,34 @@ class MobileRealtimeChannel:
                 session_id=session_id,
                 client_message_id=client_message_id,
                 message_id=cast(str, message["id"]),
+            )
+
+    async def _resume_prepared_attachment_imports(self) -> None:
+        """Finish artifacts whose durable Mobile handoff survived a process crash."""
+
+        groups: dict[
+            tuple[str, str, str],
+            list[MobileAttachmentImportRecord],
+        ] = defaultdict(list)
+        for item in self._runtime.storage.list_incomplete_attachment_imports():
+            if item.phase == "prepared":
+                groups[(item.device_id, item.session_id, item.client_message_id)].append(
+                    item
+                )
+        for (device_id, session_id, client_message_id), items in groups.items():
+            if not self._require_ctx().bus.has_pending_mobile_handoff(
+                session_key=session_id,
+                client_message_id=client_message_id,
+            ):
+                continue
+            ordered = sorted(items, key=lambda item: item.ordinal)
+            await self._import_message_attachments(
+                device_id=device_id,
+                session_id=session_id,
+                client_message_id=client_message_id,
+                attachment_ids=tuple(
+                    item.mobile_attachment_id for item in ordered
+                ),
             )
 
     async def _deliver_passive_message(

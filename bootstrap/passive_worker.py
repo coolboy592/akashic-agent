@@ -190,10 +190,16 @@ class PassiveMessageWorker:
                         isinstance(item, InboundEnvelope)
                         and item.owner is InboundOwner.LANE
                     ):
-                        await self._bus.release_channel_inbound(
-                            item,
-                            InboundOwner.LANE,
-                        )
+                        if item.channel == "mobile":
+                            await self._bus.retain_mobile_channel_inbound(
+                                item,
+                                InboundOwner.LANE,
+                            )
+                        else:
+                            await self._bus.release_channel_inbound(
+                                item,
+                                InboundOwner.LANE,
+                            )
                     raise
                 except _TerminalHandoffRetainedError as error:
                     # 终态已持久化，只重投同一权威 terminal；同 session 后续消息
@@ -208,7 +214,14 @@ class PassiveMessageWorker:
                 except Exception:
                     logger.exception("passive lane message failed thread=%s", key)
                     if isinstance(item, InboundEnvelope) and item.owner is not InboundOwner.CLOSED:
-                        await self._bus.release_channel_inbound(item, item.owner)
+                        if item.channel == "mobile":
+                            if not self._bus.mobile_inbound_cleanup_pending(item):
+                                await self._bus.retain_mobile_channel_inbound(
+                                    item,
+                                    item.owner,
+                                )
+                        else:
+                            await self._bus.release_channel_inbound(item, item.owner)
                     break
             if queue.empty():
                 task = asyncio.current_task()
@@ -237,11 +250,16 @@ class PassiveMessageWorker:
         attachment_leases: tuple[_ModelAttachmentLease, ...] = ()
         try:
             message = envelope.message
-            _, session_admission_id = (
-                self._legacy_loop.session_manager.admit_existing(
-                    envelope.session_key
+            if envelope.channel == "mobile":
+                session_admission_id = self._bus.mobile_session_admission_id(
+                    envelope
                 )
-            )
+            else:
+                _, session_admission_id = (
+                    self._legacy_loop.session_manager.admit_existing(
+                        envelope.session_key
+                    )
+                )
             attachment_leases = await self._acquire_attachment_refs(
                 message.attachments
             )
@@ -325,14 +343,23 @@ class PassiveMessageWorker:
                     await self._close_attachment_leases(attachment_leases)
                 finally:
                     try:
-                        if session_admission_id is not None:
+                        if (
+                            session_admission_id is not None
+                            and envelope.channel != "mobile"
+                        ):
                             self._legacy_loop.session_manager.release_admission(
                                 session_admission_id
                             )
                     finally:
-                        await self._bus.release_channel_inbound(
-                            envelope, InboundOwner.LOOP
-                        )
+                        if envelope.channel == "mobile":
+                            await self._bus.retain_mobile_channel_inbound(
+                                envelope,
+                                InboundOwner.LOOP,
+                            )
+                        else:
+                            await self._bus.release_channel_inbound(
+                                envelope, InboundOwner.LOOP
+                            )
 
     async def _finish_channel_envelope(
         self,
@@ -412,15 +439,21 @@ class PassiveMessageWorker:
                 try:
                     if terminal_durable:
                         await self._bus.complete_inbound(envelope)
+                    elif envelope.channel == "mobile":
+                        await self._bus.retain_mobile_channel_inbound(
+                            envelope,
+                            InboundOwner.LOOP,
+                        )
                     else:
                         await self._bus.release_channel_inbound(
                             envelope,
                             InboundOwner.LOOP,
                         )
                 finally:
-                    self._legacy_loop.session_manager.release_admission(
-                        session_admission_id
-                    )
+                    if envelope.channel != "mobile":
+                        self._legacy_loop.session_manager.release_admission(
+                            session_admission_id
+                        )
 
     async def _drain_channel_lane_queues(self) -> None:
         """Close every v3 envelope still owned by a stopped lane."""
@@ -433,10 +466,16 @@ class PassiveMessageWorker:
                 except asyncio.QueueEmpty:
                     break
                 if isinstance(item, InboundEnvelope):
-                    await self._bus.release_channel_inbound(
-                        item,
-                        InboundOwner.LANE,
-                    )
+                    if item.channel == "mobile":
+                        await self._bus.retain_mobile_channel_inbound(
+                            item,
+                            InboundOwner.LANE,
+                        )
+                    else:
+                        await self._bus.release_channel_inbound(
+                            item,
+                            InboundOwner.LANE,
+                        )
                 else:
                     retained.append(item)
             for item in retained:

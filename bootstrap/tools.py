@@ -594,6 +594,7 @@ def build_core_runtime(
     session_manager = SessionManager(workspace)
     if clear_stale_session_admissions:
         session_manager.clear_stale_admissions()
+    bus.bind_mobile_session_admission_owner(session_manager)
     loop_ref: dict[str, AgentLoop] = {}
     tools, push_tool, scheduler, memory_runtime = (
         build_registered_tools(
