@@ -1241,16 +1241,21 @@ class PluginManager:
         normalized = tuple(definitions)
         if any(not isinstance(item, CoreChannelDefinition) for item in normalized):
             raise TypeError("Core channel definitions 类型无效")
+        if not normalized:
+            return
         if self._core_channel_definitions:
             raise RuntimeError("Core channel definitions 已绑定")
         self._core_channel_definitions = normalized
-        current = self.current_snapshot
-        if current is None:
-            return
-        snapshot, _ = await self._compile_topology_snapshot(
-            dict(self._active_generations)
-        )
-        await self._publish_committed_snapshot(snapshot)
+        snapshot: RuntimeSnapshot | None = None
+        try:
+            snapshot, _ = await self._compile_topology_snapshot(
+                dict(self._active_generations)
+            )
+            await self._publish_committed_snapshot(snapshot)
+        except BaseException:
+            if self.current_snapshot is not snapshot:
+                self._core_channel_definitions = ()
+            raise
 
     @staticmethod
     def _snapshot_bot_commands(
@@ -5155,13 +5160,18 @@ class PluginManager:
             )
         ):
             return current.composition_root, False
-        if not ordered:
+        if not ordered and not self._core_channel_definitions:
             return None, False
 
         # 2. candidate 总是创建独立 Root；stable 拓扑变化也创建完整 Root。
         identity = "|".join(
             f"{item.plugin_id}:{item.generation_id}" for item in ordered
         )
+        if not identity:
+            identity = "core-channels:" + "|".join(
+                f"{item.name}:{item.generation_id}:{item.source_revision}:{item.config_revision}"
+                for item in self._core_channel_definitions
+            )
         root = CompositionRoot(
             "plugins:" + hashlib.sha256(identity.encode()).hexdigest()[:16],
             candidate_incident_limit=(1024 if candidate_owner is not None else None),

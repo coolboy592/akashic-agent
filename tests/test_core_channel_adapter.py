@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import asyncio
+import json
+from contextlib import suppress
+
 import pytest
 from types import SimpleNamespace
 
@@ -12,11 +16,14 @@ from agent.plugin_composition.channels import (
     OutboundEnvelope,
     ProviderDeliveryRequest,
 )
+from agent.plugins.manager import PluginManager
 from bootstrap.core_channel_adapter import (
     CoreLegacyChannelAdapter,
     LEGACY_ATTACHMENT_METADATA_KEY,
     map_legacy_delivery_receipt,
+    build_core_channel_definition,
 )
+from bootstrap.tools import _dispatch_v3_channel_push
 from agent.plugins.channel_generation_host import ChannelGenerationHost
 from bus.events import (
     AttachmentKind,
@@ -24,6 +31,9 @@ from bus.events import (
     DeliveryReceipt,
     DeliveryStatus,
 )
+from bus.event_bus import EventBus
+from bus.queue import MessageBus
+from agent.tools.message_push import MessagePushTool
 
 
 class _ExistingChannel:
@@ -174,3 +184,95 @@ async def test_core_catalog_host_start_exact_binding_attachment_and_stop() -> No
     await lease.aclose()
     stop_receipts = await generation.stop()
     assert stop_receipts[0].resources_closed is True
+
+
+@pytest.mark.asyncio
+async def test_manager_publishes_core_catalog_without_stable_plugins(tmp_path) -> None:
+    """无插件 stable snapshot 时也正式发布 Core channel Host。"""
+
+    manager = PluginManager(
+        plugin_dirs=[tmp_path / "plugins"],
+        event_bus=EventBus(),
+        workspace=tmp_path / "workspace",
+        installed_cache_root=tmp_path / "cache",
+    )
+    channel = _ExistingChannel()
+
+    await manager.bind_core_channel_definitions(
+        (build_core_channel_definition(channel),)
+    )
+
+    snapshot = manager.current_snapshot
+    runtime = manager.active_channel_generation
+    assert snapshot is not None
+    assert snapshot.channel_catalog is not None
+    assert snapshot.channel_catalog.definition("web") is not None
+    assert runtime is not None
+    assert runtime.snapshot_id == snapshot.snapshot_id
+    assert runtime.channel("web").admission_open is True
+
+    await manager.terminate_all()
+
+
+@pytest.mark.asyncio
+async def test_core_catalog_message_push_keeps_media_off_legacy_registration(
+    tmp_path,
+) -> None:
+    """Core catalog 命中时 MessagePush 使用 v3 receipt 并保留旧媒体投影。"""
+
+    manager = PluginManager(
+        plugin_dirs=[tmp_path / "plugins"],
+        event_bus=EventBus(),
+        workspace=tmp_path / "workspace",
+        installed_cache_root=tmp_path / "cache",
+    )
+    channel = _ExistingChannel()
+    await manager.bind_core_channel_definitions(
+        (build_core_channel_definition(channel),)
+    )
+
+    bus = MessageBus()
+    bus.bind_channel_outbound_dispatcher(
+        manager.channel_generation_host.dispatch_outbound
+    )
+    dispatch_task = asyncio.create_task(bus.dispatch_outbound())
+    tool = MessagePushTool(chat_lane=bus.chat_lane)
+    legacy_calls: list[object] = []
+
+    async def legacy(message: object) -> DeliveryReceipt:
+        legacy_calls.append(message)
+        return DeliveryReceipt(DeliveryStatus.SUCCESS)
+
+    _ = tool.register_channel("web", deliver=legacy)
+    tool.bind_v3_channel_dispatcher(
+        lambda message, passive: _dispatch_v3_channel_push(
+            manager,
+            bus,
+            message,
+            passive,
+        )
+    )
+
+    try:
+        result = json.loads(
+            await tool.execute(
+                target_channel="web",
+                target_chat_id="chat-1",
+                message="report",
+                file="/tmp/report.pdf",
+            )
+        )
+    finally:
+        await bus.aclose()
+        if not dispatch_task.done():
+            dispatch_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await dispatch_task
+        await manager.terminate_all()
+
+    assert result["status"] == "delivered"
+    assert result["retryable"] is False
+    assert legacy_calls == []
+    assert channel.received[0].attachments == (
+        ChannelAttachment(AttachmentKind.FILE, "/tmp/report.pdf", "report.pdf"),
+    )
