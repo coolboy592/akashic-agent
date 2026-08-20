@@ -211,6 +211,7 @@ def test_static_gate_accepts_v3_namespace_and_manifest(tmp_path: Path) -> None:
     assert evidence["manifest"]["api_version"] == 3
     assert evidence["namespace"]["apply_signature"] == "apply(ctx, config)"
     assert evidence["forbidden_v2_imports"] == []
+    assert evidence["forbidden_v2_classes"] == []
 
 
 def test_static_gate_rejects_generic_v2_import(tmp_path: Path) -> None:
@@ -229,6 +230,44 @@ def test_static_gate_rejects_generic_v2_import(tmp_path: Path) -> None:
 
     assert evidence["status"] == "failed"
     assert evidence["forbidden_v2_imports"][0]["module"] == "agent.plugins"
+
+
+@pytest.mark.parametrize(
+    "legacy_class, expected",
+    (
+        (
+            "class Legacy(Plugin):\n"
+            "    pass\n",
+            "Plugin",
+        ),
+        (
+            "class LegacyCommands:\n"
+            "    def telegram_bot_commands(self):\n"
+            "        return []\n",
+            "telegram_bot_commands",
+        ),
+    ),
+)
+def test_static_gate_rejects_legacy_v2_class_contracts(
+    tmp_path: Path,
+    legacy_class: str,
+    expected: str,
+) -> None:
+    root = tmp_path / "fixture"
+    _write_v3_artifact(
+        root,
+        "api_version = 3\n"
+        'name = "fixture"\n'
+        'version = "3.0.0"\n'
+        "async def apply(ctx, config):\n"
+        "    return None\n\n"
+        f"{legacy_class}",
+    )
+
+    evidence = gate._inspect_static_plugin(root, "fixture")
+
+    assert evidence["status"] == "failed"
+    assert expected in str(evidence["forbidden_v2_classes"])
 
 
 def test_locked_checkout_records_tree_clean_and_shallow_history(tmp_path: Path) -> None:

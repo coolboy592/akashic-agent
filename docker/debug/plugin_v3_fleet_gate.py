@@ -79,6 +79,33 @@ FORBIDDEN_V2_MODULES = frozenset(
         "agent.plugins.registry",
     }
 )
+FORBIDDEN_V2_CLASS_BASES = frozenset({"Plugin", f"Plugin{'Context'}"})
+FORBIDDEN_V2_FIXED_METHODS = frozenset(
+    {
+        "static_semantic_checks",
+        "readiness_semantic_checks",
+        "skill_roots",
+        "drift_skill_roots",
+        "mcp_servers",
+        "managed_services",
+        "proactive_sources",
+        "before_turn_modules",
+        "before_reasoning_modules",
+        "prompt_render_modules",
+        "before_step_modules",
+        "after_step_modules",
+        "after_reasoning_modules",
+        "after_turn_modules",
+        "proactive_modules",
+        "proactive_lifecycles",
+        "proactive_module_factories",
+        "proactive_runtime_factories",
+        "telegram_bot_commands",
+        "mobile_bot_commands",
+        "mobile_ui_available",
+        "mobile_ui_query",
+    }
+)
 E2E_NOT_RUN_REASON = (
     "static Gate 第一阶段不执行 runtime E2E；需最终 Core/plugin 组合与受控环境"
 )
@@ -406,8 +433,9 @@ def _inspect_static_plugin(root: Path, plugin_id: str) -> dict[str, object]:
     # 2. Parse the namespace AST and enforce api_version=3/apply(ctx, config).
     namespace = _inspect_namespace(root, entrypoint)
 
-    # 3. Scan production Python sources for generic v2 import edges.
+    # 3. Scan production Python sources for generic v2 import and class edges.
     forbidden = _find_forbidden_v2_imports(root)
+    forbidden_classes = _find_forbidden_v2_classes(root)
     errors = [*manifest_errors, *cast(list[str], namespace["errors"])]
     manifest_name = manifest.get("name")
     namespace_name = namespace.get("name")
@@ -423,12 +451,15 @@ def _inspect_static_plugin(root: Path, plugin_id: str) -> dict[str, object]:
         errors.append("manifest/module api_version 不一致")
     if forbidden:
         errors.append("发现 generic v2 import")
+    if forbidden_classes:
+        errors.append("发现 legacy v2 Plugin class/fixed methods")
     return {
         "status": "passed" if not errors else "failed",
         "plugin_id": plugin_id,
         "manifest": manifest,
         "namespace": namespace,
         "forbidden_v2_imports": forbidden,
+        "forbidden_v2_classes": forbidden_classes,
         "errors": errors,
     }
 
@@ -586,6 +617,82 @@ def _find_forbidden_v2_imports(root: Path) -> list[dict[str, object]]:
                     }
                 )
     return violations
+
+
+def _find_forbidden_v2_classes(root: Path) -> list[dict[str, object]]:
+    """Find retired Plugin class contracts without importing artifact code."""
+
+    violations: list[dict[str, object]] = []
+    for source in sorted(root.rglob("*.py")):
+        if any(
+            part in {".git", ".venv", "__pycache__", "scripts", "tests"}
+            for part in source.parts
+        ):
+            continue
+        try:
+            tree = ast.parse(source.read_text(encoding="utf-8"), filename=str(source))
+        except (OSError, SyntaxError):
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ClassDef):
+                continue
+            base_names = tuple(_ast_name(base) for base in node.bases)
+            legacy_bases = tuple(
+                name
+                for name in base_names
+                if name is not None and name.rsplit(".", 1)[-1] in FORBIDDEN_V2_CLASS_BASES
+            )
+            method_names = {
+                item.name
+                for item in node.body
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+            }
+            fixed_methods = tuple(sorted(method_names & FORBIDDEN_V2_FIXED_METHODS))
+            api_version = _class_literal(node, "api_version")
+            if not legacy_bases and not fixed_methods and api_version != 2:
+                continue
+            violations.append(
+                {
+                    "path": _relative_or_name(source, root),
+                    "line": node.lineno,
+                    "class": node.name,
+                    "legacy_bases": legacy_bases,
+                    "fixed_methods": fixed_methods,
+                    "api_version": api_version,
+                }
+            )
+    return violations
+
+
+def _ast_name(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        prefix = _ast_name(node.value)
+        return node.attr if prefix is None else f"{prefix}.{node.attr}"
+    return None
+
+
+def _class_literal(node: ast.ClassDef, name: str) -> object:
+    for item in node.body:
+        value: ast.AST | None = None
+        if isinstance(item, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == name
+            for target in item.targets
+        ):
+            value = item.value
+        elif (
+            isinstance(item, ast.AnnAssign)
+            and isinstance(item.target, ast.Name)
+            and item.target.id == name
+        ):
+            value = item.value
+        if value is not None:
+            try:
+                return ast.literal_eval(value)
+            except (ValueError, TypeError):
+                return None
+    return None
 
 
 def _build_report(
