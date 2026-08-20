@@ -7,9 +7,12 @@ from contextlib import suppress
 import pytest
 
 from agent.plugin_composition.channels import (
+    ChannelCapability,
     ChannelFactoryContext,
     ChannelReady,
+    ChannelRuntimePorts,
     DeliveryStatus,
+    InboundIdentity,
     ProviderDeliveryReceipt,
     ProviderDeliveryRequest,
     StopReceipt,
@@ -57,6 +60,40 @@ class _NativeChannel:
         return _NativeAdapter(context, self.received)
 
 
+class _InboundNativeAdapter(_NativeAdapter):
+    def __init__(
+        self,
+        context: ChannelFactoryContext,
+        received: list[ProviderDeliveryRequest],
+    ) -> None:
+        super().__init__(context, received)
+        self.runtime: ChannelRuntimePorts | None = None
+        self.open = False
+
+    def attach_runtime(self, ports: ChannelRuntimePorts) -> None:
+        self.runtime = ports
+
+    def open_admission(self) -> None:
+        self.open = True
+
+    def close_admission(self) -> None:
+        self.open = False
+
+
+class _InboundNativeChannel(_NativeChannel):
+    name = "telegram"
+    v3_inbound_identity = InboundIdentity.PROVIDER_MESSAGE_ID
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.adapter: _InboundNativeAdapter | None = None
+
+    def build_v3_adapter(self, context: ChannelFactoryContext) -> _InboundNativeAdapter:
+        self.contexts.append(context)
+        self.adapter = _InboundNativeAdapter(context, self.received)
+        return self.adapter
+
+
 @pytest.mark.asyncio
 async def test_manager_publishes_native_core_catalog_without_plugins(tmp_path) -> None:
     """A Core channel is materialized only through its native v3 factory."""
@@ -85,6 +122,38 @@ async def test_manager_publishes_native_core_catalog_without_plugins(tmp_path) -
     assert channel.contexts[0].binding_token == runtime.channel("web").binding_token
 
     await manager.terminate_all()
+
+
+@pytest.mark.asyncio
+async def test_native_inbound_definition_attaches_before_opening_provider_callbacks(
+    tmp_path,
+) -> None:
+    manager = PluginManager(
+        plugin_dirs=[tmp_path / "plugins"],
+        event_bus=EventBus(),
+        workspace=tmp_path / "workspace",
+        installed_cache_root=tmp_path / "cache",
+    )
+    channel = _InboundNativeChannel()
+
+    await manager.bind_core_channel_definitions(
+        (build_core_channel_definition(channel),)
+    )
+
+    catalog = manager.stable_committed_channel_catalog()
+    assert catalog is not None
+    definition = catalog.definition("telegram")
+    assert definition is not None
+    assert definition.capabilities == frozenset(
+        {ChannelCapability.INBOUND, ChannelCapability.OUTBOUND}
+    )
+    assert definition.inbound_identity is InboundIdentity.PROVIDER_MESSAGE_ID
+    assert channel.adapter is not None
+    assert channel.adapter.runtime is not None
+    assert channel.adapter.open is True
+
+    await manager.terminate_all()
+    assert channel.adapter.open is False
 
 
 @pytest.mark.asyncio

@@ -36,6 +36,7 @@ from agent.plugin_composition.channels import (
     ChannelFactoryContext,
     ChannelInboundMessage,
     ChannelRuntimePorts,
+    InboundIdentity,
     ProviderDeliveryRequest,
     RawInbound,
     StopReceipt,
@@ -428,6 +429,8 @@ async def _read_qq_image(
 
 
 class QQChannel:
+    v3_inbound_identity = InboundIdentity.PROVIDER_MESSAGE_ID
+
     name = _CHANNEL
 
     def __init__(

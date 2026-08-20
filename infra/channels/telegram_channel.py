@@ -48,6 +48,7 @@ from agent.plugin_composition.channels import (
     ChannelFactoryContext,
     ChannelInboundMessage,
     ChannelRuntimePorts,
+    InboundIdentity,
     ProviderDeliveryRequest,
     RawInbound,
     StopReceipt,
@@ -195,6 +196,8 @@ class _TelegramInboundRuntime:
 
 
 class TelegramChannel:
+
+    v3_inbound_identity = InboundIdentity.PROVIDER_MESSAGE_ID
 
     def __init__(
         self,
