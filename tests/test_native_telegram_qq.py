@@ -5,20 +5,26 @@ import base64
 import hashlib
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Mapping
 from unittest.mock import AsyncMock
 
 import pytest
 
 from agent.plugin_composition.channels import (
     AttachmentKind,
+    AttachmentReadLease,
     AttachmentRef,
+    ChannelAttachmentImportPort,
+    ChannelAttachmentReadPort,
     ChannelFactoryContext,
+    ChannelIngressPort,
     ChannelRuntimePorts,
     ChannelReady,
+    CredentialRef,
     DeliveryStatus,
     RawInbound,
     ProviderDeliveryRequest,
+    ProviderClient,
 )
 
 from tests.test_channel_clients import (
@@ -30,7 +36,10 @@ from tests.test_channel_clients import (
 
 
 class _ProviderFactory:
-    async def create(self, _credentials: object) -> object:
+    async def create(
+        self,
+        credentials: Mapping[str, CredentialRef],
+    ) -> ProviderClient:
         raise AssertionError("native channel must reuse the existing provider owner")
 
     async def aclose(self) -> None:
@@ -66,10 +75,10 @@ class _ReadPort:
 
 def _context(
     binding_token: str,
-    read_port: _ReadPort,
+    read_port: ChannelAttachmentReadPort,
     *,
-    ingress: object | None = None,
-    attachment_import: object | None = None,
+    ingress: ChannelIngressPort | None = None,
+    attachment_import: ChannelAttachmentImportPort | None = None,
 ) -> ChannelFactoryContext:
     return ChannelFactoryContext(
         snapshot_id="snapshot-1",
@@ -116,6 +125,11 @@ class _ImportPort:
             media_type or "application/octet-stream",
             data,
         )
+
+
+class _FailingReadPort:
+    async def acquire(self, ref: AttachmentRef) -> AttachmentReadLease:
+        raise RuntimeError("read rejected")
 
 
 def _runtime_context(
@@ -269,11 +283,9 @@ async def test_telegram_v3_adapter_maps_pre_and_post_provider_failures(
     )
     assert unknown.status is DeliveryStatus.UNKNOWN
 
-    async def fail_read(_ref: AttachmentRef) -> _Lease:
-        raise RuntimeError("read rejected")
-
-    read_port = SimpleNamespace(acquire=fail_read)
-    no_provider = channel.build_v3_adapter(_context("telegram-binding-2", read_port))
+    no_provider = channel.build_v3_adapter(
+        _context("telegram-binding-2", _FailingReadPort())
+    )
     rejected_attachment = await no_provider.deliver(
         ProviderDeliveryRequest(
             binding_token="telegram-binding-2",

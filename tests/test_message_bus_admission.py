@@ -4,6 +4,7 @@ import asyncio
 import gc
 import logging
 import weakref
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,6 +23,7 @@ from agent.plugin_composition.channels import (
     InboundEnvelope,
     InboundOwner,
     InboundState,
+    JsonValue,
     OutboundEnvelope,
     RawInbound,
 )
@@ -31,7 +33,7 @@ from session.manager import SessionManager
 from session.store import SessionAdmissionConflictError, SessionStore
 
 
-def _v3_outbound() -> tuple[OutboundEnvelope, SimpleNamespace]:
+def _v3_outbound() -> tuple[OutboundEnvelope, _OutboundBinding]:
     envelope = OutboundEnvelope(
         logical_delivery_id="delivery-1",
         delivery_id="delivery-1",
@@ -44,13 +46,7 @@ def _v3_outbound() -> tuple[OutboundEnvelope, SimpleNamespace]:
         body="hello",
         metadata={"kind": "final"},
     )
-    binding = SimpleNamespace(
-        snapshot_id="snapshot-1",
-        generation_id="generation-1",
-        binding_token="binding-1",
-        channel_name="feishu",
-        active=True,
-    )
+    binding = _OutboundBinding()
     return envelope, binding
 
 
@@ -92,7 +88,7 @@ def _v3_inbound(
     *,
     message_id: str = "message-1",
     attachments: tuple[AttachmentRef, ...] = (),
-    metadata: dict[str, object] | None = None,
+    metadata: dict[str, JsonValue] | None = None,
     channel: str = "feishu",
 ) -> tuple[InboundEnvelope, _InboundLease]:
     lease = _InboundLease(close_gate, channel=channel)
@@ -113,6 +109,15 @@ def _v3_inbound(
         lease=lease,
     )
     return envelope, lease
+
+
+@dataclass(frozen=True)
+class _OutboundBinding:
+    snapshot_id: str = "snapshot-1"
+    generation_id: str = "generation-1"
+    binding_token: str = "binding-1"
+    channel_name: str = "feishu"
+    active: bool = True
 
 
 @pytest.mark.asyncio

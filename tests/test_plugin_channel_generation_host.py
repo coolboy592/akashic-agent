@@ -4,7 +4,7 @@ import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from types import ModuleType, SimpleNamespace
-from typing import Any, cast
+from typing import Any, Mapping, cast
 
 import pytest
 
@@ -30,6 +30,7 @@ from agent.plugin_composition.channels import (
     InboundOwner,
     OutboundEnvelope,
     PluginChannels,
+    ProviderClient,
     ProviderClientFactory,
     ProviderDeliveryReceipt,
     ProviderDeliveryRequest,
@@ -54,7 +55,7 @@ from agent.plugins.channel_generation_host import (
 )
 from agent.plugins.composable import ComposablePlugin
 from agent.plugins.generation import GateResult, PluginContributions, PluginGeneration
-from agent.plugins.snapshot import RuntimeSnapshotCompiler, RuntimeSnapshotStore
+from agent.plugins.snapshot import RuntimeSnapshotCompiler, RuntimeSnapshotLease, RuntimeSnapshotStore
 from bus.queue import MessageBus
 from bus.event_bus import EventBus
 from bus.events_lifecycle import (
@@ -74,14 +75,30 @@ class ClientFactory:
     closed: int = 0
     fail_close: bool = False
 
-    async def create(self, credentials: Any) -> object:
+    async def create(
+        self,
+        credentials: Mapping[str, CredentialRef],
+    ) -> ProviderClient:
         self.created += 1
-        return object()
+        return _Client(credentials)
 
     async def aclose(self) -> None:
         self.closed += 1
         if self.fail_close:
             raise RuntimeError("factory close failed")
+
+
+class _Client:
+    def __init__(self, credentials: Mapping[str, CredentialRef]) -> None:
+        self._credentials = credentials
+
+    def credential(self, ref: CredentialRef) -> str:
+        if ref not in self._credentials.values():
+            raise AssertionError(f"unexpected credential: {ref.path}")
+        return "test-credential"
+
+    async def aclose(self) -> None:
+        return None
 
 
 class Adapter:
@@ -170,7 +187,7 @@ def _host(**kwargs: Any) -> ChannelGenerationHost:
     return ChannelGenerationHost(**kwargs)
 
 
-class _FakeSnapshotLease:
+class _FakeSnapshotLease(RuntimeSnapshotLease):
     def __init__(
         self,
         snapshot: Any,
@@ -178,9 +195,13 @@ class _FakeSnapshotLease:
         release_gate: asyncio.Event | None = None,
     ) -> None:
         self.snapshot = snapshot
-        self.active = True
+        self._active = True
         self.release_gate = release_gate
         self.forks: list[_FakeSnapshotLease] = []
+
+    @property
+    def active(self) -> bool:
+        return self._active
 
     def fork(self) -> _FakeSnapshotLease:
         if not self.active:
@@ -197,7 +218,7 @@ class _FakeSnapshotLease:
             return
         if self.release_gate is not None:
             await self.release_gate.wait()
-        self.active = False
+        self._active = False
 
 
 def _attachment_ref() -> AttachmentRef:
@@ -351,7 +372,9 @@ async def _make_snapshot(
             return SimpleNamespace()
 
     channel_names = tuple(getattr(module, "channel_names", ("feishu",)))
-    config_projection = {"app_secret": CredentialRef(("app_secret",))}
+    config_projection: dict[str, object] = {
+        "app_secret": CredentialRef(("app_secret",))
+    }
     for channel_name in channel_names:
         await channels.register(
             cast(Any, Context()),

@@ -77,7 +77,10 @@ class _Runtime:
         list_active_devices = getattr(self.storage, "list_active_devices", None)
         if not callable(list_active_devices):
             return 1
-        return len(list_active_devices())
+        active_devices = list_active_devices()
+        if not isinstance(active_devices, tuple):
+            raise TypeError("list_active_devices 必须返回 tuple")
+        return len(active_devices)
 
     async def publish_event(self, **event: object) -> int:
         self.events.append(dict(event))

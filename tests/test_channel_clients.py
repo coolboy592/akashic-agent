@@ -10,7 +10,7 @@ from concurrent.futures import Future
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any, Mapping, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
@@ -27,8 +27,11 @@ from bus.events_lifecycle import (
 from infra.channels.contract import ChannelContext
 from agent.plugin_composition import (
     AttachmentKind,
+    AttachmentReadLease,
     AttachmentRef,
     ChannelFactoryContext,
+    CredentialRef,
+    ProviderClient,
     RawInbound,
 )
 from agent.plugin_composition.channels import ChannelRuntimePorts
@@ -136,8 +139,27 @@ class _V3AttachmentImport:
         )
 
 
+class _UnusedProviderClient:
+    def credential(self, ref: CredentialRef) -> str:
+        raise AssertionError(f"unexpected credential lookup: {ref.path}")
+
+    async def aclose(self) -> None:
+        return None
+
+
+class _UnusedProviderFactory:
+    async def create(
+        self,
+        credentials: Mapping[str, CredentialRef],
+    ) -> ProviderClient:
+        return _UnusedProviderClient()
+
+    async def aclose(self) -> None:
+        return None
+
+
 class _NoAttachmentRead:
-    async def acquire(self, _ref: AttachmentRef) -> object:
+    async def acquire(self, ref: AttachmentRef) -> AttachmentReadLease:
         raise AssertionError("本测试不通过 native adapter 读取 outbound attachment")
 
 
@@ -152,7 +174,7 @@ async def _attach_native_v3_runtime(channel: object, *, binding_token: str):
         binding_token=binding_token,
         config={},
         credentials={},
-        provider_client_factory=SimpleNamespace(),
+        provider_client_factory=_UnusedProviderFactory(),
         ingress=ingress,
         identity=None,
         attachment_import=attachment_import,

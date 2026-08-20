@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from dataclasses import fields
 from pathlib import Path
 
 import pytest
@@ -45,8 +46,13 @@ def test_ast_mobile_contract_covers_all_sources() -> None:
         )
         assert evidence["status"] == "passed", evidence
         namespace = evidence["namespace"]
-        assert namespace["inject"].count("UI_SLOTS") == 1
-        assert namespace["apply_signature"] == "apply(ctx, config)"
+        assert isinstance(namespace, dict)
+        inject = namespace["inject"]
+        apply_signature = namespace["apply_signature"]
+        assert isinstance(inject, list)
+        assert isinstance(apply_signature, str)
+        assert inject.count("UI_SLOTS") == 1
+        assert apply_signature == "apply(ctx, config)"
 
 
 def test_assets_and_core_runner_pass_for_in_tree_akasha() -> None:
@@ -54,8 +60,12 @@ def test_assets_and_core_runner_pass_for_in_tree_akasha() -> None:
     root = gate.ROOT / contract.path
 
     assets = gate._asset_evidence(root, contract)
-    assert assets["module"]["sha256"]
-    assert assets["stylesheet"]["sha256"]
+    module = assets["module"]
+    stylesheet = assets["stylesheet"]
+    assert isinstance(module, dict)
+    assert isinstance(stylesheet, dict)
+    assert module["sha256"]
+    assert stylesheet["sha256"]
     runner = (
         "node",
         str(gate.UI_CONTRACT_RUNNER),
@@ -95,7 +105,9 @@ def test_static_contract_rejects_missing_ui_registration(tmp_path: Path) -> None
     evidence = gate._inspect_static_source(contract, root, entrypoint)
 
     assert evidence["status"] == "failed"
-    assert any("register_mobile" in error for error in evidence["errors"])
+    errors = evidence["errors"]
+    assert isinstance(errors, list)
+    assert any("register_mobile" in error for error in errors if isinstance(error, str))
 
 
 def test_python_contract_runner_is_external_process() -> None:
@@ -120,5 +132,5 @@ def test_offline_source_resolution_reports_every_missing_external() -> None:
     assert len(errors) == len(gate.EXTERNAL_PLUGIN_IDS)
 
 
-def asdict_keys(item: object) -> set[str]:
-    return set(item.__dataclass_fields__)  # type: ignore[attr-defined]
+def asdict_keys(item: gate.PluginContract) -> set[str]:
+    return {field.name for field in fields(item)}

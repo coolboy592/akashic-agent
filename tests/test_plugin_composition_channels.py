@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -51,6 +52,7 @@ from agent.plugin_composition.channels import (
     _registry_identity,
     channel_config_revision,
 )
+from agent.plugins.channel_generation_host import ChannelBindingLease
 
 
 def _runtime(plugin_id: str, root: Path, *, generation: str = "plugin-generation") -> PluginRuntime:
@@ -106,22 +108,43 @@ def _attachment(
     )
 
 
-class _Lease:
+class _Lease(ChannelBindingLease):
     snapshot_lease = object()
-    snapshot_id = "snapshot"
-    generation_id = "generation"
-    channel_name = "feishu"
-    binding_token = "binding"
 
     def __init__(self) -> None:
         self.close_calls = 0
         self.started = asyncio.Event()
         self.release = asyncio.Event()
 
+    @property
+    def snapshot_id(self) -> str:
+        return "snapshot"
+
+    @property
+    def generation_id(self) -> str:
+        return "generation"
+
+    @property
+    def channel_name(self) -> str:
+        return "feishu"
+
+    @property
+    def binding_token(self) -> str:
+        return "binding"
+
+    @property
+    def active(self) -> bool:
+        return self.close_calls == 0
+
     async def aclose(self) -> None:
         self.close_calls += 1
         self.started.set()
         await self.release.wait()
+
+
+class _Ingress:
+    async def admit(self, raw: RawInbound) -> bool:
+        return True
 
 
 def _inbound_envelope(lease: _Lease | None = None) -> InboundEnvelope:
@@ -132,7 +155,7 @@ def _inbound_envelope(lease: _Lease | None = None) -> InboundEnvelope:
         chat_id="chat",
         content="hello",
         timestamp=datetime.now(timezone.utc),
-        metadata={"nested": {"items": [1, "two"]}},
+        metadata=json.loads('{"nested": {"items": [1, "two"]}}'),
     )
     return InboundEnvelope(
         message_id="provider-message",
@@ -381,7 +404,7 @@ def test_channel_factory_context_freezes_config_and_credential_refs() -> None:
         config=raw,
         credentials={"token": CredentialRef(("token",))},
         provider_client_factory=ProviderFactory(),
-        ingress=SimpleNamespace(admit=AsyncMock()),
+        ingress=_Ingress(),
         identity=None,
     )
 
@@ -398,7 +421,7 @@ def test_channel_factory_context_freezes_config_and_credential_refs() -> None:
             config={},
             credentials={"token": CredentialRef(("other",))},
             provider_client_factory=ProviderFactory(),
-            ingress=SimpleNamespace(admit=AsyncMock()),
+            ingress=_Ingress(),
             identity=None,
         )
 
@@ -596,7 +619,7 @@ def test_attachment_ports_are_exported_and_factory_context_validates_them() -> N
 
 
 def test_c14c_metadata_is_recursively_frozen_and_rejects_unsafe_values() -> None:
-    metadata = {"nested": {"items": [1, "two"]}}
+    metadata = json.loads('{"nested": {"items": [1, "two"]}}')
     message = ChannelInboundMessage(
         channel="feishu",
         sender="sender",
