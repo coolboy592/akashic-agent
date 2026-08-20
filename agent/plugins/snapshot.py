@@ -101,11 +101,6 @@ class RuntimeSnapshot:
         default=None,
         repr=False,
     )
-    # 正式恢复可用已封存的 stable Root 验证替换载荷。
-    composition_health_exempt_root_token: object | None = field(
-        default=None,
-        repr=False,
-    )
     state: SnapshotState = "compiled"
     lease_count: int = 0
     accepting_leases: bool = True
@@ -1516,13 +1511,6 @@ class RuntimeSnapshotStore:
         if topology is None:
             raise RuntimeError("RuntimeSnapshot composition Root 缺少 TopologyView")
         receipt = root.receipt()
-        validated_reused_stable_root = (
-            snapshot.composition_validation_identity is not None
-            and snapshot.composition_validation_root_token is not None
-            and snapshot.composition_validation_root_token is not root.instance_token
-            and snapshot.composition_health_exempt_root_token
-            is root.instance_token
-        )
         if receipt.incident_overflowed or receipt.external_effects:
             raise RuntimeError(
                 "RuntimeSnapshot 插件组合拓扑未就绪: "
@@ -1531,7 +1519,7 @@ class RuntimeSnapshotStore:
                 f"incident_overflowed={receipt.incident_overflowed}, "
                 f"external_effects={receipt.external_effects}"
             )
-        if not receipt.ready and not validated_reused_stable_root:
+        if not receipt.ready:
             raise RuntimeError(
                 "RuntimeSnapshot 插件组合拓扑未就绪: "
                 f"required_pending={receipt.required_pending}, "

@@ -18,7 +18,6 @@ from agent.plugins.artifacts import ArtifactPointer, write_pointers
 from agent.plugins.dashboard_host import DashboardBinding, PluginDashboardHost
 from agent.plugins.manager import PluginManager
 from agent.plugins.manifest import write_plugin_manifest
-from agent.plugins.registry import plugin_registry
 from agent.plugins.snapshot import bind_runtime_snapshot, reset_runtime_snapshot
 from agent.tool_hooks.executor import ToolExecutor
 from agent.tool_hooks.types import ToolExecutionRequest, ToolExecutionResult, ToolSource
@@ -27,13 +26,6 @@ from bus.event_bus import EventBus
 from plugins.default_memory.dashboard import RecallInspectorDashboardReader
 from plugins.default_memory import plugin as default_memory_plugin
 from plugins.default_memory.plugin import DefaultMemoryInspector
-
-
-@pytest.fixture(autouse=True)
-def _clean_plugin_registry():
-    plugin_registry._instances.clear()
-    yield
-    plugin_registry._instances.clear()
 
 
 def _default_memory_manager(tmp_path: Path, *, memory_name: str) -> PluginManager:

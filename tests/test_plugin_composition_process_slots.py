@@ -16,16 +16,8 @@ from agent.plugin_composition.process_slots import (
     _freeze_plugin_managed_processes,
 )
 from agent.plugins.manager import PluginManager
-from agent.plugins.registry import plugin_registry
 from agent.plugins.snapshot import RuntimeSnapshot
 from bus.event_bus import EventBus
-
-
-@pytest.fixture(autouse=True)
-def _clean_registry():
-    plugin_registry._instances.clear()
-    yield
-    plugin_registry._instances.clear()
 
 
 def _plugin_dir(root: Path, name: str = "calendar") -> Path:

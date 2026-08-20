@@ -6,15 +6,7 @@ import pytest
 
 from agent.config import Config
 from agent.plugins.manager import PluginManager
-from agent.plugins.registry import plugin_registry
 from bus.event_bus import EventBus
-
-
-@pytest.fixture(autouse=True)
-def _clean_registry():
-    plugin_registry._instances.clear()
-    yield
-    plugin_registry._instances.clear()
 
 
 def _write_typed_plugin(root: Path) -> None:

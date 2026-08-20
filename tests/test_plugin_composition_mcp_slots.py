@@ -24,18 +24,10 @@ from agent.plugin_composition.mcp_slots import (
 from agent.plugins.manager import PluginManager
 from agent.plugins.artifacts import ArtifactPointer, read_pointers, write_pointers
 from agent.plugins.manifest import write_plugin_manifest
-from agent.plugins.registry import plugin_registry
 from agent.plugins.snapshot import RuntimeSnapshot
 from agent.tools.registry import ToolRegistry
 from bus.event_bus import EventBus
 from utils.process_group import OwnedProcessGroup
-
-
-@pytest.fixture(autouse=True)
-def _clean_registry():
-    plugin_registry._instances.clear()
-    yield
-    plugin_registry._instances.clear()
 
 
 def _runtime(plugin_dir: Path) -> PluginRuntime:

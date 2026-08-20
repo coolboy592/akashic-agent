@@ -29,7 +29,6 @@ from agent.plugin_composition import (
     PluginRuntime,
 )
 from agent.plugins.manager import PluginManager
-from agent.plugins.registry import plugin_registry
 from agent.plugins.snapshot import (
     RuntimeSnapshotCompiler,
     bind_runtime_snapshot,
@@ -43,13 +42,6 @@ from bus.events import InboundMessage, TurnDisposition
 from bus.queue import MessageBus
 from tests.memory_fakes import FakeMemoryEngine
 from tests.provider_fakes import ProviderContextBudgetStub
-
-
-@pytest.fixture(autouse=True)
-def _clean_registry():
-    plugin_registry._instances.clear()
-    yield
-    plugin_registry._instances.clear()
 
 
 def _write_plugin(root: Path, name: str, source: str) -> Path:

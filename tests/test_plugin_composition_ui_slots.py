@@ -21,15 +21,7 @@ from agent.plugins.mobile_ui import (
     MobileUiPluginUnavailable,
     PluginMobileUiProvider,
 )
-from agent.plugins.registry import plugin_registry
 from bus.event_bus import EventBus
-
-
-@pytest.fixture(autouse=True)
-def _clean_registry():
-    plugin_registry._instances.clear()
-    yield
-    plugin_registry._instances.clear()
 
 
 def _runtime(plugin_dir: Path) -> PluginRuntime:

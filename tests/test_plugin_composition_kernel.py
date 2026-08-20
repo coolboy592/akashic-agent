@@ -786,7 +786,7 @@ async def test_rebuilt_formal_root_health_is_rechecked_after_candidate_seal() ->
 
 
 @pytest.mark.asyncio
-async def test_reused_stable_health_exemption_never_allows_external_effects() -> None:
+async def test_reused_stable_root_must_still_be_ready() -> None:
     compiler = RuntimeSnapshotCompiler()
     validation_root = CompositionRoot("validation-root")
     _ = await validation_root.mount(lambda _: None, name="plugin")
@@ -797,20 +797,21 @@ async def test_reused_stable_health_exemption_never_allows_external_effects() ->
     store.pause_candidate_admission(candidate)
     store.seal_candidate_validation(candidate)
 
-    stable_audit = CompositionAudit()
-    reused_stable_root = CompositionRoot("reused-stable", audit=stable_audit)
-    _ = await reused_stable_root.mount(lambda _: None, name="plugin")
-    reused_snapshot = compiler.compile({}, composition_root=reused_stable_root)
+    reused_stable_root = CompositionRoot("reused-stable")
+    _ = await reused_stable_root.mount(
+        lambda _: None,
+        name="missing-consumer",
+        inject=(GREETING,),
+    )
+    reused_snapshot = compiler.compile(
+        {},
+        composition_root=reused_stable_root,
+        require_composition_ready=False,
+    )
     candidate.composition_root = reused_stable_root
     candidate.composition_topology = reused_snapshot.composition_topology
-    candidate.composition_health_exempt_root_token = reused_stable_root.instance_token
-    stable_audit.record_external(
-        kind="http",
-        target="https://example.invalid",
-        outcome="denied",
-    )
 
-    with pytest.raises(RuntimeError, match="external_effects"):
+    with pytest.raises(RuntimeError, match="required_pending"):
         await store.promote_latest()
 
     _ = await store.discard_latest(candidate)

@@ -94,7 +94,6 @@ from agent.plugins.packages import (
 )
 from infra.channels.base import SessionIdentityIndex
 from infra.channels.artifacts import ChannelAttachmentArtifactStore
-from agent.plugins.registry import plugin_registry
 from agent.plugins.artifacts import (
     ArtifactPointer,
     ArtifactSelector,
@@ -2096,10 +2095,7 @@ class PluginManager:
         stable_alias = self._stable_aliases.get(generation.module_path)
         if stable_alias is not None and not preserve_stable_alias:
             _ = self._stable_aliases.pop(generation.module_path, None)
-            if plugin_registry.get_instance(stable_alias) is generation.instance:
-                self._remove_module_tree(stable_alias)
-            else:
-                self._fresh_importer.unregister(stable_alias)
+            self._remove_module_tree(stable_alias)
         generation.state = state
         if externally_cancelled:
             raise asyncio.CancelledError
@@ -3418,7 +3414,6 @@ class PluginManager:
         generation.data_dir = production_data_dir
         replacement = await self._compile_generation_snapshot(
             generation,
-            allow_unready_stable_composition=True,
         )
         if replacement.snapshot_id != ready.snapshot.snapshot_id:
             await self._dispose_unreferenced_composition_root(replacement)
@@ -4108,7 +4103,6 @@ class PluginManager:
         try:
             production_snapshot = await self._compile_generation_snapshot(
                 generation,
-                allow_unready_stable_composition=True,
             )
             if production_snapshot.snapshot_id != validation_snapshot.snapshot_id:
                 await self._dispose_unreferenced_composition_root(production_snapshot)
@@ -4180,7 +4174,6 @@ class PluginManager:
         # 先完成可能失败的查找，再替换 stable import alias。
         self._remove_module_tree(stable_alias)
         self._fresh_importer.register(stable_alias, plugin_dir)
-        plugin_registry.register_instance(stable_alias, generation.instance)
         sys.modules[stable_alias] = published_module
         if previous is not None:
             _ = self._stable_aliases.pop(previous.module_path, None)
@@ -4812,7 +4805,6 @@ class PluginManager:
             created_activation_data_dir = not data_dir.exists()
             ensure_workspace_plugin_data_dir(data_dir, self._workspace)
         scope = PluginScope(plugin_id)
-        plugin_registry.register_instance(mp, instance)
         generation: PluginGeneration | None = None
 
         async def rollback_load(error: str) -> None:
@@ -5041,7 +5033,6 @@ class PluginManager:
         self._stable_aliases[mp] = stable_module_path
         self._remove_module_tree(stable_module_path)
         self._fresh_importer.register(stable_module_path, plugin_dir)
-        plugin_registry.register_instance(stable_module_path, instance)
         sys.modules[stable_module_path] = sys.modules[mp]
         assert generation.runtime_snapshot is not None
         await self._publish_committed_snapshot(generation.runtime_snapshot)
@@ -5054,7 +5045,6 @@ class PluginManager:
         *,
         allow_pending_composition: bool = False,
         candidate_owner: PluginGeneration | None = None,
-        allow_unready_stable_composition: bool = False,
     ) -> RuntimeSnapshot:
         generations = dict(self._active_generations)
         generations[generation.plugin_id] = generation
@@ -5072,14 +5062,6 @@ class PluginManager:
                     else composition_root.instance_token
                 ),
             )
-            current = self.current_snapshot
-            # 正式恢复可复用已封存的 stable Root 载荷。
-            reuses_stable_root = (
-                allow_unready_stable_composition
-                and candidate_owner is None
-                and current is not None
-                and composition_root is current.composition_root
-            )
             snapshot = self._snapshot_compiler.compile(
                 generations,
                 catalog_generation=generation,
@@ -5087,13 +5069,9 @@ class PluginManager:
                 composition_root=composition_root,
                 private_proactive_catalog=private_proactive_catalog,
                 core_channel_definitions=self._core_channel_definitions,
-                require_composition_ready=not reuses_stable_root,
+                require_composition_ready=True,
             )
             _validate_static_manifest_runtime(snapshot, generations)
-            if reuses_stable_root and composition_root is not None:
-                snapshot.composition_health_exempt_root_token = (
-                    composition_root.instance_token
-                )
             snapshot.tool_registry = self._compile_snapshot_tools(
                 generations,
                 self._active_workspace_mcp,
@@ -5510,7 +5488,6 @@ class PluginManager:
                 cast(type[BaseModel] | None, clone.ConfigModel),
             )
             clone.bind_static_services(self._composition_service_view())
-            plugin_registry.register_instance(module_path, clone)
             return clone, module_path, data_dir, config
         except BaseException:
             self._remove_module_tree(module_path)
@@ -6169,7 +6146,6 @@ class PluginManager:
 
     def _remove_module_tree(self, module_name: str) -> None:
         self._fresh_importer.unregister(module_name)
-        plugin_registry.remove_module_tree(module_name)
         for imported_name in tuple(sys.modules):
             if imported_name == module_name or imported_name.startswith(
                 f"{module_name}."
@@ -6240,7 +6216,6 @@ class PluginManager:
         # 3. 逐插件关闭 generation scope 并消费全部 cleanup failures。
         for mp in list(self._loaded):
             active_info = self._active_plugins.get(mp)
-            instance = plugin_registry.get_instance(mp)
             scope = self._scopes.pop(mp, None)
             if scope is not None:
                 generation = (
@@ -6256,11 +6231,7 @@ class PluginManager:
             self._remove_module_tree(mp)
             stable_alias = self._stable_aliases.pop(mp, None)
             if stable_alias is not None:
-                active_alias = plugin_registry.get_instance(stable_alias)
-                if active_alias is instance:
-                    self._remove_module_tree(stable_alias)
-                else:
-                    self._fresh_importer.unregister(stable_alias)
+                self._remove_module_tree(stable_alias)
             if active_info is not None:
                 generation = self._active_generations.get(active_info.plugin_id)
                 if generation is not None and generation.module_path == mp:
@@ -6896,7 +6867,6 @@ def _replace_snapshot_payload(
         "composition_root",
         "composition_topology",
         "composition_active_plugin_ids",
-        "composition_health_exempt_root_token",
     ):
         setattr(target, name, getattr(source, name))
 

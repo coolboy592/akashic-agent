@@ -35,7 +35,6 @@ from agent.plugins.generation_activity_host import ActivityHost
 from agent.plugins.manager import PluginManager
 from agent.plugins.manifest import write_plugin_manifest
 from agent.plugins.private_proactive import PrivateProactiveCatalog
-from agent.plugins.registry import plugin_registry
 from agent.plugins.snapshot import (
     RuntimeSnapshotCompiler,
     RuntimeSnapshotStore,
@@ -48,13 +47,6 @@ from bus.event_bus import EventBus
 from bus.queue import MessageBus
 from infra.channels.artifacts import ChannelAttachmentArtifactStore
 from session.store import SessionStore
-
-
-@pytest.fixture(autouse=True)
-def _clean_registry():
-    plugin_registry._instances.clear()
-    yield
-    plugin_registry._instances.clear()
 
 
 def _write_plugin(root: Path, name: str, source: str) -> Path:
@@ -2453,7 +2445,6 @@ async def test_cancelled_candidate_mount_cleans_partial_clones_and_data(
         if "__candidate_" in module_name
     }
     assert len(clone_modules) == 2
-    assert all(plugin_registry.get_instance(name) is not None for name in clone_modules)
 
     preparing.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -2463,7 +2454,6 @@ async def test_cancelled_candidate_mount_cleans_partial_clones_and_data(
     assert manager.current_snapshot.composition_root is stable_root
     assert manager.prepared_generation("a_first") is None
     assert clone_modules.isdisjoint(sys.modules)
-    assert all(plugin_registry.get_instance(name) is None for name in clone_modules)
     assert not attempt_root.exists()
     assert not validation_base.exists() or not any(validation_base.iterdir())
 

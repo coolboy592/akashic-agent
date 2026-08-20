@@ -25,7 +25,6 @@ from agent.plugins.generation_private_proactive_host import (
 from agent.plugins.artifacts import ArtifactPointer, write_pointers
 from agent.plugins.manager import PluginManager
 from agent.plugins.manifest import write_package_manifest
-from agent.plugins.registry import plugin_registry
 from agent.plugins.scope import PluginScope
 from bus.event_bus import EventBus
 
@@ -34,13 +33,11 @@ TEST_PLUGIN_HOME = Path(tempfile.gettempdir()) / f"akasic-plugin-tests-{os.getpi
 
 
 @pytest.fixture(autouse=True)
-def _clean_registry():
-    """Clear the v3 instance registry and isolated plugin home around each test."""
+def _clean_plugin_home():
+    """Clear the isolated plugin home around each test."""
 
-    plugin_registry._instances.clear()
     shutil.rmtree(TEST_PLUGIN_HOME, ignore_errors=True)
     yield
-    plugin_registry._instances.clear()
     shutil.rmtree(TEST_PLUGIN_HOME, ignore_errors=True)
 
 
@@ -544,9 +541,7 @@ async def test_plugin_manager_scope_cleans_v3_resources(tmp_path: Path):
     )
 
     await manager.load_all()
-    instance = plugin_registry.get_instance("akasic_plugin_plugins_scoped")
-    assert instance is not None
-    module = instance.module  # type: ignore[union-attr]
+    module = sys.modules["akasic_plugin_plugins_scoped"]
     assert module.task is not None
     assert not module.task.done()
 

@@ -39,17 +39,6 @@ from bootstrap.dashboard_api import create_dashboard_app
 from bus.event_bus import EventBus
 
 
-@pytest.fixture(autouse=True)
-def _clean_registry():
-    # v3 registry is only an import/generation projection and must not leak
-    # between tests.
-    from agent.plugins.registry import plugin_registry
-
-    plugin_registry._instances.clear()
-    yield
-    plugin_registry._instances.clear()
-
-
 def _v3_source(
     name: str,
     *,
