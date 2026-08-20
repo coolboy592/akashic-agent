@@ -72,7 +72,7 @@ def test_gate_pins_protocol_source_and_version() -> None:
         "https://github.com/kachofugetsu09/akashic-agent.git"
     )
     assert gate.PROTOCOL_SOURCE_COMMIT == (
-        "a29cd6fc57acd95538e299f100f6d4b8ba7f65c7"
+        "0940e9e74a62efef54470f11a7064a99ca5e9acc"
     )
     evidence = gate._protocol_source_evidence()
     assert evidence["commit"] == gate.PROTOCOL_SOURCE_COMMIT

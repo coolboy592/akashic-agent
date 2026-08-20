@@ -38,7 +38,7 @@ DEFAULT_REPORT = (
 COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}")
 GATE_VERSION = 1
 PROTOCOL_SOURCE_REPOSITORY = "https://github.com/kachofugetsu09/akashic-agent.git"
-PROTOCOL_SOURCE_COMMIT = "a29cd6fc57acd95538e299f100f6d4b8ba7f65c7"
+PROTOCOL_SOURCE_COMMIT = "0940e9e74a62efef54470f11a7064a99ca5e9acc"
 PROTOCOL_SOURCE_PATHS = (
     "agent/tools/events.py",
     "agent/tools/executor.py",
