@@ -27,7 +27,7 @@ from agent.plugin_composition.channels import (
 from bus.events import InboundMessage
 from bus.queue import MessageBus
 from session.manager import SessionManager
-from session.store import SessionStore
+from session.store import SessionAdmissionConflictError, SessionStore
 
 
 def _v3_outbound() -> tuple[OutboundEnvelope, SimpleNamespace]:
@@ -761,7 +761,9 @@ async def test_v3_channel_inbound_release_cancellation_clears_lane_before_return
 async def test_v3_channel_worker_preserves_exact_binding_through_terminal_delivery(
     tmp_path: Path,
 ) -> None:
-    store = SessionStore(tmp_path / "sessions.db")
+    manager = SessionManager(tmp_path)
+    manager.save(manager.get_or_create("feishu:chat-1"))
+    store = manager.control_store
     seen_request: list[TurnRequest] = []
 
     async def execute(request: TurnRequest) -> str:
@@ -795,7 +797,11 @@ async def test_v3_channel_worker_preserves_exact_binding_through_terminal_delive
     bus.bind_channel_outbound_dispatcher(dispatch)
     from bootstrap.passive_worker import PassiveMessageWorker
 
-    worker = PassiveMessageWorker(bus, runtime, cast(Any, object()))
+    worker = PassiveMessageWorker(
+        bus,
+        runtime,
+        cast(Any, SimpleNamespace(session_manager=manager)),
+    )
     worker_task = asyncio.create_task(worker.run())
     dispatch_task = asyncio.create_task(bus.dispatch_outbound())
     envelope, lease = _v3_inbound()
@@ -826,7 +832,70 @@ async def test_v3_channel_worker_preserves_exact_binding_through_terminal_delive
     await worker_task
     await dispatch_task
     await runtime.shutdown()
-    store.close()
+    manager.close()
+
+
+@pytest.mark.asyncio
+async def test_v3_channel_worker_holds_session_admission_until_terminal(
+    tmp_path: Path,
+) -> None:
+    manager = SessionManager(tmp_path)
+    manager.save(manager.get_or_create("feishu:chat-1"))
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def execute(_request: TurnRequest) -> str:
+        started.set()
+        await release.wait()
+        return "done"
+
+    runtime = ConversationRuntime(manager.control_store, execute)
+    bus = MessageBus()
+
+    async def dispatch(
+        envelope: OutboundEnvelope,
+        _binding: object,
+    ) -> ChannelDeliveryReceipt:
+        return ChannelDeliveryReceipt(
+            envelope.delivery_id,
+            DeliveryStatus.DELIVERED,
+        )
+
+    bus.bind_channel_outbound_dispatcher(dispatch)
+    from bootstrap.passive_worker import PassiveMessageWorker
+
+    worker = PassiveMessageWorker(
+        bus,
+        runtime,
+        cast(Any, SimpleNamespace(session_manager=manager)),
+    )
+    worker_task = asyncio.create_task(worker.run())
+    dispatch_task = asyncio.create_task(bus.dispatch_outbound())
+    envelope, lease = _v3_inbound()
+
+    await bus.publish_channel_inbound(envelope)
+    await asyncio.wait_for(started.wait(), timeout=2)
+    with pytest.raises(SessionAdmissionConflictError, match="正在处理消息"):
+        manager.delete_session("feishu:chat-1")
+
+    release.set()
+    await asyncio.wait_for(lease.closed_event.wait(), timeout=2)
+    deleted = False
+    for _ in range(100):
+        try:
+            deleted = manager.delete_session("feishu:chat-1")
+        except SessionAdmissionConflictError:
+            await asyncio.sleep(0)
+            continue
+        break
+    assert deleted is True
+
+    worker.stop()
+    bus.stop()
+    await worker_task
+    await dispatch_task
+    await runtime.shutdown()
+    manager.close()
 
 
 @pytest.mark.asyncio
@@ -836,7 +905,9 @@ async def test_v3_channel_worker_projects_and_closes_attachment_lease(
     from bootstrap.passive_worker import PassiveMessageWorker
     from infra.channels.artifacts import ChannelAttachmentArtifactStore
 
-    store = SessionStore(tmp_path / "sessions.db")
+    manager = SessionManager(tmp_path)
+    manager.save(manager.get_or_create("feishu:chat-1"))
+    store = manager.control_store
     attachment_store = ChannelAttachmentArtifactStore(
         workspace=tmp_path,
         session_store=store,
@@ -872,7 +943,7 @@ async def test_v3_channel_worker_projects_and_closes_attachment_lease(
     worker = PassiveMessageWorker(
         bus,
         runtime,
-        cast(Any, object()),
+        cast(Any, SimpleNamespace(session_manager=manager)),
         attachment_store=attachment_store,
     )
     worker_task = asyncio.create_task(worker.run())
@@ -892,14 +963,16 @@ async def test_v3_channel_worker_projects_and_closes_attachment_lease(
     await worker_task
     await dispatch_task
     await runtime.shutdown()
-    store.close()
+    manager.close()
 
 
 @pytest.mark.asyncio
 async def test_v3_channel_worker_cancel_closes_running_and_lane_queued_leases(
     tmp_path: Path,
 ) -> None:
-    store = SessionStore(tmp_path / "sessions.db")
+    manager = SessionManager(tmp_path)
+    manager.save(manager.get_or_create("feishu:chat-1"))
+    store = manager.control_store
     started = asyncio.Event()
     never = asyncio.Event()
 
@@ -923,7 +996,11 @@ async def test_v3_channel_worker_cancel_closes_running_and_lane_queued_leases(
     bus.bind_channel_outbound_dispatcher(dispatch)
     from bootstrap.passive_worker import PassiveMessageWorker
 
-    worker = PassiveMessageWorker(bus, runtime, cast(Any, object()))
+    worker = PassiveMessageWorker(
+        bus,
+        runtime,
+        cast(Any, SimpleNamespace(session_manager=manager)),
+    )
     worker_task = asyncio.create_task(worker.run())
     dispatch_task = asyncio.create_task(bus.dispatch_outbound())
     first, first_lease = _v3_inbound(message_id="message-1")
@@ -946,4 +1023,4 @@ async def test_v3_channel_worker_cancel_closes_running_and_lane_queued_leases(
     bus.stop()
     await dispatch_task
     await runtime.shutdown()
-    store.close()
+    manager.close()

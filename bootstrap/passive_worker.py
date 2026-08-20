@@ -233,9 +233,15 @@ class PassiveMessageWorker:
         # 1. Lane owns the accepted envelope until the runtime handle exists.
         envelope.handoff(InboundOwner.LANE, InboundOwner.LOOP)
         transferred = False
+        session_admission_id: str | None = None
         attachment_leases: tuple[_ModelAttachmentLease, ...] = ()
         try:
             message = envelope.message
+            _, session_admission_id = (
+                self._legacy_loop.session_manager.admit_existing(
+                    envelope.session_key
+                )
+            )
             attachment_leases = await self._acquire_attachment_refs(
                 message.attachments
             )
@@ -299,6 +305,7 @@ class PassiveMessageWorker:
                     envelope,
                     handle,
                     attachment_leases,
+                    session_admission_id,
                 ),
                 name=f"channel-passive-result:{handle.id}",
             )
@@ -317,15 +324,22 @@ class PassiveMessageWorker:
                 try:
                     await self._close_attachment_leases(attachment_leases)
                 finally:
-                    await self._bus.release_channel_inbound(
-                        envelope, InboundOwner.LOOP
-                    )
+                    try:
+                        if session_admission_id is not None:
+                            self._legacy_loop.session_manager.release_admission(
+                                session_admission_id
+                            )
+                    finally:
+                        await self._bus.release_channel_inbound(
+                            envelope, InboundOwner.LOOP
+                        )
 
     async def _finish_channel_envelope(
         self,
         envelope: InboundEnvelope,
         handle: TurnHandle,
         attachment_leases: tuple[_ModelAttachmentLease, ...],
+        session_admission_id: str,
     ) -> None:
         """Await the turn and settle one exact non-retryable provider delivery."""
 
@@ -392,7 +406,12 @@ class PassiveMessageWorker:
             try:
                 await self._close_attachment_leases(attachment_leases)
             finally:
-                await self._bus.complete_inbound(envelope)
+                try:
+                    await self._bus.complete_inbound(envelope)
+                finally:
+                    self._legacy_loop.session_manager.release_admission(
+                        session_admission_id
+                    )
 
     async def _drain_channel_lane_queues(self) -> None:
         """Close every v3 envelope still owned by a stopped lane."""
