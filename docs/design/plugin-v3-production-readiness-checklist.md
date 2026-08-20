@@ -178,7 +178,7 @@ Gate 报告。分支名、PR 号和浮动 ref 不能代替 commit。
 | Fitbit MCP | MCP、managed process、proactive source、mobile | C12/C13/C15/C17 | `CANDIDATE` | Core `78e50d4d` + plugin `f3fd6ee`；真实 formal monitor/MCP 与 candidate recording route 已验证只读 typed empty、写工具拒绝、exact Root 重建、敏感数据排除、显式 v2 数据迁移的进程内回滚与 Core 进程崩溃后重启恢复；40 个 Python、12 个面板测试、contract、Pyright、compileall、diff-check 与独立 review 通过，待 E2/E3 |
 | Steam MCP | Skill、MCP、proactive source | C09/C12/C15 | `CANDIDATE` | Core `78e50d4d` + plugin `2c492d7`；真实 stdio formal/candidate→promote、recording 零凭证/网络/DB、exact proactive catalog、显式 v2 数据迁移与 cleanup 已通过，待 E2/E3 |
 | QQBot | channel | C14 | `CANDIDATE` | plugin `d4bf1ed` 已完成 pure-v3 exact channel binding、provider identity、control、input-notify/preview/final 分离、附件 fail-closed、受限 media host 与取消后 UNKNOWN；36 个 QQ tests、Pyright/contract/compileall/diff-check 与独立复审通过。待 E3 recording adapter 与受控 QQ provider Gate |
-| Proactive Feedback | Dashboard、mobile、committed event observers | C02/C17 | `CANDIDATE` | plugin `41be8198` 已完成 pure-v3 committed input/outbox、candidate read/write 拒绝、ordered user IDs、重启重放与 session 公平轮转；30 个 Python、5 个 Node、Pyright/API v3 contract/compileall/diff-check 通过，主任务复核 3 个公平性/取消 oracle 通过。待 E1 exact lock 与进程崩溃 grouped Gate |
+| Proactive Feedback | Dashboard、mobile、committed event observers | C02/C17 | `CANDIDATE` | plugin `83d6eb7` 已完成 pure-v3 committed input/outbox、candidate read/write 拒绝、ordered user IDs、重启重放与 session 公平轮转，并物理移除最后一个 v2 固定查询方法名；30 个 Python、5 个 Node、Pyright/API v3 contract/compileall/diff-check 通过，主任务复核 3 个公平性/取消 oracle 通过。待 E1 exact lock 与进程崩溃 grouped Gate |
 | Huayue Skills | Skill roots | C09 | `CANDIDATE` | plugin `1171904`；pure-v3 module-level skill roots、contract 与 Pyright 已通过，待 E3 |
 
 ### 4.3 In-tree plugins 与保留族群
