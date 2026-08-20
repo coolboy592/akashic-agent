@@ -664,6 +664,30 @@ class ChannelPresentationPorts:
 
 
 @dataclass(frozen=True, slots=True)
+class ChannelRuntimePorts:
+    """Expose exact formal inbound ports without exposing the factory context."""
+
+    snapshot_id: str
+    generation_id: str
+    binding_token: str
+    ingress: ChannelIngressPort | None
+    identity: ChannelIdentityPort | None
+    attachment_import: ChannelAttachmentImportPort | None
+
+    def __post_init__(self) -> None:
+        _text(self.snapshot_id, "snapshot_id")
+        _text(self.generation_id, "generation_id")
+        _text(self.binding_token, "binding_token")
+        for name, value, method in (
+            ("ingress", self.ingress, "admit"),
+            ("identity", self.identity, "resolve"),
+            ("attachment_import", self.attachment_import, "import_bytes"),
+        ):
+            if value is not None and not callable(getattr(value, method, None)):
+                raise TypeError(f"channel runtime {name} 必须提供 {method}(...)")
+
+
+@dataclass(frozen=True, slots=True)
 class QueuedReceipt:
     """Represent queue admission separately from a settled delivery receipt."""
 
@@ -912,6 +936,16 @@ class ChannelAdapter(Protocol):
     async def deliver(self, request: ProviderDeliveryRequest) -> ProviderDeliveryReceipt: ...
 
     async def stop(self) -> StopReceipt: ...
+
+
+class ChannelRuntimeAdapter(ChannelAdapter, Protocol):
+    """Optional lifecycle seam for provider callbacks owned by a formal binding."""
+
+    def attach_runtime(self, ports: ChannelRuntimePorts) -> None: ...
+
+    def open_admission(self) -> None: ...
+
+    def close_admission(self) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)

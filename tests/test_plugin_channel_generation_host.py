@@ -107,6 +107,17 @@ class Adapter:
         self.release = asyncio.Event()
         self.stop_started = asyncio.Event()
         self.stop_release = asyncio.Event()
+        self.runtime_events: list[str] = []
+
+    def attach_runtime(self, ports: Any) -> None:
+        self.runtime_events.append("attach")
+        self.runtime_ports = ports
+
+    def open_admission(self) -> None:
+        self.runtime_events.append("open")
+
+    def close_admission(self) -> None:
+        self.runtime_events.append("close")
 
     async def start(self) -> ChannelReady:
         self.started += 1
@@ -437,6 +448,28 @@ async def test_formal_binding_starts_closed_and_delivers_after_open() -> None:
     receipt = await task
     assert receipt.delivery_id == "d1"
     await generation.stop()
+    assert factories["feishu"].closed == 1
+
+
+@pytest.mark.asyncio
+async def test_inbound_runtime_attaches_closed_then_opens_and_closes_before_drain() -> None:
+    snapshot, factories, adapters = await _make_snapshot(
+        capabilities=frozenset({ChannelCapability.INBOUND})
+    )
+    host = _host()
+    generation = await host.start(snapshot, factories)
+    adapter = adapters[next(iter(adapters))]
+    assert adapter.runtime_events == ["attach"]
+
+    binding = generation.channel("feishu")
+    assert not binding.admission_open
+    binding.open_admission()
+    assert adapter.runtime_events == ["attach", "open"]
+    binding.close_admission()
+    assert adapter.runtime_events == ["attach", "open", "close"]
+
+    await generation.stop()
+    assert adapter.runtime_events == ["attach", "open", "close"]
     assert factories["feishu"].closed == 1
 
 

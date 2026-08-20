@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
@@ -12,8 +14,10 @@ from agent.plugin_composition.channels import (
     AttachmentKind,
     AttachmentRef,
     ChannelFactoryContext,
+    ChannelRuntimePorts,
     ChannelReady,
     DeliveryStatus,
+    RawInbound,
     ProviderDeliveryRequest,
 )
 
@@ -63,6 +67,9 @@ class _ReadPort:
 def _context(
     binding_token: str,
     read_port: _ReadPort,
+    *,
+    ingress: object | None = None,
+    attachment_import: object | None = None,
 ) -> ChannelFactoryContext:
     return ChannelFactoryContext(
         snapshot_id="snapshot-1",
@@ -71,9 +78,56 @@ def _context(
         config={},
         credentials={},
         provider_client_factory=_ProviderFactory(),
-        ingress=None,
+        ingress=ingress,
         identity=None,
+        attachment_import=attachment_import,
         attachment_read=read_port,
+    )
+
+
+class _Ingress:
+    def __init__(self) -> None:
+        self.messages: list[RawInbound] = []
+
+    async def admit(self, raw: RawInbound) -> bool:
+        self.messages.append(raw)
+        return True
+
+
+class _ImportPort:
+    def __init__(self) -> None:
+        self.calls: list[tuple[bytes, AttachmentKind, str | None, str | None]] = []
+        self._counter = 0
+
+    async def import_bytes(
+        self,
+        data: bytes,
+        *,
+        kind: AttachmentKind,
+        filename: str | None,
+        media_type: str | None,
+    ) -> AttachmentRef:
+        self.calls.append((data, kind, filename, media_type))
+        self._counter += 1
+        return _ref(
+            f"inbound-{self._counter}",
+            kind,
+            filename or f"inbound-{self._counter}",
+            media_type or "application/octet-stream",
+            data,
+        )
+
+
+def _runtime_context(
+    binding_token: str,
+    ingress: _Ingress,
+    attachment_import: _ImportPort,
+) -> ChannelFactoryContext:
+    return _context(
+        binding_token,
+        _ReadPort({}, []),
+        ingress=ingress,
+        attachment_import=attachment_import,
     )
 
 
@@ -336,3 +390,236 @@ async def test_qq_v3_adapter_rejects_invalid_recipient_before_provider(
         )
     )
     assert receipt.status is DeliveryStatus.REJECTED
+
+
+@pytest.mark.asyncio
+async def test_telegram_v3_inbound_waits_for_open_and_imports_reply_media(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    mod = _import_telegram_channel(monkeypatch)
+    channel = mod.TelegramChannel("token", _Bus(), _SessionManager(tmp_path))
+    ingress = _Ingress()
+    attachment_import = _ImportPort()
+    context = _runtime_context("telegram-inbound", ingress, attachment_import)
+    adapter = channel.build_v3_adapter(context)
+    adapter.attach_runtime(
+        ChannelRuntimePorts(
+            snapshot_id=context.snapshot_id,
+            generation_id=context.generation_id,
+            binding_token=context.binding_token,
+            ingress=context.ingress,
+            identity=context.identity,
+            attachment_import=context.attachment_import,
+        )
+    )
+
+    reply = SimpleNamespace(
+        text="原消息",
+        caption="",
+        photo=[SimpleNamespace(file_id="reply-photo")],
+        document=SimpleNamespace(
+            file_id="reply-file", file_name="note.txt", mime_type="text/plain"
+        ),
+        from_user=SimpleNamespace(id=8, username="bob"),
+        message_id=8,
+    )
+    message = SimpleNamespace(
+        message_id=9,
+        text="你好",
+        caption="",
+        photo=None,
+        document=None,
+        reply_to_message=reply,
+        date=datetime(2026, 8, 20, tzinfo=timezone.utc),
+    )
+    update = SimpleNamespace(
+        effective_message=message,
+        effective_chat=SimpleNamespace(id=123),
+        effective_user=SimpleNamespace(id=7, username="alice"),
+    )
+
+    class _File:
+        def __init__(self, payload: bytes) -> None:
+            self.payload = payload
+
+        async def download_as_bytearray(self) -> bytearray:
+            return bytearray(self.payload)
+
+    channel._app.bot.get_file = AsyncMock(
+        side_effect=[_File(b"reply-image"), _File(b"reply-file")]
+    )
+    handler = asyncio.create_task(
+        channel._on_message(update, SimpleNamespace(bot=channel.bot))
+    )
+    await asyncio.sleep(0)
+    assert ingress.messages == []
+
+    adapter.open_admission()
+    await handler
+
+    assert len(ingress.messages) == 1
+    raw = ingress.messages[0]
+    assert raw.message_id == "9"
+    assert raw.provider_identity == "7"
+    assert raw.recipient == "123"
+    assert "原消息" in raw.message.content
+    assert "你好" in raw.message.content
+    assert [ref.kind for ref in raw.message.attachments] == [
+        AttachmentKind.IMAGE,
+        AttachmentKind.FILE,
+    ]
+    assert [call[0] for call in attachment_import.calls] == [
+        b"reply-image",
+        b"reply-file",
+    ]
+    adapter.close_admission()
+    assert (await adapter.stop()).resources_closed is True
+
+
+@pytest.mark.asyncio
+async def test_qq_v3_inbound_preserves_identity_and_imports_images(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    mod = _import_qq_channel(monkeypatch)
+
+    class _Response:
+        status_code = 200
+        headers = {"content-type": "image/png"}
+
+        async def aiter_bytes(self, *, chunk_size: int):
+            _ = chunk_size
+            yield b"qq-image"
+
+    from contextlib import asynccontextmanager
+
+    class _Requester:
+        @asynccontextmanager
+        async def stream(self, *_args: Any, **_kwargs: Any):
+            yield _Response()
+
+    channel = mod.QQChannel(
+        "42",
+        _Bus(),
+        _SessionManager(tmp_path),
+        http_requester=_Requester(),
+    )
+    ingress = _Ingress()
+    attachment_import = _ImportPort()
+    context = _runtime_context("qq-inbound", ingress, attachment_import)
+    adapter = channel.build_v3_adapter(context)
+    adapter.attach_runtime(
+        ChannelRuntimePorts(
+            snapshot_id=context.snapshot_id,
+            generation_id=context.generation_id,
+            binding_token=context.binding_token,
+            ingress=context.ingress,
+            identity=context.identity,
+            attachment_import=context.attachment_import,
+        )
+    )
+    event = SimpleNamespace(message_id="qq-77", time=1724140800)
+    pending = asyncio.create_task(
+        channel._handle_private(
+            "10001",
+            "hello",
+            ["http://qq.invalid/a.png"],
+            message_id="qq-77",
+            event=event,
+        )
+    )
+    await asyncio.sleep(0)
+    assert ingress.messages == []
+    adapter.open_admission()
+    await pending
+
+    assert len(ingress.messages) == 1
+    raw = ingress.messages[0]
+    assert raw.message_id == "qq-77"
+    assert raw.provider_identity == "10001"
+    assert raw.recipient == "10001"
+    assert raw.message.content == "hello"
+    assert raw.message.attachments[0].kind is AttachmentKind.IMAGE
+    assert attachment_import.calls[0][0] == b"qq-image"
+    adapter.close_admission()
+    assert (await adapter.stop()).resources_closed is True
+
+
+@pytest.mark.asyncio
+async def test_telegram_v3_inflight_callback_cannot_cross_binding_after_reload(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    mod = _import_telegram_channel(monkeypatch)
+    channel = mod.TelegramChannel("token", _Bus(), _SessionManager(tmp_path))
+    ingress_formal = _Ingress()
+    import_formal = _ImportPort()
+    formal = _runtime_context("telegram-formal", ingress_formal, import_formal)
+    adapter = channel.build_v3_adapter(formal)
+    adapter.attach_runtime(
+        ChannelRuntimePorts(
+            snapshot_id=formal.snapshot_id,
+            generation_id=formal.generation_id,
+            binding_token=formal.binding_token,
+            ingress=formal.ingress,
+            identity=formal.identity,
+            attachment_import=formal.attachment_import,
+        )
+    )
+    adapter.open_admission()
+
+    release_download = asyncio.Event()
+
+    class _File:
+        async def download_as_bytearray(self) -> bytearray:
+            await release_download.wait()
+            return bytearray(b"old-binding")
+
+    channel._app.bot.get_file = AsyncMock(return_value=_File())
+    message = SimpleNamespace(
+        message_id=21,
+        text="",
+        caption="photo",
+        photo=[SimpleNamespace(file_id="old-photo")],
+        document=None,
+        reply_to_message=None,
+        date=datetime.now(timezone.utc),
+    )
+    update = SimpleNamespace(
+        effective_message=message,
+        effective_chat=SimpleNamespace(id=321),
+        effective_user=SimpleNamespace(id=7, username="alice"),
+    )
+    old_callback = asyncio.create_task(
+        channel._on_photo(update, SimpleNamespace(bot=channel.bot))
+    )
+    await asyncio.sleep(0)
+
+    adapter.close_admission()
+    ingress_candidate = _Ingress()
+    import_candidate = _ImportPort()
+    candidate = _runtime_context(
+        "telegram-candidate", ingress_candidate, import_candidate
+    )
+    candidate_adapter = channel.build_v3_adapter(candidate)
+    candidate_adapter.attach_runtime(
+        ChannelRuntimePorts(
+            snapshot_id=candidate.snapshot_id,
+            generation_id=candidate.generation_id,
+            binding_token=candidate.binding_token,
+            ingress=candidate.ingress,
+            identity=candidate.identity,
+            attachment_import=candidate.attachment_import,
+        )
+    )
+    candidate_adapter.open_admission()
+    release_download.set()
+    with pytest.raises(RuntimeError, match="admission 已关闭"):
+        await old_callback
+    assert ingress_formal.messages == []
+    assert ingress_candidate.messages == []
+    assert import_formal.calls == []
+    assert import_candidate.calls == []
+    candidate_adapter.close_admission()
+    assert (await candidate_adapter.stop()).resources_closed is True

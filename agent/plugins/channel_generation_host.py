@@ -33,6 +33,7 @@ from agent.plugin_composition.channels import (
     ChannelPresentationPorts,
     ChannelReady,
     ChannelRegistrySnapshot,
+    ChannelRuntimePorts,
     CommittedChannelCatalog,
     CoreChannelDefinition,
     CredentialRef,
@@ -180,6 +181,7 @@ class _ChannelBindingState:
     stop_receipt: StopReceipt | None = None
     ready: ChannelReady | None = None
     internal_cancellation: str | None = None
+    runtime_attached: bool = False
     adapter_stop_settled: bool = False
     adapter_stop_succeeded: bool = False
     factory_close_settled: bool = False
@@ -1887,6 +1889,34 @@ class ChannelGenerationHost:
         state.adapter = cast(ChannelAdapter, adapter)
         self._start_counts[key] = self._start_counts.get(key, 0) + 1
         state.start_attempted = True
+        if ChannelCapability.INBOUND in state.capabilities:
+            attach_runtime = getattr(adapter, "attach_runtime", None)
+            open_admission = getattr(adapter, "open_admission", None)
+            close_admission = getattr(adapter, "close_admission", None)
+            if not all(
+                callable(item)
+                for item in (attach_runtime, open_admission, close_admission)
+            ):
+                raise TypeError(
+                    f"inbound channel adapter 缺少 runtime lifecycle: {state.channel_name}"
+                )
+            context = state.factory_context
+            if context is None:
+                raise RuntimeError("channel factory context 尚未保存")
+            attached = attach_runtime(
+                ChannelRuntimePorts(
+                    snapshot_id=context.snapshot_id,
+                    generation_id=context.generation_id,
+                    binding_token=context.binding_token,
+                    ingress=context.ingress,
+                    identity=context.identity,
+                    attachment_import=context.attachment_import,
+                )
+            )
+            if inspect.isawaitable(attached):
+                _close_awaitable(attached)
+                raise TypeError("channel adapter.attach_runtime 必须同步返回")
+            state.runtime_attached = True
         if (
             ChannelCapability.CONTROL in state.capabilities
             or ChannelCapability.TURN_STREAM in state.capabilities
@@ -1966,10 +1996,25 @@ class ChannelGenerationHost:
         if not state.started:
             raise RuntimeError("channel binding 尚未 start")
         state.admission_open = True
+        if state.runtime_attached and state.adapter is not None:
+            open_admission = getattr(state.adapter, "open_admission")
+            try:
+                open_admission()
+            except BaseException:
+                state.admission_open = False
+                raise
 
     def _close_admission(self, key: tuple[str, str]) -> None:
         state = self._binding(key)
+        was_open = state.admission_open
         state.admission_open = False
+        if not was_open:
+            return
+        try:
+            if state.runtime_attached and state.adapter is not None:
+                getattr(state.adapter, "close_admission")()
+        finally:
+            state.admission_open = False
 
     async def _drain(self, key: tuple[str, str]) -> None:
         state = self._binding(key)
@@ -2007,7 +2052,7 @@ class ChannelGenerationHost:
 
     async def _stop_binding(self, key: tuple[str, str]) -> StopReceipt:
         state = self._binding(key)
-        state.admission_open = False
+        self._close_admission(key)
         if state.stopped and state.stop_receipt is not None:
             return state.stop_receipt
         state.stopping = True
@@ -2132,7 +2177,7 @@ class ChannelGenerationHost:
             state = self._bindings.get(key)
             if state is None:
                 continue
-            state.admission_open = False
+            self._close_admission(key)
         await asyncio.gather(*(self._drain(key) for key in keys if key in self._bindings))
         await self._stop_keys(keys)
 
