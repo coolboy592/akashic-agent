@@ -18,15 +18,43 @@ sys.modules[_SPEC.name] = gate
 _SPEC.loader.exec_module(gate)
 
 
-def test_gate_scope_pins_exact_scenarios_and_explicit_webui_boundary() -> None:
+def test_gate_scope_pins_full_fleet_and_explicit_webui_boundary() -> None:
     assert gate.CHANNEL_PLUGIN_IDS == ("feishu", "qqbot")
     assert gate.PASSIVE_PLUGIN_IDS == ("citation", "meme")
-    assert gate.GATE_SCOPE["exact_plugins"] == (
+    assert gate.FLEET_EXTERNAL_PLUGIN_IDS == (
+        "setup_helper",
+        "status_commands",
+        "daynight_gate",
+        "emotion",
+        "calendar-mcp",
+        "feed-mcp",
+        "fitbit-mcp",
+        "steam-mcp",
+        "huayue-skills",
+        "github_watch",
+    )
+    assert gate.FLEET_LOCK_PLUGIN_IDS == (
+        *gate.FLEET_EXTERNAL_PLUGIN_IDS,
         "feishu",
         "qqbot",
-        "citation",
-        "meme",
     )
+    assert gate.PRIVATE_PROACTIVE_PLUGIN_IDS == (
+        "default_proactive",
+        "proactive_flow",
+        "drift_flow",
+        "wake_proactive",
+        "wake_proactive_flow",
+        "wake_drift_flow",
+    )
+    assert gate.GATE_SCOPE["exact_plugins"] == (
+        *gate.FLEET_LOCK_PLUGIN_IDS,
+        *gate.PRIVATE_PROACTIVE_PLUGIN_IDS,
+    )
+    assert gate.GATE_SCOPE["lock_plugins"] == gate.FLEET_LOCK_PLUGIN_IDS
+    assert gate.GATE_SCOPE["private_proactive_entries"] == (
+        *gate.PRIVATE_PROACTIVE_PLUGIN_IDS,
+    )
+    assert gate.GATE_SCOPE["legacy_passive_plugins"] == gate.PASSIVE_PLUGIN_IDS
     assert gate.GATE_SCOPE["provider"] == (
         "synthetic recording HTTP/WS adapter; no external delivery"
     )
@@ -37,8 +65,114 @@ def test_gate_scope_pins_exact_scenarios_and_explicit_webui_boundary() -> None:
         "channel",
         "message_push",
         "passive_webui",
+        "full_boot_catalog",
+        "candidate_lifecycle",
+        "proactive_fixed_clock",
+        "process_restart",
+        "private_default_wake",
+        "github_watch_controlled_remote",
     )
     assert len(gate._scenario_catalog_sha256()) == 64
+
+
+def test_fleet_lock_and_coverage_oracles_reject_missing_or_unexpected_ids() -> None:
+    class LockItem:
+        def __init__(self, plugin_id: str) -> None:
+            self.id = plugin_id
+
+    lock = [LockItem(plugin_id) for plugin_id in gate.FLEET_LOCK_PLUGIN_IDS]
+    assert gate._validate_fleet_lock(lock)["status"] == "complete"
+    try:
+        gate._validate_fleet_lock(lock[:-1])
+    except gate.GateFailure as error:
+        assert "missing" in str(error)
+    else:
+        raise AssertionError("缺失 fleet lock id 未被拒绝")
+
+    coverage = gate._fleet_coverage_contract(
+        active_external_ids=gate.FLEET_LOCK_PLUGIN_IDS,
+        active_private_ids=gate.PRIVATE_PROACTIVE_PLUGIN_IDS,
+    )
+    assert coverage["status"] == "complete"
+    assert coverage["families"]["default"] == [
+        "default_proactive",
+        "proactive_flow",
+        "drift_flow",
+    ]
+    try:
+        gate._fleet_coverage_contract(
+            active_external_ids=gate.FLEET_LOCK_PLUGIN_IDS[:-1],
+            active_private_ids=gate.PRIVATE_PROACTIVE_PLUGIN_IDS,
+        )
+    except gate.GateFailure as error:
+        assert "missing_external" in str(error)
+    else:
+        raise AssertionError("缺失 external fleet id 未被拒绝")
+
+
+def test_proactive_and_github_policy_oracles_are_explicit() -> None:
+    evidence = gate._proactive_coverage_oracle(gate.PROACTIVE_ORACLE_KINDS)
+    assert evidence["status"] == "complete"
+    assert evidence["required"] == [
+        "empty",
+        "skip",
+        "source",
+        "model",
+        "delivery",
+        "restart",
+    ]
+    try:
+        gate._proactive_coverage_oracle(("empty", "skip"))
+    except gate.GateFailure as error:
+        assert "model" in str(error)
+    else:
+        raise AssertionError("缺失 proactive outcome 未被拒绝")
+
+    blocked = gate._github_watch_policy(None)
+    assert blocked == {
+        "status": "blocked",
+        "reason": "no dedicated controlled GitHub remote configured",
+        "credentials_read": False,
+        "network_effects": 0,
+        "external_sends": 0,
+    }
+    controlled = gate._github_watch_policy("file:///tmp/e3-controlled-remote")
+    assert controlled["status"] == "controlled_remote"
+    assert controlled["credentials_read"] is False
+    try:
+        gate._github_watch_policy("recording://not-supported")
+    except gate.GateFailure as error:
+        assert "scheme" in str(error)
+    else:
+        raise AssertionError("未知 GitHub controlled remote scheme 未被拒绝")
+
+
+def test_runtime_evidence_mutant_missing_full_boot_is_blocked() -> None:
+    evidence = {
+        "lock": {"status": "complete"},
+        "full_boot_catalog": {"status": "complete"},
+        "candidate_lifecycle": {"status": "complete"},
+        "fleet_coverage": {"status": "complete"},
+        "proactive": {"status": "complete"},
+        "github_watch": {"status": "blocked"},
+    }
+    mutant = dict(evidence)
+    del mutant["full_boot_catalog"]
+    try:
+        gate._require_runtime_evidence(mutant)
+    except gate.GateBlocked as error:
+        assert "full_boot_catalog" in str(error)
+    else:
+        raise AssertionError("删除 full_boot_catalog runtime evidence 后仍允许通过")
+
+    blocked_proactive = dict(evidence)
+    blocked_proactive["proactive"] = {"status": "blocked"}
+    try:
+        gate._require_runtime_evidence(blocked_proactive)
+    except gate.GateBlocked as error:
+        assert "proactive" in str(error)
+    else:
+        raise AssertionError("blocked proactive runtime evidence 未阻断 Gate")
 
 
 def test_tree_digest_is_stable_for_missing_and_changes_with_content(
