@@ -174,10 +174,10 @@ Gate 报告。分支名、PR 号和浮动 ref 不能代替 commit。
 | Setup Helper | command | C11 | `CANDIDATE` | Core `78e50d4d` + plugin `65770db`；`/chatid` 与 `/myid` 走 committed registry，在 Session/模型 admission 前短路，installed candidate→formal 晋升与 Root/validation cleanup 已通过，待 E3 |
 | Status Commands | mobile、command、只读 Session projection | C11/C17/C24 | `CANDIDATE` | Core `cb2011b4` + plugin `eb245ad`；真实 Manager command/Mobile/ledger oracle 通过，待 E3 复制 workspace |
 | Feed MCP | Skill、MCP、proactive source | C09/C12/C15 | `CANDIDATE` | Core `78e50d4d` + plugin `29919dc`；在 `b4a8626` 行为迁移上补齐 SQLite 首次 WAL 并发初始化，真实 Manager/stdio、exact source lease、typed empty fetch、candidate data 排除、进程内回滚与进程崩溃后重启迁移均通过，待 E2/E3 |
-| Feishu | channel | C14 | `CANDIDATE` | plugin `fc2b4ba` 已完成 pure-v3 exact channel binding、credential redaction、provider identity、reply-aware inbound、control、preview/final 与 cleanup；多行/reply `/stop` P1 已闭合，25 个 Feishu/真实 Manager tests、Pyright/contract/compileall/diff-check 与独立复审通过，待 E3 recording adapter 与受控 Feishu provider Gate |
+| Feishu | channel | C14 | `CANDIDATE` | plugin `b693404` 已完成 pure-v3 exact channel binding、credential redaction、provider identity、reply-aware inbound、control、preview/final、受限 provider host、流式附件总量和 UNKNOWN cleanup；32 个 Feishu tests、Pyright/contract/compileall/diff-check 与独立复审通过，待 E3 recording adapter 与受控 Feishu provider Gate |
 | Fitbit MCP | MCP、managed process、proactive source、mobile | C12/C13/C15/C17 | `CANDIDATE` | Core `78e50d4d` + plugin `f3fd6ee`；真实 formal monitor/MCP 与 candidate recording route 已验证只读 typed empty、写工具拒绝、exact Root 重建、敏感数据排除、显式 v2 数据迁移的进程内回滚与 Core 进程崩溃后重启恢复；40 个 Python、12 个面板测试、contract、Pyright、compileall、diff-check 与独立 review 通过，待 E2/E3 |
 | Steam MCP | Skill、MCP、proactive source | C09/C12/C15 | `CANDIDATE` | Core `78e50d4d` + plugin `2c492d7`；真实 stdio formal/candidate→promote、recording 零凭证/网络/DB、exact proactive catalog、显式 v2 数据迁移与 cleanup 已通过，待 E2/E3 |
-| QQBot | channel | C14 | `CANDIDATE` | plugin `9c4fa62` 已完成 pure-v3 exact channel binding、provider identity、control、input-notify/preview/final 分离、附件 fail-closed 与三态外部效果；24 个 adapter 回归及真实 Manager stable→candidate discard→formal promote/terminate 共 25 tests、Pyright/contract/compileall/diff-check 通过。待 E3 recording adapter 与受控 QQ provider Gate |
+| QQBot | channel | C14 | `CANDIDATE` | plugin `d4bf1ed` 已完成 pure-v3 exact channel binding、provider identity、control、input-notify/preview/final 分离、附件 fail-closed、受限 media host 与取消后 UNKNOWN；36 个 QQ tests、Pyright/contract/compileall/diff-check 与独立复审通过。待 E3 recording adapter 与受控 QQ provider Gate |
 | Proactive Feedback | Dashboard、mobile、committed event observers | C02/C17 | `CANDIDATE` | plugin `41be8198` 已完成 pure-v3 committed input/outbox、candidate read/write 拒绝、ordered user IDs、重启重放与 session 公平轮转；30 个 Python、5 个 Node、Pyright/API v3 contract/compileall/diff-check 通过，主任务复核 3 个公平性/取消 oracle 通过。待 E1 exact lock 与进程崩溃 grouped Gate |
 | Huayue Skills | Skill roots | C09 | `CANDIDATE` | plugin `1171904`；pure-v3 module-level skill roots、contract 与 Pyright 已通过，待 E3 |
 
@@ -202,7 +202,7 @@ dedupe、ack、cursor、hazard 和原数据库协议。
 
 | 项目 | 状态 | 解除阻塞条件 |
 |---|---|---|
-| canonical source 与公开凭据审计 | `CANDIDATE` | canonical repo 已确认为 `kachofugetsu09/github-watch`，候选 `aea802c3dd37c25e8266bf720988b4661c267ca7`；tracked inventory 未发现 PEM/private key 或私有 artifact，待最终 fleet lock 固定 |
+| canonical source 与公开凭据审计 | `CANDIDATE` | canonical repo 已确认为 `kachofugetsu09/github-watch`，fleet exact head `7334ae5f7a8a7ad3642b4d42256de65cac8a7eec`；tracked inventory 未发现 PEM/private key 或私有 artifact，待最终 E3 固定报告 |
 | v3 迁移 | `CANDIDATE` | 纯 v3 `BACKGROUND_JOBS + TOOL_CATALOG + AFTER_TURN_COMMITTED`；candidate 不读 PEM/不建账本，formal invocation 才取得 programmatic Turn port 与插件数据 |
 | 行为 Gate | `CANDIDATE` | exact Core `00b13940` clean Gate 已证明初始/晋升后正式 job 各准入一个 Turn、candidate 零 external effect、Tool/listener/catalog 与 Root cleanup；待 E3 专用远端测试仓库的只读/受控写 probe |
 
@@ -268,8 +268,8 @@ E1～E3 使用一次性 workspace 和受控端点。E4 只能使用经过校验�
 ## 7. 多 Agent 分工规则
 
 - 主 agent 是本清单、Core capability 合同、集成分支和最终 Gate 的唯一 writer。
-- GitHubLuna 只在 Core seam 稳定后接收按仓库隔离的插件迁移；一个 agent 一个 repository/worktree/
-  branch，必须先记录 base commit 和 allowed paths。
+- 并行 agent 只在 Core seam 稳定后接收按仓库隔离的插件迁移；一个 agent 一个
+  repository/worktree/branch，必须先记录 base commit 和 allowed paths。
 - 适合并行的单位是彼此不共享权威文件的插件仓库，例如 lifecycle 插件组与 MCP 插件组。
 - Core seam、同一外部插件、跨仓 lock、迁移清单和最终 E2E 不能由多个 writer 并发修改。
 - 每个 agent 必须提交 clean handoff commit；主 agent 复核 diff、测试和真实行为后才更新本表状态。
@@ -280,7 +280,7 @@ E1～E3 使用一次性 workspace 和受控端点。E4 只能使用经过校验�
 - [x] W0：提交本清单，冻结状态定义、数据边界和 E2E 批次；
 - [x] W1：完成 C16、C18、C19，并复核 C01～C10；
 - [x] W2：以真实 consumer 依次完成 C11～C17、C21～C22；
-- [ ] W3：并行迁移 lifecycle/metadata/command 插件；
+- [x] W3：并行迁移 lifecycle/metadata/command 插件；
 - [x] W4：并行迁移 MCP/process/channel 插件；
 - [x] W5：迁移 Akasha、Proactive Feedback，并建立 C20；
 - [ ] W6：执行 A～I 删除批次，运行 production v2 consumer scan；

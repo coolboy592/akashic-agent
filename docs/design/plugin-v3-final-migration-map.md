@@ -14,9 +14,9 @@ candidate 自验证、promotion、stable snapshot lease 与旧 generation drain�
 Cordis 风格的 `Context / Service / Fiber / Effect / typed event`。Core 提供窄接入点和能力
 provider，插件自己决定内部 client、任务、重试、数据格式与组件拆分。
 
-当前栈已经覆盖 Tool 与被动回复两个试点族群。6 个真实插件已有纯 v3 候选，Core 侧有真实
-installed-artifact 组合 Gate 和 WebUI E2E。所有 PR 仍待按栈顺序 review/merge，因此这是
-“可交付候选”，不是已经上线的 v3-only runtime。
+本文只保留目标架构、最初 PR DAG 与删除顺序。当前目标 fleet、实现状态、exact heads 和
+最终 Gate 统一由[生产替代清单](plugin-v3-production-readiness-checklist.md)记录；不得从本文的
+2026-08-16 历史盘点推导当前完成比例或上线状态。
 
 ## 2. 最终效果图
 
@@ -140,7 +140,11 @@ client 或数据库实现。边界如下：
 Core 是受支持 API 的 owner，不是 Python 安全沙箱。同 UID 的恶意插件仍能绕过普通对象边界；
 真正的安全隔离需要独立进程或权限域，不在本迁移中伪装实现。
 
-## 4. 当前完成度
+## 4. 2026-08-16 试点盘点（历史）
+
+本节只解释最初 Tool/Passive 试点怎样形成后续架构，不是当前进度账本。当前目标已经收敛为
+fleet lock 中 20 个 external 插件与 8 个 in-tree 实现；Computer Use Linux、Context Pressure
+已退出目标，GitHub Watcher 已进入 fleet。逐插件状态只读生产替代清单。
 
 仓库当前跟踪 29 个插件实现：21 个 external lock 插件加 8 个 in-tree 插件。已有 6 个纯 v3
 候选，占 `6/29 = 20.7%`；剩余 23 个。数字只表示“存在已评审候选”，不表示 PR 已合并或
@@ -212,7 +216,10 @@ lane，不是 #425 的父链。下面只列本轮 remediation 与试点 Gate：
 PR 只按图中的依赖边合并。#432 在 #431 后可以独立 review/merge，不是 #433 或被动回复分支的
 前置；栈顶 Gate 通过也不能解释成底层 PR 可以乱序 cherry-pick。
 
-## 5. 剩余插件迁移
+## 5. 2026-08-16 原始迁移盘点（历史）
+
+本节保留当时的 consumer 调查，不能作为当前待办或 target fleet。现行迁移账本、排除项与
+private proactive 边界以生产替代清单为准。
 
 ### 5.1 External lock 插件：16 个
 
@@ -241,7 +248,10 @@ repository、确认凭证边界、公开性与真实 installed artifact，再加
 插件继续拥有自己的 GitHub client；Core 只应提供接入 loop、data root、Health/Incident 和
 可选 process/timer capability，不预建 GitHub 领域 Service。
 
-## 6. 仍需补的底座
+## 6. 2026-08-16 原始底座缺口（历史）
+
+下列条目记录第一批 consumer 如何驱动 Core seam；现行 C01～C25 能力状态与验收证据只在
+生产替代清单维护。
 
 下面的 seam 只在迁移第一个真实 consumer 时建立，不提前复制 v2 固定目录：
 
@@ -289,7 +299,10 @@ repository、确认凭证边界、公开性与真实 installed artifact，再加
 最终删除 PR 不保留 deprecated alias、空 `Plugin` 壳或 v2/v3 自动探测。旧配置/manifest 若需要
 离线迁移，应由一次性、可审阅的安装迁移 owner 完成，不能让 runtime 永久双读。
 
-## 8. 实施与合并顺序
+## 8. 2026-08-16 原始实施顺序（历史）
+
+下列顺序只用于审阅最初 stacked PR，不再是当前收尾命令。当前收尾固定为同一 clean head 的
+static fleet、Mobile、WebUI、E1～E4，再由生产替代清单关闭 W6～W9。
 
 ```text
 1. 先按 parent chain review/merge #395 → #397 → #398 → #399 → #400 → #401

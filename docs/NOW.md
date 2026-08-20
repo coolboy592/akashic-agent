@@ -21,8 +21,9 @@
   production owner。只允许 Default/Wake 六个 exact builtin 通过 Core-private proactive bridge；
   外部插件不得获得这个入口。Computer Use Linux 与 Context Pressure 已退出 fleet，
   不为它们保留兼容面，但既有 plugin-data 不删除。
-- 最终只在同一 clean head 集中运行 static fleet、Mobile、Tool/Passive composition、
-  WebUI 和 E1～E4。E3 必须使用 fixed-clock/model/recording sink 与本地受控 Git 远端；
+- 最终只在同一 clean head 集中运行 static fleet、Mobile、WebUI 和 E1～E4。独立 Tool/Passive
+  composition 只保留为族群 PR 诊断，不重复进入最终证据链；E2 已覆盖 Tool 组合，WebUI 与 E1
+  已覆盖 Passive 组合。E3 必须使用 fixed-clock/model/recording sink 与本地受控 Git 远端；
   E4 只读取 E1～E3 exact-head 报告并操作复制 workspace。任何 blocked scenario、v2 consumer、
   非同 head 报告或清理残留都不得声称可替代线上 Akashic；hua-home 切换仍需单独授权。
 
