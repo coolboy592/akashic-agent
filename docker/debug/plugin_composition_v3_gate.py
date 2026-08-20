@@ -38,10 +38,10 @@ DEFAULT_REPORT = (
 COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}")
 GATE_VERSION = 1
 PROTOCOL_SOURCE_REPOSITORY = "https://github.com/kachofugetsu09/akashic-agent.git"
-PROTOCOL_SOURCE_COMMIT = "b60a7ed1bcbed1f772e041336d5c858b4b9fac90"
+PROTOCOL_SOURCE_COMMIT = "a29cd6fc57acd95538e299f100f6d4b8ba7f65c7"
 PROTOCOL_SOURCE_PATHS = (
     "agent/tools/events.py",
-    "agent/tool_hooks/executor.py",
+    "agent/tools/executor.py",
 )
 EXPECTED_PLUGIN_IDS = ("shell_restore", "shell_safety", "tool_loop_guard")
 SCENARIO_PROFILE = "plugin-tool-v3-v1"
