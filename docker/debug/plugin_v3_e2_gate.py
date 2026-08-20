@@ -51,11 +51,11 @@ from agent.plugins.snapshot import (  # noqa: E402
     reset_runtime_snapshot,
 )
 from agent.plugins.static_manifest import load_static_plugin_manifest  # noqa: E402
-from agent.tool_hooks.executor import ToolExecutor  # noqa: E402
-from agent.tool_hooks.types import (  # noqa: E402
+from agent.tools.events import (  # noqa: E402
     ToolExecutionRequest,
     ToolExecutionResult,
 )
+from agent.tools.executor import ToolExecutor  # noqa: E402
 from bus.event_bus import EventBus  # noqa: E402
 
 DEFAULT_LOCK = ROOT / "docker" / "debug" / "plugin-v3-fleet.lock.json"

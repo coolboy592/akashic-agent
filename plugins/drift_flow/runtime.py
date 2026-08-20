@@ -30,7 +30,8 @@ from agent.prompting import (
     build_context_frame_content,
     build_context_frame_message,
 )
-from agent.tool_hooks import ToolExecutionRequest, ToolExecutor
+from agent.tools.events import ToolExecutionRequest
+from agent.tools.executor import ToolExecutor
 from bus.events_lifecycle import DriftFinished
 from plugins.default_proactive.context import AgentTickContext
 from plugins.drift_flow.state import DriftStateStore, SkillMeta

@@ -23,11 +23,11 @@ from agent.plugins.snapshot import (  # noqa: E402
     bind_runtime_snapshot,
     reset_runtime_snapshot,
 )
-from agent.tool_hooks.executor import ToolExecutor  # noqa: E402
-from agent.tool_hooks.types import (  # noqa: E402
+from agent.tools.events import (  # noqa: E402
     ToolExecutionRequest,
     ToolExecutionResult,
 )
+from agent.tools.executor import ToolExecutor  # noqa: E402
 from bus.event_bus import EventBus  # noqa: E402
 
 

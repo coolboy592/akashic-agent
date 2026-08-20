@@ -14,7 +14,6 @@ from agent.model_runtime.context_compaction import (
 )
 from agent.model_runtime.types import ModelUsage
 from agent.provider import LLMProvider
-from agent.tool_hooks import ToolExecutionRequest, ToolExecutor
 from agent.tool_runtime import (
     append_assistant_tool_calls,
     append_tool_result,
@@ -22,7 +21,6 @@ from agent.tool_runtime import (
     build_tool_schemas,
     tool_call_batch_snapshot,
 )
-from agent.tool_hooks.types import ToolExecutionResult
 from agent.tools.base import (
     Tool,
     ToolExecutionContext,
@@ -30,6 +28,8 @@ from agent.tools.base import (
     normalize_tool_result,
     tool_execution_context_scope,
 )
+from agent.tools.events import ToolExecutionRequest, ToolExecutionResult
+from agent.tools.executor import ToolExecutor
 from prompts.completion import VERIFIABLE_COMPLETION_RULES
 
 logger = logging.getLogger(__name__)

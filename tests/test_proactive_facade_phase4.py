@@ -27,7 +27,6 @@ from proactive_v2.loop import ProactiveLoop
 
 def test_proactive_bootstrap_hides_generic_v2_projection_abi() -> None:
     removed = {
-        "tool_hooks",
         "proactive_modules",
         "proactive_lifecycles",
         "proactive_module_factories",

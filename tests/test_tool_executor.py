@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from typing import Any, AsyncIterator
@@ -13,15 +14,16 @@ from agent.plugins.snapshot import (
     bind_runtime_snapshot,
     reset_runtime_snapshot,
 )
-from agent.tool_hooks.executor import ToolExecutor
-from agent.tool_hooks.types import ToolExecutionRequest
 from agent.tools.events import (
     TOOL_EXECUTION_AUTHORIZE,
     TOOL_INPUT_PREPARE,
     TOOL_RESULT,
+    ToolExecutionRequest,
     ToolInput,
     ToolResult,
+    ToolSource,
 )
+from agent.tools.executor import ToolExecutor
 
 
 async def _invoke(tool_name: str, arguments: dict[str, Any]) -> Any:
@@ -42,8 +44,9 @@ async def _bound_root(root: CompositionRoot) -> AsyncIterator[None]:
         await store.close()
 
 
+@pytest.mark.parametrize("source", ["passive", "subagent"])
 @pytest.mark.asyncio
-async def test_tool_executor_runs_typed_events_in_order() -> None:
+async def test_tool_executor_runs_typed_events_in_order(source: ToolSource) -> None:
     order: list[str] = []
     observed: list[ToolResult] = []
     root = CompositionRoot("typed-tool-events")
@@ -83,8 +86,8 @@ async def test_tool_executor_runs_typed_events_in_order() -> None:
                 call_id="call-1",
                 tool_name="shell",
                 arguments={"command": "rm file.txt"},
-                source="passive",
-                session_key="session",
+                source=source,
+                session_key=f"{source}:session",
             ),
             invoke,
         )
@@ -95,6 +98,11 @@ async def test_tool_executor_runs_typed_events_in_order() -> None:
     assert len(observed) == 1
     assert observed[0].status == "success"
     assert observed[0].arguments == {"command": "mv file.txt"}
+
+
+def test_legacy_tool_hooks_namespace_is_not_importable() -> None:
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module("agent.tool_hooks")
 
 
 @pytest.mark.asyncio

@@ -3,11 +3,12 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from agent.plugin_composition import CompositionError
-from agent.tool_hooks.types import ToolExecutionRequest, ToolExecutionResult
 from agent.tools.events import (
     TOOL_EXECUTION_AUTHORIZE,
     TOOL_INPUT_PREPARE,
     TOOL_RESULT,
+    ToolExecutionRequest,
+    ToolExecutionResult,
     ToolInput,
     ToolResult,
 )

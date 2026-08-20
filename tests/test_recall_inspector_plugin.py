@@ -19,9 +19,13 @@ from agent.plugins.dashboard_host import DashboardBinding, PluginDashboardHost
 from agent.plugins.manager import PluginManager
 from agent.plugins.manifest import write_plugin_manifest
 from agent.plugins.snapshot import bind_runtime_snapshot, reset_runtime_snapshot
-from agent.tool_hooks.executor import ToolExecutor
-from agent.tool_hooks.types import ToolExecutionRequest, ToolExecutionResult, ToolSource
-from agent.tools.events import ToolResult
+from agent.tools.events import (
+    ToolExecutionRequest,
+    ToolExecutionResult,
+    ToolResult,
+    ToolSource,
+)
+from agent.tools.executor import ToolExecutor
 from bus.event_bus import EventBus
 from plugins.default_memory.dashboard import RecallInspectorDashboardReader
 from plugins.default_memory import plugin as default_memory_plugin

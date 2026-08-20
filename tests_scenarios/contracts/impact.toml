@@ -183,7 +183,7 @@ scenarios = ["contract_catalog", "plugin_generation_contract", "plugin_domain_ob
 [groups.events]
 priority = "p1"
 requirements = ["RUN-001", "OUT-001"]
-paths = ["bus/**", "agent/tool_hooks/**"]
+paths = ["bus/**", "agent/tools/events.py", "agent/tools/executor.py"]
 depends_on = []
 scenarios = ["contract_catalog", "plugin_domain_observe_events"]
 

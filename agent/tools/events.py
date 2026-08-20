@@ -1,17 +1,44 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import Any, Literal, cast
 
 from agent.plugin_composition import ObserveEventKey, SerialEventKey, TransformEventKey
 
-if TYPE_CHECKING:
-    from agent.tool_hooks.types import ToolExecutionRequest, ToolExecutionResult
-
 ToolSource = Literal["passive", "proactive", "subagent"]
 ToolStatus = Literal["success", "denied", "error"]
+
+
+@dataclass
+class ToolExecutionRequest:
+    """Describe one Core-owned tool execution admission request."""
+
+    call_id: str
+    tool_name: str
+    arguments: dict[str, Any]
+    source: ToolSource
+    session_key: str = ""
+    channel: str = ""
+    chat_id: str = ""
+    request_text: str = ""
+    tool_batch: tuple[dict[str, Any], ...] = field(default_factory=tuple)
+    tool_batch_index: int = 0
+
+
+def _empty_str_list() -> list[str]:
+    return []
+
+
+@dataclass
+class ToolExecutionResult:
+    """Record the settled result of one Core-owned tool execution."""
+
+    status: ToolStatus
+    output: Any
+    final_arguments: dict[str, Any]
+    extra_messages: list[str] = field(default_factory=_empty_str_list)
 
 
 @dataclass(frozen=True, slots=True)
