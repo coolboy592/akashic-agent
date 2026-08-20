@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
+from fastapi import WebSocket
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketState
 
@@ -16,6 +17,7 @@ from agent.plugin_composition.channels import (
     ChannelRuntimePorts,
     ChannelFactoryContext,
     DeliveryStatus as V3DeliveryStatus,
+    InboundEnvelope,
     InboundOwner,
     ProviderDeliveryRequest,
     RawInbound,
@@ -1347,7 +1349,7 @@ async def test_web_v3_ingress_persists_unprefixed_identity_for_exact_session(
             {"session_id": session_key, "text": "hello", "media": []},
         )
         envelope = await bus.consume_inbound()
-        assert envelope is not None
+        assert isinstance(envelope, InboundEnvelope)
         chat_id = session_key.removeprefix("web:")
         assert envelope.session_key == session_key
         assert envelope.message.chat_id == chat_id
