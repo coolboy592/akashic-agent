@@ -249,6 +249,19 @@ class _MobileInboundRuntime:
             raise RuntimeError("Mobile v3 ingress 缺少 Core ingress")
         return await active.ingress.admit(raw)
 
+    async def recover(
+        self,
+        raw: RawInbound,
+        *,
+        ports: ChannelRuntimePorts,
+    ) -> bool:
+        """Use only Core's durable recovery ingress for a retained handoff."""
+
+        recovery = ports.recovery_ingress
+        if recovery is None:
+            raise RuntimeError("Mobile v3 ingress 缺少 Core recovery port")
+        return await recovery.recover(raw)
+
     async def wait_quiescent(self) -> None:
         current = asyncio.current_task()
         tasks = tuple(task for task in self._tasks if task is not current)
@@ -987,7 +1000,7 @@ class MobileRealtimeChannel:
             raise RuntimeError("v3 Mobile handoff 缺少 exact marker")
         ports, task = self._v3_inbound_runtime.capture()
         try:
-            return await self._v3_inbound_runtime.admit(raw, ports=ports)
+            return await self._v3_inbound_runtime.recover(raw, ports=ports)
         finally:
             self._v3_inbound_runtime.release_capture(task)
 

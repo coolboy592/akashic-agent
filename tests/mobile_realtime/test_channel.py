@@ -252,12 +252,18 @@ class _Bus:
                 ingress=self,
                 identity=None,
                 attachment_import=None,
+                recovery_ingress=self,
             )
         )
         channel._open_v3_inbound()
 
     async def admit(self, raw: RawInbound) -> bool:
         self.order.append("admit")
+        self.inbound.append(raw)
+        return True
+
+    async def recover(self, raw: RawInbound) -> bool:
+        self.order.append("recover")
         self.inbound.append(raw)
         return True
 

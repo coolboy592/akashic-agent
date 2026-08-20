@@ -20,7 +20,9 @@ from agent.plugin_composition.channels import (
     ChannelReady,
     ChannelTerminalStatus,
     ChannelInboundMessage,
+    CommittedChannelCatalog,
     ControlResponseBodies,
+    CoreChannelDefinition,
     InboundIdentity,
     CredentialRef,
     DeliveryStatus,
@@ -63,6 +65,7 @@ from bus.events_lifecycle import (
     TurnStarted,
 )
 from bootstrap.channel_presentation import ChannelTurnPresentationBridge
+from session.manager import SessionManager
 
 
 @dataclass
@@ -1266,6 +1269,8 @@ async def test_formal_ingress_acquires_exact_binding_and_deduplicates() -> None:
     generation.open_admission()
     adapter = tuple(adapters.values())[0]
     assert adapter.context.ingress is not None
+    assert not hasattr(adapter.context, "recovery_ingress")
+    assert adapter.runtime_ports.recovery_ingress is None
     raw = RawInbound(
         message_id="provider-message-1",
         message=ChannelInboundMessage(
@@ -1288,6 +1293,128 @@ async def test_formal_ingress_acquires_exact_binding_and_deduplicates() -> None:
     assert not sources[0].forks[0].active
 
     await generation.stop()
+
+
+@pytest.mark.asyncio
+async def test_external_mobile_adapter_never_receives_core_recovery_capability() -> None:
+    module = _module(name="mobile")
+    module.channel_names = ("mobile",)  # type: ignore[attr-defined]
+    snapshot, factories, adapters = await _make_snapshot(
+        module=module,
+        capabilities=frozenset({ChannelCapability.INBOUND}),
+    )
+    generation = await _host().start(snapshot, factories)
+    adapter = tuple(adapters.values())[0]
+
+    assert not hasattr(adapter.context, "recovery_ingress")
+    assert adapter.runtime_ports.recovery_ingress is None
+
+    await generation.stop()
+
+
+@pytest.mark.asyncio
+async def test_durable_recovery_replaces_retained_claim_without_weakening_duplicates(
+    tmp_path: Any,
+) -> None:
+    root_token = object()
+    adapters: dict[str, Adapter] = {}
+
+    def factory(context: Any) -> Adapter:
+        adapter = Adapter(context)
+        adapters[context.binding_token] = adapter
+        return adapter
+
+    definition = CoreChannelDefinition(
+        name="mobile",
+        capabilities=frozenset(
+            {ChannelCapability.INBOUND, ChannelCapability.OUTBOUND}
+        ),
+        factory=factory,
+        inbound_identity=InboundIdentity.PROVIDER_MESSAGE_ID,
+        source_revision="core-mobile-source-1",
+        config_revision="core-mobile-config-1",
+        generation_id="core-mobile-generation-1",
+    )
+    catalog = CommittedChannelCatalog(
+        core_definitions=(definition,),
+        root_instance_token=root_token,
+    )
+    snapshot = SimpleNamespace(
+        snapshot_id="snapshot-core-mobile",
+        state="committed",
+        composition_root=SimpleNamespace(instance_token=root_token),
+        channel_catalog=catalog,
+        channel_registry=catalog.registry,
+        channel_registry_identity=catalog.identity,
+        generations={},
+    )
+    factories = {"mobile": ClientFactory()}
+    manager = SessionManager(tmp_path / "workspace")
+    session_key = "mobile:retained-recovery"
+    manager.save(manager.get_or_create(session_key))
+    bus = MessageBus()
+    bus.bind_durable_inbound_store(manager.control_store)
+    bus.bind_mobile_session_admission_owner(manager)
+
+    def acquire(snapshot_id: str) -> _FakeSnapshotLease:
+        assert snapshot_id == snapshot.snapshot_id
+        return _FakeSnapshotLease(snapshot)
+
+    async def remember(_channel: str, _identity: str, _recipient: str) -> None:
+        return None
+
+    host = _host(
+        snapshot_lease_acquirer=acquire,
+        identity_resolver=lambda _channel, _identity: None,
+        identity_rememberer=remember,
+    )
+    host.bind_inbound_publisher(bus.publish_channel_inbound)
+    generation = await host.start(snapshot, factories)
+    generation.open_admission()
+    adapter = tuple(adapters.values())[0]
+    context = adapter.context
+    assert context.ingress is not None
+    assert not hasattr(context, "recovery_ingress")
+    assert adapter.runtime_ports.recovery_ingress is not None
+    bus.bind_mobile_channel_inbound_recoverer(
+        adapter.runtime_ports.recovery_ingress.recover
+    )
+    raw = RawInbound(
+        message_id="provider-retained-recovery",
+        provider_identity="device:1",
+        recipient="retained-recovery",
+        message=ChannelInboundMessage(
+            channel="mobile",
+            sender="device:1",
+            chat_id="retained-recovery",
+            content="hello",
+            timestamp=datetime.now(timezone.utc),
+            metadata={
+                "session_key_override": session_key,
+                "client_message_id": "provider-retained-recovery",
+                "mobile_v3_handoff": True,
+                "mobile_handoff_id": "handoff-retained-recovery",
+            },
+        ),
+    )
+    assert await bus.reserve_mobile_channel_handoff(raw) is True
+    assert await context.ingress.admit(raw) is True
+    assert await context.ingress.admit(raw) is False
+    first = await bus.consume_inbound()
+    assert isinstance(first, InboundEnvelope)
+    await bus.retain_mobile_channel_inbound(first, InboundOwner.LANE)
+
+    await bus.recover_durable_inbounds()
+    assert await context.ingress.admit(raw) is False
+    recovered = await bus.consume_inbound()
+    assert isinstance(recovered, InboundEnvelope)
+    recovered.handoff(InboundOwner.LANE, InboundOwner.LOOP)
+    await bus.complete_inbound(recovered)
+
+    assert manager.control_store.list_inbound_handoffs() == []
+    await generation.stop()
+    await bus.aclose()
+    manager.close()
 
 
 @pytest.mark.asyncio

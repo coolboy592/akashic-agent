@@ -212,6 +212,10 @@ class ChannelIngressPort(Protocol):
     async def admit(self, raw: RawInbound) -> bool: ...
 
 
+class ChannelRecoveryIngressPort(Protocol):
+    async def recover(self, raw: RawInbound) -> bool: ...
+
+
 class ChannelIdentityPort(Protocol):
     def resolve(self, provider_identity: str) -> str | None: ...
 
@@ -673,6 +677,7 @@ class ChannelRuntimePorts:
     ingress: ChannelIngressPort | None
     identity: ChannelIdentityPort | None
     attachment_import: ChannelAttachmentImportPort | None
+    recovery_ingress: ChannelRecoveryIngressPort | None = None
 
     def __post_init__(self) -> None:
         _text(self.snapshot_id, "snapshot_id")
@@ -682,6 +687,7 @@ class ChannelRuntimePorts:
             ("ingress", self.ingress, "admit"),
             ("identity", self.identity, "resolve"),
             ("attachment_import", self.attachment_import, "import_bytes"),
+            ("recovery_ingress", self.recovery_ingress, "recover"),
         ):
             if value is not None and not callable(getattr(value, method, None)):
                 raise TypeError(f"channel runtime {name} 必须提供 {method}(...)")

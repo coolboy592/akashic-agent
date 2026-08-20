@@ -472,6 +472,21 @@ class _ChannelIngress:
         return await self._host._admit_inbound(self._key, raw)
 
 
+class _ChannelRecoveryIngress:
+    """Re-admit one Core-owned durable handoff without weakening provider dedupe."""
+
+    def __init__(
+        self,
+        host: ChannelGenerationHost,
+        key: tuple[str, str],
+    ) -> None:
+        self._host = host
+        self._key = key
+
+    async def recover(self, raw: RawInbound) -> bool:
+        return await self._host._recover_inbound(self._key, raw)
+
+
 class _ChannelIdentity:
     """Resolve recipients through the Core-owned durable identity index."""
 
@@ -1612,6 +1627,38 @@ class ChannelGenerationHost:
     def _release_presentation_operation(self, key: tuple[str, str]) -> None:
         self._release_in_flight(key)
 
+    async def _recover_inbound(
+        self,
+        key: tuple[str, str],
+        raw: RawInbound,
+    ) -> bool:
+        """Replace only a prior accepted claim for Core-owned durable recovery."""
+
+        if not isinstance(raw, RawInbound):
+            raise TypeError("Channel recovery 只接受 RawInbound")
+        state = self._binding(key)
+        if state.plugin_id != "core" or state.channel_name != "mobile":
+            raise RuntimeError("Channel recovery 只属于 Core Mobile")
+        if (
+            ChannelCapability.INBOUND not in state.capabilities
+            or state.inbound_identity is not InboundIdentity.PROVIDER_MESSAGE_ID
+        ):
+            raise RuntimeError("channel 未声明可用的 inbound capability")
+        if raw.message.channel != state.channel_name:
+            raise RuntimeError("RawInbound channel 与 exact binding 不一致")
+        if not state.admission_open or state.stopping or state.stopped:
+            raise RuntimeError("channel admission 已关闭")
+
+        # 1. 只有 recovery port 可替换已接受 claim；普通 admit 仍保持 duplicate=False。
+        dedupe_key = (raw.provider_identity or "", raw.message_id)
+        if dedupe_key in state.inbound_message_id_set:
+            state.inbound_message_id_set.remove(dedupe_key)
+            try:
+                state.inbound_message_ids.remove(dedupe_key)
+            except ValueError as error:
+                raise RuntimeError("Channel inbound dedupe index 不一致") from error
+        return await self._admit_inbound(key, raw)
+
     async def _admit_inbound(
         self,
         key: tuple[str, str],
@@ -1971,6 +2018,12 @@ class ChannelGenerationHost:
                     ingress=context.ingress,
                     identity=context.identity,
                     attachment_import=context.attachment_import,
+                    recovery_ingress=(
+                        _ChannelRecoveryIngress(self, key)
+                        if state.plugin_id == "core"
+                        and state.channel_name == "mobile"
+                        else None
+                    ),
                 )
             )
             if inspect.isawaitable(attached):

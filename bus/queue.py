@@ -555,6 +555,8 @@ class MessageBus:
         if raw.message.channel != "mobile":
             raise ValueError("mobile handoff reserve 只接受 Mobile RawInbound")
         async with self._durable_handoff_lock:
+            if self._outbound_closed:
+                raise RuntimeError("message bus 已关闭")
             handoff_id, session_key = self._mobile_v3_identity(
                 raw.message_id, raw.message
             )
@@ -689,6 +691,9 @@ class MessageBus:
             await envelope.close(InboundOwner.INGRESS)
             raise RuntimeError("v3 Mobile inbound 缺少 durable handoff identity")
         async with self._durable_handoff_lock:
+            if self._outbound_closed:
+                await envelope.close(InboundOwner.INGRESS)
+                raise RuntimeError("message bus 已关闭")
             _, acquired = self._ensure_mobile_v3_admission(
                 handoff_id,
                 envelope.session_key,
@@ -729,6 +734,8 @@ class MessageBus:
                     envelope.chat_id,
                 )
                 lane_pending = True
+                if self._outbound_closed:
+                    raise RuntimeError("message bus 已关闭")
                 envelope.handoff(InboundOwner.INGRESS, InboundOwner.BUS)
                 self._inbound.put_nowait(envelope)
             except BaseException:
@@ -738,8 +745,8 @@ class MessageBus:
                         envelope.channel,
                         envelope.chat_id,
                     )
-                if envelope.owner is InboundOwner.BUS:
-                    await envelope.close(InboundOwner.BUS)
+                if envelope.owner in {InboundOwner.INGRESS, InboundOwner.BUS}:
+                    await envelope.close(envelope.owner)
                 raise
             admission.envelope = envelope
             admission.recoverable = False
@@ -997,30 +1004,35 @@ class MessageBus:
     ) -> None:
         """Delete the durable row before releasing its exact binding and Session owner."""
 
-        admission = self._mobile_v3_admissions.get(handoff_id)
-        if admission is None or admission.envelope is not envelope:
-            raise RuntimeError("Mobile exact completion owner 丢失")
-        if admission.cleanup_pending:
-            raise RuntimeError("Mobile exact cleanup 已在重试中")
-        store = self._durable_inbound_store
-        if store is None:
-            raise RuntimeError("mobile inbound durable handoff store 未绑定")
-        try:
-            store.complete_inbound_handoff(handoff_id)
-        except OSError as error:
-            logger.error(
-                "message_bus cleanup_degraded: retained exact Mobile owner "
-                "handoff=%s error=%s",
+        async with self._durable_handoff_lock:
+            admission = self._mobile_v3_admissions.get(handoff_id)
+            if admission is None or admission.envelope is not envelope:
+                raise RuntimeError("Mobile exact completion owner 丢失")
+            if admission.cleanup_pending:
+                raise RuntimeError("Mobile exact cleanup 已在重试中")
+            store = self._durable_inbound_store
+            if store is None:
+                raise RuntimeError("mobile inbound durable handoff store 未绑定")
+            try:
+                store.complete_inbound_handoff(handoff_id)
+            except OSError as error:
+                logger.error(
+                    "message_bus cleanup_degraded: retained exact Mobile owner "
+                    "handoff=%s error=%s",
+                    handoff_id,
+                    error,
+                )
+                admission.cleanup_pending = True
+                self._schedule_inbound_cleanup_retry(id(envelope))
+                raise
+            except Exception as error:
+                self._record_inbound_cleanup_fatal(error, id(envelope))
+                raise
+            await self._finalize_mobile_v3_owner_locked(
+                envelope,
                 handoff_id,
-                error,
+                admission,
             )
-            admission.cleanup_pending = True
-            self._schedule_inbound_cleanup_retry(id(envelope))
-            raise
-        except Exception as error:
-            self._record_inbound_cleanup_fatal(error, id(envelope))
-            raise
-        await self._finalize_mobile_v3_owner(envelope, handoff_id, admission)
 
     async def retain_mobile_channel_inbound(
         self,
@@ -1040,18 +1052,19 @@ class MessageBus:
         envelope: InboundEnvelope,
         expected_owner: InboundOwner,
     ) -> None:
-        handoff_id = self._mobile_v3_handoffs.get(id(envelope))
-        if handoff_id is None:
-            raise RuntimeError("Mobile exact recovery owner 丢失")
-        admission = self._mobile_v3_admissions.get(handoff_id)
-        if admission is None or admission.envelope is not envelope:
-            raise RuntimeError("Mobile exact Session recovery owner 丢失")
-        await self._release_channel_inbound(envelope, expected_owner)
-        admission.envelope = None
-        admission.cleanup_pending = False
-        admission.recoverable = True
-        self._mobile_v3_handoffs.pop(id(envelope), None)
-        self._recovery_claimed.discard(handoff_id)
+        async with self._durable_handoff_lock:
+            handoff_id = self._mobile_v3_handoffs.get(id(envelope))
+            if handoff_id is None:
+                raise RuntimeError("Mobile exact recovery owner 丢失")
+            admission = self._mobile_v3_admissions.get(handoff_id)
+            if admission is None or admission.envelope is not envelope:
+                raise RuntimeError("Mobile exact Session recovery owner 丢失")
+            await self._release_channel_inbound(envelope, expected_owner)
+            admission.envelope = None
+            admission.cleanup_pending = False
+            admission.recoverable = True
+            self._mobile_v3_handoffs.pop(id(envelope), None)
+            self._recovery_claimed.discard(handoff_id)
 
     async def release_channel_inbound(
         self,
@@ -1115,40 +1128,46 @@ class MessageBus:
         try:
             while True:
                 await asyncio.sleep(delay)
-                exact_handoff_id = self._mobile_v3_handoffs.get(owner_key)
-                if exact_handoff_id is not None:
-                    exact = self._mobile_v3_admissions.get(exact_handoff_id)
-                    if exact is None or exact.envelope is None:
-                        raise RuntimeError(
-                            f"Mobile exact cleanup owner 丢失: {owner_key}"
-                        )
-                    if not exact.cleanup_pending:
-                        raise RuntimeError(
-                            f"Mobile exact cleanup owner 状态非法: {owner_key}"
-                        )
-                    store = self._durable_inbound_store
-                    if store is None:
-                        raise RuntimeError("mobile inbound durable handoff store 未绑定")
-                    try:
-                        store.complete_inbound_handoff(exact_handoff_id)
-                    except OSError as error:
-                        attempt += 1
-                        delay = min(_INBOUND_CLEANUP_RETRY_MAX_DELAY, delay * 2)
-                        logger.error(
-                            "message_bus cleanup_degraded: retry failed "
-                            "handoff=%s attempt=%s next_delay=%.3f error=%s",
+                async with self._durable_handoff_lock:
+                    exact_handoff_id = self._mobile_v3_handoffs.get(owner_key)
+                    if exact_handoff_id is not None:
+                        exact = self._mobile_v3_admissions.get(exact_handoff_id)
+                        if exact is None or exact.envelope is None:
+                            raise RuntimeError(
+                                f"Mobile exact cleanup owner 丢失: {owner_key}"
+                            )
+                        if not exact.cleanup_pending:
+                            raise RuntimeError(
+                                f"Mobile exact cleanup owner 状态非法: {owner_key}"
+                            )
+                        store = self._durable_inbound_store
+                        if store is None:
+                            raise RuntimeError(
+                                "mobile inbound durable handoff store 未绑定"
+                            )
+                        try:
+                            store.complete_inbound_handoff(exact_handoff_id)
+                        except OSError as error:
+                            attempt += 1
+                            delay = min(
+                                _INBOUND_CLEANUP_RETRY_MAX_DELAY,
+                                delay * 2,
+                            )
+                            logger.error(
+                                "message_bus cleanup_degraded: retry failed "
+                                "handoff=%s attempt=%s next_delay=%.3f error=%s",
+                                exact_handoff_id,
+                                attempt,
+                                delay,
+                                error,
+                            )
+                            continue
+                        await self._finalize_mobile_v3_owner_locked(
+                            exact.envelope,
                             exact_handoff_id,
-                            attempt,
-                            delay,
-                            error,
+                            exact,
                         )
-                        continue
-                    await self._finalize_mobile_v3_owner(
-                        exact.envelope,
-                        exact_handoff_id,
-                        exact,
-                    )
-                    return
+                        return
                 owner = self._inbound_accepted.get(owner_key)
                 if owner is None:
                     raise RuntimeError(f"inbound cleanup owner 丢失: {owner_key}")
@@ -1192,26 +1211,25 @@ class MessageBus:
             if current is asyncio.current_task():
                 self._inbound_cleanup_tasks.pop(owner_key, None)
 
-    async def _finalize_mobile_v3_owner(
+    async def _finalize_mobile_v3_owner_locked(
         self,
         envelope: InboundEnvelope,
         handoff_id: str,
         admission: _MobileV3Admission,
     ) -> None:
-        """Release exact lease and Session admission only after durable DELETE."""
+        """Release the exact owner after DELETE while the durable lock is held."""
 
+        if self._mobile_v3_admissions.get(handoff_id) is not admission:
+            raise RuntimeError("Mobile exact admission 在完成期间变更")
+        if self._mobile_v3_handoffs.get(id(envelope)) != handoff_id:
+            raise RuntimeError("Mobile exact handoff 在完成期间变更")
         await self._release_channel_inbound(envelope, InboundOwner.LOOP)
         owner = self._mobile_session_admission_owner
         if owner is None:
             raise RuntimeError("mobile session admission owner 未绑定")
         owner.release_admission(admission.admission_id)
-        async with self._durable_handoff_lock:
-            if self._mobile_v3_admissions.get(handoff_id) is not admission:
-                raise RuntimeError("Mobile exact admission 在完成期间变更")
-            if self._mobile_v3_handoffs.get(id(envelope)) != handoff_id:
-                raise RuntimeError("Mobile exact handoff 在完成期间变更")
-            self._mobile_v3_handoffs.pop(id(envelope))
-            self._mobile_v3_admissions.pop(handoff_id)
+        self._mobile_v3_handoffs.pop(id(envelope))
+        self._mobile_v3_admissions.pop(handoff_id)
         self._recovery_claimed.discard(handoff_id)
 
     async def _finalize_inbound_owner(
@@ -1307,24 +1325,25 @@ class MessageBus:
     async def _release_mobile_v3_admissions_for_shutdown(self) -> None:
         """Drop process-local owners while leaving durable rows for the next boot."""
 
-        owner = self._mobile_session_admission_owner
-        if self._mobile_v3_admissions and owner is None:
-            raise RuntimeError("mobile session admission owner 未绑定")
-        for handoff_id, admission in tuple(self._mobile_v3_admissions.items()):
-            envelope = admission.envelope
-            if envelope is not None:
-                if envelope.owner is not InboundOwner.CLOSED:
-                    await self._release_channel_inbound(envelope, envelope.owner)
-                else:
-                    await self._chat_lane.mark_passive_done(
-                        envelope.channel,
-                        envelope.chat_id,
-                    )
-                self._mobile_v3_handoffs.pop(id(envelope), None)
-            assert owner is not None
-            owner.release_admission(admission.admission_id)
-            self._mobile_v3_admissions.pop(handoff_id)
-            self._recovery_claimed.discard(handoff_id)
+        async with self._durable_handoff_lock:
+            owner = self._mobile_session_admission_owner
+            if self._mobile_v3_admissions and owner is None:
+                raise RuntimeError("mobile session admission owner 未绑定")
+            for handoff_id, admission in tuple(self._mobile_v3_admissions.items()):
+                envelope = admission.envelope
+                if envelope is not None:
+                    if envelope.owner is not InboundOwner.CLOSED:
+                        await self._release_channel_inbound(envelope, envelope.owner)
+                    else:
+                        await self._chat_lane.mark_passive_done(
+                            envelope.channel,
+                            envelope.chat_id,
+                        )
+                    self._mobile_v3_handoffs.pop(id(envelope), None)
+                assert owner is not None
+                owner.release_admission(admission.admission_id)
+                self._mobile_v3_admissions.pop(handoff_id)
+                self._recovery_claimed.discard(handoff_id)
 
     async def _drain_outbound_queue(self) -> None:
         """排空尚未 dispatch 的出站项：收束其 receipt 并回滚 lane pending 计数。"""
