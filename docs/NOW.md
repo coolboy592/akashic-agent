@@ -13,20 +13,6 @@
 - 在独立 Fitbit canonical source 变更中让 monitor 与 MCP 读取同一个 `validation_port_env`，再以一次性 workspace 验收真实隔离 listener、child tool trace、正式切换和旧 listener 恢复；不得在 Core 中添加 Fitbit 特判。
 - 补充 turn-boundary rollout 的进程崩溃注入矩阵，覆盖 terminal 封口后、候选服务停止后、正式 endpoint 切换后和 pointer 提交前；恢复失败必须保持 degraded 可见，不能只恢复 pointer。
 
-## P0 · 插件组合内核
-
-- 按 [0037 pure-v3 决策](decisions/0037-plugin-runtime-is-pure-v3.md) 完成最后收口：把 Core 内建
-  Channel 投影接入 committed catalog/Host，完成 full-fleet E3，再按
-  [生产替代清单](design/plugin-v3-production-readiness-checklist.md) A～I 物理删除剩余 v2
-  production owner。只允许 Default/Wake 六个 exact builtin 通过 Core-private proactive bridge；
-  外部插件不得获得这个入口。Computer Use Linux 与 Context Pressure 已退出 fleet，
-  不为它们保留兼容面，但既有 plugin-data 不删除。
-- 最终只在同一 clean head 集中运行 static fleet、Mobile、WebUI 和 E1～E4。独立 Tool/Passive
-  composition 只保留为族群 PR 诊断，不重复进入最终证据链；E2 已覆盖 Tool 组合，WebUI 与 E1
-  已覆盖 Passive 组合。E3 必须使用 fixed-clock/model/recording sink 与本地受控 Git 远端；
-  E4 只读取 E1～E3 exact-head 报告并操作复制 workspace。任何 blocked scenario、v2 consumer、
-  非同 head 报告或清理残留都不得声称可替代线上 Akashic；hua-home 切换仍需单独授权。
-
 ## P0 · 独立语义验收
 
 - 将 CTX-001 当前的 trace、完整状态快照和 fixture `DELETE` pilot 升级为 SQLite authorizer 与一次性候选真实 retry seam mutant；导入失败、fixture 失败或超时不得计为 mutant kill。
