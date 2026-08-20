@@ -23,6 +23,7 @@ from agent.plugin_composition.channels import (
     InboundOwner,
     InboundState,
     OutboundEnvelope,
+    RawInbound,
 )
 from bus.events import InboundMessage
 from bus.queue import MessageBus
@@ -54,11 +55,16 @@ def _v3_outbound() -> tuple[OutboundEnvelope, SimpleNamespace]:
 
 
 class _InboundLease:
-    def __init__(self, close_gate: asyncio.Event | None = None) -> None:
+    def __init__(
+        self,
+        close_gate: asyncio.Event | None = None,
+        *,
+        channel: str = "feishu",
+    ) -> None:
         self.snapshot_id = "snapshot-1"
         self.generation_id = "generation-1"
         self.binding_token = "binding-1"
-        self.channel_name = "feishu"
+        self.channel_name = channel
         self.snapshot_lease = SimpleNamespace(
             active=True,
             snapshot=SimpleNamespace(snapshot_id=self.snapshot_id),
@@ -87,15 +93,16 @@ def _v3_inbound(
     message_id: str = "message-1",
     attachments: tuple[AttachmentRef, ...] = (),
     metadata: dict[str, object] | None = None,
+    channel: str = "feishu",
 ) -> tuple[InboundEnvelope, _InboundLease]:
-    lease = _InboundLease(close_gate)
+    lease = _InboundLease(close_gate, channel=channel)
     envelope = InboundEnvelope(
         message_id=message_id,
         snapshot_id=lease.snapshot_id,
         generation_id=lease.generation_id,
         binding_token=lease.binding_token,
         message=ChannelInboundMessage(
-            channel="feishu",
+            channel=channel,
             sender="user-1",
             chat_id="chat-1",
             content="hello",
@@ -652,6 +659,117 @@ async def test_v3_channel_inbound_transfers_bus_lane_loop_and_closes_once() -> N
         InboundState.TERMINAL,
     )
     assert lease.closed == 1
+
+
+@pytest.mark.asyncio
+async def test_v3_mobile_inbound_reserves_before_bus_queue_and_deletes_after_terminal(
+    tmp_path: Path,
+) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    bus = MessageBus()
+    bus.bind_durable_inbound_store(store)
+    envelope, lease = _v3_inbound(
+        channel="mobile",
+        message_id="client-message-1",
+        metadata={
+            "session_key_override": "mobile:chat-1",
+            "client_message_id": "client-message-1",
+            "mobile_v3_handoff": True,
+            "mobile_handoff_id": "handoff-1",
+        },
+    )
+
+    await bus.publish_channel_inbound(envelope)
+    assert [row["handoff_id"] for row in store.list_inbound_handoffs()] == [
+        "handoff-1"
+    ]
+    assert await bus.consume_inbound() is envelope
+    envelope.handoff(InboundOwner.LANE, InboundOwner.LOOP)
+    await bus.complete_inbound(envelope)
+
+    assert store.list_inbound_handoffs() == []
+    assert lease.closed == 1
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_v3_mobile_handoff_recovers_through_current_exact_binding(
+    tmp_path: Path,
+) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    original = MessageBus()
+    original.bind_durable_inbound_store(store)
+    envelope, _ = _v3_inbound(
+        channel="mobile",
+        message_id="client-message-2",
+        metadata={
+            "session_key_override": "mobile:chat-2",
+            "client_message_id": "client-message-2",
+            "mobile_v3_handoff": True,
+            "mobile_handoff_id": "handoff-2",
+        },
+    )
+    await original.publish_channel_inbound(envelope)
+
+    restarted = MessageBus()
+    restarted.bind_durable_inbound_store(store)
+    recovered_leases: list[_InboundLease] = []
+
+    async def recover(raw: object) -> bool:
+        assert isinstance(raw, RawInbound)
+        lease = _InboundLease(channel="mobile")
+        recovered_leases.append(lease)
+        recovered = InboundEnvelope(
+            message_id=raw.message_id,
+            snapshot_id=lease.snapshot_id,
+            generation_id=lease.generation_id,
+            binding_token=lease.binding_token,
+            message=raw.message,
+            lease=lease,
+        )
+        await restarted.publish_channel_inbound(recovered)
+        return True
+
+    restarted.bind_mobile_channel_inbound_recoverer(recover)
+    await restarted.recover_durable_inbounds()
+    recovered = await restarted.consume_inbound()
+    assert isinstance(recovered, InboundEnvelope)
+    assert recovered.message_id == "client-message-2"
+    recovered.handoff(InboundOwner.LANE, InboundOwner.LOOP)
+    await restarted.complete_inbound(recovered)
+
+    assert store.list_inbound_handoffs() == []
+    assert recovered_leases[0].closed == 1
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_v3_mobile_bus_close_retains_durable_handoff_for_next_boot(
+    tmp_path: Path,
+) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    bus = MessageBus()
+    bus.bind_durable_inbound_store(store)
+    envelope, lease = _v3_inbound(
+        channel="mobile",
+        message_id="client-message-3",
+        metadata={
+            "session_key_override": "mobile:chat-3",
+            "client_message_id": "client-message-3",
+            "mobile_v3_handoff": True,
+            "mobile_handoff_id": "handoff-3",
+        },
+    )
+
+    await bus.publish_channel_inbound(envelope)
+    await bus.aclose()
+
+    assert envelope.state is InboundState.TERMINAL
+    assert lease.closed == 1
+    assert [row["handoff_id"] for row in store.list_inbound_handoffs()] == [
+        "handoff-3"
+    ]
+    store.close()
 
 
 @pytest.mark.asyncio

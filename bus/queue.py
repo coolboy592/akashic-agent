@@ -9,12 +9,16 @@ from typing import Protocol, cast
 from uuid import uuid4
 
 from agent.plugin_composition.channels import (
+    AttachmentKind,
+    AttachmentRef,
+    ChannelInboundMessage,
     ChannelDeliveryReceipt,
     DeliveryStatus as ChannelDeliveryStatus,
     InboundEnvelope,
     InboundOwner,
     InboundState,
     OutboundEnvelope,
+    RawInbound,
 )
 from bus.events import InboundItem, InboundMessage
 
@@ -25,6 +29,11 @@ _T = TypeVar("_T")
 _DURABLE_INBOUND_RECOVERY_PAGE_SIZE = 256
 _INBOUND_CLEANUP_RETRY_INITIAL_DELAY = 0.1
 _INBOUND_CLEANUP_RETRY_MAX_DELAY = 5.0
+_MOBILE_V3_HANDOFF = "mobile_v3_handoff"
+_MOBILE_V3_HANDOFF_ID = "mobile_handoff_id"
+_MOBILE_V3_ATTACHMENT_REFS = "mobile_v3_attachment_refs"
+
+MobileInboundRecoverer = Callable[[RawInbound], Awaitable[bool]]
 
 
 class DurableInboundStore(Protocol):
@@ -119,6 +128,73 @@ def _inbound_from_handoff(row: dict[str, str | None]) -> InboundMessage:
         media=cast(list[str], media),
         metadata=cast(dict[str, object], metadata),
         handoff_id=cast(str, values["handoff_id"]),
+    )
+
+
+def _raw_mobile_from_handoff(row: dict[str, str | None]) -> RawInbound | None:
+    """Rebuild only a marked v3 Mobile handoff without reviving a legacy lease."""
+
+    legacy = _inbound_from_handoff(row)
+    metadata = legacy.metadata
+    if metadata.get(_MOBILE_V3_HANDOFF) is not True:
+        return None
+    handoff_id = row.get("handoff_id")
+    requested_handoff_id = metadata.get(_MOBILE_V3_HANDOFF_ID)
+    client_message_id = metadata.get("client_message_id")
+    refs_json = metadata.get(_MOBILE_V3_ATTACHMENT_REFS, [])
+    if (
+        not isinstance(handoff_id, str)
+        or requested_handoff_id != handoff_id
+        or not isinstance(client_message_id, str)
+        or not isinstance(refs_json, list)
+    ):
+        raise ValueError("v3 Mobile inbound handoff identity invalid")
+    refs: list[AttachmentRef] = []
+    for item in refs_json:
+        if not isinstance(item, dict):
+            raise ValueError("v3 Mobile attachment handoff invalid")
+        artifact_id = item.get("artifact_id")
+        kind = item.get("kind")
+        filename = item.get("filename")
+        media_type = item.get("media_type")
+        size_bytes = item.get("size_bytes")
+        sha256 = item.get("sha256")
+        if (
+            not isinstance(artifact_id, str)
+            or not isinstance(kind, str)
+            or filename is not None and not isinstance(filename, str)
+            or media_type is not None and not isinstance(media_type, str)
+            or isinstance(size_bytes, bool)
+            or not isinstance(size_bytes, int)
+            or not isinstance(sha256, str)
+        ):
+            raise ValueError("v3 Mobile attachment handoff invalid")
+        try:
+            refs.append(
+                AttachmentRef(
+                    artifact_id=artifact_id,
+                    kind=AttachmentKind(kind),
+                    filename=filename,
+                    media_type=media_type,
+                    size_bytes=size_bytes,
+                    sha256=sha256,
+                )
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError("v3 Mobile attachment handoff invalid") from error
+    return RawInbound(
+        message_id=client_message_id,
+        provider_identity=legacy.sender,
+        recipient=legacy.chat_id,
+        message=ChannelInboundMessage(
+            channel=legacy.channel,
+            sender=legacy.sender,
+            chat_id=legacy.chat_id,
+            content=legacy.content,
+            timestamp=legacy.timestamp,
+            metadata=metadata,
+            attachments=tuple(refs),
+        ),
     )
 
 
@@ -341,6 +417,8 @@ class MessageBus:
         self._inbound_cleanup_tasks: dict[int, asyncio.Task[None]] = {}
         self._inbound_cleanup_error: BaseException | None = None
         self._recovery_claimed: set[str] = set()
+        self._mobile_v3_handoffs: dict[int, str] = {}
+        self._mobile_inbound_recoverer: MobileInboundRecoverer | None = None
         self._durable_handoff_lock = asyncio.Lock()
         self._chat_lane = chat_lane or ChatLane()
         self._running = False
@@ -367,6 +445,18 @@ class MessageBus:
             raise RuntimeError("durable inbound store 已绑定")
         self._durable_inbound_store = store
 
+    def bind_mobile_channel_inbound_recoverer(
+        self,
+        recoverer: MobileInboundRecoverer,
+    ) -> None:
+        """Bind the current formal Mobile ingress used after a process restart."""
+
+        if not callable(recoverer):
+            raise TypeError("mobile v3 inbound recoverer 必须可调用")
+        if self._mobile_inbound_recoverer is not None:
+            raise RuntimeError("mobile v3 inbound recoverer 已绑定")
+        self._mobile_inbound_recoverer = recoverer
+
     async def recover_durable_inbounds(self) -> None:
         """分页重放尚未完成的移动 handoff，不以 bus 容量拒绝消息。
 
@@ -379,6 +469,7 @@ class MessageBus:
         store = self._durable_inbound_store
         if store is None:
             return
+        exact_rows: list[tuple[str, RawInbound]] = []
         async with self._durable_handoff_lock:
             # 1. 只读取有限页，避免启动时把整个 durable backlog 搬入内存。
             rows = store.list_inbound_handoffs(
@@ -400,6 +491,10 @@ class MessageBus:
                     continue
                 item = _inbound_from_handoff(row)
                 self._recovery_claimed.add(handoff_id)
+                raw = _raw_mobile_from_handoff(row)
+                if raw is not None:
+                    exact_rows.append((handoff_id, raw))
+                    continue
                 try:
                     await self._reserve_and_queue_mobile(
                         item, allow_existing_handoff=True
@@ -407,6 +502,18 @@ class MessageBus:
                 except BaseException:
                     self._recovery_claimed.discard(handoff_id)
                     raise
+        recoverer = self._mobile_inbound_recoverer
+        for handoff_id, raw in exact_rows:
+            if recoverer is None:
+                raise RuntimeError("v3 Mobile inbound recovery port 未绑定")
+            try:
+                accepted = await recoverer(raw)
+            except BaseException:
+                self._recovery_claimed.discard(handoff_id)
+                raise
+            if not accepted:
+                self._recovery_claimed.discard(handoff_id)
+                raise RuntimeError("v3 Mobile inbound recovery 被 current binding 拒绝")
 
     def has_pending_mobile_handoff(
         self,
@@ -457,6 +564,9 @@ class MessageBus:
             or envelope.state is not InboundState.ADMITTED
         ):
             raise RuntimeError("v3 Channel inbound 必须由 INGRESS/ADMITTED 交给 Bus")
+        if envelope.channel == "mobile":
+            await self._reserve_and_queue_mobile_channel(envelope)
+            return
         await self._chat_lane.mark_passive_pending(
             envelope.channel,
             envelope.chat_id,
@@ -478,6 +588,85 @@ class MessageBus:
                 envelope.chat_id,
             )
             raise
+
+    async def _reserve_and_queue_mobile_channel(
+        self,
+        envelope: InboundEnvelope,
+    ) -> None:
+        """Durably reserve a v3 Mobile envelope before the Bus owns its lease."""
+
+        metadata = dict(envelope.metadata)
+        handoff_id = metadata.get(_MOBILE_V3_HANDOFF_ID)
+        client_message_id = metadata.get("client_message_id")
+        if (
+            metadata.get(_MOBILE_V3_HANDOFF) is not True
+            or not isinstance(handoff_id, str)
+            or not handoff_id
+            or not isinstance(client_message_id, str)
+            or not client_message_id
+        ):
+            await envelope.close(InboundOwner.INGRESS)
+            raise RuntimeError("v3 Mobile inbound 缺少 durable handoff identity")
+        refs: list[dict[str, object]] = [
+            {
+                "artifact_id": ref.artifact_id,
+                "kind": ref.kind.value,
+                "filename": ref.filename,
+                "media_type": ref.media_type,
+                "size_bytes": ref.size_bytes,
+                "sha256": ref.sha256,
+            }
+            for ref in envelope.message.attachments
+        ]
+        persisted_metadata: dict[str, object] = dict(metadata)
+        persisted_metadata[_MOBILE_V3_ATTACHMENT_REFS] = refs
+        store = self._durable_inbound_store
+        if store is None:
+            await envelope.close(InboundOwner.INGRESS)
+            raise RuntimeError("mobile inbound durable handoff store 未绑定")
+        async with self._durable_handoff_lock:
+            persisted_id, created = store.reserve_inbound_handoff(
+                handoff_id=handoff_id,
+                dedupe_key=f"{envelope.session_key}:{client_message_id}",
+                channel=envelope.channel,
+                sender=envelope.sender,
+                chat_id=envelope.chat_id,
+                session_key=envelope.session_key,
+                content=envelope.content,
+                timestamp=envelope.timestamp.astimezone(timezone.utc).isoformat(),
+                media_json="[]",
+                metadata_json=json.dumps(
+                    persisted_metadata,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                    allow_nan=False,
+                ),
+                created_at=datetime.now(timezone.utc).isoformat(),
+            )
+            is_recovery = handoff_id in self._recovery_claimed
+            if not created and not (is_recovery and persisted_id == handoff_id):
+                await envelope.close(InboundOwner.INGRESS)
+                return
+            if persisted_id != handoff_id:
+                await envelope.close(InboundOwner.INGRESS)
+                raise RuntimeError("v3 Mobile inbound durable handoff identity 漂移")
+            await self._chat_lane.mark_passive_pending(
+                envelope.channel,
+                envelope.chat_id,
+            )
+            try:
+                envelope.handoff(InboundOwner.INGRESS, InboundOwner.BUS)
+                self._inbound.put_nowait(envelope)
+            except BaseException:
+                await self._chat_lane.mark_passive_done(
+                    envelope.channel,
+                    envelope.chat_id,
+                )
+                if envelope.owner is InboundOwner.BUS:
+                    await envelope.close(InboundOwner.BUS)
+                raise
+            self._mobile_v3_handoffs[id(envelope)] = handoff_id
 
     async def _publish_inbound(
         self,
@@ -558,6 +747,14 @@ class MessageBus:
     async def complete_inbound(self, msg: InboundItem | InboundEnvelope) -> None:
         self._raise_inbound_cleanup_error()
         if isinstance(msg, InboundEnvelope):
+            handoff_id = self._mobile_v3_handoffs.get(id(msg))
+            if handoff_id is not None:
+                store = self._durable_inbound_store
+                if store is None:
+                    raise RuntimeError("mobile inbound durable handoff store 未绑定")
+                store.complete_inbound_handoff(handoff_id)
+                self._mobile_v3_handoffs.pop(id(msg), None)
+                self._recovery_claimed.discard(handoff_id)
             await self.release_channel_inbound(msg, InboundOwner.LOOP)
             return
         owner = self._inbound_accepted.get(id(msg))

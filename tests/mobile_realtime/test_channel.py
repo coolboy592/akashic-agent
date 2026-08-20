@@ -23,8 +23,10 @@ from agent.plugin_composition.channels import (
     AttachmentRef,
     ChannelCommitRole,
     ChannelFactoryContext,
+    ChannelRuntimePorts,
     DeliveryStatus as V3DeliveryStatus,
     ProviderDeliveryRequest,
+    RawInbound,
 )
 from infra.mobile_realtime.runtime_inspection import RuntimeInspectionService
 from bus.events import (
@@ -238,6 +240,25 @@ class _Bus:
     async def publish_inbound(self, message: object) -> None:
         self.inbound.append(message)
 
+    def bind_mobile_channel_inbound_recoverer(self, recoverer: object) -> None:
+        channel = getattr(recoverer, "__self__", None)
+        assert isinstance(channel, MobileRealtimeChannel)
+        channel._attach_v3_inbound(
+            ChannelRuntimePorts(
+                snapshot_id="test-snapshot",
+                generation_id="test-generation",
+                binding_token="test-binding",
+                ingress=self,
+                identity=None,
+                attachment_import=None,
+            )
+        )
+        channel._open_v3_inbound()
+
+    async def admit(self, raw: RawInbound) -> bool:
+        self.inbound.append(raw)
+        return True
+
     def has_pending_mobile_handoff(
         self,
         *,
@@ -249,6 +270,9 @@ class _Bus:
 
 class _FailingBus(_Bus):
     async def publish_inbound(self, message: object) -> None:
+        raise RuntimeError("bus unavailable")
+
+    async def admit(self, raw: RawInbound) -> bool:
         raise RuntimeError("bus unavailable")
 
 
@@ -371,6 +395,49 @@ def _provider_delivery(channel: MobileRealtimeChannel):
         )
 
     return deliver
+
+
+@pytest.mark.asyncio
+async def test_mobile_message_send_uses_exact_v3_ingress_without_legacy_bus(
+    tmp_path: Path,
+) -> None:
+    storage = MobileRealtimeStorage(tmp_path / "mobile.db")
+    device_id = uuid4().hex
+    _register_device(storage, device_id)
+    runtime = _Runtime(storage)
+    channel = MobileRealtimeChannel(cast(MobileGatewayRuntime, runtime))
+    bus = _Bus()
+    manager = SessionManager(tmp_path / "workspace")
+    await channel.start(
+        cast(
+            Any,
+            SimpleNamespace(
+                bus=bus,
+                session_manager=manager,
+                event_bus=_EventBus(),
+                push_tool=_PushTool(),
+                interrupt_controller=None,
+                attachment_store=AttachmentStore(tmp_path / "uploads"),
+            ),
+        )
+    )
+    session_id = f"mobile:{uuid4()}"
+    reply = await channel.handle_command(
+        device_id=device_id,
+        frame=_message_frame(
+            frame_id="01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            session_id=session_id,
+        ),
+    )
+
+    assert reply.type == "message.send.ok"
+    assert len(bus.inbound) == 1
+    raw = cast(RawInbound, bus.inbound[0])
+    assert raw.message.channel == "mobile"
+    assert raw.message.metadata["session_key_override"] == session_id
+    assert raw.message.metadata["mobile_v3_handoff"] is True
+    manager.close()
+    storage.close()
 
 
 @pytest.mark.asyncio
@@ -1517,13 +1584,9 @@ async def test_message_send_is_idempotent_and_session_is_shared_between_devices(
     assert mismatched.payload["code"] == "client_message_id_mismatch"
     assert len(bus.inbound) == 2
     assert all(
-        item.metadata["require_existing_session"] is True for item in bus.inbound
+        cast(RawInbound, item).message.metadata["require_existing_session"] is True
+        for item in bus.inbound
     )
-    with pytest.raises(ValueError, match="正在处理消息"):
-        manager.delete_session(session_id)
-    for item in bus.inbound:
-        assert item.session_admission_id is not None
-        manager.release_admission(item.session_admission_id)
     assert manager.delete_session(session_id)
     with pytest.raises(KeyError, match="session 不存在"):
         manager.get_existing(session_id)
@@ -1597,9 +1660,9 @@ async def test_mobile_message_adopts_finalized_upload_before_bus_admission(
 
     assert reply.type == "message.send.ok"
     assert len(bus.inbound) == 1
-    inbound = bus.inbound[0]
-    assert inbound.media == []
-    artifact_ids = cast(list[str], inbound.metadata["attachment_ids"])
+    inbound = cast(RawInbound, bus.inbound[0])
+    artifact_ids = cast(list[str], inbound.message.metadata["attachment_ids"])
+    assert tuple(ref.artifact_id for ref in inbound.message.attachments) == artifact_ids
     assert len(artifact_ids) == 1
     imported = storage.list_attachment_imports(
         session_id=session_id,
@@ -1608,22 +1671,7 @@ async def test_mobile_message_adopts_finalized_upload_before_bus_admission(
     assert imported[0].phase == "artifact_committed"
     assert imported[0].artifact_id == artifact_ids[0]
 
-    # 1. Mobile handoff 只持久化 opaque artifact ID，不复制旧上传路径。
-    durable_bus = MessageBus()
-    durable_bus.bind_durable_inbound_store(manager.control_store)
-    await durable_bus.publish_inbound(inbound)
-    handoff = manager.control_store.list_inbound_handoffs()[0]
-    assert json.loads(cast(str, handoff["media_json"])) == []
-    assert json.loads(cast(str, handoff["metadata_json"]))["attachment_ids"] == (
-        artifact_ids
-    )
-    assert str(source) not in cast(str, handoff["metadata_json"])
-    consumed = await durable_bus.consume_inbound()
-    assert consumed is inbound
-    await durable_bus.complete_inbound(consumed)
-    await durable_bus.aclose()
-
-    # 2. artifact read lease 可读，且只暴露进程内 fd 路径。
+    # 1. artifact read lease 可读，且只暴露进程内 fd 路径。
     ref = artifact_store.resolve_refs(tuple(artifact_ids))[0]
     lease = await artifact_store.acquire(ref)
     try:
@@ -1631,13 +1679,13 @@ async def test_mobile_message_adopts_finalized_upload_before_bus_admission(
     finally:
         await lease.aclose()
 
-    # 3. Session commit 与 Mobile import phase 最终收束到同一 artifact ID。
+    # 2. Session commit 与 Mobile import phase 最终收束到同一 artifact ID。
     session = manager.get_existing(session_id)
     pending: dict[str, object] = {
         "role": "user",
         "content": "with attachment",
         "client_message_id": "01ARZ3NDEKTSV4RRFFQ69G5FAX",
-        "attachment_ids": artifact_ids,
+        "attachment_ids": list(artifact_ids),
     }
     await manager.append_messages(session, [pending])
     await channel.stop()
@@ -1661,7 +1709,6 @@ async def test_mobile_message_adopts_finalized_upload_before_bus_admission(
         client_message_id="01ARZ3NDEKTSV4RRFFQ69G5FAX",
     )[0].phase == "message_bound"
 
-    manager.release_admission(inbound.session_admission_id)
     await restarted.stop()
     manager.close()
     storage.close()
@@ -1803,10 +1850,9 @@ async def test_claimed_message_admission_does_not_recreate_after_exists_check(
         ),
     )
 
-    assert reply.type == "message.send.error"
-    assert reply.payload["code"] == "session_not_found"
+    assert reply.type == "message.send.ok"
     assert not original_exists(session_id)
-    assert bus.inbound == []
+    assert len(bus.inbound) == 1
     with pytest.raises(KeyError, match="session 不存在"):
         manager.get_existing(session_id)
     manager.close()
@@ -2168,9 +2214,11 @@ async def test_message_send_resolves_reply_into_agent_context_and_metadata(
     )
 
     assert reply.type == "message.send.ok"
-    inbound = bus.inbound[0]
-    assert f"被回复消息（来自 Akashic）：\n{target_content}" in inbound.content
-    assert inbound.content.endswith("【你当前新消息】\n你好")
+    inbound = cast(RawInbound, bus.inbound[0]).message
+    assert channel_module._normalize_v3_content(
+        f"被回复消息（来自 Akashic）：\n{target_content}"
+    ) in inbound.content
+    assert inbound.content.endswith("【你当前新消息】\u2028你好")
     assert inbound.metadata["display_content"] == "你好"
     assert inbound.metadata["reply_to_message_id"] == target["id"]
     assert inbound.metadata["reply_role"] == "assistant"
@@ -2196,9 +2244,10 @@ async def test_message_send_resolves_reply_into_agent_context_and_metadata(
         ),
     )
     assert second.type == "message.send.ok"
-    assert bus.inbound[1].metadata["require_existing_session"] is True
-    assert bus.inbound[1].metadata["reply_to_message_id"] == user_target["id"]
-    assert "被回复消息（来自 你）：\n之前的问题" in bus.inbound[1].content
+    second_inbound = cast(RawInbound, bus.inbound[1]).message
+    assert second_inbound.metadata["require_existing_session"] is True
+    assert second_inbound.metadata["reply_to_message_id"] == user_target["id"]
+    assert "被回复消息（来自 你）：\u2028之前的问题" in second_inbound.content
 
     media_target = session.add_message(
         "user",
@@ -2218,8 +2267,9 @@ async def test_message_send_resolves_reply_into_agent_context_and_metadata(
         ),
     )
     assert third.type == "message.send.ok"
-    assert bus.inbound[2].metadata["reply_preview"] == "[附件]"
-    assert "被回复消息（来自 你）：\n[附件]" in bus.inbound[2].content
+    third_inbound = cast(RawInbound, bus.inbound[2]).message
+    assert third_inbound.metadata["reply_preview"] == "[附件]"
+    assert "被回复消息（来自 你）：\u2028[附件]" in third_inbound.content
 
     proactive_target = session.add_message(
         "assistant",
@@ -2237,9 +2287,11 @@ async def test_message_send_resolves_reply_into_agent_context_and_metadata(
         ),
     )
     assert fourth.type == "message.send.ok"
-    assert bus.inbound[3].metadata["reply_to_message_id"] == proactive_target["id"]
+    fourth_inbound = cast(RawInbound, bus.inbound[3]).message
+    assert fourth_inbound.metadata["reply_to_message_id"] == proactive_target["id"]
     assert (
-        "被回复消息（来自 Akashic）：\n尚未同步历史的主动消息" in bus.inbound[3].content
+        "被回复消息（来自 Akashic）：\u2028尚未同步历史的主动消息"
+        in fourth_inbound.content
     )
     manager.close()
     storage.close()
@@ -3169,7 +3221,7 @@ async def test_message_send_preserves_mobile_slash_command_for_bus(
 
     assert reply.type == "message.send.ok"
     assert len(bus.inbound) == 1
-    assert cast(Any, bus.inbound[0]).content == "/undo"
+    assert cast(RawInbound, bus.inbound[0]).message.content == "/undo"
     await channel.stop()
     manager.close()
     storage.close()
@@ -5505,8 +5557,6 @@ async def test_send_and_turn_started_bind_each_client_message_id_per_session(
         {"content": "A", "client_message_id": first_id, "control_turn_id": "turn-A"},
         {"content": "B", "client_message_id": second_id, "control_turn_id": "turn-B"},
     ]
-    for item in bus.inbound:
-        manager.release_admission(item.session_admission_id)
     manager.close()
     storage.close()
 

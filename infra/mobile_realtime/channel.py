@@ -13,20 +13,24 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from time import monotonic
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 from uuid import UUID, uuid4
 
 from agent.plugin_composition.channels import (
     AttachmentKind,
     AttachmentReadLease,
     AttachmentRef,
+    ChannelInboundMessage,
     ChannelAttachmentReadPort,
     ChannelCommitRole,
     ChannelFactoryContext,
     ChannelReady,
+    ChannelRuntimePorts,
     DeliveryStatus as ProviderDeliveryStatus,
+    InboundIdentity,
     ProviderDeliveryReceipt,
     ProviderDeliveryRequest,
+    RawInbound,
     StopReceipt,
 )
 
@@ -36,7 +40,6 @@ from bus.events import (
     ChannelMessage,
     DeliveryReceipt,
     DeliveryStatus,
-    InboundMessage,
     TurnTerminalStatus,
 )
 from bus.events_lifecycle import (
@@ -182,6 +185,68 @@ class _ProcessTurnState:
     final_suffix_emitted: str = ""
 
 
+class _MobileInboundRuntime:
+    """Gate Mobile callbacks on the one formal v3 binding currently open."""
+
+    def __init__(self) -> None:
+        self._ports: ChannelRuntimePorts | None = None
+        self._open = False
+        self._wake = asyncio.Event()
+        self._tasks: set[asyncio.Task[object]] = set()
+
+    def attach(self, ports: ChannelRuntimePorts) -> None:
+        if self._open:
+            raise RuntimeError("Mobile v3 ingress 已打开")
+        if ports.ingress is None:
+            raise RuntimeError("Mobile v3 ingress 缺少 Core ingress")
+        self._ports = ports
+        self._wake.clear()
+
+    def open(self) -> None:
+        if self._ports is None:
+            raise RuntimeError("Mobile v3 ingress 尚未 attach")
+        self._open = True
+        self._wake.set()
+
+    def close(self) -> None:
+        self._open = False
+        self._ports = None
+        self._wake.set()
+
+    async def wait_open(self) -> ChannelRuntimePorts:
+        ports = self._ports
+        if ports is None:
+            raise RuntimeError("Mobile v3 ingress 尚未 attach")
+        await self._wake.wait()
+        if not self._open or self._ports is not ports:
+            raise RuntimeError("Mobile v3 ingress admission 已关闭")
+        return ports
+
+    async def admit(
+        self,
+        raw: RawInbound,
+        *,
+        ports: ChannelRuntimePorts | None = None,
+    ) -> bool:
+        active = ports or await self.wait_open()
+        if not self._open or self._ports is not active or active.ingress is None:
+            return False
+        task = asyncio.current_task()
+        if task is not None:
+            self._tasks.add(task)
+        try:
+            return await active.ingress.admit(raw)
+        finally:
+            if task is not None:
+                self._tasks.discard(task)
+
+    async def wait_quiescent(self) -> None:
+        current = asyncio.current_task()
+        tasks = tuple(task for task in self._tasks if task is not current)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+
 class MobileV3ChannelAdapter:
     """Expose one already-started Mobile channel through the native v3 ABI."""
 
@@ -205,6 +270,21 @@ class MobileV3ChannelAdapter:
         self._started = True
         return ChannelReady(self._context.binding_token)
 
+    def attach_runtime(self, ports: ChannelRuntimePorts) -> None:
+        """Bind the Mobile command callback to this exact Core ingress."""
+
+        self._channel._attach_v3_inbound(ports)
+
+    def open_admission(self) -> None:
+        """Allow Mobile message.send only after formal publication."""
+
+        self._channel._open_v3_inbound()
+
+    def close_admission(self) -> None:
+        """Reject new Mobile message.send before the binding drains."""
+
+        self._channel._close_v3_inbound()
+
     async def deliver(
         self,
         request: ProviderDeliveryRequest,
@@ -226,6 +306,8 @@ class MobileV3ChannelAdapter:
         if self._stopped:
             return StopReceipt(self._context.binding_token, resources_closed=True)
         self._stopped = True
+        self._channel._close_v3_inbound()
+        await self._channel._drain_v3_inbound()
         return StopReceipt(self._context.binding_token, resources_closed=True)
 
 
@@ -247,6 +329,15 @@ _MOBILE_HISTORY_PAYLOAD_MAX_BYTES = 240 * 1024
 _MOBILE_TOOL_ARGUMENT_REDACTED = "[已隐藏]"
 _MOBILE_TOOL_ARGUMENT_TRUNCATED = "[已截断]"
 _MOBILE_HISTORY_DETAIL_OMITTED = "[历史同步时已省略过长详情]"
+
+
+def _normalize_v3_content(value: str) -> str:
+    """Keep Mobile text while replacing control characters forbidden by v3 envelopes."""
+
+    return "".join(
+        "\u2028" if ord(char) in {10, 13} else " " if ord(char) < 32 else char
+        for char in value
+    )
 
 
 def _utf8_chunks(text: str, max_bytes: int) -> Iterator[str]:
@@ -300,6 +391,7 @@ class MobileRealtimeChannel:
     """把移动协议接入现有消息、生命周期和主动推送总线。"""
 
     name = "mobile"
+    v3_inbound_identity = InboundIdentity.PROVIDER_MESSAGE_ID
 
     def __init__(self, runtime: MobileGatewayRuntime) -> None:
         self._runtime = runtime
@@ -322,6 +414,7 @@ class MobileRealtimeChannel:
         self._runtime_inspection: RuntimeInspectionService | None = None
         self._model_registry: ModelRegistry | None = None
         self._channel_attachment_store: ChannelAttachmentArtifactStore | None = None
+        self._v3_inbound_runtime = _MobileInboundRuntime()
 
     def bind_channel_attachment_store(
         self,
@@ -389,6 +482,9 @@ class MobileRealtimeChannel:
         if self._ctx is not None:
             raise RuntimeError("MobileRealtimeChannel 已启动")
         self._ctx = ctx
+        bind_recoverer = getattr(ctx.bus, "bind_mobile_channel_inbound_recoverer", None)
+        if callable(bind_recoverer):
+            bind_recoverer(self._recover_v3_handoff)
         self._attachments = AttachmentTransferService(
             self._runtime.storage,
             ctx.attachment_store,
@@ -850,9 +946,36 @@ class MobileRealtimeChannel:
 
         if context.binding_token.strip() == "":
             raise ValueError("Mobile v3 binding token 不能为空")
-        if self._ctx is None or self._attachments is None:
-            raise RuntimeError("MobileRealtimeChannel 必须先由 ChannelHost 启动")
         return MobileV3ChannelAdapter(self, context)
+
+    def _attach_v3_inbound(self, ports: ChannelRuntimePorts) -> None:
+        """Store one formal ingress before the legacy transport begins accepting frames."""
+
+        self._v3_inbound_runtime.attach(ports)
+
+    def _open_v3_inbound(self) -> None:
+        """Open the provider callback only after the formal binding is published."""
+
+        self._v3_inbound_runtime.open()
+
+    def _close_v3_inbound(self) -> None:
+        """Prevent new Mobile commands from observing a retired binding."""
+
+        self._v3_inbound_runtime.close()
+
+    async def _drain_v3_inbound(self) -> None:
+        """Wait until every callback admitted by this binding has settled its handoff."""
+
+        await self._v3_inbound_runtime.wait_quiescent()
+
+    async def _recover_v3_handoff(self, raw: RawInbound) -> bool:
+        """Replay one durable Mobile handoff through the current formal binding only."""
+
+        if raw.message.channel != self.name:
+            raise RuntimeError("v3 Mobile handoff channel 不一致")
+        if raw.message.metadata.get("mobile_v3_handoff") is not True:
+            raise RuntimeError("v3 Mobile handoff 缺少 exact marker")
+        return await self._v3_inbound_runtime.admit(raw)
 
     async def deliver_v3(
         self,
@@ -2081,6 +2204,7 @@ class MobileRealtimeChannel:
         frame: MessageSendCommand,
         session_id: str,
     ) -> CommandReply:
+        ports = await self._v3_inbound_runtime.wait_open()
         ctx = self._require_ctx()
         claimed_session = self._runtime.storage.has_session_claim(session_id)
         if claimed_session and not ctx.session_manager.session_exists(session_id):
@@ -2104,7 +2228,11 @@ class MobileRealtimeChannel:
             "client_created_at": frame.payload.client_created_at,
             "device_id": device_id,
             "require_existing_session": True,
+            "session_key_override": session_id,
+            "mobile_v3_handoff": True,
+            "mobile_handoff_id": uuid4().hex,
         }
+        refs: tuple[AttachmentRef, ...] = ()
         if frame.payload.media_refs:
             refs = await self._import_message_attachments(
                 device_id=device_id,
@@ -2140,27 +2268,21 @@ class MobileRealtimeChannel:
         )
         if not claimed_session:
             _ = ctx.session_manager.get_or_create(session_id)
-        try:
-            _, admission_id = ctx.session_manager.admit_existing(session_id)
-        except KeyError as error:
-            raise MobileCommandError(
-                "session_not_found",
-                "会话已从电脑端删除，请在手机上新建会话后继续",
-            ) from error
-        inbound = InboundMessage(
-            channel=self.name,
-            sender=f"device:{device_id}",
-            chat_id=self._chat_id(session_id),
-            content=inbound_content,
-            media=media,
-            metadata=metadata,
-            session_admission_id=admission_id,
+        raw = RawInbound(
+            message_id=frame.payload.client_message_id,
+            provider_identity=f"device:{device_id}",
+            recipient=self._chat_id(session_id),
+            message=ChannelInboundMessage(
+                channel=self.name,
+                sender=f"device:{device_id}",
+                chat_id=self._chat_id(session_id),
+                content=_normalize_v3_content(inbound_content),
+                timestamp=datetime.now(timezone.utc),
+                metadata=cast(Any, metadata),
+                attachments=refs,
+            ),
         )
-        try:
-            await ctx.bus.publish_inbound(inbound)
-        except BaseException:
-            ctx.session_manager.release_admission(admission_id)
-            raise
+        _ = await self._v3_inbound_runtime.admit(raw, ports=ports)
         # 3. 时间链：入站消息被总线接受并返回 ACK
         received_at = self._send_received_at.get(
             (session_id, frame.payload.client_message_id)

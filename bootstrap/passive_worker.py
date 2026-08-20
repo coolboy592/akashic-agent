@@ -343,6 +343,7 @@ class PassiveMessageWorker:
     ) -> None:
         """Await the turn and settle one exact non-retryable provider delivery."""
 
+        terminal_durable = envelope.channel != "mobile"
         try:
             result = await handle.result()
             legacy_view = InboundMessage(
@@ -402,12 +403,20 @@ class PassiveMessageWorker:
                     receipt.status.value,
                     receipt.error,
                 )
+            else:
+                terminal_durable = True
         finally:
             try:
                 await self._close_attachment_leases(attachment_leases)
             finally:
                 try:
-                    await self._bus.complete_inbound(envelope)
+                    if terminal_durable:
+                        await self._bus.complete_inbound(envelope)
+                    else:
+                        await self._bus.release_channel_inbound(
+                            envelope,
+                            InboundOwner.LOOP,
+                        )
                 finally:
                     self._legacy_loop.session_manager.release_admission(
                         session_admission_id
