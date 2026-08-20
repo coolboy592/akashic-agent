@@ -55,6 +55,7 @@ from plugins.akasha.application.rebuild import rebuild_memory
 from plugins.akasha.application.runtime import OnlineMemoryRuntime
 from plugins.akasha.config import AkashaConfig, load_akasha_config, render_akasha_config
 from plugins.akasha.dashboard import register as register_dashboard
+from plugins.akasha.domain import features as features_module
 from plugins.akasha.domain.features import BurstAwareFeaturePool
 from plugins.akasha.domain.model import MemoryConfig
 from plugins.akasha.engine import (
@@ -3215,6 +3216,34 @@ def test_online_runtime_keeps_previous_sidecar_when_version_rebuild_fails(
     assert hashlib.sha256(sessions_path.read_bytes()).hexdigest() == source_sha
     assert hashlib.sha256(index_path.read_bytes()).hexdigest() == index_sha
     assert not memory_path.exists()
+
+
+@pytest.mark.parametrize(
+    ("context_mass", "query", "context", "expected_node"),
+    (
+        (1.0, np.asarray([1.0, 0.0]), np.zeros(2), 0),
+        (0.0, np.zeros(2), np.asarray([0.0, 1.0]), 1),
+    ),
+)
+def test_burst_seed_keeps_the_only_available_evidence_source(
+    context_mass: float,
+    query: np.ndarray,
+    context: np.ndarray,
+    expected_node: int,
+) -> None:
+    """An unavailable source cannot erase the other side of the mixture."""
+
+    seed = features_module._mix_sources(  # pyright: ignore[reportPrivateUsage]
+        {
+            "query_dense": query,
+            "query_bm25": np.zeros(2),
+            "context_dense": context,
+            "context_bm25": np.zeros(2),
+        },
+        context_mass,
+    )
+
+    assert seed == ((expected_node, 1.0),)
 
 
 def _write_inspector_config(workspace: Path) -> None:
