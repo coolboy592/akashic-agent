@@ -326,7 +326,7 @@ def _validate_report(
         if report.get("scenario_profile") != E3_PROFILE:
             raise GateBlocked(f"E3 scenario_profile 不匹配: {report.get('scenario_profile')!r}")
         runtime = _mapping(report.get("runtime"), "E3.runtime")
-        for field in ("channel", "message_push", "cleanup"):
+        for field in ("channel", "message_push", "channel_cleanup"):
             if field not in runtime:
                 raise GateBlocked(f"E3 runtime 缺少 {field}")
     elif label == "Passive WebUI":

@@ -39,7 +39,7 @@ def _report_payload(label: str, head: str, tree: str, lock_sha: str) -> dict[str
         base.update({
             "lock_sha256": lock_sha,
             "scenario_profile": gate.E3_PROFILE,
-            "runtime": {"channel": {}, "message_push": {}, "cleanup": {}},
+            "runtime": {"channel": {}, "message_push": {}, "channel_cleanup": {}},
         })
     else:
         base.update({
@@ -110,6 +110,31 @@ def test_validate_final_reports_rejects_incomplete_e1(tmp_path: Path) -> None:
             e1_report=e1,
             e2_report=paths["E2"],
             e3_report=paths["E3"],
+            passive_webui_report=paths["Passive"],
+            current_identity=identity,
+            lock_sha256="l",
+        )
+
+
+def test_validate_final_reports_rejects_stale_e3_cleanup_field(tmp_path: Path) -> None:
+    identity = {"head": "h", "tree": "t", "lock_sha256": "l"}
+    payload = _report_payload("E3", "h", "t", "l")
+    runtime = payload["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["cleanup"] = runtime.pop("channel_cleanup")
+    e3 = _write(tmp_path / "E3.json", payload)
+    paths = {
+        label: _write(
+            tmp_path / f"{label}.json", _report_payload(label, "h", "t", "l")
+        )
+        for label in ("E1", "E2", "Passive")
+    }
+
+    with pytest.raises(gate.GateBlocked, match="channel_cleanup"):
+        gate.validate_final_reports(
+            e1_report=paths["E1"],
+            e2_report=paths["E2"],
+            e3_report=e3,
             passive_webui_report=paths["Passive"],
             current_identity=identity,
             lock_sha256="l",
