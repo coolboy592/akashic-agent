@@ -301,8 +301,11 @@ class AttachmentTransferService:
                 candidates,
                 message_id=message_id,
             )
-        except BaseException:
+        except (AttachmentStateError, TypeError, ValueError):
             self.cleanup_outbound_candidates(candidates)
+            raise
+        except BaseException:
+            # 数据库可能已提交后才报告未知错误，保留候选供恢复对账。
             raise
 
     def snapshot_outbound_ref_batch(

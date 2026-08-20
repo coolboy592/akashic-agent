@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import sqlite3
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -682,6 +683,93 @@ async def test_native_v3_mobile_passive_rejects_terminal_after_device_race(
 
 
 @pytest.mark.asyncio
+async def test_native_v3_mobile_passive_preserves_pending_delta_for_retry(
+    tmp_path: Path,
+) -> None:
+    class _NoZeroEventRuntime(_Runtime):
+        async def publish_event(self, **event: object) -> int:
+            recipient_count = self._recipient_count()
+            if recipient_count > 0:
+                self.events.append(dict(event))
+            return recipient_count
+
+    runtime = _NoZeroEventRuntime(MobileRealtimeStorage(tmp_path / "mobile.db"))
+    channel, storage, manager = await _started_native_mobile_channel(
+        tmp_path,
+        runtime=runtime,
+    )
+    session_id = f"mobile:{uuid4()}"
+    turn_id = "turn:passive-delta-race"
+    key = (session_id, turn_id)
+    channel._process_turns[key] = channel_module._ProcessTurnState(
+        next_ordinal=0,
+        thinking_block=None,
+        tool_blocks={},
+        answer_segments=[],
+        control_turn_id=turn_id,
+    )
+    async with channel._delta_locked(session_id, turn_id):
+        assert not channel._accept_segment_locked(
+            session_id=session_id,
+            turn_id=turn_id,
+            event_type="answer.delta",
+            delta="pending delta",
+            block_id=None,
+            ordinal=None,
+        )
+    batch = channel._delta_batches[key]
+    batch.timer.cancel()
+    _ = await asyncio.gather(batch.timer, return_exceptions=True)
+
+    original_list_active_devices = storage.list_active_devices
+    calls = 0
+
+    def list_active_devices_with_race() -> tuple[DeviceRecord, ...]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return original_list_active_devices()
+        return ()
+
+    storage.list_active_devices = (  # type: ignore[method-assign]
+        list_active_devices_with_race
+    )
+    adapter = channel.build_v3_adapter(_native_context())
+    await adapter.start()
+    request = ProviderDeliveryRequest(
+        binding_token="binding-1",
+        delivery_id="delivery-passive-delta-race",
+        recipient=session_id,
+        body="done",
+        commit_role=ChannelCommitRole.PASSIVE,
+        control_turn_id=turn_id,
+    )
+    rejected = await adapter.deliver(request)
+    assert rejected.status is V3DeliveryStatus.REJECTED
+    assert calls >= 2
+    assert key in channel._delta_batches
+    assert channel._delta_batches[key].segments == [
+        ("answer.delta", "pending delta", None, None)
+    ]
+    assert runtime.events == []
+
+    storage.list_active_devices = (  # type: ignore[method-assign]
+        original_list_active_devices
+    )
+    delivered = await adapter.deliver(request)
+    assert delivered.status is V3DeliveryStatus.DELIVERED
+    assert channel._delta_batches == {}
+    assert [event["event_type"] for event in runtime.events] == [
+        "answer.delta",
+        "message.final",
+    ]
+    await adapter.stop()
+    await channel.stop()
+    manager.close()
+    storage.close()
+
+
+@pytest.mark.asyncio
 async def test_native_v3_mobile_adapter_cleans_candidates_on_cancelled_precommit(
     tmp_path: Path,
 ) -> None:
@@ -782,6 +870,52 @@ async def test_native_v3_mobile_adapter_retains_candidates_after_unknown_effect(
     assert receipt.status is V3DeliveryStatus.UNKNOWN
     assert storage.count_durable_events("device-1") == 1
     assert [path for path in (tmp_path / "uploads").rglob("*") if path.is_file()]
+    await adapter.stop()
+    await channel.stop()
+    manager.close()
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_native_v3_mobile_passive_keeps_file_after_post_commit_db_error(
+    tmp_path: Path,
+) -> None:
+    data = b"passive-post-commit-error"
+    requested = _native_ref(data)
+    channel, storage, manager = await _started_native_mobile_channel(tmp_path)
+    original_create = storage.create_or_read_outbound_attachments
+
+    def commit_then_raise(
+        records: tuple[AttachmentRecord, ...],
+        *,
+        message_id: str | None = None,
+    ) -> tuple[AttachmentRecord, ...]:
+        _ = original_create(records, message_id=message_id)
+        raise sqlite3.OperationalError("post-commit acknowledgement lost")
+
+    storage.create_or_read_outbound_attachments = (  # type: ignore[method-assign]
+        commit_then_raise
+    )
+    read_port = _ReadPort({requested.artifact_id: data})
+    adapter = channel.build_v3_adapter(_native_context(read_port))
+    await adapter.start()
+    receipt = await adapter.deliver(
+        ProviderDeliveryRequest(
+            binding_token="binding-1",
+            delivery_id="delivery-passive-post-commit-error",
+            recipient=f"mobile:{uuid4()}",
+            body="unknown registration result",
+            attachments=(requested,),
+            session_message_id="assistant-message-1",
+            commit_role=ChannelCommitRole.PASSIVE,
+        )
+    )
+    assert receipt.status is V3DeliveryStatus.UNKNOWN
+    row = storage._db.execute(  # pyright: ignore[reportPrivateUsage]
+        "SELECT local_path FROM mobile_attachments WHERE direction = 'outbound'"
+    ).fetchone()
+    assert row is not None
+    assert Path(row[0]).is_file()
     await adapter.stop()
     await channel.stop()
     manager.close()

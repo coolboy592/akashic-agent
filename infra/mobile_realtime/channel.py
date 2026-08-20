@@ -1083,9 +1083,30 @@ class MobileRealtimeChannel:
                     error = registration_result.error
                     if isinstance(error, asyncio.CancelledError):
                         raise error
+                    if isinstance(
+                        error,
+                        (
+                            AttachmentRequestError,
+                            AttachmentStateError,
+                            TypeError,
+                            ValueError,
+                        ),
+                    ):
+                        return ProviderDeliveryReceipt(
+                            request.delivery_id,
+                            ProviderDeliveryStatus.REJECTED,
+                            error=str(error),
+                        )
+                    logger.error(
+                        "mobile v3 passive attachment registration unknown: "
+                        "delivery_id=%s error=%s",
+                        request.delivery_id,
+                        error,
+                        exc_info=True,
+                    )
                     return ProviderDeliveryReceipt(
                         request.delivery_id,
-                        ProviderDeliveryStatus.REJECTED,
+                        ProviderDeliveryStatus.UNKNOWN,
                         error=str(error),
                     )
                 records = cast(
@@ -2860,7 +2881,11 @@ class MobileRealtimeChannel:
                     DeliveryStatus.SUCCESS,
                     canonical_media=tuple(media),
                 )
-            _ = await self._flush_batch_locked(session_id, turn_id)
+            _ = await self._flush_batch_locked(
+                session_id,
+                turn_id,
+                require_recipient=require_recipient,
+            )
             state = self._process_turns.get(key)
             emitted_content = (
                 ""
@@ -3164,7 +3189,13 @@ class MobileRealtimeChannel:
                 return False
             return await self._flush_batch_locked(session_id, turn_id)
 
-    async def _flush_batch_locked(self, session_id: str, turn_id: str) -> bool:
+    async def _flush_batch_locked(
+        self,
+        session_id: str,
+        turn_id: str,
+        *,
+        require_recipient: bool = False,
+    ) -> bool:
         """锁内逐段发布当前批；每段成功后才消费，失败保留失败段及后续段。"""
 
         key = (session_id, turn_id)
@@ -3184,12 +3215,20 @@ class MobileRealtimeChannel:
                     raise AssertionError("thinking delta block 缺少 ordinal")
                 payload["block_id"] = block_id
                 payload["ordinal"] = ordinal
-            _ = await self._runtime.publish_event(
+            recipient_count = await self._runtime.publish_event(
                 event_type=event_type,
                 session_id=session_id,
                 turn_id=turn_id,
                 payload=payload,
             )
+            if require_recipient and (
+                isinstance(recipient_count, bool)
+                or not isinstance(recipient_count, int)
+                or recipient_count <= 0
+            ):
+                raise _NoMobileRecipients(
+                    "Mobile delta 没有提交给任何目标设备"
+                )
             # 1. publish 确认成功后才消费该段，并精确扣减 UTF-8 byte_count；
             #    失败段与后续段原样留在批里，成功段不回卷，重试不丢不重。
             _ = batch.segments.pop(0)
@@ -3311,7 +3350,11 @@ class MobileRealtimeChannel:
             return False
         # 2. 按 wire 顺序先 flush 已接受 delta（含 final suffix）；已发布不回卷
         #    不重复，失败重试时对应 batch 为空，process state 保留供 suffix 计算。
-        _ = await self._flush_batch_locked(session_id, turn_id)
+        _ = await self._flush_batch_locked(
+            session_id,
+            turn_id,
+            require_recipient=require_recipient,
+        )
         # 3. durable 终态发布：await 成功返回前没有任何已提交 closed 墓碑。
         if device_id is None:
             recipient_count = await self._runtime.publish_event(
