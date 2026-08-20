@@ -19,7 +19,9 @@ logger = logging.getLogger(__name__)
 
 from agent.config_models import Config
 from agent.plugin_composition.channels import (
+    ChannelCommitRole,
     ChannelDeliveryReceipt,
+    ChannelTerminalStatus,
     DeliveryStatus as ChannelDeliveryStatus,
     JsonValue,
     OutboundEnvelope,
@@ -60,9 +62,7 @@ from bus.event_bus import EventBus
 from bus.events import (
     ChannelMessage,
 )
-from bootstrap.core_channel_adapter import (
-    encode_legacy_channel_message,
-)
+from bootstrap.channel_attachment_import import import_channel_attachments
 from bus.processing import ProcessingState
 from bus.queue import MessageBus
 from core.memory.runtime import MemoryRuntime
@@ -80,6 +80,7 @@ async def _dispatch_v3_channel_push(
     bus: MessageBus,
     message: ChannelMessage,
     passive: bool,
+    attachment_store: ChannelAttachmentArtifactStore | None = None,
 ) -> ChannelDeliveryReceipt:
     """Dispatch one direct push through the exact public stable Channel binding."""
 
@@ -115,22 +116,19 @@ async def _dispatch_v3_channel_push(
                 await binding.aclose()
             raise
 
-    # 2. Plugin v3 remains text-only; Core migration adapters retain old attachment paths.
+    # 2. 在 provider 调用前把授权来源冻结为 Core-owned opaque refs。
     if binding is None:
         raise RuntimeError("v3 Channel catalog 存在但 exact binding 未建立")
     delivery_id = uuid4().hex
-    if message.attachments and descriptor is not None and descriptor.owner != "core":
-        await binding.aclose()
-        return ChannelDeliveryReceipt(
-            delivery_id=delivery_id,
-            status=ChannelDeliveryStatus.REJECTED,
-            error="v3 Channel 首批迁移不接受附件",
-        )
-
-    metadata = encode_legacy_channel_message(message)
-
-    # 3. The exact binding remains retained until the one-shot receipt settles.
     try:
+        if message.attachments and attachment_store is None:
+            raise RuntimeError("Channel attachment store 尚未绑定")
+        attachment_refs = await import_channel_attachments(
+            cast("ChannelAttachmentArtifactStore", attachment_store),
+            message.attachments,
+        ) if message.attachments else ()
+
+        # 3. exact binding 保留到唯一一次 typed receipt 收束。
         return await bus.publish_channel_outbound_awaited(
             OutboundEnvelope(
                 logical_delivery_id=delivery_id,
@@ -142,7 +140,23 @@ async def _dispatch_v3_channel_push(
                 channel=message.channel,
                 recipient=message.chat_id,
                 body=message.content,
-                metadata=cast(Mapping[str, JsonValue], metadata),
+                metadata=cast(Mapping[str, JsonValue], message.metadata),
+                attachments=attachment_refs,
+                commit_role=(
+                    ChannelCommitRole.PASSIVE
+                    if passive
+                    else ChannelCommitRole.DIRECT
+                ),
+                thinking=message.thinking,
+                reply_to=message.reply_to,
+                session_message_id=message.session_message_id,
+                control_turn_id=message.control_turn_id,
+                execution_attempt_id=message.execution_attempt_id,
+                terminal_status=(
+                    ChannelTerminalStatus(message.terminal_status.value)
+                    if message.terminal_status is not None
+                    else None
+                ),
             ),
             binding,
             passive=passive,
@@ -676,6 +690,7 @@ def build_core_runtime(
             bus,
             message,
             passive,
+            channel_attachment_store,
         )
     )
     plugin_manager.channel_generation_host.bind_inbound_publisher(

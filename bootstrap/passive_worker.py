@@ -21,6 +21,7 @@ from agent.control.models import (
 from agent.control.runtime import ConversationRuntime, TurnHandle
 from agent.looping.core import AgentLoop
 from agent.plugin_composition.channels import (
+    ChannelCommitRole,
     DeliveryStatus as ChannelDeliveryStatus,
     AttachmentRef,
     InboundEnvelope,
@@ -28,6 +29,7 @@ from agent.plugin_composition.channels import (
     OutboundEnvelope,
     AttachmentReadLease,
     ChannelDeliveryReceipt,
+    ChannelTerminalStatus,
 )
 from bus.events import (
     ChannelMessage,
@@ -37,7 +39,7 @@ from bus.events import (
 )
 from bus.queue import MessageBus
 from bus.events import channel_message_from_outbound
-from bootstrap.core_channel_adapter import encode_legacy_channel_message
+from bootstrap.channel_attachment_import import import_channel_attachments
 from core.common.diagnostic_log import turn_milestone
 
 logger = logging.getLogger(__name__)
@@ -339,6 +341,17 @@ class PassiveMessageWorker:
             )
             terminal = self._terminal_outbound(legacy_view, result)
             terminal_message = channel_message_from_outbound(terminal)
+            attachment_store = self._attachment_store
+            if terminal_message.attachments and attachment_store is None:
+                raise RuntimeError("PassiveWorker Channel attachment store 尚未绑定")
+            attachment_refs = (
+                await import_channel_attachments(
+                    cast("ChannelAttachmentArtifactStore", attachment_store),
+                    terminal_message.attachments,
+                )
+                if terminal_message.attachments
+                else ()
+            )
             delivery_id = result.id
             receipt = await self._bus.publish_channel_outbound_awaited(
                 OutboundEnvelope(
@@ -351,9 +364,18 @@ class PassiveMessageWorker:
                     channel=envelope.channel,
                     recipient=envelope.chat_id,
                     body=terminal_message.content,
-                    metadata=cast(
-                        Any,
-                        encode_legacy_channel_message(terminal_message),
+                    metadata=cast(Any, terminal_message.metadata),
+                    attachments=attachment_refs,
+                    commit_role=ChannelCommitRole.PASSIVE,
+                    thinking=terminal_message.thinking,
+                    reply_to=terminal_message.reply_to,
+                    session_message_id=terminal_message.session_message_id,
+                    control_turn_id=terminal_message.control_turn_id,
+                    execution_attempt_id=terminal_message.execution_attempt_id,
+                    terminal_status=(
+                        ChannelTerminalStatus(terminal_message.terminal_status.value)
+                        if terminal_message.terminal_status is not None
+                        else None
                     ),
                 ),
                 envelope.lease,

@@ -488,7 +488,20 @@ async def test_v3_channel_direct_push_uses_exact_stable_binding(
         "app_id = 'app-1'\napp_secret = 'secret'\n",
         encoding="utf-8",
     )
-    manager = _manager(tmp_path)
+    workspace = tmp_path / "workspace"
+    session_store = SessionStore(workspace / "sessions.db")
+    attachment_store = ChannelAttachmentArtifactStore(
+        workspace=workspace,
+        session_store=session_store,
+    )
+    manager = PluginManager(
+        plugin_dirs=[tmp_path / "plugins"],
+        event_bus=EventBus(),
+        tool_registry=None,
+        workspace=workspace,
+        installed_cache_root=tmp_path / "home" / "cache",
+        channel_attachment_store=attachment_store,
+    )
     await manager.load_all()
     bus = MessageBus()
     bus.bind_channel_outbound_dispatcher(
@@ -502,6 +515,7 @@ async def test_v3_channel_direct_push_uses_exact_stable_binding(
             bus,
             message,
             passive,
+            attachment_store,
         )
     )
 
@@ -513,6 +527,8 @@ async def test_v3_channel_direct_push_uses_exact_stable_binding(
 
     monkeypatch.setattr(manager.snapshot_store, "acquire", reject_stable_reacquire)
 
+    image = tmp_path / "image.png"
+    image.write_bytes(b"channel image")
     try:
         delivered = json.loads(
             await asyncio.wait_for(
@@ -524,12 +540,12 @@ async def test_v3_channel_direct_push_uses_exact_stable_binding(
                 timeout=1,
             )
         )
-        rejected = json.loads(
+        attached = json.loads(
             await asyncio.wait_for(
                 tool.execute(
                     target_channel="feishu",
                     target_chat_id="ou_1",
-                    image="/must-not-be-read.png",
+                    image=str(image),
                 ),
                 timeout=1,
             )
@@ -540,8 +556,9 @@ async def test_v3_channel_direct_push_uses_exact_stable_binding(
 
     assert delivered["status"] == "delivered"
     assert delivered["retryable"] is False
-    assert rejected["status"] == "rejected"
-    assert rejected["retryable"] is False
+    assert attached["status"] == "delivered"
+    assert attached["retryable"] is False
+    assert len(session_store.list_attachments()) == 1
     runtime = manager.active_channel_generation
     assert runtime is not None
     assert runtime.channel("feishu").in_flight == 0
@@ -551,6 +568,7 @@ async def test_v3_channel_direct_push_uses_exact_stable_binding(
     with pytest.raises(asyncio.CancelledError):
         await dispatch_task
     await manager.terminate_all()
+    session_store.close()
 
 
 @pytest.mark.asyncio

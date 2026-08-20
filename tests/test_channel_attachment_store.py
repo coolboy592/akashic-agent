@@ -9,6 +9,11 @@ from pathlib import Path
 import pytest
 
 from agent.plugin_composition.channels import AttachmentKind, AttachmentRef
+from bootstrap.channel_attachment_import import import_channel_attachments
+from bus.events import (
+    AttachmentKind as LegacyAttachmentKind,
+    ChannelAttachment,
+)
 from infra.channels.artifacts import ChannelAttachmentArtifactStore
 from session.store import SessionStore
 
@@ -213,6 +218,35 @@ async def test_adopted_file_remains_readable_after_source_is_deleted(stores) -> 
 
     lease = await artifact_store.acquire(ref)
     assert await lease.read_bytes(max_bytes=1024) == b"legacy provider bytes"
+    await lease.aclose()
+
+
+@pytest.mark.asyncio
+async def test_outbound_import_returns_opaque_ref_without_exposing_source_path(
+    stores,
+    tmp_path: Path,
+) -> None:
+    _, artifact_store = stores
+    source = tmp_path / "authorized-source.txt"
+    source.write_bytes(b"authorized outbound bytes")
+
+    refs = await import_channel_attachments(
+        artifact_store,
+        (
+            ChannelAttachment(
+                LegacyAttachmentKind.FILE,
+                str(source),
+                "evidence.txt",
+            ),
+        ),
+    )
+    source.unlink()
+
+    assert len(refs) == 1
+    assert refs[0].filename == "evidence.txt"
+    assert str(source) not in repr(refs[0])
+    lease = await artifact_store.acquire(refs[0])
+    assert await lease.read_bytes(max_bytes=1024) == b"authorized outbound bytes"
     await lease.aclose()
 
 
