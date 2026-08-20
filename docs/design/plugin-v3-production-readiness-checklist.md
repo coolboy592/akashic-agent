@@ -34,7 +34,7 @@ semantic_delta: breaking
 capability_owner: mixed
 consumer_scope:
   - akashic core plugin runtime
-  - 19 locked external plugins
+  - 20 locked external plugins
   - 8 in-tree plugin implementations
   - later admitted GitHub Watcher canonical source
 runtime_patch: required
@@ -113,14 +113,14 @@ Gate 报告。分支名、PR 号和浮动 ref 不能代替 commit。
 | ID | 能力 owner | 状态 | 验收 oracle | 首个真实 consumer |
 |---|---|---|---|---|
 | C11 | committed channel command catalog | `CANDIDATE` | command/provisional 独立复核 25 tests、累计 command/kernel/loader/Manager/hot-reload 339 tests、Basedpyright/compileall/diff-check 已通过；Status Commands `eb245ad` 已以真实 Manager committed registry 执行 `/memorystatus`；Core `PluginManager`/bootstrap/Telegram/Mobile 已只读 committed catalog provider，旧 `telegram_bot_commands/mobile_bot_commands` 聚合与 list fallback 已删除，legacy claim fail-loud；待 E3 全量命令目录 | Status Commands |
-| C12 | scoped MCP capability | `CANDIDATE` | `8653bab0` 已接入 Root-local declaration、candidate/formal MCP catalog fence、exact snapshot route、跨 boot durable recovery；Calendar `654d078d` 的真实 Manager Gate 完成 stdio handshake、完整 14-tool catalog 与零 CallTool/Google 调用，24 个插件/迁移/Host tests、Pyright 0、独立 review 无 P0/P1；待最终 E2 exact lock | Calendar MCP |
+| C12 | scoped MCP capability | `CANDIDATE` | `8653bab0` 已接入 Root-local declaration、candidate/formal MCP catalog fence、exact snapshot route、跨 boot durable recovery；`b18e876e` 已物理删除 workspace MCP 的第二套 Manager/snapshot/admin/watcher owner，插件 MCP 只走 static manifest → exact Root → McpGenerationHost。Calendar `654d078d` 的真实 Manager Gate 完成 stdio handshake、完整 14-tool catalog 与零 CallTool/Google 调用；待最终 E2 exact lock | Calendar MCP |
 | C13 | managed process capability | `CANDIDATE` | `8653bab0` 已接入 generation-scoped start/readiness/port/log、sibling drain、retained tombstone 与不可取消 recovery；Calendar `654d078d` 的正式 `calendar_api` readiness `/health=200`，terminate 后端口、进程、task、Root Effect/listener 全零；待最终 E2 process 族 Gate | Calendar MCP |
-| C14 | inbound/outbound channel capability | `CANDIDATE` | `5e58d38d` 已在 `fc1a2a76` 基础上补齐 exact-binding control、typed turn presentation、EventBus owner-task bridge、provider identity 与同步 snapshot claim；provisional pause/drain 真实 Store oracle、Channel/Bus/Manager 相关 88～116 tests、Pyright 0，独立复核无 P0/P1。待 Feishu/QQ v3 adapter、Core built-in transition 与 E3 才进入 `READY` | Feishu / QQBot |
+| C14 | inbound/outbound channel capability | `CANDIDATE` | `5e58d38d` 已在 `fc1a2a76` 基础上补齐 exact-binding control、typed turn presentation、EventBus owner-task bridge、provider identity 与同步 snapshot claim；`4d6459ff` 已把 Core built-in Channel 发布到 committed catalog/Host，并物理删除 MessagePush/Bus/Channel legacy delivery fallback，299 个组合回归与 BasedPyright 通过。待旧测试 oracle 对账与最终 E3 才进入 `READY` | Feishu / QQBot |
 | C15 | timer / proactive source / turn enqueue capability | `CANDIDATE` | Core `78e50d4d` 已修复 candidate/formal Root 重建时 proactive/private/background catalog 的 exact Root payload 替换；Calendar `654d078d`、Feed `b4a8626`、Steam `2c492d7`、Fitbit `f3fd6ee` 已证明 exact committed source/MCP binding、candidate recording 零凭证/远端写入、typed empty/items/failure 与 ActivityHost cleanup。待最终 fixed-clock E3 | Calendar、Feed、Steam、Fitbit |
 | C16 | v3 admission/lifecycle 收口 | `CANDIDATE` | `4ba266ad` 已通过独立 review；non-callable listener、spawn coroutine、apply signature、wrong-task lifecycle 全部 fail-loud，malformed admission 零 data-dir 写入 | Core |
 | C17 | mobile UI/query capability | `CANDIDATE` | `2c6e4f71` + `b173f551` 已通过独立 review；activation token、strict JSON、candidate 不发布与 exact lease 已由 372 个集成回归、Basedpyright/compileall/diff-check 验证，待 Akasha/Observe 迁移后进入 E1/E4 | Akasha / Observe |
 | C18 | Core-private v3 generation metadata | `CANDIDATE` | `2d9fb408` 已通过独立 review；v3 stable load、candidate clone 与 formal rebuild 不再构造或读取 `PluginContext`，59 loader + 208 Manager/hot-reload 回归通过 | Core |
-| C19 | full-fleet Health/Incident/Topology inspection | `CANDIDATE` | stable lease 按插件投影 current Fiber/Health、累计与 bounded Incident、Topology；mixed active/inactive v3 + v2 inspection 与 kernel/protocol 回归通过，独立 review 的 inactive projection P1 已关闭 | 全量 runtime |
+| C19 | full-fleet Health/Incident/Topology inspection | `CANDIDATE` | stable lease 按插件投影 current Fiber/Health、累计与 bounded Incident、Topology；active/inactive v3 inspection 与 kernel/protocol 回归通过，独立 review 的 inactive projection P1 已关闭 | 全量 runtime |
 | C20 | Proactive 私有兼容岛 | `CANDIDATE` | Core `1968e503` 已把 Default/Wake 六个内建 module 收进 Core-private catalog/Host；跨 publication tx reload/rollback、lexical symlink admission 与 kernel start failure 的 exact ownership 已闭合。独立复审无 P0/P1，主任务复跑 4 个关键 mutant，累计 private/Manager/hot-reload/ActivityHost 回归与 Pyright 0 通过，待 E3 fixed-clock/recording Gate | Default/Wake Proactive |
 | C21 | generation-scoped background job / LLM capability | `CANDIDATE` | Core `de08b698` + `467a4c93` 已完成 committed catalog、trigger/interval、exact LLM lease、cancel/drain、Emotion domain receipt 与 paired-document recovery；Emotion `201ff1e` 把 `emotion_state`、projection 与 durable domain receipt 收进同一 SQLite transaction，去掉 external production 对 `proactive_v2` 的依赖，并以真实 Manager 覆盖 precommit rollback、commit 后取消重入和 Core 进程崩溃重入。Core/插件定向回归、Pyright/contract/compileall/diff-check 通过，待 E1/E3 | Emotion |
 | C22 | static v3 artifact manifest / install staging | `CANDIDATE` | 集成 head `3e1f5c10`（独立复审 head `b6967d13`）已在 import 前校验 identity/runtime/validation、custom entrypoint 与 C12/C13 descriptor，不成功 staging 不创建正式 data/artifact/pointer；Calendar `654d078d` 已由真实 Host 消费 exact staged `.venv/bin/python`，manifest/apply/runtime identity 一致且候选排除 credential/receipt；待全部 external v3 与最终 artifact Gate | Calendar MCP / 全部 external v3 |
@@ -218,13 +218,13 @@ GitHub Watcher 只以上述 canonical source exact head 进入最终 fleet lock�
 | A | Default Memory legacy data name | `CANDIDATE`（Core `3f25f767` 已删除正式/candidate 对 `workspace/observe/recall_inspector.jsonl` 的读取与 hard-link；旧文件不删除，exact generation data root 与 discard write-set 由 51 个定向回归锁定，待 E1/E4） |
 | B | legacy assistant metadata slots | `CANDIDATE`（Core `695f35ac` 已删除 legacy assistant metadata slot 出口，待 E1/E4） |
 | C | legacy Dashboard ABI | `CANDIDATE`（Core `92ac1713` 已删除 v2 backend/import 路径，待 E1/E3/E4） |
-| D | ToolHook ABI、catalog 与 traces | `IMPLEMENTED`（Core `586eceaa` 已删除 Manager publication；普通 loop/subagent 与私有 proactive 内部 executor 夹层仍待物理删除） |
-| E | v2 static-active / stable-health exception | `OPEN` |
-| F | `PluginContext` | `OPEN` |
-| G | v2 doctor / class discovery | `IMPLEMENTED`（Core `2228f26b` 已让 doctor 只接受 v3 namespace；Manager/install class discovery 待删除） |
-| H | `Plugin` base、registry、Manager 固定能力方法 | `IMPLEMENTED`（Core `28fc562e` 已删除 Manager 对外 proactive 列表；base/registry 与其他固定贡献待删除） |
-| I | RuntimeSnapshot v2 固定字段 | `OPEN` |
-| J | v2 lock、Gate 和 runtime 双路径 | `OPEN` |
+| D | ToolHook ABI、catalog 与 traces | `IMPLEMENTED`（Core `0940e9e7` 已把 execution contract/Executor 收归 typed Tool owner并物理删除 `agent.tool_hooks`；最终 Tool Gate 待跑） |
+| E | v2 static-active / stable-health exception | `IMPLEMENTED`（stable-health exemption 已删除，正式 Root 始终必须 ready；`static_active/is_active` 是 Akasha/Default Memory 二选一所需的 v3 static projection，不属于删除对象） |
+| F | `PluginContext` | `IMPLEMENTED`（通用 `PluginContext` 文件与 production consumer 已物理删除；memory-engine factory 不是该 ABI） |
+| G | v2 doctor / class discovery | `IMPLEMENTED`（doctor、Manager 与 installer 都只接受静态 manifest + v3 namespace，旧 class discovery 已删除） |
+| H | `Plugin` base、registry、Manager 固定能力方法 | `IMPLEMENTED`（`Plugin` base/registry、fixed contribution consumer、workspace MCP owner与 Channel fallback 已物理删除；只保留 Default/Wake exact builtin 私有 proactive bridge） |
+| I | RuntimeSnapshot v2 固定字段 | `IMPLEMENTED`（snapshot 只保存 generation、Root/topology 与 typed capability catalog；workspace MCP generation 与 health exemption 已删除，待最终零 consumer scan） |
+| J | v2 lock、Gate 和 runtime 双路径 | `IMPLEMENTED`（v2 lock/Gate/CI 已删除，static fleet 增加 legacy class/fixed-method AST mutant；待同一 clean head 的 E1～E4 报告） |
 
 最终 production scan 必须证明：普通插件无法通过 import、动态 discovery、manifest 或 cache
 重新进入 v2；测试 fixture 若保留历史格式，必须位于明确的 migration-test namespace。
