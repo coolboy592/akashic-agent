@@ -16,12 +16,14 @@ from agent.plugin_composition import (
     ChannelAttachmentImportPort,
     ChannelAttachmentReadPort,
     ChannelCapability,
+    ChannelCommitRole,
     ChannelDeliveryReceipt,
     ChannelInboundMessage,
     ChannelCleanupFailure,
     ChannelDefinition,
     ChannelFactoryContext,
     ChannelReady,
+    ChannelTerminalStatus,
     CompositionError,
     CompositionRoot,
     CredentialRef,
@@ -407,6 +409,13 @@ def test_channel_provider_delivery_and_cleanup_receipts_are_typed() -> None:
         delivery_id="delivery",
         recipient="recipient",
         body="",
+        commit_role=ChannelCommitRole.PASSIVE,
+        thinking="thinking",
+        reply_to="reply",
+        session_message_id="message",
+        control_turn_id="turn",
+        execution_attempt_id="attempt",
+        terminal_status=ChannelTerminalStatus.COMPLETED,
     )
     receipt = ProviderDeliveryReceipt(
         delivery_id=request.delivery_id,
@@ -425,6 +434,8 @@ def test_channel_provider_delivery_and_cleanup_receipts_are_typed() -> None:
     )
 
     assert ChannelReady(request.binding_token).admission_open is False
+    assert request.commit_role is ChannelCommitRole.PASSIVE
+    assert request.terminal_status is ChannelTerminalStatus.COMPLETED
     assert receipt.status is DeliveryStatus.DELIVERED
     assert StopReceipt(
         request.binding_token,

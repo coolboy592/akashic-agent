@@ -13,10 +13,12 @@ from agent.plugin_composition.channels import (
     AttachmentRef,
     AttachmentReadLease,
     ChannelCapability,
+    ChannelCommitRole,
     ChannelDeliveryReceipt,
     ChannelDefinition,
     ChannelFactoryFreezeInput,
     ChannelReady,
+    ChannelTerminalStatus,
     ChannelInboundMessage,
     ControlResponseBodies,
     InboundIdentity,
@@ -101,6 +103,7 @@ class Adapter:
         self.started = 0
         self.stopped = 0
         self.deliveries: list[str] = []
+        self.requests: list[ProviderDeliveryRequest] = []
         self.release = asyncio.Event()
         self.stop_started = asyncio.Event()
         self.stop_release = asyncio.Event()
@@ -115,6 +118,7 @@ class Adapter:
 
     async def deliver(self, request: ProviderDeliveryRequest) -> ProviderDeliveryReceipt:
         self.deliveries.append(request.delivery_id)
+        self.requests.append(request)
         if not self.release.is_set():
             await self.release.wait()
         delivery_id = "wrong" if self.wrong_receipt else request.delivery_id
@@ -1064,6 +1068,13 @@ async def test_exact_binding_lease_dispatches_one_outbound_envelope() -> None:
         recipient="u",
         body="hi",
         metadata={},
+        commit_role=ChannelCommitRole.PASSIVE,
+        thinking="thinking",
+        reply_to="reply",
+        session_message_id="message",
+        control_turn_id="turn",
+        execution_attempt_id="attempt",
+        terminal_status=ChannelTerminalStatus.COMPLETED,
     )
     for adapter in adapters.values():
         adapter.release.set()
@@ -1076,6 +1087,14 @@ async def test_exact_binding_lease_dispatches_one_outbound_envelope() -> None:
         ("p1",),
     )
     assert tuple(adapters.values())[0].deliveries == ["d1"]
+    request = tuple(adapters.values())[0].requests[0]
+    assert request.commit_role is ChannelCommitRole.PASSIVE
+    assert request.thinking == "thinking"
+    assert request.reply_to == "reply"
+    assert request.session_message_id == "message"
+    assert request.control_turn_id == "turn"
+    assert request.execution_attempt_id == "attempt"
+    assert request.terminal_status is ChannelTerminalStatus.COMPLETED
     await owner.aclose()
     await generation.stop()
 

@@ -355,6 +355,13 @@ class ChannelBindingLease:
                 body=envelope.body,
                 attachments=envelope.attachments,
                 metadata=envelope.metadata,
+                commit_role=envelope.commit_role,
+                thinking=envelope.thinking,
+                reply_to=envelope.reply_to,
+                session_message_id=envelope.session_message_id,
+                control_turn_id=envelope.control_turn_id,
+                execution_attempt_id=envelope.execution_attempt_id,
+                terminal_status=envelope.terminal_status,
             ),
             retained_binding=self,
         )

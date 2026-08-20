@@ -86,6 +86,18 @@ class DeliveryStatus(StrEnum):
     UNKNOWN = "unknown"
 
 
+class ChannelCommitRole(StrEnum):
+    DIRECT = "direct"
+    PASSIVE = "passive"
+
+
+class ChannelTerminalStatus(StrEnum):
+    COMPLETED = "completed"
+    FAILED = "failed"
+    INTERRUPTED = "interrupted"
+    CANCELLED = "cancelled"
+
+
 class AttachmentKind(StrEnum):
     FILE = "file"
     IMAGE = "image"
@@ -395,6 +407,13 @@ class OutboundEnvelope:
     body: str
     metadata: Mapping[str, JsonValue]
     attachments: tuple[AttachmentRef, ...] = ()
+    commit_role: ChannelCommitRole = ChannelCommitRole.DIRECT
+    thinking: str | None = None
+    reply_to: str | None = None
+    session_message_id: str | None = None
+    control_turn_id: str | None = None
+    execution_attempt_id: str | None = None
+    terminal_status: ChannelTerminalStatus | None = None
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -422,6 +441,21 @@ class OutboundEnvelope:
             "attachments",
             _attachment_refs(self.attachments, "attachments"),
         )
+        if not isinstance(self.commit_role, ChannelCommitRole):
+            raise TypeError("commit_role 必须是 ChannelCommitRole")
+        for field_name in (
+            "thinking",
+            "reply_to",
+            "session_message_id",
+            "control_turn_id",
+            "execution_attempt_id",
+        ):
+            _optional_string(getattr(self, field_name), field_name)
+        if self.terminal_status is not None and not isinstance(
+            self.terminal_status,
+            ChannelTerminalStatus,
+        ):
+            raise TypeError("terminal_status 必须是 ChannelTerminalStatus 或 None")
 
 
 @dataclass(frozen=True, slots=True)
@@ -818,6 +852,13 @@ class ProviderDeliveryRequest:
     body: str
     attachments: tuple[AttachmentRef, ...] = ()
     metadata: Mapping[str, JsonValue] = field(default_factory=dict)
+    commit_role: ChannelCommitRole = ChannelCommitRole.DIRECT
+    thinking: str | None = None
+    reply_to: str | None = None
+    session_message_id: str | None = None
+    control_turn_id: str | None = None
+    execution_attempt_id: str | None = None
+    terminal_status: ChannelTerminalStatus | None = None
 
     def __post_init__(self) -> None:
         _text(self.binding_token, "binding_token")
@@ -832,6 +873,21 @@ class ProviderDeliveryRequest:
         )
         metadata = _freeze_json_mapping(self.metadata)
         object.__setattr__(self, "metadata", metadata)
+        if not isinstance(self.commit_role, ChannelCommitRole):
+            raise TypeError("commit_role 必须是 ChannelCommitRole")
+        for field_name in (
+            "thinking",
+            "reply_to",
+            "session_message_id",
+            "control_turn_id",
+            "execution_attempt_id",
+        ):
+            _optional_string(getattr(self, field_name), field_name)
+        if self.terminal_status is not None and not isinstance(
+            self.terminal_status,
+            ChannelTerminalStatus,
+        ):
+            raise TypeError("terminal_status 必须是 ChannelTerminalStatus 或 None")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1708,10 +1764,17 @@ def _string(value: object, field_name: str) -> str:
     return value
 
 
+def _optional_string(value: object, field_name: str) -> str | None:
+    if value is None:
+        return None
+    return _string(value, field_name)
+
+
 __all__ = [
     "CHANNELS",
     "ChannelAdapter",
     "ChannelCapability",
+    "ChannelCommitRole",
     "ChannelAttachmentImportPort",
     "ChannelAttachmentReadPort",
     "ChannelCleanupFailure",
@@ -1721,6 +1784,7 @@ __all__ = [
     "ChannelIngressPort",
     "ChannelIdentityPort",
     "ChannelReady",
+    "ChannelTerminalStatus",
     "ChannelPresentationPorts",
     "ChannelInboundMessage",
     "AttachmentKind",
