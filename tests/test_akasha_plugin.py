@@ -3290,6 +3290,60 @@ def test_online_runtime_rebuilds_pair_after_crash_between_sidecar_replaces(
     assert recovered_memory_sha == (final_index_sha,)
 
 
+def test_online_runtime_reopens_unchanged_sidecars_without_rebuilding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """正常进程重启必须复用未变化的派生库组合。"""
+
+    # 1. 发布一组完整的稀疏索引与记忆快照。
+    sessions_path = tmp_path / "sessions.db"
+    index_path = tmp_path / "memory" / "akasha-v2-index.db"
+    memory_path = tmp_path / "memory" / "akasha.db"
+    _create_sessions(sessions_path)
+    _append_turn(
+        sessions_path,
+        sequence=0,
+        user="alpha request",
+        assistant="beta reply",
+        started=datetime(2026, 8, 5, tzinfo=timezone.utc),
+        with_embeddings=True,
+    )
+    first = OnlineMemoryRuntime(
+        sessions_path=sessions_path,
+        index_path=index_path,
+        memory_path=memory_path,
+        embedding_model="embedding-model",
+        embedding_dimension=2,
+        config=MemoryConfig(),
+    )
+    first.close()
+    index_sha = hashlib.sha256(index_path.read_bytes()).hexdigest()
+    memory_sha = hashlib.sha256(memory_path.read_bytes()).hexdigest()
+
+    # 2. 再次打开同一组合，不得进入全量重建路径。
+    def reject_rebuild(_runtime: OnlineMemoryRuntime) -> MemoryCycle:
+        raise AssertionError("unchanged sidecars must not rebuild")
+
+    monkeypatch.setattr(
+        OnlineMemoryRuntime,
+        "_fresh_rebuild_from_source",
+        reject_rebuild,
+    )
+    reopened = OnlineMemoryRuntime(
+        sessions_path=sessions_path,
+        index_path=index_path,
+        memory_path=memory_path,
+        embedding_model="embedding-model",
+        embedding_dimension=2,
+        config=MemoryConfig(),
+    )
+    reopened.close()
+
+    assert hashlib.sha256(index_path.read_bytes()).hexdigest() == index_sha
+    assert hashlib.sha256(memory_path.read_bytes()).hexdigest() == memory_sha
+
+
 @pytest.mark.parametrize(
     ("context_mass", "query", "context", "expected_node"),
     (

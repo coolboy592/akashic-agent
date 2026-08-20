@@ -121,43 +121,31 @@ def build_sparse_index(
         time_stats = _load_time_stats(output)
         stream_state = _load_stream_state(output)
 
-        # 3. Encode each turn before committing it to online statistics.
+        # 3. 编码新增 Turn，只写入逻辑值发生变化的状态。
+        metadata = {
+            "index_version": INDEX_VERSION,
+            "tool_chain_projection_version": TOOL_CHAIN_PROJECTION_VERSION,
+            "embedding_model": config.embedding_model,
+            "turns_missing_embeddings": str(missing),
+            "turns_excluded_interrupted": str(excluded_interrupted),
+            "turns_excluded_memory": str(excluded_memory),
+            **lexical_identity(),
+        }
+        if config.embedding_dimension is not None:
+            metadata["embedding_dimension"] = str(config.embedding_dimension)
+        persisted_metadata = dict(
+            output.execute("SELECT key, value FROM metadata")
+        )
         with output:
             for turn in new_turns:
                 encoded = _encode_turn(turn, lexical, time_stats, stream_state, config)
                 _persist_turn(output, turn, encoded)
                 _commit_stream_state(stream_state, turn)
-            _persist_online_state(output, lexical, time_stats, stream_state)
-            _set_metadata(output, "index_version", INDEX_VERSION)
-            _set_metadata(
-                output,
-                "tool_chain_projection_version",
-                TOOL_CHAIN_PROJECTION_VERSION,
-            )
-            _set_metadata(output, "embedding_model", config.embedding_model)
-            if config.embedding_dimension is not None:
-                _set_metadata(
-                    output,
-                    "embedding_dimension",
-                    str(config.embedding_dimension),
-                )
-            _set_metadata(
-                output,
-                "turns_missing_embeddings",
-                str(missing),
-            )
-            _set_metadata(
-                output,
-                "turns_excluded_interrupted",
-                str(excluded_interrupted),
-            )
-            _set_metadata(
-                output,
-                "turns_excluded_memory",
-                str(excluded_memory),
-            )
-            for key, value in lexical_identity().items():
-                _set_metadata(output, key, value)
+            if new_turns:
+                _persist_online_state(output, lexical, time_stats, stream_state)
+            for key, value in metadata.items():
+                if persisted_metadata.get(key) != value:
+                    _set_metadata(output, key, value)
         return _build_result(
             output,
             turns,
