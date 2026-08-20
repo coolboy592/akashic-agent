@@ -1,6 +1,6 @@
 # 插件 v3 MCP / managed process capability 任务合同
 
-- 状态：Core capability candidate / Calendar consumer Gate pending
+- 状态：Core capability complete / workspace MCP compatibility removed / Calendar consumer Gate pending
 - 日期：2026-08-16
 - 实现提交：`8653bab0`
 - 清单：C12、C13、C22
@@ -32,8 +32,9 @@ Core validation host ── start/handshake/ready ──► candidate snapshot
 Core production host ── exact descriptor ──► stable snapshot / tool routes
 ```
 
-本任务不迁移 proactive source，不执行 Calendar 旧数据搬运，不调用真实 OAuth/远端写操作，不改
-workspace MCP watcher/admin 兼容岛，也不暴露任意 `create_subprocess_exec` 给插件。
+本任务不迁移 proactive source，不执行 Calendar 旧数据搬运，不调用真实 OAuth/远端写操作，也不暴露任意
+`create_subprocess_exec` 给插件。独立 workspace MCP watcher/admin 兼容岛已删除；所有运行时 MCP 必须经静态
+manifest、exact Root registry 和 generation host。
 
 Core seam 的 `semantic_delta: none`；Calendar 迁移的 data/port 行为另行核对。旧 v2 声明在迁移期仍由
 adapter 冻结。同一 Root/registry 内的 v2/v3 server/process 名称冲突 fail-loud；stable 与 candidate
@@ -328,7 +329,8 @@ C12/C13 只能标为 `CANDIDATE`，不能标为 `READY`。
    固定收集/validation adapter、Snapshot v2 固定 projection 与 v2 Gate。底层 `McpClient`、process-group、
    readiness/recovery implementation 保留为 Core 内部实现。
 
-workspace MCP watcher/admin 是独立兼容岛，未建立自己的迁移合同前不得随包级 v2 删除。
+workspace MCP watcher/admin 兼容岛已删除；迁移后的 MCP 只能由插件静态 manifest 声明并由 Core generation host
+拥有运行时 client、route 和 cleanup。
 Fitbit monitor 当前没有通用 candidate port injection；canonical source 增加受 Core 控制的端口入口前不得标记
 C13 candidate-isolated，也不能借固定 `18765` 通过 Gate。
 

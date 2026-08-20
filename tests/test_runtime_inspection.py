@@ -124,7 +124,6 @@ def test_mcp_projection_uses_exact_v3_registry_and_live_tool_view() -> None:
                 )
             ),
             tool_registry=registry,
-            workspace_mcp_generation=None,
         ),
     )
 

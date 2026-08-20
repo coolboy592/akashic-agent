@@ -796,8 +796,6 @@ async def test_core_runtime_stop_closes_session_manager(tmp_path: Path):
         scheduler=SimpleNamespace(),  # type: ignore[arg-type]
         provider=SimpleNamespace(),  # type: ignore[arg-type]
         light_provider=None,
-        workspace_mcp_watcher=SimpleNamespace(stop=lambda: None),  # type: ignore[arg-type]
-        workspace_mcp_watcher_task=None,
         memory_runtime=SimpleNamespace(),  # type: ignore[arg-type]
         presence=SimpleNamespace(),  # type: ignore[arg-type]
         plugin_manager=None,

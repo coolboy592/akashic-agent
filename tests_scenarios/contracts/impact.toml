@@ -116,13 +116,10 @@ priority = "p0"
 requirements = ["PLG-004", "PLG-008", "PLG-009", "TST-001", "TST-003"]
 paths = [
   "agent/mcp/**",
-  "agent/tools/workspace_mcp.py",
   "bootstrap/toolsets/protocol.py",
   "proactive_v2/mcp_sources.py",
-  "tests/test_mcp_declarations.py",
   "tests/test_mcp_sources_async.py",
-  "tests/test_workspace_mcp_admin.py",
-  "tests/test_workspace_mcp_reload_probe.py",
+  "tests/test_workspace_mcp_removed.py",
 ]
 depends_on = ["plugin", "lifecycle"]
 scenarios = ["mcp_call_finality", "mcp_process_lifecycle"]

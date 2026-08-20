@@ -377,7 +377,7 @@ def _skill_items(workspace: Path, snapshot: RuntimeSnapshot) -> list[dict[str, o
 
 
 def _mcp_items(snapshot: RuntimeSnapshot) -> list[dict[str, object]]:
-    """Project exact v3 and workspace MCP servers from stable owners."""
+    """Project exact v3 MCP servers from the stable Root registry."""
 
     # 1. v3 declarations provide owner identity; ToolRegistry provides live schemas.
     items: list[dict[str, object]] = []
@@ -396,26 +396,6 @@ def _mcp_items(snapshot: RuntimeSnapshot) -> list[dict[str, object]]:
                 }
             )
 
-    # 2. Workspace MCP remains owned by its prepared workspace generation.
-    workspace_generation = snapshot.workspace_mcp_generation
-    if workspace_generation is not None:
-        for server in workspace_generation.catalog.servers.values():
-            tools = [
-                {
-                    "name": info.name,
-                    "description": info.description,
-                    "input_schema": info.input_schema,
-                }
-                for info in server.client.tool_infos
-            ]
-            items.append(
-                {
-                    "owner_id": "workspace",
-                    "name": server.name,
-                    "tool_count": len(tools),
-                    "tools": tools,
-                }
-            )
     return sorted(items, key=lambda item: (str(item["owner_id"]), str(item["name"])))
 
 

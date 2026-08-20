@@ -144,11 +144,11 @@ async def test_fresh_init_core_configuration_matrix(
 
     try:
         await runtime.start()
-        assert {
+        assert not {
             "workspace_mcp_apply",
             "workspace_mcp_remove",
             "workspace_mcp_status",
-        } <= runtime.tools.get_registered_names()
+        }.intersection(runtime.tools.get_registered_names())
         assert runtime.memory_runtime.engine.describe().name == memory_name
         manager = runtime.plugin_manager
         activity_host = manager.activity_host

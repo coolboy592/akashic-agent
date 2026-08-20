@@ -144,41 +144,21 @@ python scripts/check_yoyo_migrations.py --base origin/main
 新增 migration 前按 [Yoyo 迁移维护手册](../../docs/design/git-migration-authoring.md)补齐
 真实状态变换与相应 case。不再构造 Git cursor、固定 baseline、repair 清单或专用容器 Gate。
 
-## Runtime 扩展生命周期验收门
+## v3 MCP / managed-process 验收门
 
-workspace MCP 和 agent restart 共用 `docker-compose.control-gate.yml`，但每次运行都会创建
-独立 Compose project 与 sandbox。Gate 复制当前 tracked 和 non-ignored untracked 源码，记录
-Git HEAD、工作树状态、源码摘要、容器 `/app` 摘要与 image ID；运行结束后按 Compose project
-label 检查容器、网络和卷均无残留。
-
-```text
-┌─ workspace MCP Gate
-│  ├─ v1 → v2 → watched-content reload
-│  ├─ 旧 turn lease 与新 generation 隔离
-│  ├─ 坏声明整批 rollback、修复后自动恢复
-│  └─ 删除声明后工具与真实 MCP 进程全部退出
-└─ restart + MCP 组合 Gate
-   ├─ tool_search → agent_restart → terminal delivery
-   ├─ Supervisor 固定、每 boot 一个 Guardian、Gateway/boot ID 更换
-   ├─ MCP 热更后跨进程重启恢复，旧 MCP PID 退出
-   ├─ 裸 exit 75、stale readiness、断线、TERM 与 owner SIGKILL 矩阵
-   └─ 20 轮 FD、线程、zombie 与非终态 turn 资源门禁
-```
-
-本地合并前运行：
+MCP 与 managed process 只能由插件静态 manifest 声明，经过 exact Root-local
+`McpServerRegistry` / `ManagedProcessRegistry` 冻结，再由对应 generation host 物化。
+workspace 手工 TOML、watcher/admin 和独立热重载路径已删除；Gate 不读取正式 workspace。
 
 ```bash
-python docker/debug/workspace_mcp_reload_probe.py
+python docker/debug/plugin_v3_fleet_gate.py
+python docker/debug/plugin_v3_tool_composition_gate.py
 python docker/debug/restart_probe.py --soak
 ```
 
-验收以两个 host `gate.json` 的 `status=passed` 为准，不能只使用容器内
-`restart-gate.json`。两份报告必须来自同一 HEAD、相同 source digest；CI 还要求工作树为空。
-owner 故障矩阵分别杀死 Supervisor 和 Guardian，要求剩余 owner 清空 Gateway、MCP 与
-double-fork 后代；未知 PID 和不属于当前 boot 的端口不构成 kill 授权。
-20 轮 soak 的阈值为 supervisor FD 增量不超过 2、线程增量为 0，child FD 增量不超过 4、
-线程增量不超过 2；supervisor 与新 child 的 sampled RSS 增量及内核记录的 HWM 增量分别
-不超过 64 MiB，并要求无 zombie、无 `queued/in_progress` turn。
+每个报告必须记录同一源码 HEAD、manifest/artifact digest、候选与 stable generation、真实
+MCP handshake/readiness、进程/stdio cleanup 和无残留资源；不能用旧 workspace MCP probe
+替代 v3 插件 Gate。
 
 确定性模型 sidecar 的控制协议：
 

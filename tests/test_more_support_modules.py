@@ -1261,6 +1261,8 @@ async def test_app_runtime_start_passes_markdown_store_to_memory_optimizer(
         markdown=SimpleNamespace(store=markdown_store),
         aclose=AsyncMock(),
     )
+    plugin_manager = MagicMock()
+    plugin_manager.bind_core_channel_definitions = AsyncMock()
     core = SimpleNamespace(
         loop=SimpleNamespace(
             run=lambda: "loop-task",
@@ -1277,8 +1279,8 @@ async def test_app_runtime_start_passes_markdown_store_to_memory_optimizer(
         memory_runtime=memory_runtime,
         channel_attachment_store=MagicMock(),
         presence=MagicMock(),
-        plugin_manager=MagicMock(),
-        workspace_mcp_watcher_task=None,
+        plugin_manager=plugin_manager,
+        bind_conversation_runtime=MagicMock(),
         start=AsyncMock(),
         stop=AsyncMock(),
     )
@@ -1293,6 +1295,7 @@ async def test_app_runtime_start_passes_markdown_store_to_memory_optimizer(
                 stop_all=AsyncMock(),
                 bind_plugin_channels=MagicMock(),
                 swap_plugin_channels=AsyncMock(),
+                channels=(),
             )
         ),
     )

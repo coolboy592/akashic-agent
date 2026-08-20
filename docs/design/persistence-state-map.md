@@ -454,7 +454,7 @@ Akasha V2 保存 turn 指针、稀疏特征、engram hub、有向关系、activa
 ### 10.3 MCP 的插件路径与现有直装路径
 
 - 目标路径：插件类的 `mcp_servers()` 声明 MCP；安装器准备 runtime；插件 generation 发布 MCP catalog。
-- 当前兼容路径：`WorkspaceMcpAdmin` 仍可写 `mcp/servers/*.toml`，`WorkspaceMcpWatcher` 会把它发布成独立 generation，并用 `mcp/backups/` 回滚。
+- 旧 `mcp/servers/*.toml`、`WorkspaceMcpAdmin` 和 `WorkspaceMcpWatcher` 已删除；MCP 声明只由插件静态 manifest 进入 Root registry 与 generation host。
 - 两条路径发生同名冲突时，当前启动流程 fail-loud。这证明它们确实是两套并列 owner，而不是同一安装流程的不同界面。
 
 产品意图已经确认：新增和保留的 MCP 应通过插件安装。直装声明需要迁移成插件贡献；完成迁移前保留兼容读取和恢复能力，但不再把它定义为长期 canonical 资产，也不新增依赖这条路径的功能。

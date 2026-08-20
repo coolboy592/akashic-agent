@@ -8,7 +8,6 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Literal
 
-from agent.mcp.generation import WorkspaceMcpGeneration
 from agent.plugins.generation import PluginGeneration
 from agent.plugins.private_proactive import PrivateProactiveCatalog
 from agent.tools.registry import ToolRegistry
@@ -71,7 +70,6 @@ class RuntimeSnapshot:
     snapshot_id: str
     generations: Mapping[str, PluginGeneration]
     skill_catalog_generation_id: str | None
-    workspace_mcp_generation: WorkspaceMcpGeneration | None = None
     dashboard_bindings: tuple[object, ...] = ()
     mobile_ui_registry: MobileUiRegistry | None = None
     mobile_ui_registry_identity: str | None = None
@@ -135,7 +133,6 @@ class RuntimeSnapshotCompiler:
         *,
         catalog_generation: PluginGeneration | None = None,
         snapshot_revision: str = "",
-        workspace_mcp_generation: WorkspaceMcpGeneration | None = None,
         composition_root: CompositionRoot | None = None,
         private_proactive_catalog: PrivateProactiveCatalog | None = None,
         core_channel_definitions: tuple[CoreChannelDefinition, ...] = (),
@@ -158,11 +155,6 @@ class RuntimeSnapshotCompiler:
         identity += "|skill:" + (
             catalog_owner.skill_catalog.generation_id
             if catalog_owner is not None and catalog_owner.skill_catalog is not None
-            else ""
-        )
-        identity += "|workspace-mcp:" + (
-            workspace_mcp_generation.generation_id
-            if workspace_mcp_generation is not None
             else ""
         )
         identity += f"|snapshot:{snapshot_revision}"
@@ -400,7 +392,6 @@ class RuntimeSnapshotCompiler:
                 if catalog_owner is not None and catalog_owner.skill_catalog is not None
                 else None
             ),
-            workspace_mcp_generation=workspace_mcp_generation,
             mobile_ui_registry=mobile_ui_registry,
             mobile_ui_registry_identity=(
                 None if mobile_ui_registry is None else mobile_ui_registry.identity
@@ -725,22 +716,6 @@ class RuntimeSnapshotStore:
                 or snapshot.lease_count > 0
             )
             and any(item is generation for item in snapshot.generations.values())
-            for snapshot in self._snapshots.values()
-        )
-
-    def workspace_mcp_is_referenced_elsewhere(
-        self,
-        generation: WorkspaceMcpGeneration,
-        *,
-        excluding_snapshot_id: str,
-    ) -> bool:
-        return any(
-            snapshot.snapshot_id != excluding_snapshot_id
-            and (
-                snapshot.state in {"validating", "committed"}
-                or snapshot.lease_count > 0
-            )
-            and snapshot.workspace_mcp_generation is generation
             for snapshot in self._snapshots.values()
         )
 
@@ -1213,8 +1188,6 @@ class RuntimeSnapshotStore:
         snapshot.lease_count += 1
         for generation in snapshot.generations.values():
             generation.lease_count += 1
-        if snapshot.workspace_mcp_generation is not None:
-            snapshot.workspace_mcp_generation.lease_count += 1
         return RuntimeSnapshotLease(
             self,
             snapshot,
@@ -1228,8 +1201,6 @@ class RuntimeSnapshotStore:
         snapshot.lease_count += 1
         for generation in snapshot.generations.values():
             generation.lease_count += 1
-        if snapshot.workspace_mcp_generation is not None:
-            snapshot.workspace_mcp_generation.lease_count += 1
         return RuntimeSnapshotLease(
             self,
             snapshot,
@@ -1255,8 +1226,6 @@ class RuntimeSnapshotStore:
         snapshot.lease_count -= 1
         for generation in snapshot.generations.values():
             generation.lease_count -= 1
-        if snapshot.workspace_mcp_generation is not None:
-            snapshot.workspace_mcp_generation.lease_count -= 1
         self._schedule_drain(snapshot)
         async with self._condition:
             self._condition.notify_all()

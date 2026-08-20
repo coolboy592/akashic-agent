@@ -36,7 +36,6 @@ from agent.looping.ports import (
     MemoryServices,
     SessionServices,
 )
-from agent.mcp.watcher import WorkspaceMcpWatcher
 from agent.provider import LLMProvider
 from agent.model_runtime.registry import ModelRegistry
 from agent.retrieval.default_pipeline import DefaultMemoryRetrievalPipeline
@@ -241,8 +240,6 @@ class CoreRuntime:
     scheduler: SchedulerService
     provider: LLMProvider
     light_provider: LLMProvider | None
-    workspace_mcp_watcher: WorkspaceMcpWatcher
-    workspace_mcp_watcher_task: asyncio.Task[None] | None
     memory_runtime: MemoryRuntime
     presence: PresenceStore
     channel_attachment_store: "ChannelAttachmentArtifactStore | None" = None
@@ -284,13 +281,9 @@ class CoreRuntime:
     async def start(self) -> None:
         """启动外部连接和插件扩展。"""
 
-        # 1. workspace MCP 必须先原子发布，插件同名声明随后 fail-loud
-        await self.workspace_mcp_watcher.reconcile()
-
-        # 2. 加载插件后同步 skill，再绑定工具 hook。
+        # 1. 加载插件后同步 skill，再绑定工具 hook。
         if self.plugin_manager is not None:
             await self.plugin_manager.load_all()
-            self.plugin_manager.assert_no_workspace_mcp_plugin_conflicts()
             if self.workspace is not None:
                 from agent.plugins.skill_links import PluginSkillLinker
 
@@ -312,10 +305,6 @@ class CoreRuntime:
                 manifest_path = sync_manifest()
                 logger.info("插件清单已同步: %s", manifest_path)
             logger.info("插件加载完成: %d 个", self.plugin_manager.loaded_count)
-        # 3. 首次启动全部成功后才启动容错热重载 watcher
-        self.workspace_mcp_watcher_task = asyncio.create_task(
-            self.workspace_mcp_watcher.run(), name="workspace_mcp_watcher"
-        )
 
     async def inspect_modules(self) -> str:
         """按实际运行时依赖生成各阶段模块图。"""
@@ -438,21 +427,8 @@ class CoreRuntime:
         async def _close_session_manager() -> None:
             self.session_manager.close()
 
-        async def _stop_workspace_mcp_watcher() -> None:
-            self.workspace_mcp_watcher.stop()
-            task = self.workspace_mcp_watcher_task
-            if task is not None:
-                _ = task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-            if self.plugin_manager is not None:
-                await self.plugin_manager.discard_workspace_mcp_candidate()
-
         # 2. 由统一 cleanup runner 完成全部步骤并保留失败。
         await run_cleanup_steps(
-            ("workspace_mcp_watcher.stop", _stop_workspace_mcp_watcher),
             ("spawn.shutdown", _stop_spawn),
             ("shell.shutdown", _stop_shell),
             ("compaction.shutdown", self.loop.shutdown_compaction),
@@ -782,43 +758,6 @@ def build_core_runtime(
         bus.publish_channel_inbound
     )
     loop.bind_runtime_snapshot_store(plugin_manager.snapshot_store)
-    workspace_mcp_watcher = WorkspaceMcpWatcher(
-        plugin_manager,
-        workspace / "mcp" / "servers",
-        mcp_root=workspace / "mcp",
-    )
-    if config.tool_search_enabled:
-        from agent.mcp.admin import WorkspaceMcpAdmin
-        from agent.tools.workspace_mcp import (
-            WorkspaceMcpApplyTool,
-            WorkspaceMcpRemoveTool,
-            WorkspaceMcpStatusTool,
-        )
-
-        workspace_mcp_admin = WorkspaceMcpAdmin(workspace, workspace_mcp_watcher)
-        tools.register(
-            WorkspaceMcpApplyTool(workspace_mcp_admin),
-            risk="external-side-effect",
-            always_on=False,
-            preloadable=False,
-            requires_turn_search=True,
-            search_hint="安装 注册 更新 添加 MCP server 常驻服务 热重载",
-        )
-        tools.register(
-            WorkspaceMcpRemoveTool(workspace_mcp_admin),
-            risk="external-side-effect",
-            always_on=False,
-            preloadable=False,
-            requires_turn_search=True,
-            search_hint="删除 卸载 移除 MCP server 停止常驻服务",
-        )
-        tools.register(
-            WorkspaceMcpStatusTool(workspace_mcp_admin),
-            risk="read-only",
-            always_on=False,
-            search_hint="查看 列出 诊断 MCP server generation 热加载错误",
-        )
-
     return CoreRuntime(
         config=config,
         workspace=workspace,
@@ -833,8 +772,6 @@ def build_core_runtime(
         provider=provider,
         light_provider=light_provider,
         agent_provider=agent_provider,
-        workspace_mcp_watcher=workspace_mcp_watcher,
-        workspace_mcp_watcher_task=None,
         memory_runtime=memory_runtime,
         presence=presence,
         channel_attachment_store=channel_attachment_store,

@@ -229,7 +229,6 @@ class AppRuntime:
         self.mobile_gateway_task: asyncio.Task[None] | None = None
         self.plugin_watcher: PluginWatcher | None = None
         self.plugin_watcher_task: asyncio.Task[None] | None = None
-        self.workspace_mcp_watcher_task: asyncio.Task[None] | None = None
         self.tasks: list[Awaitable[None]] = []
         self._memory_optimizer = None
         self._shutdown = False
@@ -313,7 +312,6 @@ class AppRuntime:
             await self.core.start()
             if self.readiness is not None:
                 self.readiness.mark_stage("core.ready")
-            self.workspace_mcp_watcher_task = self.core.workspace_mcp_watcher_task
             app_server_endpoint: str | None = None
             workspace_token: str | None = None
             if self.config.app_server.enabled:
@@ -653,7 +651,6 @@ class AppRuntime:
                     self.chat_task,
                     self.mobile_gateway_task,
                     self.plugin_watcher_task,
-                    self.workspace_mcp_watcher_task,
                 )
                 if task is not None
             }
@@ -690,9 +687,7 @@ class AppRuntime:
                     watched_task = self.plugin_watcher_task
                     self.plugin_watcher_task = None
                 else:
-                    assert self.workspace_mcp_watcher_task is not None
-                    watched_task = self.workspace_mcp_watcher_task
-                    self.workspace_mcp_watcher_task = None
+                    raise RuntimeError("未知 runtime watcher task")
                 await watched_task
         except (asyncio.CancelledError, Exception) as error:
             run_error = error

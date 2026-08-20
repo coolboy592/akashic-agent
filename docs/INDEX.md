@@ -132,7 +132,7 @@
 
 任务同时命中两行以上、会修改持久数据或会产生外部不可逆效果时，读取 `projectneed.md` 全文。执行阶段可以收窄材料，评审阶段必须展开所有相关 diff、状态变化和证据。
 
-Skill/MCP 任务固定从插件安装链进入：插件 source → `skill_roots` / `drift_skill_roots` / `mcp_servers` → 安装 staging 与 runtime 准备 → generation catalog → workspace 投影。只有调查兼容迁移时才进入 `agent/mcp/admin.py`、`WorkspaceMcpWatcher` 或手工 skill 目录；不能从这些旧入口反推新的能力安装设计。
+Skill/MCP 任务固定从插件安装链进入：插件 source → `skill_roots` / `drift_skill_roots` / `mcp_servers` → 安装 staging 与 runtime 准备 → generation catalog → workspace 投影。独立 workspace MCP 声明、watcher/admin 和手工 MCP 目录不再是运行时入口；不能从已删除的旧 API 反推新的能力安装设计。
 
 ## 5. 持久化任务的强制前置读取
 

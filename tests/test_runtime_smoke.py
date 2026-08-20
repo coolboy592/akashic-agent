@@ -623,41 +623,6 @@ async def test_app_runtime_run_stops_primary_tasks_after_server_failure(tmp_path
 
 
 @pytest.mark.asyncio
-async def test_app_runtime_supervises_workspace_mcp_watcher_failure(tmp_path):
-    runtime = bootstrap_app.AppRuntime(cast(Any, object()), tmp_path)
-    primary_stopped = asyncio.Event()
-    core_stopped = asyncio.Event()
-
-    async def _failed_watcher() -> None:
-        raise KeyError("unexpected watcher failure")
-
-    async def _primary() -> None:
-        try:
-            await asyncio.Event().wait()
-        finally:
-            primary_stopped.set()
-
-    class _Core:
-        async def stop(self) -> None:
-            core_stopped.set()
-
-    async def _start() -> None:
-        runtime.core = cast(Any, _Core())
-        runtime.workspace_mcp_watcher_task = asyncio.create_task(
-            _failed_watcher()
-        )
-        runtime.tasks = [_primary()]
-
-    runtime.start = _start  # type: ignore[method-assign]
-    with pytest.raises(KeyError, match="unexpected watcher failure"):
-        await runtime.run()
-
-    assert primary_stopped.is_set()
-    assert core_stopped.is_set()
-    assert runtime.workspace_mcp_watcher_task is None
-
-
-@pytest.mark.asyncio
 async def test_app_runtime_run_stops_primary_tasks_after_server_return(tmp_path):
     runtime = bootstrap_app.AppRuntime(cast(Any, object()), tmp_path)
     runtime.dashboard_server = _FakeDashboardServer()

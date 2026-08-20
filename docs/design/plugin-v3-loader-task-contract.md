@@ -53,7 +53,7 @@ async def apply(ctx: Context, config: Config) -> None:
 
 ## 3. publication 与失败语义
 
-- 每次 v3 拓扑变化创建完整候选 Root；只改变 v2、workspace MCP 等非组合 payload 时共享同一 Root identity。
+- 每次 v3 拓扑变化创建完整候选 Root；MCP 只作为插件 Root registry 与 generation host 的一部分发布，不再存在独立 workspace MCP payload。
 - installed candidate 使用隔离 workspace/plugin-data 挂载并验证；晋升前排空 candidate lease，以同一 generation/config 在正式路径重建 Root，identity 不一致即拒绝。
 - stable/latest 快照各自持有 Root。旧快照仍有 lease 时旧 Root 不清理；最后一个引用排空后才 dispose。
 - apply 失败、required Service 缺失、重复 Service、拓扑不 ready、外部效果审计失败都不能进入可租用候选。

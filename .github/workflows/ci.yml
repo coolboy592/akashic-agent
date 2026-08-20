@@ -215,7 +215,7 @@ jobs:
           name: programmatic-control-gate
           path: docker/debug/reports/programmatic-control/
 
-  runtime-extension-gate:
+  restart-gate:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -232,13 +232,10 @@ jobs:
       - name: Install runtime dependencies
         run: python -m pip install -r requirements.txt
 
-      - name: Run workspace MCP lifecycle gate
-        run: python docker/debug/workspace_mcp_reload_probe.py
-
-      - name: Run restart and MCP soak gate
+      - name: Run restart soak gate
         run: python docker/debug/restart_probe.py --soak
 
-      - name: Verify combined source and cleanup evidence
+      - name: Verify restart cleanup evidence
         run: |
           python - <<'PY'
           import json
@@ -252,26 +249,21 @@ jobs:
               path = max(reports, key=lambda item: item.stat().st_mtime_ns)
               return json.loads(path.read_text(encoding="utf-8"))
 
-          mcp = latest("workspace-mcp/*/gate.json")
           restart = latest("restart/*/gate.json")
-          restart_digest = restart["sourceDigest"]
-          assert isinstance(restart_digest, dict)
-          assert mcp["status"] == restart["status"] == "passed"
-          assert mcp["head"] == restart["head"] == os.environ["GITHUB_SHA"]
-          assert mcp["sourceDigest"] == restart_digest["sha256"]
-          assert mcp["dirtyStatus"] == restart["dirtyStatus"] == []
+          assert restart["status"] == "passed"
+          assert restart["head"] == os.environ["GITHUB_SHA"]
+          assert restart["dirtyStatus"] == []
           assert not any(
-              mcp[name]
+              restart[name]
               for name in ("residualContainers", "residualNetworks", "residualVolumes")
           )
           assert not any(restart["residualResources"].values())
           PY
 
-      - name: Upload runtime extension evidence
+      - name: Upload restart evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: runtime-extension-gate
+          name: restart-gate
           path: |
-            docker/debug/reports/workspace-mcp/
             docker/debug/reports/restart/

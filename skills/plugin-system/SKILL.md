@@ -1,7 +1,7 @@
 ---
 name: plugin-system
 description: 说明并执行 Akashic v3 插件安装、加载、配置、插件内 MCP、Skill、生命周期、卸载与 turn 边界更新。
-when_to_use: 用户询问或要求处理 Akashic 插件、marketplace、插件自带 MCP、Skill、插件配置、安装、更新、卸载或排障时。独立本地 MCP server 使用 manage-workspace-mcp。
+when_to_use: 用户询问或要求处理 Akashic 插件、marketplace、插件自带 MCP、Skill、插件配置、安装、更新、卸载或排障时。所有 MCP server 都必须作为 v3 插件声明并经 Core generation host 发布。
 metadata: {"akashic": {"always": false}}
 ---
 
