@@ -2296,7 +2296,8 @@ def _prepare_host_sandbox(
 def _install_control_failure_plugin(sandbox: Path) -> None:
     """安装只为 PC10 构造 started 后 gate failure 的隔离插件。"""
 
-    cache = sandbox / "home/.akashic-plugin/cache/gate/control_failure/1.0.0"
+    plugin_base = sandbox / "home/.akashic-plugin/cache/gate/control_failure"
+    cache = plugin_base / ".artifacts/1.0.0"
     manifest = sandbox / "home/.akashic-plugin/manifest.toml"
     cache.mkdir(parents=True, exist_ok=True)
     _ = (cache / "plugin.py").write_text(
@@ -2332,6 +2333,16 @@ def _install_control_failure_plugin(sandbox: Path) -> None:
         "version = '1.0.0'\n"
         "api_version = 3\n"
         "entrypoint = 'plugin.py'\n",
+        encoding="utf-8",
+    )
+    _ = (plugin_base / ".pointers.json").write_text(
+        json.dumps(
+            {
+                "stable": ".artifacts/1.0.0",
+                "latest": ".artifacts/1.0.0",
+            },
+            sort_keys=True,
+        ),
         encoding="utf-8",
     )
     manifest.parent.mkdir(parents=True, exist_ok=True)

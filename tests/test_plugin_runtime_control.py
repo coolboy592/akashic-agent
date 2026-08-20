@@ -213,8 +213,6 @@ async def test_mcp_candidate_uses_isolated_data_and_exact_read_only_surface(
         assert candidate.production_data_dir == production_data
         assert (validation_data / marker.name).read_bytes() == production_before
         assert not (tmp_path / "workspace" / "candidate-mcp-started.json").exists()
-        assert (validation_workspace / "candidate-mcp-started.json").is_file()
-        assert (validation_data / "candidate-mcp-started.json").is_file()
         assert marker.read_bytes() == production_before
         assert _directory_digest(production_data) == production_digest_before
 
@@ -223,8 +221,16 @@ async def test_mcp_candidate_uses_isolated_data_and_exact_read_only_surface(
         probe = await _call_runtime_probe(
             candidate_server,
         )
-        assert probe["workspace"] == str(validation_workspace)
-        assert probe["data_dir"] == str(validation_data)
+        runtime_workspace = Path(str(probe["workspace"]))
+        runtime_data = Path(str(probe["data_dir"]))
+        assert runtime_workspace.name == "workspace"
+        assert runtime_workspace.is_relative_to(validation_root / "composition")
+        assert runtime_data == (
+            runtime_workspace / "plugin-data" / "runtime_mcp-lab"
+        )
+        assert (runtime_workspace / "candidate-mcp-started.json").is_file()
+        assert (runtime_data / "candidate-mcp-started.json").is_file()
+        assert (runtime_data / marker.name).read_bytes() == production_before
         assert marker.read_bytes() == production_before
         assert _directory_digest(production_data) == production_digest_before
 
