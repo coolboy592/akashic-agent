@@ -9,6 +9,18 @@ from collections.abc import AsyncIterable
 from typing import Any, cast
 from uuid import uuid4
 
+from agent.plugin_composition.channels import (
+    AttachmentKind as V3AttachmentKind,
+    AttachmentReadLease,
+    AttachmentRef,
+    ChannelAttachmentReadPort,
+    ChannelFactoryContext,
+    ChannelReady,
+    DeliveryStatus as V3DeliveryStatus,
+    ProviderDeliveryReceipt,
+    ProviderDeliveryRequest,
+    StopReceipt,
+)
 from fastapi import WebSocket
 from starlette.websockets import WebSocketDisconnect, WebSocketState
 
@@ -26,6 +38,7 @@ from bus.events_lifecycle import (
     TurnStarted,
 )
 from infra.channels.base import AttachmentStore
+from infra.channels.artifacts import ChannelAttachmentArtifactStore
 from infra.channels.contract import ChannelContext
 from infra.channels.reply_context import build_reply_inbound_text
 
@@ -38,11 +51,50 @@ class UploadTooLargeError(ValueError):
     """上传内容超过单文件上限。"""
 
 
+class WebNativeChannelAdapter:
+    """把一个已启动的 Web provider owner 暴露为 v3 native adapter。"""
+
+    def __init__(
+        self,
+        channel: WebChatChannel,
+        context: ChannelFactoryContext,
+    ) -> None:
+        self._channel = channel
+        self._binding_token = context.binding_token
+        self._attachment_read = context.attachment_read
+        self._started = False
+
+    async def start(self) -> ChannelReady:
+        """返回 binding readiness，不重复启动 Web provider owner。"""
+
+        self._started = True
+        return ChannelReady(self._binding_token)
+
+    async def deliver(self, request: ProviderDeliveryRequest) -> ProviderDeliveryReceipt:
+        """把 exact v3 request 投影为 Web final frame。"""
+
+        if not self._started:
+            raise RuntimeError("Web native channel 尚未 start")
+        if request.binding_token != self._binding_token:
+            raise RuntimeError("Web native channel binding token 不匹配")
+        return await self._channel.deliver_v3(
+            request,
+            attachment_read=self._attachment_read,
+        )
+
+    async def stop(self) -> StopReceipt:
+        """停止 adapter binding，但不关闭由 ChannelHost 持有的 Web provider。"""
+
+        self._started = False
+        return StopReceipt(self._binding_token, resources_closed=True)
+
+
 class WebChatChannel:
     def __init__(self, channel_name: str = "web") -> None:
         self.name = channel_name
         self._ctx: ChannelContext | None = None
         self._attachments: AttachmentStore | None = None
+        self._artifact_store: ChannelAttachmentArtifactStore | None = None
         self._connections: dict[str, set[WebSocket]] = {}
         self._active_turn_ids: dict[str, str] = {}
         self._media_paths: set[str] = set()
@@ -65,6 +117,28 @@ class WebChatChannel:
 
         if self._attachments is None:
             self._attachments = store
+
+    def bind_artifact_store(self, store: ChannelAttachmentArtifactStore) -> None:
+        """绑定 Core-owned artifact store，供 Web upload/read API 使用。"""
+
+        if not isinstance(store, ChannelAttachmentArtifactStore):
+            raise TypeError("Web artifact store 类型无效")
+        if self._artifact_store is not None and self._artifact_store is not store:
+            raise RuntimeError("Web artifact store 不允许在运行中替换")
+        self._artifact_store = store
+
+    @property
+    def artifact_store(self) -> ChannelAttachmentArtifactStore | None:
+        """Return the currently bound Core artifact owner, if the API is ready."""
+
+        return self._artifact_store
+
+    def build_v3_adapter(self, context: ChannelFactoryContext) -> WebNativeChannelAdapter:
+        """为一个 exact Core binding 创建不接管 provider 生命周期的 native adapter。"""
+
+        if not isinstance(context, ChannelFactoryContext):
+            raise TypeError("Web native adapter context 类型无效")
+        return WebNativeChannelAdapter(self, context)
 
     async def stop(self) -> None:
         async with self._connection_lock:
@@ -98,7 +172,7 @@ class WebChatChannel:
         finally:
             await self._remove_connection(websocket, session_keys)
 
-    def save_upload(self, data: bytes, filename: str) -> dict[str, str]:
+    def save_upload(self, data: bytes, filename: str) -> dict[str, Any]:
         if len(data) > MAX_UPLOAD_BYTES:
             raise UploadTooLargeError("上传内容超过 50MB 限制")
         suffix = Path(filename).suffix
@@ -114,7 +188,7 @@ class WebChatChannel:
         filename: str,
         *,
         max_bytes: int = MAX_UPLOAD_BYTES,
-    ) -> dict[str, str]:
+    ) -> dict[str, object]:
         """在分配正式附件前有界读取，并以 fsync + replace 原子发布。"""
 
         return await self._save_upload_stream(chunks, filename, max_bytes=max_bytes)
@@ -125,13 +199,41 @@ class WebChatChannel:
         filename: str,
         *,
         max_bytes: int,
-    ) -> dict[str, str]:
+    ) -> dict[str, object]:
         if max_bytes <= 0:
             raise ValueError("max_bytes must be positive")
         suffix = Path(filename).suffix
         if not suffix:
             guessed = mimetypes.guess_extension(mimetypes.guess_type(filename)[0] or "")
             suffix = guessed or ".bin"
+        if self._artifact_store is not None:
+            data = bytearray()
+            total = 0
+            async for chunk in chunks:
+                if not isinstance(chunk, bytes):
+                    raise TypeError("上传 chunk 必须是 bytes")
+                total += len(chunk)
+                if total > max_bytes:
+                    raise UploadTooLargeError(
+                        f"上传内容超过 {max_bytes // (1024 * 1024)}MB 限制"
+                    )
+                data.extend(chunk)
+            if total == 0:
+                raise ValueError("上传内容不能为空")
+            media_type = mimetypes.guess_type(filename)[0]
+            kind = (
+                V3AttachmentKind.IMAGE
+                if media_type is not None and media_type.startswith("image/")
+                else V3AttachmentKind.FILE
+            )
+            ref = await self._artifact_store.import_bytes(
+                bytes(data),
+                kind=kind,
+                filename=filename,
+                media_type=media_type,
+            )
+            return self._artifact_result(ref)
+
         store = self._require_attachment_store()
         staging = store.create_staging_path(prefix=".web_", suffix=".part")
         total = 0
@@ -162,12 +264,57 @@ class WebChatChannel:
         return self._upload_result(filename, path)
 
     @staticmethod
-    def _upload_result(filename: str, path: Path) -> dict[str, str]:
+    def _upload_result(filename: str, path: Path) -> dict[str, Any]:
         return {
             "filename": filename,
             "upload_path": str(path),
             "upload_url": f"/api/chat/media?path={str(path)}",
         }
+
+    @staticmethod
+    def _artifact_result(ref: AttachmentRef) -> dict[str, Any]:
+        """返回只含 opaque artifact identity 的 Web upload projection。"""
+
+        return {
+            "filename": ref.filename,
+            "artifact_id": ref.artifact_id,
+            "kind": ref.kind.value,
+            "media_type": ref.media_type,
+            "size_bytes": ref.size_bytes,
+            "sha256": ref.sha256,
+            "upload_url": f"/api/chat/artifacts/{ref.artifact_id}",
+        }
+
+    @staticmethod
+    def artifact_descriptor(ref: AttachmentRef) -> dict[str, Any]:
+        """把 Core-owned ref 投影为不含本地路径的 Web descriptor。"""
+
+        return {
+            "artifact_id": ref.artifact_id,
+            "kind": ref.kind.value,
+            "filename": ref.filename,
+            "media_type": ref.media_type,
+            "size_bytes": ref.size_bytes,
+            "sha256": ref.sha256,
+            "url": f"/api/chat/artifacts/{ref.artifact_id}",
+        }
+
+    async def read_artifact(self, artifact_id: str) -> tuple[bytes, str | None, str | None]:
+        """通过 Core read lease 读取一个有界、不可变 artifact。"""
+
+        store = self._artifact_store
+        if store is None:
+            raise RuntimeError("Web artifact store 尚未绑定")
+        refs = store.resolve_refs((artifact_id,))
+        if len(refs) != 1:
+            raise RuntimeError("Web artifact resolve 返回数量无效")
+        ref = refs[0]
+        lease = await store.acquire(ref)
+        try:
+            data = await lease.read_bytes(max_bytes=MAX_UPLOAD_BYTES)
+        finally:
+            await lease.aclose()
+        return data, ref.media_type, ref.filename
 
     def upload_roots(self) -> list[Path]:
         return [self._require_attachment_store().root]
@@ -264,6 +411,150 @@ class WebChatChannel:
             canonical_media=tuple(media),
         )
 
+    async def deliver_v3(
+        self,
+        request: ProviderDeliveryRequest,
+        *,
+        attachment_read: ChannelAttachmentReadPort | None,
+    ) -> ProviderDeliveryReceipt:
+        """Deliver one exact v3 request without exposing source paths to Web clients."""
+
+        if not isinstance(request, ProviderDeliveryRequest):
+            raise TypeError("Web native deliver 只接受 ProviderDeliveryRequest")
+        session_key = self._session_key(request.recipient)
+        async with self._connection_lock:
+            has_socket = bool(self._connections.get(session_key))
+        if not has_socket:
+            return ProviderDeliveryReceipt(
+                request.delivery_id,
+                V3DeliveryStatus.REJECTED,
+                error="Web 会话没有可用连接",
+            )
+
+        leases: list[AttachmentReadLease] = []
+        result: ProviderDeliveryReceipt | None = None
+        delivered = 0
+        try:
+            if request.attachments:
+                if attachment_read is None:
+                    result = ProviderDeliveryReceipt(
+                        request.delivery_id,
+                        V3DeliveryStatus.REJECTED,
+                        error="Web channel 缺少 attachment read port",
+                    )
+                else:
+                    for ref in request.attachments:
+                        lease = await attachment_read.acquire(ref)
+                        leases.append(lease)
+
+            if result is None:
+                metadata = dict(request.metadata)
+                metadata.pop("_channel_commit_role", None)
+                if request.commit_role.value != "passive":
+                    metadata.setdefault("source", "message_push")
+                frame: dict[str, Any] = {
+                    "type": "message.final",
+                    "session_id": session_key,
+                    "turn_id": request.control_turn_id or self._current_turn_id(session_key),
+                    "content": request.body,
+                    "thinking": request.thinking or "",
+                    "media": [self.artifact_descriptor(ref) for ref in request.attachments],
+                    "metadata": metadata,
+                }
+                if request.reply_to is not None:
+                    frame["reply_to"] = request.reply_to
+                if request.session_message_id is not None:
+                    frame["session_message_id"] = request.session_message_id
+                if request.control_turn_id is not None:
+                    frame["control_turn_id"] = request.control_turn_id
+                if request.execution_attempt_id is not None:
+                    frame["execution_attempt_id"] = request.execution_attempt_id
+                if request.terminal_status is not None:
+                    frame["terminal_status"] = request.terminal_status.value
+                duration = metadata.get("turn_duration_ms")
+                if isinstance(duration, (int, float)) and not isinstance(duration, bool):
+                    frame["duration_ms"] = duration
+                delivered, failed = await self._broadcast_native(session_key, frame)
+                if failed:
+                    result = ProviderDeliveryReceipt(
+                        request.delivery_id,
+                        V3DeliveryStatus.UNKNOWN,
+                        error="Web WebSocket frame 发送状态未知",
+                    )
+                elif delivered == 0:
+                    result = ProviderDeliveryReceipt(
+                        request.delivery_id,
+                        V3DeliveryStatus.REJECTED,
+                        error="Web 会话没有可用连接",
+                    )
+                else:
+                    result = ProviderDeliveryReceipt(
+                        request.delivery_id,
+                        V3DeliveryStatus.DELIVERED,
+                    )
+        except (OSError, ValueError, TypeError, RuntimeError) as error:
+            result = ProviderDeliveryReceipt(
+                request.delivery_id,
+                V3DeliveryStatus.REJECTED,
+                error=str(error),
+            )
+        finally:
+            close_error: Exception | None = None
+            cancellation: asyncio.CancelledError | None = None
+            for lease in reversed(leases):
+                try:
+                    await lease.aclose()
+                except asyncio.CancelledError as error:
+                    cancellation = cancellation or error
+                except Exception as error:
+                    close_error = close_error or error
+            if close_error is not None:
+                logger.error("[web_chat] attachment read lease 关闭失败: %s", close_error)
+                if delivered > 0:
+                    result = ProviderDeliveryReceipt(
+                        request.delivery_id,
+                        V3DeliveryStatus.UNKNOWN,
+                        error="Web attachment read lease 关闭状态未知",
+                    )
+            if cancellation is not None:
+                raise cancellation
+        if result is None:
+            raise RuntimeError("Web native delivery 未产生 receipt")
+        return result
+
+    async def _broadcast_native(
+        self,
+        session_key: str,
+        frame: dict[str, Any],
+    ) -> tuple[int, int]:
+        """Broadcast a native frame and preserve provider uncertainty after send errors."""
+
+        async with self._connection_lock:
+            sockets = list(self._connections.get(session_key, set()))
+        if not sockets:
+            return 0, 0
+        stale: list[WebSocket] = []
+        delivered = 0
+        failed = 0
+        for socket in sockets:
+            if socket.application_state != WebSocketState.CONNECTED:
+                stale.append(socket)
+                continue
+            try:
+                await socket.send_json(frame)
+                delivered += 1
+            except Exception as error:
+                logger.warning("[web_chat] native WebSocket frame 发送失败: %s", error)
+                failed += 1
+                stale.append(socket)
+        if stale:
+            async with self._connection_lock:
+                current = self._connections.get(session_key)
+                if current is not None:
+                    for socket in stale:
+                        current.discard(socket)
+        return delivered, failed
+
     async def _handle_client_frame(
         self,
         websocket: WebSocket,
@@ -328,6 +619,17 @@ class WebChatChannel:
             return session_key
         reply_to_message_id = payload.get("reply_to_message_id")
         metadata: dict[str, object] = {"client_request_id": request_id}
+        if media and self._artifact_store is not None:
+            try:
+                refs = self._artifact_store.resolve_refs(tuple(media))
+            except ValueError as error:
+                await self._send_error(websocket, request_id, "media 附件不存在")
+                logger.info("[web_chat] rejected unknown inbound artifact: %s", error)
+                return session_key
+            if len(refs) != len(media):
+                raise RuntimeError("Web artifact resolve 返回数量无效")
+            metadata["attachment_ids"] = [ref.artifact_id for ref in refs]
+            media = []
         if "model_runtime_id" in payload:
             model_runtime_id = payload["model_runtime_id"]
             if not isinstance(model_runtime_id, str):
@@ -583,3 +885,36 @@ def _reply_source_text(target: dict[str, Any]) -> str:
     if isinstance(media, list) and media:
         return "[附件]"
     return "[无文字消息]"
+
+
+def build_web_channel_definition(channel: WebChatChannel) -> Any:
+    """Project the already-started Web owner into a Core native channel definition."""
+
+    from agent.plugin_composition.channels import (
+        ChannelCapability,
+        CoreChannelDefinition,
+    )
+
+    if not isinstance(channel, WebChatChannel):
+        raise TypeError("Web Core channel definition 只接受 WebChatChannel")
+
+    return CoreChannelDefinition(
+        name=channel.name,
+        capabilities=frozenset({ChannelCapability.OUTBOUND}),
+        factory=channel.build_v3_adapter,
+        inbound_identity=None,
+        source_revision="core-web-v3",
+        config_revision="core-web-v3",
+        generation_id="core-web-v3",
+        config={"channel": channel.name},
+        factory_export="infra.channels.web_chat_channel.WebChatChannel.build_v3_adapter",
+    )
+
+
+__all__ = [
+    "MAX_UPLOAD_BYTES",
+    "UploadTooLargeError",
+    "WebChatChannel",
+    "WebNativeChannelAdapter",
+    "build_web_channel_definition",
+]

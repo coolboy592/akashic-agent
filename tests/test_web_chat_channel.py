@@ -10,10 +10,17 @@ from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketState
 
 from bootstrap.chat_api import create_chat_app
+from agent.plugin_composition.channels import (
+    AttachmentKind as V3AttachmentKind,
+    AttachmentRef,
+    ChannelFactoryContext,
+    DeliveryStatus as V3DeliveryStatus,
+    ProviderDeliveryRequest,
+)
 from bus.events import AttachmentKind, ChannelAttachment, ChannelMessage
 from infra.channels.base import AttachmentStore
 from infra.channels.web_chat_channel import UploadTooLargeError, WebChatChannel
-from session.manager import Session
+from session.manager import Session, SessionManager
 
 
 class _Bus:
@@ -43,6 +50,58 @@ class _WebSocket:
 
     async def send_json(self, frame: dict[str, Any]) -> None:
         self.frames.append(frame)
+
+
+class _FailingWebSocket(_WebSocket):
+    async def send_json(self, frame: dict[str, Any]) -> None:
+        _ = frame
+        raise OSError("socket closed")
+
+
+class _ProviderClientFactory:
+    async def create(self, credentials: Any) -> Any:
+        _ = credentials
+        raise AssertionError("Web native adapter 不应创建 provider client")
+
+    async def aclose(self) -> None:
+        return None
+
+
+class _AttachmentLease:
+    def __init__(self, ref: AttachmentRef) -> None:
+        self.ref = ref
+        self.closed = False
+
+    async def read_bytes(self, *, max_bytes: int) -> bytes:
+        _ = max_bytes
+        return b"artifact"
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+class _AttachmentRead:
+    def __init__(self) -> None:
+        self.leases: list[_AttachmentLease] = []
+
+    async def acquire(self, ref: AttachmentRef) -> _AttachmentLease:
+        lease = _AttachmentLease(ref)
+        self.leases.append(lease)
+        return lease
+
+
+def _v3_context(read: _AttachmentRead | None = None) -> ChannelFactoryContext:
+    return ChannelFactoryContext(
+        snapshot_id="snapshot-1",
+        generation_id="generation-1",
+        binding_token="binding-1",
+        config={},
+        credentials={},
+        provider_client_factory=cast(Any, _ProviderClientFactory()),
+        ingress=None,
+        identity=None,
+        attachment_read=cast(Any, read),
+    )
 
 
 class _SessionManager:
@@ -724,3 +783,196 @@ async def test_web_final_preserves_full_outbound_projection(tmp_path: Path) -> N
         }
     ]
     assert channel.has_media(image)
+
+
+@pytest.mark.asyncio
+async def test_web_v3_native_delivery_projects_opaque_artifacts_and_semantics() -> None:
+    channel = WebChatChannel()
+    socket = _WebSocket()
+    channel._connections["web:abc"] = {cast(Any, socket)}
+    read = _AttachmentRead()
+    ref = AttachmentRef(
+        artifact_id="artifact-1",
+        kind=V3AttachmentKind.IMAGE,
+        filename="meme.png",
+        media_type="image/png",
+        size_bytes=7,
+        sha256="a" * 64,
+    )
+    adapter = channel.build_v3_adapter(_v3_context(read))
+    ready = await adapter.start()
+    receipt = await adapter.deliver(
+        ProviderDeliveryRequest(
+            binding_token=ready.binding_token,
+            delivery_id="delivery-1",
+            recipient="abc",
+            body="answer",
+            attachments=(ref,),
+            metadata={"turn_duration_ms": 17, "render": "card"},
+            thinking="reasoning",
+            reply_to="user-1",
+            session_message_id="assistant-1",
+            control_turn_id="turn-1",
+            execution_attempt_id="attempt-1",
+        )
+    )
+
+    assert receipt.status is V3DeliveryStatus.DELIVERED
+    assert read.leases[0].closed is True
+    assert socket.frames == [{
+        "type": "message.final",
+        "session_id": "web:abc",
+        "turn_id": "turn-1",
+        "content": "answer",
+        "thinking": "reasoning",
+        "media": [{
+            "artifact_id": "artifact-1",
+            "kind": "image",
+            "filename": "meme.png",
+            "media_type": "image/png",
+            "size_bytes": 7,
+            "sha256": "a" * 64,
+            "url": "/api/chat/artifacts/artifact-1",
+        }],
+        "metadata": {
+            "turn_duration_ms": 17,
+            "render": "card",
+            "source": "message_push",
+        },
+        "reply_to": "user-1",
+        "session_message_id": "assistant-1",
+        "control_turn_id": "turn-1",
+        "execution_attempt_id": "attempt-1",
+        "duration_ms": 17,
+    }]
+
+
+@pytest.mark.asyncio
+async def test_web_v3_native_delivery_rejects_without_socket() -> None:
+    channel = WebChatChannel()
+    adapter = channel.build_v3_adapter(_v3_context())
+    await adapter.start()
+    receipt = await adapter.deliver(
+        ProviderDeliveryRequest(
+            binding_token="binding-1",
+            delivery_id="delivery-1",
+            recipient="missing",
+            body="answer",
+        )
+    )
+
+    assert receipt.status is V3DeliveryStatus.REJECTED
+    assert receipt.error == "Web 会话没有可用连接"
+
+
+@pytest.mark.asyncio
+async def test_web_v3_native_delivery_marks_socket_failure_unknown() -> None:
+    channel = WebChatChannel()
+    channel._connections["web:abc"] = {cast(Any, _FailingWebSocket())}
+    adapter = channel.build_v3_adapter(_v3_context())
+    await adapter.start()
+    receipt = await adapter.deliver(
+        ProviderDeliveryRequest(
+            binding_token="binding-1",
+            delivery_id="delivery-1",
+            recipient="abc",
+            body="answer",
+        )
+    )
+
+    assert receipt.status is V3DeliveryStatus.UNKNOWN
+
+
+@pytest.mark.asyncio
+async def test_web_v3_native_delivery_marks_partial_broadcast_unknown() -> None:
+    channel = WebChatChannel()
+    delivered_socket = _WebSocket()
+    channel._connections["web:abc"] = {
+        cast(Any, delivered_socket),
+        cast(Any, _FailingWebSocket()),
+    }
+    adapter = channel.build_v3_adapter(_v3_context())
+    await adapter.start()
+    receipt = await adapter.deliver(
+        ProviderDeliveryRequest(
+            binding_token="binding-1",
+            delivery_id="delivery-1",
+            recipient="abc",
+            body="answer",
+        )
+    )
+
+    assert receipt.status is V3DeliveryStatus.UNKNOWN
+    assert len(delivered_socket.frames) == 1
+
+
+@pytest.mark.asyncio
+async def test_web_artifact_api_returns_opaque_upload_and_bounded_readback(
+    tmp_path: Path,
+) -> None:
+    session_manager = SessionManager(tmp_path)
+    bus = _Bus()
+    channel = WebChatChannel()
+    await channel.start(cast(Any, SimpleNamespace(
+        bus=bus,
+        session_manager=session_manager,
+        event_bus=_EventBus(),
+        push_tool=_PushTool(),
+        attachment_store=AttachmentStore(tmp_path / "uploads"),
+        interrupt_controller=None,
+    )))
+    app = create_chat_app(workspace=tmp_path, channel=channel)
+
+    with TestClient(app) as client:
+        upload = client.post(
+            "/api/chat/uploads",
+            params={"filename": "meme.png"},
+            content=b"image",
+        )
+        payload = upload.json()
+        assert upload.status_code == 200
+        assert payload["filename"] == "meme.png"
+        assert payload["kind"] == "image"
+        assert payload["artifact_id"]
+        assert "upload_path" not in payload
+        assert all(str(tmp_path) not in str(value) for value in payload.values())
+
+        readback = client.get(payload["upload_url"])
+        traversal = client.get("/api/chat/artifacts/../sessions.db")
+        with client.websocket_connect("/ws") as ws:
+            ws.send_json({"type": "session.create", "request_id": "create"})
+            session_id = ws.receive_json()["session_id"]
+            ws.send_json({
+                "type": "message.send",
+                "request_id": "send",
+                "session_id": session_id,
+                "text": "请查看附件",
+                "media": [payload["artifact_id"]],
+            })
+
+    assert readback.status_code == 200
+    assert readback.content == b"image"
+    assert traversal.status_code in {404, 405}
+    assert len(bus.inbound) == 1
+    assert bus.inbound[0].media == []
+    assert bus.inbound[0].metadata["attachment_ids"] == [payload["artifact_id"]]
+
+
+@pytest.mark.asyncio
+async def test_web_v3_adapter_stop_closes_binding_without_stopping_provider() -> None:
+    channel = WebChatChannel()
+    adapter = channel.build_v3_adapter(_v3_context())
+    ready = await adapter.start()
+    receipt = await adapter.stop()
+
+    assert receipt.binding_token == ready.binding_token
+    assert receipt.resources_closed is True
+    with pytest.raises(RuntimeError, match="尚未 start"):
+        await adapter.deliver(
+            ProviderDeliveryRequest(
+                binding_token=ready.binding_token,
+                delivery_id="delivery-after-stop",
+                recipient="abc",
+                body="answer",
+            )
+        )

@@ -11,7 +11,21 @@ export type ChatFrame =
   | { type: "react.tool.started"; session_id: string; turn_id: string; call_id: string; tool_name: string; arguments: unknown }
   | { type: "react.tool.completed"; session_id: string; turn_id: string; call_id: string; tool_name: string; status: string; result_preview: string }
   | { type: "answer.delta"; session_id: string; turn_id: string; delta: string }
-  | { type: "message.final"; session_id: string; turn_id: string; content: string; thinking?: string; media?: string[]; duration_ms?: number; metadata?: Record<string, unknown> }
+  | {
+    type: "message.final";
+    session_id: string;
+    turn_id: string;
+    content: string;
+    thinking?: string;
+    media?: ArtifactDescriptor[];
+    duration_ms?: number;
+    metadata?: Record<string, unknown>;
+    reply_to?: string;
+    session_message_id?: string;
+    control_turn_id?: string;
+    execution_attempt_id?: string;
+    terminal_status?: string;
+  }
   | { type: "turn.output.completed"; session_id: string; turn_id: string; client_message_id?: string }
   | { type: "turn.interrupted"; request_id: string; session_id: string; status: string; message: string }
   | { type: "error"; request_id: string; message: string }
@@ -55,7 +69,7 @@ export function parseChatFrame(value: unknown): ChatFrame {
     case "message.final":
       requireStrings(frame, ["session_id", "turn_id", "content"]);
       if (frame.thinking !== undefined && typeof frame.thinking !== "string") throw new Error("message.final.thinking 格式无效");
-      if (frame.media !== undefined && (!Array.isArray(frame.media) || frame.media.some((item) => typeof item !== "string"))) {
+      if (frame.media !== undefined && (!Array.isArray(frame.media) || frame.media.some((item) => !artifactDescriptor(item)))) {
         throw new Error("message.final.media 格式无效");
       }
       if (frame.duration_ms !== undefined && (typeof frame.duration_ms !== "number" || !Number.isFinite(frame.duration_ms))) {
@@ -82,6 +96,33 @@ export function parseChatFrame(value: unknown): ChatFrame {
       throw new Error(`WebSocket 返回了未知消息类型: ${frame.type}`);
   }
   return frame as unknown as ChatFrame;
+}
+
+type ArtifactDescriptor = {
+  artifact_id: string;
+  kind: "file" | "image";
+  filename: string | null;
+  media_type: string | null;
+  size_bytes: number;
+  sha256: string;
+  url: string;
+};
+
+function artifactDescriptor(value: unknown): value is ArtifactDescriptor {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const item = value as Record<string, unknown>;
+  return typeof item.artifact_id === "string"
+    && item.artifact_id.length > 0
+    && (item.kind === "file" || item.kind === "image")
+    && (item.filename === null || typeof item.filename === "string")
+    && (item.media_type === null || typeof item.media_type === "string")
+    && typeof item.size_bytes === "number"
+    && Number.isInteger(item.size_bytes)
+    && item.size_bytes >= 0
+    && typeof item.sha256 === "string"
+    && /^[0-9a-f]{64}$/.test(item.sha256)
+    && typeof item.url === "string"
+    && item.url.startsWith("/api/chat/artifacts/");
 }
 
 export function traceKindForChatFrame(frame: ChatFrame): WebTurnTraceKind | undefined {

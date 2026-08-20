@@ -60,7 +60,15 @@ test("history projection owns reply, tools, media, filtering, and navigation lab
     id: 9,
     role: "assistant",
     content: "完成",
-    media: ["/tmp/result.png"],
+    media: [{
+      artifact_id: "artifact-result",
+      kind: "image",
+      filename: "result.png",
+      media_type: "image/png",
+      size_bytes: 6,
+      sha256: "a".repeat(64),
+      url: "/api/chat/artifacts/artifact-result",
+    }],
     reasoning_content: "思考",
     turn_duration_ms: "42",
     reply_to_message_id: "7",
@@ -87,12 +95,28 @@ test("HTTP and upload failures stay explicit at the transport boundary", async (
 
     globalThis.fetch = async (input) => String(input).startsWith("blob:")
       ? new Response("file-body", { status: 200 })
-      : new Response(JSON.stringify({ filename: "note.txt", upload_path: "/uploads/note.txt" }), { status: 200 });
+      : new Response(JSON.stringify({
+        filename: "note.txt",
+        artifact_id: "artifact-note",
+        kind: "file",
+        media_type: "text/plain",
+        size_bytes: 9,
+        sha256: "b".repeat(64),
+        upload_url: "/api/chat/artifacts/artifact-note",
+      }), { status: 200 });
     const uploaded = await uploadFiles(
       [{ filename: "note.txt", url: "blob:note" }],
       new AbortController().signal,
     );
-    assert.deepEqual(uploaded, [{ filename: "note.txt", upload_path: "/uploads/note.txt" }]);
+    assert.deepEqual(uploaded, [{
+      filename: "note.txt",
+      artifact_id: "artifact-note",
+      kind: "file",
+      media_type: "text/plain",
+      size_bytes: 9,
+      sha256: "b".repeat(64),
+      upload_url: "/api/chat/artifacts/artifact-note",
+    }]);
   } finally {
     globalThis.fetch = originalFetch;
   }

@@ -22,6 +22,7 @@ from agent.plugins.mobile_ui import (
 from agent.model_runtime.registry import ModelRegistry
 from agent.model_runtime.session_selection import read_session_model_selection
 from infra.channels.base import AttachmentStore
+from infra.channels.artifacts import ChannelAttachmentArtifactStore
 from infra.channels.web_chat_channel import (
     MAX_UPLOAD_BYTES,
     UploadTooLargeError,
@@ -33,6 +34,7 @@ from infra.mobile_realtime.runtime_inspection import (
     RuntimeInspectionService,
 )
 from infra.mobile_realtime.storage import PairingStateError
+from session.store import SessionStore
 
 if TYPE_CHECKING:
     from infra.mobile_realtime.gateway import MobilePairingAdmin
@@ -71,6 +73,17 @@ def create_chat_app(
     model_registry: ModelRegistry | None = None,
 ) -> FastAPI:
     channel.bind_attachment_store(AttachmentStore(workspace / "uploads"))
+    channel_context = channel._ctx
+    if channel.artifact_store is None and channel_context is not None:
+        session_store = channel_context.session_manager.control_store
+        if isinstance(session_store, SessionStore):
+            channel.bind_artifact_store(
+                ChannelAttachmentArtifactStore(
+                    workspace=workspace,
+                    session_store=session_store,
+                    max_import_bytes=MAX_UPLOAD_BYTES,
+                )
+            )
     app = FastAPI(title="Akashic Chat API")
     app.state.workspace = workspace
     app.state.channel = channel
@@ -268,7 +281,7 @@ def create_chat_app(
     async def upload_file(
         request: Request,
         filename: str = Query(default="upload.bin"),
-    ) -> dict[str, str]:
+    ) -> dict[str, object]:
         declared_length = request.headers.get("content-length")
         if declared_length is not None:
             try:
@@ -290,6 +303,23 @@ def create_chat_app(
             raise HTTPException(status_code=413, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/api/chat/artifacts/{artifact_id}")
+    async def read_artifact(artifact_id: str) -> Response:
+        try:
+            data, media_type, filename = await channel.read_artifact(artifact_id)
+        except (RuntimeError, ValueError) as error:
+            raise HTTPException(status_code=404, detail="附件不存在") from error
+        headers: dict[str, str] = {}
+        if filename:
+            safe_filename = Path(filename).name.replace('"', "").replace("\r", "").replace("\n", "")
+            if safe_filename:
+                headers["Content-Disposition"] = f'inline; filename="{safe_filename}"'
+        return Response(
+            content=data,
+            media_type=media_type or "application/octet-stream",
+            headers=headers,
+        )
 
     @app.get("/api/chat/media")
     def read_media(path: str = Query(...)) -> FileResponse:

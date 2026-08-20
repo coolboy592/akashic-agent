@@ -309,7 +309,7 @@ export function useDesktopChatController() {
         request_id: createUuid(),
         session_id: sessionId,
         text: cleanText,
-        media: media.map((item) => item.upload_path),
+        media: media.map((item) => item.artifact_id),
       };
       if (reply) payload.reply_to_message_id = reply.id;
       if (modelSelectionDirty) {

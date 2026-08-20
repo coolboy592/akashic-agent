@@ -48,7 +48,22 @@ test("frame controller preserves thinking, tool, answer, and terminal lifecycle"
   applyChatFrame(parseChatFrame({ type: "react.tool.started", session_id: "session", turn_id: "turn", call_id: "call", tool_name: "shell", arguments: { cmd: "pwd" } }), context);
   applyChatFrame(parseChatFrame({ type: "react.tool.completed", session_id: "session", turn_id: "turn", call_id: "call", tool_name: "shell", status: "success", result_preview: "ok" }), context);
   applyChatFrame(parseChatFrame({ type: "answer.delta", session_id: "session", turn_id: "turn", delta: "答案" }), context);
-  applyChatFrame(parseChatFrame({ type: "message.final", session_id: "session", turn_id: "turn", content: "答案", media: ["/tmp/a.png"], duration_ms: 50 }), context);
+  applyChatFrame(parseChatFrame({
+    type: "message.final",
+    session_id: "session",
+    turn_id: "turn",
+    content: "答案",
+    media: [{
+      artifact_id: "artifact-a",
+      kind: "image",
+      filename: "a.png",
+      media_type: "image/png",
+      size_bytes: 1,
+      sha256: "a".repeat(64),
+      url: "/api/chat/artifacts/artifact-a",
+    }],
+    duration_ms: 50,
+  }), context);
 
   assert.equal(status, "idle");
   assert.equal(error, "");
