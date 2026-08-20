@@ -4,6 +4,7 @@ import asyncio
 import logging
 import mimetypes
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 from collections.abc import AsyncIterable
 from typing import Any, cast
@@ -13,12 +14,16 @@ from agent.plugin_composition.channels import (
     AttachmentKind as V3AttachmentKind,
     AttachmentReadLease,
     AttachmentRef,
+    ChannelInboundMessage,
     ChannelAttachmentReadPort,
     ChannelFactoryContext,
+    ChannelRuntimePorts,
     ChannelReady,
     DeliveryStatus as V3DeliveryStatus,
+    InboundIdentity,
     ProviderDeliveryReceipt,
     ProviderDeliveryRequest,
+    RawInbound,
     StopReceipt,
 )
 from fastapi import WebSocket
@@ -28,7 +33,6 @@ from bus.events import (
     ChannelMessage,
     DeliveryReceipt,
     DeliveryStatus,
-    InboundMessage,
 )
 from bus.events_lifecycle import (
     StreamDeltaReady,
@@ -63,12 +67,103 @@ class WebNativeChannelAdapter:
         self._binding_token = context.binding_token
         self._attachment_read = context.attachment_read
         self._started = False
+        self._stopped = False
+        self._runtime: ChannelRuntimePorts | None = None
+        self._admission_open = False
+        self._in_flight = 0
+        self._drain_event = asyncio.Event()
+        self._drain_event.set()
+        self._stop_receipt: StopReceipt | None = None
+        channel._register_v3_adapter(self)
+
+    @property
+    def binding_token(self) -> str:
+        return self._binding_token
+
+    @property
+    def admission_open(self) -> bool:
+        return self._admission_open
 
     async def start(self) -> ChannelReady:
         """返回 binding readiness，不重复启动 Web provider owner。"""
 
+        if self._stopped:
+            raise RuntimeError("Web native channel binding 已停止")
+        if self._started:
+            raise RuntimeError("Web native channel binding 重复 start")
         self._started = True
         return ChannelReady(self._binding_token)
+
+    def attach_runtime(self, ports: ChannelRuntimePorts) -> None:
+        """把 provider callback 固定到一个不可替换的 exact Core binding。"""
+
+        if not isinstance(ports, ChannelRuntimePorts):
+            raise TypeError("Web runtime ports 类型无效")
+        if ports.binding_token != self._binding_token:
+            raise RuntimeError("Web runtime ports binding token 不匹配")
+        if ports.ingress is None:
+            raise RuntimeError("Web v3 ingress 缺少 Core ingress")
+        if self._stopped:
+            raise RuntimeError("Web native channel binding 已停止")
+        if self._runtime is not None:
+            raise RuntimeError("Web v3 ingress runtime 不允许替换")
+        self._runtime = ports
+
+    def open_admission(self) -> None:
+        """在 stable publication 完成后打开当前 exact Web ingress。"""
+
+        if not self._started:
+            raise RuntimeError("Web native channel 尚未 start")
+        if self._runtime is None:
+            raise RuntimeError("Web v3 ingress 尚未 attach")
+        if self._admission_open:
+            raise RuntimeError("Web v3 ingress 已打开")
+        self._channel._open_v3_binding(self)
+        self._admission_open = True
+
+    def close_admission(self) -> None:
+        """同步拒绝新 Web callback，已开始的 callback 继续使用旧 binding。"""
+
+        if not self._admission_open:
+            return
+        self._admission_open = False
+        self._channel._close_v3_binding(self)
+
+    def begin_inbound(self) -> ChannelRuntimePorts:
+        """在 provider callback 的第一个 await 前锁定当前 exact binding。"""
+
+        runtime = self._runtime
+        if (
+            self._stopped
+            or not self._started
+            or not self._admission_open
+            or runtime is None
+            or runtime.ingress is None
+        ):
+            raise RuntimeError("Web v3 ingress admission 已关闭")
+        self._in_flight += 1
+        self._drain_event.clear()
+        return runtime
+
+    def _finish_inbound(self) -> None:
+        if self._in_flight <= 0:
+            raise RuntimeError("Web v3 ingress in-flight 计数下溢")
+        self._in_flight -= 1
+        if self._in_flight == 0:
+            self._drain_event.set()
+
+    async def admit_captured(
+        self,
+        runtime: ChannelRuntimePorts,
+        raw: RawInbound,
+    ) -> bool:
+        """把已获准的 Web callback 投递到其开始时捕获的 Core ingress。"""
+
+        if not isinstance(raw, RawInbound):
+            raise TypeError("Web v3 ingress 只接受 RawInbound")
+        if runtime is not self._runtime or runtime.ingress is None:
+            raise RuntimeError("Web v3 ingress runtime 已失效")
+        return await runtime.ingress.admit(raw)
 
     async def deliver(self, request: ProviderDeliveryRequest) -> ProviderDeliveryReceipt:
         """把 exact v3 request 投影为 Web final frame。"""
@@ -85,11 +180,21 @@ class WebNativeChannelAdapter:
     async def stop(self) -> StopReceipt:
         """停止 adapter binding，但不关闭由 ChannelHost 持有的 Web provider。"""
 
+        if self._stop_receipt is not None:
+            return self._stop_receipt
+        self.close_admission()
+        await self._drain_event.wait()
         self._started = False
-        return StopReceipt(self._binding_token, resources_closed=True)
+        self._stopped = True
+        self._runtime = None
+        self._channel._unregister_v3_adapter(self)
+        self._stop_receipt = StopReceipt(self._binding_token, resources_closed=True)
+        return self._stop_receipt
 
 
 class WebChatChannel:
+    v3_inbound_identity = InboundIdentity.PROVIDER_MESSAGE_ID
+
     def __init__(self, channel_name: str = "web") -> None:
         self.name = channel_name
         self._ctx: ChannelContext | None = None
@@ -100,6 +205,7 @@ class WebChatChannel:
         self._media_paths: set[str] = set()
         self._connection_lock = asyncio.Lock()
         self._events_bound = False
+        self._v3_adapters: dict[str, WebNativeChannelAdapter] = {}
 
     async def start(self, ctx: ChannelContext) -> None:
         self._ctx = ctx
@@ -139,6 +245,38 @@ class WebChatChannel:
         if not isinstance(context, ChannelFactoryContext):
             raise TypeError("Web native adapter context 类型无效")
         return WebNativeChannelAdapter(self, context)
+
+    def _register_v3_adapter(self, adapter: WebNativeChannelAdapter) -> None:
+        current = self._v3_adapters.get(adapter.binding_token)
+        if current is not None and current is not adapter:
+            raise RuntimeError("Web v3 binding token 已注册")
+        self._v3_adapters[adapter.binding_token] = adapter
+
+    def _unregister_v3_adapter(self, adapter: WebNativeChannelAdapter) -> None:
+        if self._v3_adapters.get(adapter.binding_token) is adapter:
+            self._v3_adapters.pop(adapter.binding_token, None)
+
+    def _open_v3_binding(self, adapter: WebNativeChannelAdapter) -> None:
+        if self._v3_adapters.get(adapter.binding_token) is not adapter:
+            raise RuntimeError("Web v3 binding 未注册")
+        if any(
+            current is not adapter and current.admission_open
+            for current in self._v3_adapters.values()
+        ):
+            raise RuntimeError("Web v3 不允许同时打开多个 binding")
+
+    def _close_v3_binding(self, adapter: WebNativeChannelAdapter) -> None:
+        if self._v3_adapters.get(adapter.binding_token) is not adapter:
+            raise RuntimeError("Web v3 binding 未注册")
+
+    def _begin_v3_inbound(self) -> tuple[WebNativeChannelAdapter, ChannelRuntimePorts]:
+        """在处理 Web frame 前捕获唯一打开的 exact Core binding。"""
+
+        adapters = tuple(self._v3_adapters.values())
+        for adapter in adapters:
+            if adapter.admission_open:
+                return adapter, adapter.begin_inbound()
+        raise RuntimeError("Web v3 ingress admission 已关闭")
 
     async def stop(self) -> None:
         async with self._connection_lock:
@@ -591,6 +729,20 @@ class WebChatChannel:
         request_id: str,
         payload: dict[str, Any],
     ) -> str:
+        return await self._send_user_message_in_binding(
+            websocket,
+            request_id,
+            payload,
+        )
+
+    async def _send_user_message_in_binding(
+        self,
+        websocket: WebSocket,
+        request_id: str,
+        payload: dict[str, Any],
+    ) -> str:
+        """验证并构造 Web exact inbound，再在首个 await 前捕获 binding。"""
+
         ctx = self._require_ctx()
         session_key = self._normalize_session_id(payload.get("session_id"))
         if not session_key:
@@ -619,6 +771,7 @@ class WebChatChannel:
             return session_key
         reply_to_message_id = payload.get("reply_to_message_id")
         metadata: dict[str, object] = {"client_request_id": request_id}
+        attachments: tuple[AttachmentRef, ...] = ()
         if media and self._artifact_store is not None:
             try:
                 refs = self._artifact_store.resolve_refs(tuple(media))
@@ -628,8 +781,11 @@ class WebChatChannel:
                 return session_key
             if len(refs) != len(media):
                 raise RuntimeError("Web artifact resolve 返回数量无效")
-            metadata["attachment_ids"] = [ref.artifact_id for ref in refs]
+            attachments = tuple(refs)
             media = []
+        elif media:
+            await self._send_error(websocket, request_id, "Web artifact store 尚未绑定")
+            return session_key
         if "model_runtime_id" in payload:
             model_runtime_id = payload["model_runtime_id"]
             if not isinstance(model_runtime_id, str):
@@ -685,18 +841,32 @@ class WebChatChannel:
                 reply_content,
                 sender_label="你" if reply_role == "user" else "Akashic",
             )
-        await self._add_connection(session_key, websocket)
         chat_id = self._chat_id(session_key)
-        await ctx.bus.publish_inbound(
-            InboundMessage(
+        raw = RawInbound(
+            message_id=request_id.strip() or uuid4().hex,
+            provider_identity=session_key,
+            recipient=session_key,
+            message=ChannelInboundMessage(
                 channel=self.name,
                 sender="web",
                 chat_id=chat_id,
-                content=inbound_content,
-                media=media,
-                metadata=metadata,
-            )
+                content=_normalize_v3_content(inbound_content),
+                timestamp=datetime.now(timezone.utc),
+                metadata=cast(Any, metadata),
+                attachments=attachments,
+            ),
         )
+        try:
+            adapter, runtime = self._begin_v3_inbound()
+        except RuntimeError as error:
+            logger.info("[web_chat] rejected inbound message: %s", error)
+            await self._send_error(websocket, request_id, str(error))
+            return session_key
+        try:
+            await self._add_connection(session_key, websocket)
+            await adapter.admit_captured(runtime, raw)
+        finally:
+            adapter._finish_inbound()
         return session_key
 
     async def _stop_turn(
@@ -887,6 +1057,15 @@ def _reply_source_text(target: dict[str, Any]) -> str:
     return "[无文字消息]"
 
 
+def _normalize_v3_content(value: str) -> str:
+    """把 Web 文本归一化为 Core inbound 允许的无控制字符正文。"""
+
+    return "".join(
+        "\u2028" if ord(char) in {10, 13} else " " if ord(char) < 32 else char
+        for char in value
+    )
+
+
 def build_web_channel_definition(channel: WebChatChannel) -> Any:
     """Project the already-started Web owner into a Core native channel definition."""
 
@@ -900,9 +1079,9 @@ def build_web_channel_definition(channel: WebChatChannel) -> Any:
 
     return CoreChannelDefinition(
         name=channel.name,
-        capabilities=frozenset({ChannelCapability.OUTBOUND}),
+        capabilities=frozenset({ChannelCapability.INBOUND, ChannelCapability.OUTBOUND}),
         factory=channel.build_v3_adapter,
-        inbound_identity=None,
+        inbound_identity=InboundIdentity.PROVIDER_MESSAGE_ID,
         source_revision="core-web-v3",
         config_revision="core-web-v3",
         generation_id="core-web-v3",
