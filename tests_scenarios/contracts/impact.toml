@@ -138,6 +138,7 @@ paths = [
   "bootstrap/wiring.py",
   "tests/test_plugin_*.py",
 ]
+deleted_paths = ["agent/tool_hooks/**"]
 depends_on = ["lifecycle"]
 scenarios = ["plugin_generation_contract", "plugin_uninstall_drain_finality", "mcp_process_lifecycle", "plugin_domain_observe_events"]
 
