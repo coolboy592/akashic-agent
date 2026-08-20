@@ -32,6 +32,7 @@ from agent.plugins.manifest import write_plugin_manifest  # noqa: E402
 from docker.debug import (
     plugin_passive_composition_v3_gate as composition_gate,
 )  # noqa: E402
+from docker.debug import plugin_v3_fleet_gate as fleet_gate  # noqa: E402
 from docker.debug import programmatic_control_probe as control_probe  # noqa: E402
 
 DEFAULT_REPORT = ROOT / "docker/debug/reports/plugin-passive-webui-v3" / "gate.json"
@@ -42,6 +43,7 @@ MODEL_RESPONSE = "答复正文\n§cited:[mem_1]§ <meme:shy>"
 USER_INPUT = "请给我一条带引用和表情的回复"
 MARKETPLACE = "webui"
 EXPECTED_PLUGIN_IDS = ("citation@webui", "meme@webui")
+EXPECTED_SOURCE_IDS = ("citation", "meme")
 READINESS_TIMEOUT_S = 60.0
 SCENARIO_TIMEOUT_S = 30.0
 
@@ -76,9 +78,7 @@ def _run_host(report_path: Path, *, require_clean: bool) -> int:
     source_before = control_probe._repository_digest(
         ROOT
     )  # pyright: ignore[reportPrivateUsage]
-    lock = composition_gate._load_lock(  # pyright: ignore[reportPrivateUsage]
-        composition_gate.DEFAULT_LOCK
-    )
+    lock = _load_final_sources()
     run_id = f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
     sandbox = Path(tempfile.mkdtemp(prefix="akashic-passive-webui-v3-", dir="/tmp"))
     project = f"akashic-passive-webui-{run_id.lower()}"
@@ -223,8 +223,10 @@ def _run_host(report_path: Path, *, require_clean: bool) -> int:
         "scenario_profile": SCENARIO_PROFILE,
         "scenario_sha256": _scenario_sha256(),
         "core": {"head": core_head, "tree": core_tree, "dirty_status": core_status},
-        "lock": str(composition_gate.DEFAULT_LOCK.relative_to(ROOT)),
-        "lock_sha256": _sha256(composition_gate.DEFAULT_LOCK),
+        "lock": str(fleet_gate.DEFAULT_LOCK.relative_to(ROOT)),
+        "lock_sha256": _sha256(fleet_gate.DEFAULT_LOCK),
+        "contract_lock": str(composition_gate.DEFAULT_LOCK.relative_to(ROOT)),
+        "contract_lock_sha256": _sha256(composition_gate.DEFAULT_LOCK),
         "config_sha256": config_sha256,
         "sources": source_evidence,
         "contract_report": contract_report,
@@ -236,6 +238,37 @@ def _run_host(report_path: Path, *, require_clean: bool) -> int:
     _write_json(report_path, report)
     print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
     return 0 if passed else 1
+
+
+def _load_final_sources() -> composition_gate.GateLock:
+    """把 WebUI 场景绑定到最终 fleet identity 与 contract owner。"""
+
+    # 1. Passive lock 只拥有固定的公开 contract checker。
+    passive = composition_gate._load_lock(  # pyright: ignore[reportPrivateUsage]
+        composition_gate.DEFAULT_LOCK
+    )
+
+    # 2. Citation 与 Meme 统一从最终 fleet lock 取得。
+    fleet = {
+        item.id: item
+        for item in fleet_gate._load_lock(  # pyright: ignore[reportPrivateUsage]
+            fleet_gate.DEFAULT_LOCK
+        )
+    }
+    missing = sorted(set(EXPECTED_SOURCE_IDS) - set(fleet))
+    if missing:
+        raise GateFailure(f"最终 fleet lock 缺少 WebUI source: {missing}")
+    plugins = tuple(
+        composition_gate.SourceLock(
+            id=fleet[plugin_id].id,
+            repository=fleet[plugin_id].repository,
+            requested_ref=fleet[plugin_id].requested_ref,
+            resolved_sha=fleet[plugin_id].resolved_sha,
+            change_source_pr_head=fleet[plugin_id].change_source_pr_head,
+        )
+        for plugin_id in EXPECTED_SOURCE_IDS
+    )
+    return composition_gate.GateLock(contract=passive.contract, plugins=plugins)
 
 
 def _run_inside() -> dict[str, object]:

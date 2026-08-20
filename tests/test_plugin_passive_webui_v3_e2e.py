@@ -11,15 +11,23 @@ from docker.debug import plugin_passive_webui_v3_e2e as gate
 
 
 def test_gate_freezes_exact_pure_v3_scenario() -> None:
-    lock = gate.composition_gate._load_lock(  # pyright: ignore[reportPrivateUsage]
-        gate.composition_gate.DEFAULT_LOCK
-    )
+    lock = gate._load_final_sources()  # pyright: ignore[reportPrivateUsage]
+    fleet = {
+        item.id: item
+        for item in gate.fleet_gate._load_lock(  # pyright: ignore[reportPrivateUsage]
+            gate.fleet_gate.DEFAULT_LOCK
+        )
+    }
 
     assert gate.GATE_VERSION == 2
     assert gate.SCENARIO_PROFILE == "citation-meme-webui-v3-v1"
     assert gate.EXPECTED_PLUGIN_IDS == ("citation@webui", "meme@webui")
     assert tuple(item.id for item in lock.plugins) == ("citation", "meme")
+    assert all(
+        item.resolved_sha == fleet[item.id].resolved_sha for item in lock.plugins
+    )
     assert all(item.requested_ref == item.resolved_sha for item in lock.plugins)
+    assert gate.fleet_gate.DEFAULT_LOCK.name == "plugin-v3-fleet.lock.json"
     assert len(gate._scenario_sha256()) == 64  # pyright: ignore[reportPrivateUsage]
 
 
