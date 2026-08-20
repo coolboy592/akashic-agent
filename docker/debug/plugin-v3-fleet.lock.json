@@ -95,9 +95,9 @@
     {
       "id": "feishu",
       "repository": "https://github.com/akashic-plugins/feishu",
-      "requested_ref": "fc2b4ba11511d957b0d4202f7e3aba40605927b0",
-      "resolved_sha": "fc2b4ba11511d957b0d4202f7e3aba40605927b0",
-      "change_source_pr_head": "fc2b4ba11511d957b0d4202f7e3aba40605927b0"
+      "requested_ref": "b69340439640d82a965b46243eb8565108804a56",
+      "resolved_sha": "b69340439640d82a965b46243eb8565108804a56",
+      "change_source_pr_head": "b69340439640d82a965b46243eb8565108804a56"
     },
     {
       "id": "fitbit-mcp",
@@ -116,9 +116,9 @@
     {
       "id": "qqbot",
       "repository": "https://github.com/akashic-plugins/qqbot",
-      "requested_ref": "9c4fa628a68cbed424d7bcf8d196cbcdfe93db3f",
-      "resolved_sha": "9c4fa628a68cbed424d7bcf8d196cbcdfe93db3f",
-      "change_source_pr_head": "9c4fa628a68cbed424d7bcf8d196cbcdfe93db3f"
+      "requested_ref": "d4bf1ed0256068b56963621e8587ca66e7f6786f",
+      "resolved_sha": "d4bf1ed0256068b56963621e8587ca66e7f6786f",
+      "change_source_pr_head": "d4bf1ed0256068b56963621e8587ca66e7f6786f"
     },
     {
       "id": "proactive_feedback",
