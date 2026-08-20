@@ -28,6 +28,12 @@ from typing import Any, cast
 
 from agent.config_models import QQGroupConfig
 from agent.looping.interrupt import InterruptController
+from agent.plugin_composition.channels import (
+    AttachmentRef,
+    ChannelAdapter,
+    ChannelFactoryContext,
+    ProviderDeliveryRequest,
+)
 from bus.event_bus import EventBus
 from bus.events import (
     ChannelMessage,
@@ -49,6 +55,7 @@ from infra.channels.group_filter import (
     GroupMessageFilter,
     strip_at_segments,
 )
+from infra.channels.native_delivery import NativeChannelDeliveryAdapter
 from core.net.http import HttpRequester, RequestBudget, get_default_http_requester
 from session.manager import SessionManager
 
@@ -778,6 +785,11 @@ class QQChannel:
             send_image=self.send_image,
         )
 
+    def build_v3_adapter(self, context: ChannelFactoryContext) -> ChannelAdapter:
+        """Build a Core adapter over this already-started QQ provider owner."""
+
+        return QQV3ChannelAdapter(self, context)
+
     def _require_main_loop(self) -> asyncio.AbstractEventLoop:
         if self._main_loop is None:
             raise RuntimeError("QQ main loop 未就绪")
@@ -793,6 +805,65 @@ class QQChannel:
             raise RuntimeError("QQ bot loop 未就绪")
         future = asyncio.run_coroutine_threadsafe(coro, self._bot_loop)
         return await asyncio.wrap_future(future)
+
+
+class QQV3ChannelAdapter(NativeChannelDeliveryAdapter):
+    """Deliver Core requests through an already-started QQChannel."""
+
+    def __init__(self, channel: QQChannel, context: ChannelFactoryContext) -> None:
+        self._channel = channel
+        super().__init__(
+            context,
+            channel_name=channel.name,
+            validate_recipient=self._validate_recipient,
+            send_text=self._send_text,
+            send_attachment=self._send_attachment,
+        )
+
+    def _validate_recipient(self, recipient: str) -> None:
+        if recipient.startswith(_GROUP_PREFIX):
+            group_id = recipient[len(_GROUP_PREFIX) :]
+            if not group_id.isdigit() or int(group_id) <= 0:
+                raise ValueError(f"QQ 群聊 recipient 无效: {recipient}")
+            return
+        if not recipient.isdigit() or int(recipient) <= 0:
+            raise ValueError(f"QQ 私聊 recipient 无效: {recipient}")
+
+    async def _send_text(self, request: ProviderDeliveryRequest) -> None:
+        await self._channel.send(request.recipient, request.body)
+
+    async def _send_attachment(
+        self,
+        request: ProviderDeliveryRequest,
+        ref: AttachmentRef,
+        payload: bytes,
+    ) -> None:
+        api = self._channel._api
+        if api is None:
+            raise RuntimeError("QQChannel 尚未启动")
+        uri = "base64://" + base64.b64encode(payload).decode("ascii")
+        recipient = request.recipient
+        if ref.kind.value == "image":
+            if recipient.startswith(_GROUP_PREFIX):
+                group_id = int(recipient[len(_GROUP_PREFIX) :])
+                await self._channel._run_on_bot_loop(
+                    api.send_group_image(group_id, uri)
+                )
+            else:
+                await self._channel._run_on_bot_loop(
+                    api.send_private_image(int(recipient), uri)
+                )
+            return
+        filename = ref.filename or ref.artifact_id
+        if recipient.startswith(_GROUP_PREFIX):
+            group_id = int(recipient[len(_GROUP_PREFIX) :])
+            await self._channel._run_on_bot_loop(
+                api.send_group_file(group_id, uri, filename)
+            )
+        else:
+            await self._channel._run_on_bot_loop(
+                api.send_private_file(int(recipient), uri, filename)
+            )
 
 
 def _is_local(path: str) -> bool:

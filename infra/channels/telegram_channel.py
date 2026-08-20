@@ -7,6 +7,7 @@ Telegram Channel
 import logging
 import asyncio
 import html
+from io import BytesIO
 import json
 import time
 from collections.abc import Callable, Coroutine
@@ -39,9 +40,17 @@ from bus.events_lifecycle import (
 )
 from bus.queue import MessageBus
 from agent.looping.interrupt import InterruptController
+from agent.plugin_composition.channels import (
+    AttachmentRef,
+    ChannelAdapter,
+    ChannelCommitRole,
+    ChannelFactoryContext,
+    ProviderDeliveryRequest,
+)
 from infra.channels.base import AttachmentStore, MessageDeduper, SessionIdentityIndex
 from infra.channels.contract import ChannelContext
 from infra.channels.delivery import deliver_message_parts
+from infra.channels.native_delivery import NativeChannelDeliveryAdapter
 from infra.channels.reply_context import build_reply_inbound_text
 from infra.channels.telegram_utils import (
     TelegramOutboundLimiter,
@@ -780,6 +789,11 @@ class TelegramChannel:
             send_image=self.send_image,
         )
 
+    def build_v3_adapter(self, context: ChannelFactoryContext) -> ChannelAdapter:
+        """Build a Core adapter over this already-started Telegram provider owner."""
+
+        return TelegramV3ChannelAdapter(self, context)
+
     async def _send_document_file(
         self,
         chat_id: int,
@@ -836,6 +850,78 @@ class TelegramChannel:
                 )
             return
         logger.warning("[telegram] polling 异常，框架将自动重试: %s", exc)
+
+
+class TelegramV3ChannelAdapter(NativeChannelDeliveryAdapter):
+    """Deliver Core requests through an already-started TelegramChannel."""
+
+    def __init__(self, channel: TelegramChannel, context: ChannelFactoryContext) -> None:
+        self._channel = channel
+        super().__init__(
+            context,
+            channel_name=channel.name,
+            validate_recipient=channel._resolve_chat_id,
+            send_text=self._send_text,
+            send_attachment=self._send_attachment,
+        )
+
+    async def _send_text(self, request: ProviderDeliveryRequest) -> None:
+        if bool(request.metadata.get("streamed_reply")):
+            chat_id = self._channel._resolve_chat_id(request.recipient)
+            stream = self._channel._active_streams.pop(str(chat_id), None)
+            if stream is not None:
+                await stream.finalize(request.body)
+                return
+        if request.commit_role is ChannelCommitRole.PASSIVE:
+            await self._channel.send(request.recipient, request.body)
+        else:
+            await self._channel.send_stream(request.recipient, request.body)
+
+    async def _send_attachment(
+        self,
+        request: ProviderDeliveryRequest,
+        ref: AttachmentRef,
+        payload: bytes,
+    ) -> None:
+        chat_id = int(self._channel._resolve_chat_id(request.recipient))
+        if ref.kind.value == "image":
+            await self._channel._telegram_outbound_limiter.run(
+                chat_id,
+                kind="send",
+                label="send_photo(v3)",
+                action=lambda: self._send_photo_bytes(chat_id, ref, payload),
+            )
+            return
+        await self._channel._telegram_outbound_limiter.run(
+            chat_id,
+            kind="send",
+            label="send_document(v3)",
+            action=lambda: self._send_document_bytes(chat_id, ref, payload),
+        )
+
+    async def _send_document_bytes(
+        self,
+        chat_id: int,
+        ref: AttachmentRef,
+        payload: bytes,
+    ) -> object:
+        document = BytesIO(payload)
+        document.name = ref.filename or ref.artifact_id
+        return await self._channel._app.bot.send_document(
+            chat_id=chat_id,
+            document=document,
+            filename=ref.filename,
+        )
+
+    async def _send_photo_bytes(
+        self,
+        chat_id: int,
+        ref: AttachmentRef,
+        payload: bytes,
+    ) -> object:
+        photo = BytesIO(payload)
+        photo.name = ref.filename or ref.artifact_id
+        return await self._channel._app.bot.send_photo(chat_id=chat_id, photo=photo)
 
 
 def _format_turn_live(
