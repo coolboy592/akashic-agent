@@ -54,7 +54,7 @@ def test_gate_scope_pins_full_fleet_and_explicit_webui_boundary() -> None:
     assert gate.GATE_SCOPE["private_proactive_entries"] == (
         *gate.PRIVATE_PROACTIVE_PLUGIN_IDS,
     )
-    assert gate.GATE_SCOPE["legacy_passive_plugins"] == gate.PASSIVE_PLUGIN_IDS
+    assert gate.GATE_SCOPE["passive_plugins"] == gate.PASSIVE_PLUGIN_IDS
     assert gate.GATE_SCOPE["provider"] == (
         "synthetic recording HTTP/WS adapter; no external delivery"
     )

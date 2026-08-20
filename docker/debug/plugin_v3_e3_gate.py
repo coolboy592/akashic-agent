@@ -69,7 +69,7 @@ from session.manager import SessionManager  # noqa: E402
 
 DEFAULT_REPORT = ROOT / "docker/debug/reports/plugin-v3-e3" / "gate.json"
 GATE_VERSION = 1
-SCENARIO_PROFILE = "plugin-v3-e3-fleet-channel-proactive-v2"
+SCENARIO_PROFILE = "plugin-v3-e3-fleet-channel-proactive-v3"
 CHANNEL_PLUGIN_IDS = ("feishu", "qqbot")
 PASSIVE_PLUGIN_IDS = ("citation", "meme")
 FLEET_EXTERNAL_PLUGIN_IDS = (
@@ -124,7 +124,7 @@ GATE_SCOPE = {
     "exact_plugins": E3_EXACT_PLUGIN_IDS,
     "lock_plugins": FLEET_LOCK_PLUGIN_IDS,
     "private_proactive_entries": PRIVATE_PROACTIVE_PLUGIN_IDS,
-    "legacy_passive_plugins": PASSIVE_PLUGIN_IDS,
+    "passive_plugins": PASSIVE_PLUGIN_IDS,
     "provider": "synthetic recording HTTP/WS adapter; no external delivery",
     "proactive_provider": "fixed-clock deterministic model and recording sink",
     "github_watch": "dedicated controlled remote or strict fail-loud blocked",
@@ -593,16 +593,16 @@ async def _run_runtime(sandbox: Path) -> dict[str, object]:
         source_evidence.append(asdict(evidence))
     for plugin_id in CHANNEL_PLUGIN_IDS:
         _copy_source_tree(fleet_providers / plugin_id, channel_providers / plugin_id)
-    legacy_locks = {
+    passive_locks = {
         item.id: item
         for item in lock_items
         if item.id in PASSIVE_PLUGIN_IDS
     }
-    if set(legacy_locks) != set(PASSIVE_PLUGIN_IDS):
-        raise GateBlocked("legacy passive compatibility lock 缺少 Citation/Meme")
+    if set(passive_locks) != set(PASSIVE_PLUGIN_IDS):
+        raise GateBlocked("E3 passive lock 缺少 Citation/Meme")
     for plugin_id in PASSIVE_PLUGIN_IDS:
         checkout = passive_providers / plugin_id
-        evidence = fleet_gate._checkout_locked_plugin(legacy_locks[plugin_id], checkout)
+        evidence = fleet_gate._checkout_locked_plugin(passive_locks[plugin_id], checkout)
         source_evidence.append(asdict(evidence))
     _prepare_channel_checkouts(fleet_providers)
     _prepare_channel_checkouts(channel_providers)
