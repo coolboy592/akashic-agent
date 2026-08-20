@@ -5,193 +5,61 @@ import json
 from contextlib import suppress
 
 import pytest
-from types import SimpleNamespace
 
 from agent.plugin_composition.channels import (
+    ChannelFactoryContext,
     ChannelReady,
-    ChannelCapability,
-    CommittedChannelCatalog,
-    CoreChannelDefinition,
-    DeliveryStatus as ChannelDeliveryState,
-    OutboundEnvelope,
+    DeliveryStatus,
+    ProviderDeliveryReceipt,
     ProviderDeliveryRequest,
+    StopReceipt,
 )
 from agent.plugins.manager import PluginManager
-from bootstrap.core_channel_adapter import (
-    CoreLegacyChannelAdapter,
-    LEGACY_ATTACHMENT_METADATA_KEY,
-    LEGACY_REPLY_TO_METADATA_KEY,
-    map_legacy_delivery_receipt,
-    build_core_channel_definition,
-)
+from agent.tools.message_push import MessagePushTool
+from bootstrap.core_channel_adapter import build_core_channel_definition
 from bootstrap.tools import _dispatch_v3_channel_push
-from agent.plugins.channel_generation_host import ChannelGenerationHost
-from bus.events import (
-    AttachmentKind,
-    ChannelAttachment,
-    DeliveryReceipt,
-    DeliveryStatus,
-)
 from bus.event_bus import EventBus
 from bus.queue import MessageBus
-from agent.tools.message_push import MessagePushTool
 
 
-class _ExistingChannel:
+class _NativeAdapter:
+    def __init__(
+        self,
+        context: ChannelFactoryContext,
+        received: list[ProviderDeliveryRequest],
+    ) -> None:
+        self._binding_token = context.binding_token
+        self._received = received
+
+    async def start(self) -> ChannelReady:
+        return ChannelReady(self._binding_token)
+
+    async def deliver(
+        self,
+        request: ProviderDeliveryRequest,
+    ) -> ProviderDeliveryReceipt:
+        self._received.append(request)
+        return ProviderDeliveryReceipt(request.delivery_id, DeliveryStatus.DELIVERED)
+
+    async def stop(self) -> StopReceipt:
+        return StopReceipt(self._binding_token, resources_closed=True)
+
+
+class _NativeChannel:
     name = "web"
 
     def __init__(self) -> None:
-        self.received = []
+        self.received: list[ProviderDeliveryRequest] = []
+        self.contexts: list[ChannelFactoryContext] = []
 
-    async def _deliver_message(self, message):
-        self.received.append(message)
-        return DeliveryReceipt(
-            DeliveryStatus.SUCCESS,
-            canonical_media=tuple(item.source for item in message.attachments),
-        )
-
-
-class _ProviderFactory:
-    async def create(self, credentials):
-        raise AssertionError("Core adapter must not resolve credentials")
-
-    async def aclose(self):
-        return None
-
-
-class _SnapshotLease:
-    def __init__(self, snapshot) -> None:
-        self.snapshot = snapshot
-        self.active = True
-
-    def fork(self):
-        return _SnapshotLease(self.snapshot)
-
-    async def release(self):
-        self.active = False
+    def build_v3_adapter(self, context: ChannelFactoryContext) -> _NativeAdapter:
+        self.contexts.append(context)
+        return _NativeAdapter(context, self.received)
 
 
 @pytest.mark.asyncio
-async def test_legacy_adapter_preserves_existing_attachment_delivery() -> None:
-    channel = _ExistingChannel()
-    adapter = CoreLegacyChannelAdapter(channel, "binding-1")
-    request = ProviderDeliveryRequest(
-        binding_token="binding-1",
-        delivery_id="delivery-1",
-        recipient="chat-1",
-        body="report",
-        metadata={
-            LEGACY_ATTACHMENT_METADATA_KEY: (
-                {"kind": "file", "source": "/tmp/report.pdf", "filename": "report.pdf"},
-            ),
-            LEGACY_REPLY_TO_METADATA_KEY: "message-1",
-        },
-    )
-
-    assert await adapter.start() == ChannelReady("binding-1")
-    receipt = await adapter.deliver(request)
-
-    assert receipt.status is ChannelDeliveryState.DELIVERED
-    assert channel.received[0].attachments == (
-        ChannelAttachment(AttachmentKind.FILE, "/tmp/report.pdf", "report.pdf"),
-    )
-    assert channel.received[0].reply_to == "message-1"
-    assert (await adapter.stop()).resources_closed is True
-
-
-@pytest.mark.parametrize(
-    ("legacy_status", "detail", "expected"),
-    (
-        (DeliveryStatus.SUCCESS, None, ChannelDeliveryState.DELIVERED),
-        (DeliveryStatus.PARTIAL, "one part committed", ChannelDeliveryState.UNKNOWN),
-        (DeliveryStatus.FAILED, "provider timeout", ChannelDeliveryState.UNKNOWN),
-        (DeliveryStatus.FAILED, "pre-effect:no provider call", ChannelDeliveryState.REJECTED),
-    ),
-)
-def test_telegram_qq_legacy_receipt_mapping_is_non_retryable(
-    legacy_status: DeliveryStatus,
-    detail: str | None,
-    expected: ChannelDeliveryState,
-) -> None:
-    receipt = map_legacy_delivery_receipt(
-        "delivery-1",
-        DeliveryReceipt(legacy_status, detail=detail),
-    )
-
-    assert receipt.delivery_id == "delivery-1"
-    assert receipt.status is expected
-
-
-@pytest.mark.asyncio
-async def test_core_catalog_host_start_exact_binding_attachment_and_stop() -> None:
-    channel = _ExistingChannel()
-
-    def factory(context):
-        return CoreLegacyChannelAdapter(channel, context.binding_token)
-
-    definition = CoreChannelDefinition(
-        name="web",
-        capabilities=frozenset({ChannelCapability.OUTBOUND}),
-        factory=factory,
-        inbound_identity=None,
-        source_revision="core-test-source",
-        config_revision="core-test-config",
-        generation_id="core-test-generation",
-    )
-    root = object()
-    catalog = CommittedChannelCatalog(
-        core_definitions=(definition,),
-        root_instance_token=root,
-    )
-    snapshot = SimpleNamespace(
-        snapshot_id="core-snapshot",
-        state="committed",
-        composition_root=SimpleNamespace(instance_token=root),
-        channel_registry=None,
-        channel_registry_identity=None,
-        channel_catalog=catalog,
-        generations={},
-    )
-    async def noop(*_args):
-        return None
-
-    host = ChannelGenerationHost(
-        on_before_start=noop,
-        config_revision_checker=noop,
-        on_failure=noop,
-    )
-    generation = await host.start_formal(snapshot, {"web": _ProviderFactory()})
-    generation.open_admission()
-    lease = host.acquire_binding(_SnapshotLease(snapshot), "web")
-    envelope = OutboundEnvelope(
-        logical_delivery_id="delivery-1",
-        delivery_id="delivery-1",
-        attempt_sequence=1,
-        snapshot_id=lease.snapshot_id,
-        generation_id=lease.generation_id,
-        binding_token=lease.binding_token,
-        channel="web",
-        recipient="chat-1",
-        body="report",
-        metadata={
-            LEGACY_ATTACHMENT_METADATA_KEY: (
-                {"kind": "file", "source": "/tmp/report.pdf", "filename": "report.pdf"},
-            )
-        },
-    )
-
-    receipt = await host.dispatch_outbound(envelope, lease)
-
-    assert receipt.status is ChannelDeliveryState.DELIVERED
-    assert channel.received[0].attachments[0].source == "/tmp/report.pdf"
-    await lease.aclose()
-    stop_receipts = await generation.stop()
-    assert stop_receipts[0].resources_closed is True
-
-
-@pytest.mark.asyncio
-async def test_manager_publishes_core_catalog_without_stable_plugins(tmp_path) -> None:
-    """无插件 stable snapshot 时也正式发布 Core channel Host。"""
+async def test_manager_publishes_native_core_catalog_without_plugins(tmp_path) -> None:
+    """A Core channel is materialized only through its native v3 factory."""
 
     manager = PluginManager(
         plugin_dirs=[tmp_path / "plugins"],
@@ -199,7 +67,7 @@ async def test_manager_publishes_core_catalog_without_stable_plugins(tmp_path) -
         workspace=tmp_path / "workspace",
         installed_cache_root=tmp_path / "cache",
     )
-    channel = _ExistingChannel()
+    channel = _NativeChannel()
 
     await manager.bind_core_channel_definitions(
         (build_core_channel_definition(channel),)
@@ -213,15 +81,17 @@ async def test_manager_publishes_core_catalog_without_stable_plugins(tmp_path) -
     assert runtime is not None
     assert runtime.snapshot_id == snapshot.snapshot_id
     assert runtime.channel("web").admission_open is True
+    assert len(channel.contexts) == 1
+    assert channel.contexts[0].binding_token == runtime.channel("web").binding_token
 
     await manager.terminate_all()
 
 
 @pytest.mark.asyncio
-async def test_core_catalog_message_push_keeps_media_off_legacy_registration(
+async def test_native_core_catalog_routes_message_push_without_legacy_fallback(
     tmp_path,
 ) -> None:
-    """Core catalog 命中时 MessagePush 使用 v3 receipt 并保留媒体投影。"""
+    """MessagePush reaches the native adapter with one exact committed request."""
 
     manager = PluginManager(
         plugin_dirs=[tmp_path / "plugins"],
@@ -229,7 +99,7 @@ async def test_core_catalog_message_push_keeps_media_off_legacy_registration(
         workspace=tmp_path / "workspace",
         installed_cache_root=tmp_path / "cache",
     )
-    channel = _ExistingChannel()
+    channel = _NativeChannel()
     await manager.bind_core_channel_definitions(
         (build_core_channel_definition(channel),)
     )
@@ -240,7 +110,6 @@ async def test_core_catalog_message_push_keeps_media_off_legacy_registration(
     )
     dispatch_task = asyncio.create_task(bus.dispatch_outbound())
     tool = MessagePushTool(chat_lane=bus.chat_lane)
-    assert not hasattr(tool, "register_channel")
     tool.bind_v3_channel_dispatcher(
         lambda message, passive: _dispatch_v3_channel_push(
             manager,
@@ -256,7 +125,6 @@ async def test_core_catalog_message_push_keeps_media_off_legacy_registration(
                 target_channel="web",
                 target_chat_id="chat-1",
                 message="report",
-                file="/tmp/report.pdf",
             )
         )
     finally:
@@ -269,6 +137,19 @@ async def test_core_catalog_message_push_keeps_media_off_legacy_registration(
 
     assert result["status"] == "delivered"
     assert result["retryable"] is False
-    assert channel.received[0].attachments == (
-        ChannelAttachment(AttachmentKind.FILE, "/tmp/report.pdf", "report.pdf"),
-    )
+    assert len(channel.received) == 1
+    request = channel.received[0]
+    assert request.recipient == "chat-1"
+    assert request.body == "report"
+    assert request.binding_token == channel.contexts[0].binding_token
+
+
+def test_core_catalog_rejects_channel_without_native_v3_factory() -> None:
+    class _LegacyOnly:
+        name = "legacy"
+
+        async def _deliver_message(self, _message: object) -> object:
+            return object()
+
+    with pytest.raises(TypeError, match="build_v3_adapter"):
+        build_core_channel_definition(_LegacyOnly())
