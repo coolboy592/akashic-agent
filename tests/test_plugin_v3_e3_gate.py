@@ -88,6 +88,14 @@ def test_fleet_lock_and_coverage_oracles_reject_missing_or_unexpected_ids() -> N
         assert "missing" in str(error)
     else:
         raise AssertionError("缺失 fleet lock id 未被拒绝")
+    try:
+        gate._validate_fleet_lock(
+            [*lock, LockItem("unexpected-e3-plugin")]
+        )
+    except gate.GateFailure as error:
+        assert "extra" in str(error)
+    else:
+        raise AssertionError("未知 fleet lock id 未被拒绝")
 
     coverage = gate._fleet_coverage_contract(
         active_external_ids=gate.FLEET_LOCK_PLUGIN_IDS,
@@ -173,6 +181,14 @@ def test_runtime_evidence_mutant_missing_full_boot_is_blocked() -> None:
         assert "proactive" in str(error)
     else:
         raise AssertionError("blocked proactive runtime evidence 未阻断 Gate")
+
+    blocked_github = dict(evidence)
+    try:
+        gate._require_runtime_evidence(blocked_github)
+    except gate.GateBlocked as error:
+        assert "controlled remote" in str(error)
+    else:
+        raise AssertionError("blocked GitHub Watch runtime evidence 未阻断 Gate")
 
 
 def test_tree_digest_is_stable_for_missing_and_changes_with_content(

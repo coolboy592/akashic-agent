@@ -27,6 +27,9 @@ if str(ROOT) not in sys.path:
 from agent.plugins import channel_generation_host  # noqa: E402
 from agent.plugins.dashboard_host import PluginDashboardHost  # noqa: E402
 from agent.plugins.generation_activity_host import ActivityHost  # noqa: E402
+from agent.plugins.generation_job_host import (  # noqa: E402
+    BackgroundJobActivityAdapter,
+)
 from agent.plugins.generation_private_proactive_host import PrivateProactiveHost  # noqa: E402
 from agent.plugins.generation_proactive_host import ProactiveActivityAdapter  # noqa: E402
 from agent.plugins.manager import PluginManager  # noqa: E402
@@ -210,6 +213,50 @@ class GateFailure(RuntimeError):
 
 class GateBlocked(GateFailure):
     """Represent an explicitly unavailable external or runtime prerequisite."""
+
+
+class _NamedPrivateProactiveHost(PrivateProactiveHost):
+    """Give the Default and Wake private children distinct ActivityHost names."""
+
+    def __init__(self, family: str, name: str) -> None:
+        super().__init__(family)
+        self.name = name
+
+
+class _RecordingTurnHandle:
+    """Complete one synthetic Turn immediately while retaining its identity."""
+
+    def __init__(self, turn_id: str) -> None:
+        self.id = turn_id
+
+    async def result(self) -> None:
+        return None
+
+
+class _RecordingConversationRuntime:
+    """Record formal programmatic Turn admission without running a model."""
+
+    def __init__(self) -> None:
+        self.requests: list[dict[str, object]] = []
+
+    async def start_turn(
+        self,
+        request: object,
+        *,
+        runtime_snapshot_lease: object,
+    ) -> _RecordingTurnHandle:
+        turn_id = f"e3-recording-turn-{len(self.requests) + 1}"
+        self.requests.append(
+            {
+                "turn_id": turn_id,
+                "thread_id": str(getattr(request, "thread_id", "")),
+                "input": str(getattr(request, "input", "")),
+                "snapshot_id": str(
+                    getattr(getattr(runtime_snapshot_lease, "snapshot", None), "snapshot_id", "")
+                ),
+            }
+        )
+        return _RecordingTurnHandle(turn_id)
 
 
 def _validate_fleet_lock(lock_items: Iterable[object]) -> dict[str, object]:
@@ -515,11 +562,14 @@ def _require_runtime_evidence(runtime: Mapping[str, object]) -> None:
     if not isinstance(proactive, Mapping) or proactive.get("status") != "complete":
         raise GateBlocked(f"E3 proactive scenario 未执行: {proactive!r}")
     github_watch = runtime["github_watch"]
-    if not isinstance(github_watch, Mapping) or github_watch.get("status") not in {
-        "blocked",
-        "controlled_remote",
-    }:
-        raise GateBlocked(f"E3 GitHub Watch policy 未结算: {github_watch!r}")
+    if (
+        not isinstance(github_watch, Mapping)
+        or github_watch.get("status") != "controlled_remote"
+    ):
+        raise GateBlocked(
+            "E3 GitHub Watch controlled remote scenario 未完成: "
+            f"{github_watch!r}"
+        )
 
 
 async def _run_runtime(sandbox: Path) -> dict[str, object]:
@@ -702,12 +752,26 @@ async def _run_full_fleet_scenario(
         session_manager=sessions,
         installed_cache_root=sandbox / "fleet-plugin-home" / "cache",
     )
+    conversation_runtime = _RecordingConversationRuntime()
+    background_adapter = BackgroundJobActivityAdapter(
+        event_bus,
+        manager.snapshot_store,
+        ledger_path=str(workspace / "runtime" / "background-jobs.sqlite"),
+        workspace=str(workspace),
+        interval_poll_seconds=3600,
+    )
+    background_adapter.bind_conversation_runtime(
+        conversation_runtime,
+        programmatic_session_creator=sessions.control_store.create_session,
+        programmatic_session_reader=sessions.control_store.get_session_meta,
+    )
     activity_adapter = ProactiveActivityAdapter(
         manager.composition_generation_host
     )
-    private_adapter = PrivateProactiveHost("default")
+    private_default = _NamedPrivateProactiveHost("default", "private_proactive")
+    private_wake = _NamedPrivateProactiveHost("wake", "private_proactive_wake")
     activity_host = ActivityHost(
-        (activity_adapter, private_adapter)
+        (background_adapter, activity_adapter, private_default, private_wake)
     )
     manager.bind_activity_host(activity_host)
     factories = {
@@ -733,6 +797,9 @@ async def _run_full_fleet_scenario(
             "source_fetch": activity_adapter.source_fetch_invocations,
             "module": activity_adapter.module_invocations,
             "handler_resolution": activity_adapter.handler_resolution_count,
+            "background_handler_resolution": (
+                background_adapter.handler_resolution_count
+            ),
         }
 
         # 2. Prepare and discard a candidate without changing stable publication or executing activity.
@@ -752,6 +819,9 @@ async def _run_full_fleet_scenario(
             "source_fetch": activity_adapter.source_fetch_invocations,
             "module": activity_adapter.module_invocations,
             "handler_resolution": activity_adapter.handler_resolution_count,
+            "background_handler_resolution": (
+                background_adapter.handler_resolution_count
+            ),
         }
         if counts_after_discard != counts_before_candidate:
             raise GateFailure(
@@ -795,9 +865,11 @@ async def _run_full_fleet_scenario(
             },
         }
         coverage = _fleet_coverage_from_snapshot(promoted)
-        github_watch = _github_watch_policy(None)
-        if github_watch["status"] != "blocked":
-            raise GateFailure("GitHub Watch 未按无 controlled remote 严格阻断")
+        github_watch = await _run_github_watch_controlled_remote(
+            manager=manager,
+            background_adapter=background_adapter,
+            sandbox=sandbox,
+        )
         proactive = await _run_deterministic_proactive(
             manager=manager,
             activity_host=activity_host,
@@ -819,6 +891,315 @@ async def _run_full_fleet_scenario(
             channel_generation_host._resolve_sync_factory = original_resolver
             await event_bus.aclose()
             sessions._store.close()
+
+
+async def _run_github_watch_controlled_remote(
+    *,
+    manager: PluginManager,
+    background_adapter: BackgroundJobActivityAdapter,
+    sandbox: Path,
+) -> dict[str, object]:
+    """Run the locked GitHub Watch job against a local bare remote and Core Turn port."""
+
+    # 1. Create a disposable bare repository whose commit is the only checkout input.
+    remote, seed_commit = _create_controlled_git_remote(sandbox)
+    remote_uri = remote.as_uri()
+    binding = background_adapter.active_binding
+    if binding is None:
+        raise GateFailure("GitHub Watch 缺少 committed BackgroundJob binding")
+    poll_keys = tuple(key for key in binding.jobs if key.endswith(":poll"))
+    if poll_keys != ("github-watch:poll",):
+        raise GateFailure(f"GitHub Watch job catalog 错误: {poll_keys}")
+    generation = manager.generation("github-watch")
+    if generation is None:
+        raise GateFailure("GitHub Watch generation 缺失")
+    module = cast(Any, generation.instance).module
+    original_client = module.GitHubClient
+    original_checkout = module.CheckoutManager
+    clients: list[Any] = []
+    reactions: list[dict[str, object]] = []
+
+    class ControlledGitHubClient:
+        """Expose deterministic GitHub API reads while retaining no credentials."""
+
+        def __init__(
+            self,
+            *,
+            app_id: int,
+            installation_id: int,
+            pem_path: Path,
+        ) -> None:
+            del app_id, installation_id, pem_path
+            self.phase = 0
+            self.credentials_read = False
+            clients.append(self)
+
+        def installation_token(self) -> str:
+            raise AssertionError("controlled GitHub remote attempted credential access")
+
+        def repository(self, _repo: str) -> dict[str, object]:
+            return {
+                "owner": {"login": "recording-owner"},
+                "default_branch": "main",
+            }
+
+        def issues(self, _repo: str) -> list[dict[str, object]]:
+            return [self._issue()]
+
+        def pulls(self, _repo: str) -> list[dict[str, object]]:
+            return []
+
+        def issue(self, _repo: str, _number: int) -> dict[str, object]:
+            return self._issue()
+
+        def comments(self, _repo: str, _number: int) -> list[dict[str, object]]:
+            if self.phase == 0:
+                return []
+            return [
+                {
+                    "id": 1,
+                    "body": "@akashic-review-bot inspect this local issue",
+                    "user": {"login": "recording-owner"},
+                    "html_url": "file:///controlled/comment/1",
+                }
+            ]
+
+        def timeline(self, _repo: str, _number: int) -> list[dict[str, object]]:
+            return []
+
+        def add_reaction(
+            self,
+            _repo: str,
+            _number: int,
+            content: str,
+        ) -> dict[str, object]:
+            reactions.append(
+                {
+                    "content": content,
+                    "remote": remote_uri,
+                    "external": False,
+                }
+            )
+            return {
+                "content": content,
+                "html_url": "file:///controlled/reaction/1",
+                "id": 1,
+            }
+
+        def _issue(self) -> dict[str, object]:
+            return {
+                "number": 1,
+                "updated_at": (
+                    "2026-08-20T00:00:00Z"
+                    if self.phase == 0
+                    else "2026-08-20T00:01:00Z"
+                ),
+                "title": "Controlled E3 issue",
+                "body": "Inspect the deterministic local checkout.",
+                "user": {"login": "recording-owner"},
+                "state": "open",
+                "draft": False,
+                "html_url": "file:///controlled/issue/1",
+            }
+
+    class ControlledCheckoutManager(original_checkout):
+        """Reuse the real checkout/worktree flow with a file remote and no token."""
+
+        def __init__(self, client: object, **kwargs: object) -> None:
+            super().__init__(client, **kwargs)
+            self._controlled_remote_uri = remote_uri
+
+        def _ensure_mirror(self, repo: str, operation_dir: Path) -> Path:
+            mirror = self._mirror_path(repo)
+            if (mirror / "HEAD").is_file() and (mirror / "objects").is_dir():
+                return mirror
+            mirror.parent.mkdir(parents=True, exist_ok=True)
+            self._run(
+                [
+                    "git",
+                    "-c",
+                    "credential.helper=",
+                    "clone",
+                    "--mirror",
+                    self._controlled_remote_uri,
+                    str(mirror),
+                ]
+            )
+            return mirror
+
+        def _refresh_mirror(self, mirror: Path, operation_dir: Path) -> None:
+            del operation_dir
+            self._run(
+                [
+                    "git",
+                    "-C",
+                    str(mirror),
+                    "worktree",
+                    "prune",
+                    "--expire",
+                    "now",
+                ]
+            )
+            self._run(
+                [
+                    "git",
+                    "-C",
+                    str(mirror),
+                    "fetch",
+                    "origin",
+                    "--prune",
+                    "+refs/heads/*:refs/heads/*",
+                ]
+            )
+
+        def _run_authenticated(self, operation_dir: Path, command: list[str]) -> None:
+            del operation_dir
+            self._run(command)
+
+    setattr(module, "GitHubClient", ControlledGitHubClient)
+    setattr(module, "CheckoutManager", ControlledCheckoutManager)
+    try:
+        # 2. Admit one baseline poll and one owner-mention poll via the real adapter.
+        await background_adapter.enqueue_interval(
+            binding,
+            "github-watch:poll",
+            interval_bucket="e3-github-baseline",
+        )
+        await _wait_background_job_settled(binding)
+        if len(clients) != 1:
+            raise GateFailure(f"GitHub Watch formal runtime 创建次数错误: {len(clients)}")
+        clients[0].phase = 1
+        await background_adapter.enqueue_interval(
+            binding,
+            "github-watch:poll",
+            interval_bucket="e3-github-owner-mention",
+        )
+        await _wait_background_job_settled(binding)
+
+        # 3. Verify durable job, event, and programmatic Turn identities.
+        first = background_adapter.ledger
+        if first is None:
+            raise GateFailure("GitHub Watch 缺少 BackgroundJob outcome ledger")
+        outcomes = []
+        for bucket in ("e3-github-baseline", "e3-github-owner-mention"):
+            outcome = first.find_by_event(
+                plugin_id="github-watch",
+                job_name="poll",
+                interval_bucket=bucket,
+            )
+            if outcome is None or str(outcome.state.value) != "succeeded":
+                raise GateFailure(f"GitHub Watch job outcome 未成功: {bucket} {outcome}")
+            outcomes.append(
+                {
+                    "interval_bucket": bucket,
+                    "invocation_id": outcome.invocation_id,
+                    "state": outcome.state.value,
+                    "snapshot_id": outcome.snapshot_id,
+                    "plugin_generation_id": outcome.plugin_generation_id,
+                }
+            )
+        bound = getattr(module, "_bound", None)
+        ledger = None if bound is None else getattr(bound, "ledger", None)
+        if ledger is None:
+            raise GateFailure("GitHub Watch formal EventLedger 未初始化")
+        event_key = "recording-owner/recording-repo:issue:1:comment:1"
+        event = ledger.get_event(event_key)
+        if event.status != "dispatched":
+            raise GateFailure(f"GitHub Watch event 未 dispatched: {event}")
+        if not isinstance(event.thread_id, str) or not event.thread_id:
+            raise GateFailure("GitHub Watch event 缺少 programmatic Session identity")
+        if not isinstance(event.turn_id, str) or not event.turn_id:
+            raise GateFailure("GitHub Watch event 缺少 programmatic Turn identity")
+        # The synthetic runtime is owned by the adapter through the job invocation port.
+        runtime = background_adapter.conversation_runtime
+        requests = [] if runtime is None else list(getattr(runtime, "requests", ()))
+        if len(requests) != 1:
+            raise GateFailure(f"GitHub Watch programmatic Turn 次数错误: {len(requests)}")
+        if requests[0]["turn_id"] != event.turn_id or requests[0]["thread_id"] != event.thread_id:
+            raise GateFailure(
+                "GitHub Watch job/Turn identity 不一致: "
+                f"request={requests[0]} event={event}"
+            )
+        if not all(not bool(client.credentials_read) for client in clients):
+            raise GateFailure("GitHub Watch 读取了 formal credentials")
+        policy = _github_watch_policy(remote_uri)
+        policy.update(
+            {
+                "bare_remote": remote.is_dir() and (remote / "HEAD").is_file(),
+                "seed_commit": seed_commit,
+                "job": {
+                    "key": "github-watch:poll",
+                    "binding_snapshot_id": binding.snapshot_id,
+                    "outcomes": outcomes,
+                },
+                "event": {
+                    "event_key": event.event_key,
+                    "status": event.status,
+                    "thread_id": event.thread_id,
+                    "turn_id": event.turn_id,
+                    "trigger_kind": event.trigger_kind,
+                },
+                "programmatic_turns": requests,
+                "reactions": reactions,
+            }
+        )
+        if policy["bare_remote"] is not True:
+            raise GateFailure("GitHub controlled remote 不是有效 bare file:// remote")
+        return policy
+    finally:
+        setattr(module, "GitHubClient", original_client)
+        setattr(module, "CheckoutManager", original_checkout)
+
+
+async def _wait_background_job_settled(binding: object) -> None:
+    """Wait for explicit job admission without consuming the long-lived interval loop."""
+
+    # 1. Poll only the accepted invocation state; ActivityHost owns interval shutdown.
+    runtime = cast(Any, binding)
+    for _ in range(500):
+        if not runtime.pending_admission and not runtime.queued and not runtime.running:
+            await asyncio.sleep(0)
+            if not runtime.pending_admission and not runtime.queued and not runtime.running:
+                return
+        await asyncio.sleep(0.01)
+    raise GateFailure("GitHub Watch explicit job 未在 deterministic window 内结算")
+
+
+def _create_controlled_git_remote(sandbox: Path) -> tuple[Path, str]:
+    """Create one local bare remote and return its path plus seed commit."""
+
+    # 1. Seed an ordinary repository with one deterministic commit.
+    source = sandbox / "github-controlled-source"
+    remote = sandbox / "github-controlled-remote.git"
+    source.mkdir(parents=True, exist_ok=False)
+    remote.mkdir(parents=True, exist_ok=False)
+    _run_local_git(remote, "init", "--bare")
+    _run_local_git(source, "init")
+    _run_local_git(source, "config", "user.name", "E3 recording")
+    _run_local_git(source, "config", "user.email", "e3-recording@example.invalid")
+    (source / "README.md").write_text("E3 controlled remote\n", encoding="utf-8")
+    _run_local_git(source, "add", "README.md")
+    _run_local_git(source, "commit", "-m", "seed controlled E3 remote")
+    _run_local_git(source, "branch", "-M", "main")
+    _run_local_git(source, "remote", "add", "origin", remote.as_uri())
+    _run_local_git(source, "push", "origin", "main")
+    _run_local_git(remote, "symbolic-ref", "HEAD", "refs/heads/main")
+    seed_commit = _run_local_git(source, "rev-parse", "HEAD")
+    return remote, seed_commit
+
+
+def _run_local_git(cwd: Path, *args: str) -> str:
+    """Run one explicit local Git command in the disposable Gate sandbox."""
+
+    completed = subprocess.run(
+        ("git", *args),
+        cwd=cwd,
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    return completed.stdout.strip()
 
 
 async def _run_deterministic_proactive(
