@@ -1261,8 +1261,11 @@ async def test_app_runtime_start_passes_markdown_store_to_memory_optimizer(
         markdown=SimpleNamespace(store=markdown_store),
         aclose=AsyncMock(),
     )
+    startup_order: list[str] = []
     plugin_manager = MagicMock()
-    plugin_manager.bind_core_channel_definitions = AsyncMock()
+    plugin_manager.bind_core_channel_definitions = AsyncMock(
+        side_effect=lambda definitions: startup_order.append("bindings")
+    )
     core = SimpleNamespace(
         loop=SimpleNamespace(
             run=lambda: "loop-task",
@@ -1287,17 +1290,16 @@ async def test_app_runtime_start_passes_markdown_store_to_memory_optimizer(
     monkeypatch.setattr(
         "bootstrap.app.build_core_runtime", lambda *args, **kwargs: core
     )
+    channel_host = SimpleNamespace(
+        start_all=AsyncMock(side_effect=lambda: startup_order.append("providers")),
+        stop_all=AsyncMock(),
+        bind_plugin_channels=MagicMock(),
+        swap_plugin_channels=AsyncMock(),
+        channels=(),
+    )
     monkeypatch.setattr(
         "bootstrap.app.start_channels",
-        AsyncMock(
-            return_value=SimpleNamespace(
-                start_all=AsyncMock(),
-                stop_all=AsyncMock(),
-                bind_plugin_channels=MagicMock(),
-                swap_plugin_channels=AsyncMock(),
-                channels=(),
-            )
-        ),
+        AsyncMock(return_value=channel_host),
     )
     build_proactive_runtime = MagicMock(return_value=([], None))
     monkeypatch.setattr(
@@ -1335,6 +1337,7 @@ async def test_app_runtime_start_passes_markdown_store_to_memory_optimizer(
         build_memory_optimizer_task.call_args.kwargs["memory_store"] is markdown_store
     )
     assert app.dashboard_server.manual_memory_optimizer is memory_optimizer
+    assert startup_order == ["bindings", "providers"]
     await app.shutdown()
 
 
