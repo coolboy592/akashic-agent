@@ -78,6 +78,7 @@ _DOCUMENTS_ALLOWLIST = frozenset(
     {
         ("emotion", "merge_pending"),
         ("emotion", "merge_proactive_pending"),
+        ("emotion@github", "merge_proactive_pending"),
     }
 )
 _PROGRAMMATIC_SESSION_RESERVED_FIELDS = frozenset(

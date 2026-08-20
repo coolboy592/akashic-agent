@@ -181,7 +181,7 @@ terminal receipt 并删除 staging bytes；若目标已经偏移则 fail-loud，
 正常提交在同一个 Core pair lock 下、第一次 replace 前重新读取两份目标：必须逐字节等于 intent 的 old bytes/absent marker，
 任一偏移即进入 degraded，保留 DB receipt 与 intent，且不写正文。
 
-只有 descriptor 同时声明 `domain_effect` 与 `domain_effect_lookup_export` 的 module 能调用 `run()`；只有 Core allowlist 的 Emotion merge job 得到 documents port，
+只有 descriptor 同时声明 `domain_effect` 与 `domain_effect_lookup_export` 的 module 能调用 `run()`；Core allowlist 同时固定直接 source identity `emotion` 与 installed identity `emotion@github`，且只有 `merge_proactive_pending`（保留测试期 `merge_pending`）得到 documents port，
 其他插件为 `None`。Core 只拥有 effect terminal/journal 与两份文档原子恢复，不理解 Emotion DB/schema/content。
 
 - 第一版 triggers 只支持正整数 interval 与 `CoreEvent` typed enum。plugin-defined event class/字符串不作为跨 clone

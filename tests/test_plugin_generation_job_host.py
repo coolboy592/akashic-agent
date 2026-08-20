@@ -143,12 +143,14 @@ def _fixture(
     conversation_runtime_binder: Any | None = None,
     validation_candidate_plugin_ids: frozenset[str] = frozenset(),
     retry_policy: RetryPolicy | None = None,
+    plugin_id_override: str | None = None,
+    job_name: str = "merge_pending",
 ):
-    plugin_id = "emotion" if documents else "drift"
+    plugin_id = plugin_id_override or ("emotion" if documents else "drift")
     plugin = _module(handler, name=plugin_id, domain_lookup=domain_lookup)
     job_triggers = triggers or (CoreEventTrigger(CoreEvent.DRIFT_FINISHED),)
     definition = BackgroundJobDefinition(
-        name="merge_pending",
+        name=job_name,
         triggers=job_triggers,
         handler_export="merge_pending",
         model_role=model_role,
@@ -188,7 +190,7 @@ def _fixture(
         required_health=cast(HealthHandle, _Health()),
     )
     catalog = BackgroundJobCatalog(
-        {f"{plugin_id}:merge_pending": binding},
+        {f"{plugin_id}:{job_name}": binding},
         root_instance_token=object(),
     )
     generation = SimpleNamespace(
@@ -405,6 +407,27 @@ async def test_prepare_is_pure_and_materialized_binding_is_closed(tmp_path) -> N
     assert store.leases == 0
     assert adapter.subscription_count == 0
     assert adapter.timer_count == 0
+
+
+@pytest.mark.asyncio
+async def test_installed_emotion_domain_effect_is_in_core_allowlist(tmp_path) -> None:
+    async def handler(ctx) -> None:
+        return None
+
+    adapter, plan, target_lease, store, _ = _fixture(
+        tmp_path,
+        handler,
+        documents=True,
+        domain_lookup=lambda ctx: None,
+        plugin_id_override="emotion@github",
+        job_name="merge_proactive_pending",
+    )
+
+    runtime = await adapter.materialize_closed("tx-1", plan)
+    assert "emotion@github:merge_proactive_pending" in runtime.jobs
+    await adapter.close_components("tx-1", runtime)
+    await target_lease.release()
+    assert store.leases == 0
 
 
 @pytest.mark.asyncio
