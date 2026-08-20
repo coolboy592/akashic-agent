@@ -1360,8 +1360,13 @@ async def test_durable_recovery_replaces_retained_claim_without_weakening_duplic
         assert snapshot_id == snapshot.snapshot_id
         return _FakeSnapshotLease(snapshot)
 
+    remember_calls = 0
+
     async def remember(_channel: str, _identity: str, _recipient: str) -> None:
-        return None
+        nonlocal remember_calls
+        remember_calls += 1
+        if remember_calls == 2:
+            raise OSError("identity store unavailable")
 
     host = _host(
         snapshot_lease_acquirer=acquire,
@@ -1404,6 +1409,10 @@ async def test_durable_recovery_replaces_retained_claim_without_weakening_duplic
     assert isinstance(first, InboundEnvelope)
     await bus.retain_mobile_channel_inbound(first, InboundOwner.LANE)
 
+    with pytest.raises(OSError, match="identity store unavailable"):
+        await bus.recover_durable_inbounds()
+    assert await context.ingress.admit(raw) is False
+
     await bus.recover_durable_inbounds()
     assert await context.ingress.admit(raw) is False
     recovered = await bus.consume_inbound()
@@ -1411,7 +1420,38 @@ async def test_durable_recovery_replaces_retained_claim_without_weakening_duplic
     recovered.handoff(InboundOwner.LANE, InboundOwner.LOOP)
     await bus.complete_inbound(recovered)
 
+    # 进程重启后 Host 没有旧 claim，durable row 仍能由 current binding 恢复。
+    restart_session_key = "mobile:restart-no-claim"
+    manager.save(manager.get_or_create(restart_session_key))
+    restart_raw = RawInbound(
+        message_id="provider-restart-no-claim",
+        provider_identity="device:1",
+        recipient="restart-no-claim",
+        message=ChannelInboundMessage(
+            channel="mobile",
+            sender="device:1",
+            chat_id="restart-no-claim",
+            content="restart",
+            timestamp=datetime.now(timezone.utc),
+            metadata={
+                "session_key_override": restart_session_key,
+                "client_message_id": "provider-restart-no-claim",
+                "mobile_v3_handoff": True,
+                "mobile_handoff_id": "handoff-restart-no-claim",
+            },
+        ),
+    )
+    assert await bus.reserve_mobile_channel_handoff(restart_raw) is True
+    await bus.defer_mobile_channel_handoff("handoff-restart-no-claim")
+    await bus.recover_durable_inbounds()
+    assert await context.ingress.admit(restart_raw) is False
+    restart_recovered = await bus.consume_inbound()
+    assert isinstance(restart_recovered, InboundEnvelope)
+    restart_recovered.handoff(InboundOwner.LANE, InboundOwner.LOOP)
+    await bus.complete_inbound(restart_recovered)
+
     assert manager.control_store.list_inbound_handoffs() == []
+    assert remember_calls == 4
     await generation.stop()
     await bus.aclose()
     manager.close()

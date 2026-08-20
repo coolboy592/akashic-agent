@@ -1649,20 +1649,26 @@ class ChannelGenerationHost:
         if not state.admission_open or state.stopping or state.stopped:
             raise RuntimeError("channel admission 已关闭")
 
-        # 1. 只有 recovery port 可替换已接受 claim；普通 admit 仍保持 duplicate=False。
+        # 1. 进程内恢复复用旧 claim，不在任何 await 窗口释放 duplicate fence。
         dedupe_key = (raw.provider_identity or "", raw.message_id)
         if dedupe_key in state.inbound_message_id_set:
-            state.inbound_message_id_set.remove(dedupe_key)
-            try:
-                state.inbound_message_ids.remove(dedupe_key)
-            except ValueError as error:
-                raise RuntimeError("Channel inbound dedupe index 不一致") from error
+            if state.inbound_message_ids.count(dedupe_key) != 1:
+                raise RuntimeError("Channel inbound dedupe index 不一致")
+            return await self._admit_inbound(
+                key,
+                raw,
+                _retained_claim=dedupe_key,
+            )
+
+        # 2. 进程重启时无内存 claim，由 current binding 新建正常 claim。
         return await self._admit_inbound(key, raw)
 
     async def _admit_inbound(
         self,
         key: tuple[str, str],
         raw: RawInbound,
+        *,
+        _retained_claim: tuple[str, str] | None = None,
     ) -> bool:
         """Acquire, enqueue, and retain one deduplicated exact inbound lease."""
 
@@ -1680,7 +1686,14 @@ class ChannelGenerationHost:
             raise RuntimeError("channel admission 已关闭")
         provider_scope = raw.provider_identity or ""
         dedupe_key = (provider_scope, raw.message_id)
-        if dedupe_key in state.inbound_message_id_set:
+        retained_claim = _retained_claim is not None
+        if retained_claim and (
+            _retained_claim != dedupe_key
+            or dedupe_key not in state.inbound_message_id_set
+            or state.inbound_message_ids.count(dedupe_key) != 1
+        ):
+            raise RuntimeError("Channel retained recovery claim 不一致")
+        if not retained_claim and dedupe_key in state.inbound_message_id_set:
             return False
         acquirer = self._snapshot_lease_acquirer
         publisher = self._inbound_publisher
@@ -1688,8 +1701,9 @@ class ChannelGenerationHost:
             raise RuntimeError("Channel ingress runtime ports 未绑定")
 
         # 1. Claim before any await so concurrent duplicate callbacks serialize.
-        state.inbound_message_id_set.add(dedupe_key)
-        state.inbound_message_ids.append(dedupe_key)
+        if not retained_claim:
+            state.inbound_message_id_set.add(dedupe_key)
+            state.inbound_message_ids.append(dedupe_key)
         self._begin_presentation_operation(key, allow_closed=False)
         accepted = False
         binding: ChannelBindingLease | None = None
@@ -1785,11 +1799,12 @@ class ChannelGenerationHost:
         finally:
             try:
                 if not accepted:
-                    state.inbound_message_id_set.discard(dedupe_key)
-                    try:
-                        state.inbound_message_ids.remove(dedupe_key)
-                    except ValueError:
-                        pass
+                    if not retained_claim:
+                        state.inbound_message_id_set.discard(dedupe_key)
+                        try:
+                            state.inbound_message_ids.remove(dedupe_key)
+                        except ValueError:
+                            pass
                     if binding is not None and binding.active:
                         await binding.aclose()
             finally:
