@@ -2356,9 +2356,22 @@ class PluginManager:
             self._channel_catalog_identity(transaction.previous)
             != self._channel_catalog_identity(transaction.candidate)
         )
+        previous_activity_identity = self._activity_catalog_identity(
+            transaction.previous
+        )
+        candidate_activity_identity = self._activity_catalog_identity(
+            transaction.candidate
+        )
         activity_catalog_changed = (
-            self._activity_catalog_identity(transaction.previous)
-            != self._activity_catalog_identity(transaction.candidate)
+            previous_activity_identity != candidate_activity_identity
+            or (
+                candidate_activity_identity is not None
+                and (
+                    transaction.previous is None
+                    or transaction.previous.snapshot_id
+                    != transaction.candidate.snapshot_id
+                )
+            )
         )
         if (
             not endpoints_changed
@@ -5755,20 +5768,12 @@ class PluginManager:
             self._snapshot_store.install(snapshot)
             return
         transaction = self._snapshot_store.begin_publish(snapshot)
-        if (
-            self._channel_catalog_identity(transaction.previous)
-            != self._channel_catalog_identity(snapshot)
-            or self._activity_catalog_identity(transaction.previous)
-            != self._activity_catalog_identity(snapshot)
-        ):
-            await self._commit_snapshot_with_publication_participants(
-                transaction,
-                old_commands=(),
-                new_commands=(),
-                promote_latest=False,
-            )
-            return
-        await self._snapshot_store.commit(transaction)
+        await self._commit_snapshot_with_publication_participants(
+            transaction,
+            old_commands=(),
+            new_commands=(),
+            promote_latest=False,
+        )
 
     def _collect_candidate_contributions(
         self,

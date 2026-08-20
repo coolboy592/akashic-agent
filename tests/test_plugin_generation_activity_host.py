@@ -505,6 +505,60 @@ async def test_manager_activity_only_change_uses_closed_provisional_boundary(
 
 
 @pytest.mark.asyncio
+async def test_manager_rebinds_unchanged_activity_catalog_to_new_snapshot(
+    tmp_path,
+) -> None:
+    child = _RecordingChild()
+    host = ActivityHost((child,))
+    manager = PluginManager(
+        [],
+        event_bus=EventBus(),
+        workspace=tmp_path / "workspace",
+    )
+    manager.bind_activity_host(host)
+    compiler = RuntimeSnapshotCompiler()
+    old_root = CompositionRoot("activity-exact-old")
+    new_root = CompositionRoot("activity-exact-new")
+    old = compiler.compile(
+        {},
+        snapshot_revision="activity-exact-old",
+        composition_root=old_root,
+        private_proactive_catalog=PrivateProactiveCatalog(
+            (),
+            root_instance_token=old_root.instance_token,
+        ),
+    )
+    new = compiler.compile(
+        {},
+        snapshot_revision="activity-exact-new",
+        composition_root=new_root,
+        private_proactive_catalog=PrivateProactiveCatalog(
+            (),
+            root_instance_token=new_root.instance_token,
+        ),
+    )
+
+    await manager._publish_committed_snapshot(old)
+    old_binding = cast(Any, host.active).child_bindings["recording"]
+    child.events.clear()
+    await manager._publish_committed_snapshot(new)
+
+    assert manager.current_snapshot is new
+    assert host.active is not None
+    assert host.active.snapshot_id == new.snapshot_id
+    assert host.active.admission_open
+    assert child.events == [
+        "prepare",
+        f"stop:{old_binding}",
+        f"materialize:{new.snapshot_id}",
+        f"finalize:binding:{new.snapshot_id}:2",
+        f"close:{old_binding}",
+    ]
+    await host.close()
+    await manager._snapshot_store.close()
+
+
+@pytest.mark.asyncio
 async def test_initial_stable_activity_prepare_failure_discards_pending_candidate(
     tmp_path,
 ) -> None:
