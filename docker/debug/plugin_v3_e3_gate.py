@@ -1704,6 +1704,7 @@ async def _run_channel_scenario(
         ),
     }
     received: list[dict[str, str]] = []
+    inbound_owned: list[Any] = []
     original_resolver = channel_generation_host._resolve_sync_factory
     manager = PluginManager(
         plugin_dirs=[providers],
@@ -1716,6 +1717,7 @@ async def _run_channel_scenario(
     manager.bind_channel_provider_factory_resolver(lambda _snapshot: factories)
 
     async def publish_inbound(envelope: object) -> None:
+        owned = cast(Any, envelope)
         received.append(
             {
                 "channel": str(
@@ -1727,7 +1729,8 @@ async def _run_channel_scenario(
                 "binding_token": str(getattr(envelope, "binding_token")),
             }
         )
-        await cast(Any, envelope).close(InboundOwner.INGRESS)
+        owned.handoff(InboundOwner.INGRESS, InboundOwner.BUS)
+        inbound_owned.append(owned)
 
     manager.channel_generation_host.bind_inbound_publisher(publish_inbound)
 
@@ -1881,6 +1884,8 @@ async def _run_channel_scenario(
                 recipient="recording-chat",
             )
             accepted = await cast(Any, ingress).admit(raw)
+            owned = inbound_owned.pop(0)
+            await owned.close(InboundOwner.BUS)
             duplicate = await cast(Any, ingress).admit(raw)
             channel_received = [
                 item for item in received if item["channel"] == channel
@@ -1988,6 +1993,9 @@ async def _run_channel_scenario(
         }
     finally:
         try:
+            for envelope in tuple(inbound_owned):
+                if envelope.owner is InboundOwner.BUS:
+                    await envelope.close(InboundOwner.BUS)
             await manager.terminate_all()
         finally:
             channel_generation_host._resolve_sync_factory = original_resolver
