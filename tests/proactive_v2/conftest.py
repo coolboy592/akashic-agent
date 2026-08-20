@@ -15,9 +15,12 @@ from proactive_v2.frame import new_proactive_frame
 from plugins.default_proactive.gateway import GatewayDeps
 from plugins.proactive_flow.tools import ToolDeps
 from agent.looping.ports import SessionServices
+from agent.plugin_composition.channels import (
+    ChannelDeliveryReceipt,
+    DeliveryStatus as ChannelDeliveryStatus,
+)
 from agent.turns.orchestrator import TurnOrchestrator, TurnOrchestratorDeps
 from agent.turns.outbound import OutboundDispatch
-from bus.events import DeliveryReceipt, DeliveryStatus
 
 
 # ── FakeStateStore ────────────────────────────────────────────────────────
@@ -268,10 +271,18 @@ def make_proactive_pipeline(
         presence=cast(Any, SimpleNamespace(record_proactive_sent=lambda _key: None)),
     )
     class _Outbound:
-        async def dispatch(self, outbound: OutboundDispatch) -> DeliveryReceipt:
+        async def dispatch(
+            self,
+            outbound: OutboundDispatch,
+        ) -> ChannelDeliveryReceipt:
             sent = await sender.send(outbound.content)
-            return DeliveryReceipt(
-                DeliveryStatus.SUCCESS if sent else DeliveryStatus.FAILED
+            return ChannelDeliveryReceipt(
+                delivery_id=str(outbound.metadata["delivery_id"]),
+                status=(
+                    ChannelDeliveryStatus.DELIVERED
+                    if sent
+                    else ChannelDeliveryStatus.REJECTED
+                ),
             )
 
     orchestrator = TurnOrchestrator(

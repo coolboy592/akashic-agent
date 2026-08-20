@@ -44,7 +44,10 @@ def _complete_observation() -> dict[str, object]:
                     "data": {
                         "name": "message_push",
                         "status": "success",
-                        "resultPreview": "消息已发送",
+                        "resultPreview": (
+                            '{"delivery_id":"proof-4","status":"delivered",'
+                            '"provider_ids":[],"error":null}'
+                        ),
                     },
                 },
             ],

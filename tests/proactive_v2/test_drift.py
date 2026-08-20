@@ -23,9 +23,12 @@ from agent.tools.registry import ToolRegistry
 from agent.tools.shell import ShellTaskStopTool, ShellTool, ShellWriteStdinTool
 from agent.tools.unified_exec import ShellProcessManager, UnknownExecutionError
 from agent.looping.ports import SessionServices
+from agent.plugin_composition.channels import (
+    ChannelDeliveryReceipt,
+    DeliveryStatus as ChannelDeliveryStatus,
+)
 from agent.turns.orchestrator import TurnOrchestrator, TurnOrchestratorDeps
 from agent.turns.outbound import OutboundDispatch
-from bus.events import DeliveryReceipt, DeliveryStatus
 from plugins.default_proactive.context import AgentTickContext
 from plugins.drift_flow.runtime import DriftTurnPipeline, DriftTurnPipelineDeps
 from plugins.drift_flow.state import DriftStateStore
@@ -1704,10 +1707,18 @@ async def test_agent_tick_drift_emits_delivery_result(
     )
 
     class _Outbound:
-        async def dispatch(self, outbound: OutboundDispatch) -> DeliveryReceipt:
+        async def dispatch(
+            self,
+            outbound: OutboundDispatch,
+        ) -> ChannelDeliveryReceipt:
             sent = await sender(outbound.content)
-            return DeliveryReceipt(
-                DeliveryStatus.SUCCESS if sent else DeliveryStatus.FAILED
+            return ChannelDeliveryReceipt(
+                delivery_id=str(outbound.metadata["delivery_id"]),
+                status=(
+                    ChannelDeliveryStatus.DELIVERED
+                    if sent
+                    else ChannelDeliveryStatus.REJECTED
+                ),
             )
 
     orchestrator = TurnOrchestrator(
