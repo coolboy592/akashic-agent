@@ -40,6 +40,9 @@ async def test_committed_control_turn_survives_shell_cleanup_error(
     loop._interrupt_states = {}
     loop._session_lanes = SessionLaneRegistry()
     loop._runtime_snapshot_store = None
+    loop._passive_pipeline = SimpleNamespace(
+        run_command=AsyncMock(return_value=None)
+    )
     loop._llm_services = SimpleNamespace(provider=object())
     loop._resume_interrupted_message = AsyncMock(
         side_effect=lambda message, _key: (message, False)

@@ -138,21 +138,27 @@ async def test_installed_mcp_update_keeps_old_artifact_until_lease_drains(
         assert latest_probe["pid"] != old_probe["pid"]
         assert latest_probe["runtime_version"] == "v2"
 
-        # 3. 候选 lease 排空后重连正式数据路径；旧 stable 仍等待自己的 lease。
+        # 3. 候选 lease 排空后，promotion 必须等待旧 stable lease 排空。
         candidate_snapshot = latest_lease.snapshot
         await latest_lease.release()
         latest_lease = None
-        promoted = await app._promote_plugin(plugin_id)
+        promote_task = asyncio.create_task(app._promote_plugin(plugin_id))
+        await asyncio.sleep(0)
+        assert not promote_task.done()
+        await old_lease.release()
+        old_lease = None
+        promoted = await asyncio.wait_for(promote_task, timeout=30)
         assert promoted["publication_state"] == "promoted"
         promoted_lease = manager.snapshot_store.lease()
         assert promoted_lease.snapshot is candidate_snapshot
         promoted_generation = promoted_lease.snapshot.generations[plugin_id]
         promoted_runtime = _composition_runtime(manager, promoted_generation)
-        assert promoted_runtime.generation_id != latest_runtime.generation_id
+        assert promoted_runtime is not latest_runtime
+        assert promoted_runtime.generation_id == latest_runtime.generation_id
+        assert promoted_runtime.mode == "formal"
 
         await promoted_lease.release()
         promoted_lease = None
-        await old_lease.release()
         await manager.snapshot_store.retry_drains()
         assert manager._composition_generation_host.get(old_generation.generation_id) is None
         assert old_artifact.is_dir()

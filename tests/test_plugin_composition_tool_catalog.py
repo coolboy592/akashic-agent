@@ -119,7 +119,8 @@ def test_candidate_side_effect_fence_uses_full_marketplace_plugin_id() -> None:
         contributions=SimpleNamespace(mcp_servers={}),
     )
     snapshot = SimpleNamespace(
-        generations=MappingProxyType({"watcher@github": generation})
+        generations=MappingProxyType({"watcher@github": generation}),
+        mcp_server_registry=None,
     )
     message = InboundMessage("web", "hua", "1", "inspect")
 

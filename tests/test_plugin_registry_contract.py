@@ -21,21 +21,13 @@ def test_v2_decorator_module_and_exports_are_removed() -> None:
 
 
 def test_registry_drops_tool_hook_metadata_and_dead_lookups() -> None:
-    """Keep only metadata still required by the current Manager transition path."""
+    """Keep the superseded global plugin registry physically absent."""
 
-    registry = (
-        REPOSITORY_ROOT / "agent" / "plugins" / "registry.py"
-    ).read_text(encoding="utf-8")
+    registry = REPOSITORY_ROOT / "agent" / "plugins" / "registry.py"
+    public_api = (REPOSITORY_ROOT / "agent" / "plugins" / "__init__.py").read_text(
+        encoding="utf-8"
+    )
 
-    for removed_name in (
-        "HandlerType",
-        "PluginEventType",
-        "LIFECYCLE",
-        "TOOL_HOOK",
-        "PRE_TOOL",
-        "hook_tool_name",
-        "get_by_name",
-        "get_by_event_type",
-        "get_handlers_by_event_type",
-    ):
-        assert removed_name not in registry
+    assert not registry.exists()
+    assert "agent.plugins.registry" not in public_api
+    assert "plugin_registry" not in public_api

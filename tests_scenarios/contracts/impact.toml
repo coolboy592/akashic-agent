@@ -136,7 +136,6 @@ paths = [
   "scripts/plugin_composition_experiment.py",
   "bootstrap/tools.py",
   "bootstrap/wiring.py",
-  "tests/fixtures/plugins/**",
   "tests/test_plugin_*.py",
 ]
 depends_on = ["lifecycle"]
@@ -223,7 +222,14 @@ scenarios = ["memory_persistence_contract", "plugin_domain_observe_events"]
 [groups.jobs]
 priority = "p1"
 requirements = ["SCH-001", "SCH-002"]
-paths = ["agent/scheduler.py", "agent/plugins/jobs.py", "agent/tools/schedule.py", "bootstrap/toolsets/schedule.py"]
+paths = [
+  "agent/scheduler.py",
+  "agent/plugin_composition/background_jobs.py",
+  "agent/plugins/generation_job_host.py",
+  "agent/plugins/job_outcome_ledger.py",
+  "agent/tools/schedule.py",
+  "bootstrap/toolsets/schedule.py",
+]
 depends_on = ["plugin"]
 scenarios = ["contract_catalog"]
 
