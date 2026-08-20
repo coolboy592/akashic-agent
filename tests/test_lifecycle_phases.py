@@ -16,6 +16,7 @@ import pytest
 from agent.context import ContextBuilder
 from agent.plugin_composition.channels import (
     AttachmentKind,
+    AttachmentRef,
     ChannelDeliveryReceipt,
     DeliveryStatus as ChannelDeliveryStatus,
 )
@@ -41,6 +42,7 @@ from bus.events import (
 from bus.events_lifecycle import TurnCommitted
 from core.error_context import current_client_message_id, current_session_key
 from infra.channels.artifacts import ChannelAttachmentArtifactStore
+from bootstrap.channel_attachment_import import ChannelOutboundAttachmentImporter
 from agent.lifecycle.types import (
     AfterReasoningCtx,
     AfterReasoningInput,
@@ -1586,9 +1588,27 @@ async def test_after_reasoning_collects_v3_metadata_and_outbound_slots():
         for index, persisted in enumerate(messages):
             persisted["id"] = f"{current.key}:{index}"
 
+    class Importer:
+        async def import_media(
+            self,
+            media: tuple[str, ...],
+        ) -> tuple[AttachmentRef, ...]:
+            return tuple(
+                AttachmentRef(
+                    artifact_id=f"artifact-{index}",
+                    kind=AttachmentKind.IMAGE,
+                    filename=Path(source).name,
+                    media_type="image/png",
+                    size_bytes=index + 1,
+                    sha256=f"{index + 1:064x}",
+                )
+                for index, source in enumerate(media)
+            )
+
     services = SimpleNamespace(
         presence=Mock(),
         session_manager=SimpleNamespace(append_messages=append_messages),
+        outbound_attachment_importer=Importer(),
     )
     turn_result = TurnRunResult(
         reply="reply",
@@ -1615,11 +1635,67 @@ async def test_after_reasoning_collects_v3_metadata_and_outbound_slots():
     }
     assert session.messages[0]["client_message_id"] == "01ARZ3NDEKTSV4RRFFQ69G5FAV"
     assert session.messages[1]["citation_ids"] == ["mem_1"]
-    assert session.messages[1]["media"] == ["/tmp/from-turn.png", "/tmp/a.png"]
+    assert session.messages[1]["attachment_ids"] == ["artifact-0", "artifact-1"]
     assert result.outbound.metadata["before_turn_flag"] == "bt"
     assert result.outbound.metadata["plugin_flag"] == "m"
-    assert result.outbound.media == ["/tmp/from-turn.png", "/tmp/a.png"]
+    assert [ref.artifact_id for ref in result.outbound.attachment_refs] == [
+        "artifact-0",
+        "artifact-1",
+    ]
+    assert result.outbound.media == []
     assert result.outbound.session_message_id == "telegram:123:1"
+
+
+@pytest.mark.asyncio
+async def test_after_reasoning_commits_outbound_attachment_binding_atomically(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    manager = SessionManager(workspace)
+    artifact_store = ChannelAttachmentArtifactStore(
+        workspace=workspace,
+        session_store=manager.control_store,
+    )
+    source = tmp_path / "generated.png"
+    source.write_bytes(b"generated image bytes")
+    session = manager.get_or_create("telegram:123")
+    state = TurnState(
+        msg=_inbound(),
+        session_key=session.key,
+        dispatch_outbound=True,
+    )
+    state.session = session
+    services = SimpleNamespace(
+        presence=None,
+        session_manager=manager,
+        outbound_attachment_importer=ChannelOutboundAttachmentImporter(
+            artifact_store
+        ),
+    )
+    phase = Phase(
+        default_after_reasoning_modules(EventBus(), cast(Any, services)),
+        frame_factory=AfterReasoningFrame,
+    )
+
+    result = await phase.run(
+        AfterReasoningInput(
+            state=state,
+            turn_result=TurnRunResult(
+                reply="reply",
+                media=[str(source)],
+            ),
+        )
+    )
+
+    assistant = session.messages[-1]
+    attachment_ids = assistant.get("attachment_ids")
+    assert isinstance(attachment_ids, list) and len(attachment_ids) == 1
+    assert manager.control_store.message_attachment_ids(assistant["id"]) == tuple(
+        attachment_ids
+    )
+    assert result.outbound.attachment_refs[0].artifact_id == attachment_ids[0]
+    assert result.outbound.media == []
+    manager.close()
 
 
 def _assistant_metadata_ctx() -> AfterReasoningCtx:

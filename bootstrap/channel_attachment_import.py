@@ -8,13 +8,38 @@ from agent.plugin_composition.channels import (
     AttachmentKind,
     AttachmentRef,
 )
-from bus.events import ChannelAttachment
+from bus.events import (
+    AttachmentKind as LegacyAttachmentKind,
+    ChannelAttachment,
+)
 from infra.channels.artifacts import ChannelAttachmentArtifactStore
 from infra.channels.base import AttachmentStore
 from infra.mobile_realtime.remote_media import snapshot_remote_media
 
 
 _MAX_IMPORT_BYTES = 50 * 1024 * 1024
+
+
+class ChannelOutboundAttachmentImporter:
+    """Import model-produced media through the same Core artifact boundary."""
+
+    def __init__(self, store: ChannelAttachmentArtifactStore) -> None:
+        self._store = store
+
+    async def import_media(
+        self,
+        media: tuple[str, ...],
+    ) -> tuple[AttachmentRef, ...]:
+        return await import_channel_attachments(
+            self._store,
+            tuple(
+                ChannelAttachment(
+                    kind=LegacyAttachmentKind.IMAGE,
+                    source=source,
+                )
+                for source in media
+            ),
+        )
 
 
 async def import_channel_attachments(
@@ -71,4 +96,7 @@ async def _import_remote(
         )
 
 
-__all__ = ["import_channel_attachments"]
+__all__ = [
+    "ChannelOutboundAttachmentImporter",
+    "import_channel_attachments",
+]

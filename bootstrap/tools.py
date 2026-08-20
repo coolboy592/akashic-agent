@@ -62,7 +62,10 @@ from bus.event_bus import EventBus
 from bus.events import (
     ChannelMessage,
 )
-from bootstrap.channel_attachment_import import import_channel_attachments
+from bootstrap.channel_attachment_import import (
+    ChannelOutboundAttachmentImporter,
+    import_channel_attachments,
+)
 from bus.processing import ProcessingState
 from bus.queue import MessageBus
 from core.memory.runtime import MemoryRuntime
@@ -121,12 +124,16 @@ async def _dispatch_v3_channel_push(
         raise RuntimeError("v3 Channel catalog 存在但 exact binding 未建立")
     delivery_id = uuid4().hex
     try:
+        if message.attachments and message.attachment_refs:
+            raise RuntimeError("ChannelMessage 不得同时携带 path 与 opaque refs")
         if message.attachments and attachment_store is None:
             raise RuntimeError("Channel attachment store 尚未绑定")
-        attachment_refs = await import_channel_attachments(
-            cast("ChannelAttachmentArtifactStore", attachment_store),
-            message.attachments,
-        ) if message.attachments else ()
+        attachment_refs = message.attachment_refs
+        if message.attachments:
+            attachment_refs = await import_channel_attachments(
+                cast("ChannelAttachmentArtifactStore", attachment_store),
+                message.attachments,
+            )
 
         # 3. exact binding 保留到唯一一次 typed receipt 收束。
         return await bus.publish_channel_outbound_awaited(
@@ -649,6 +656,12 @@ def build_core_runtime(
     channel_attachment_store = ChannelAttachmentArtifactStore(
         workspace=workspace,
         session_store=session_manager.control_store,
+    )
+    session_services = loop_deps.session_services
+    if session_services is None:
+        raise RuntimeError("AgentLoop 缺少 SessionServices")
+    session_services.outbound_attachment_importer = (
+        ChannelOutboundAttachmentImporter(channel_attachment_store)
     )
     plugin_manager = _PluginManager(
         plugin_dirs=_resolve_plugin_dirs(workspace),

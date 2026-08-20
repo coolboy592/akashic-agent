@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
 from agent.plugin_composition.channels import (
+    AttachmentRef,
     ChannelDeliveryReceipt,
     DeliveryStatus as ChannelDeliveryStatus,
 )
@@ -24,6 +25,7 @@ class OutboundDispatch:
     reply_to: str | None = None
     metadata: dict[str, object] = field(default_factory=dict[str, object])
     media: list[str] = field(default_factory=list[str])
+    attachment_refs: tuple[AttachmentRef, ...] = ()
     session_message_id: str | None = None
     control_turn_id: str | None = None
 
@@ -61,6 +63,7 @@ class PushToolOutboundPort:
                 attachments=tuple(
                     ChannelAttachment(AttachmentKind.IMAGE, item) for item in media
                 ),
+                attachment_refs=outbound.attachment_refs,
                 metadata=dict(outbound.metadata),
                 reply_to=outbound.reply_to,
                 session_message_id=outbound.session_message_id,

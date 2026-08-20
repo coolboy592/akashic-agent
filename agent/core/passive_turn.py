@@ -779,6 +779,7 @@ class PassiveTurnPipeline:
                     reply_to=outbound.reply_to,
                     metadata=outbound.metadata,
                     media=outbound.media,
+                    attachment_refs=outbound.attachment_refs,
                     session_message_id=outbound.session_message_id,
                     control_turn_id=(
                         outbound.control_turn_id or running_turn_id.get() or None

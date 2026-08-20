@@ -28,6 +28,7 @@ from agent.lifecycle.types import (
     AfterReasoningInput,
     TurnSnapshot,
 )
+from agent.plugin_composition.channels import AttachmentRef
 from bus.event_bus import EventBus
 from bus.events import OutboundMessage
 from core.common.diagnostic_log import turn_milestone
@@ -78,6 +79,7 @@ _PERSISTED_USER_SLOT = "reasoning:persisted_user"
 _PERSISTED_ASSISTANT_SLOT = "reasoning:persisted_assistant"
 _SEALED_ASSISTANT_METADATA_SLOT = "reasoning:assistant_metadata"
 _PENDING_SESSION_METADATA_SLOT = "reasoning:session_metadata"
+_ASSISTANT_ATTACHMENT_REFS_SLOT = "reasoning:assistant_attachment_refs"
 _OUTBOUND_METADATA_PREFIX = "outbound:metadata:"
 _OUTBOUND_MEDIA_PREFIX = "outbound:media:"
 _ASSISTANT_FIXED_FIELDS = {
@@ -100,6 +102,7 @@ _ASSISTANT_CORE_METADATA_FIELDS = {
     "turn_terminal",
     "turn_input_count",
     "skip_post_memory",
+    "attachment_ids",
 }
 _RETIRED_ASSISTANT_FIELDS = frozenset({"react_compaction"})
 _ASSISTANT_FORBIDDEN_PLUGIN_FIELDS = frozenset(
@@ -211,9 +214,42 @@ class _RunCompositionAfterReasoningCleanupModule:
         return frame
 
 
+class _ImportAssistantAttachmentsModule:
+    slot = "after_reasoning.import_attachments"
+    requires = ("after_reasoning.composition_cleanup", _CTX_SLOT)
+    produces = (_ASSISTANT_ATTACHMENT_REFS_SLOT,)
+
+    def __init__(self, session_services: SessionServices) -> None:
+        self._session_services = session_services
+
+    async def run(self, frame: AfterReasoningFrame) -> AfterReasoningFrame:
+        """Import outbound media before any Session message mutation."""
+
+        # 1. 冻结 Core 与 v3 lifecycle 共同产生的媒体列表。
+        ctx = cast(AfterReasoningCtx, frame.slots[_CTX_SLOT])
+        media = list(ctx.media)
+        _append_media(
+            media,
+            collect_prefixed_slots(frame.slots, _OUTBOUND_MEDIA_PREFIX),
+        )
+        if not media:
+            frame.slots[_ASSISTANT_ATTACHMENT_REFS_SLOT] = ()
+            return frame
+
+        # 2. 先完成 artifact transaction，随后 message binding 才能同批提交。
+        importer = self._session_services.outbound_attachment_importer
+        if importer is None:
+            raise RuntimeError("outbound attachment importer 尚未绑定")
+        refs = await importer.import_media(tuple(media))
+        if any(not isinstance(ref, AttachmentRef) for ref in refs):
+            raise TypeError("outbound attachment importer 返回值无效")
+        frame.slots[_ASSISTANT_ATTACHMENT_REFS_SLOT] = refs
+        return frame
+
+
 class _PersistUserMessageModule:
     slot = "after_reasoning.persist_user"
-    requires = ("after_reasoning.composition_cleanup", _CTX_SLOT)
+    requires = ("after_reasoning.import_attachments", _CTX_SLOT)
     produces = (_PERSISTED_USER_SLOT,)
 
     def __init__(self, session_services: SessionServices) -> None:
@@ -295,6 +331,7 @@ class _PersistAssistantMessageModule:
         "after_reasoning.persist_user",
         _CTX_SLOT,
         _SEALED_ASSISTANT_METADATA_SLOT,
+        _ASSISTANT_ATTACHMENT_REFS_SLOT,
     )
     produces = (_PERSISTED_ASSISTANT_SLOT,)
 
@@ -332,15 +369,17 @@ class _PersistAssistantMessageModule:
         ):
             assistant_kwargs["skip_post_memory"] = True
         if frame.input.state.persistence.persist_assistant:
-            media = list(ctx.media)
-            _append_media(
-                media,
-                collect_prefixed_slots(frame.slots, _OUTBOUND_MEDIA_PREFIX),
+            refs = cast(
+                tuple[AttachmentRef, ...],
+                frame.slots[_ASSISTANT_ATTACHMENT_REFS_SLOT],
             )
+            if refs:
+                assistant_kwargs["attachment_ids"] = [
+                    ref.artifact_id for ref in refs
+                ]
             frame.slots[_PERSISTED_ASSISTANT_SLOT] = _pending_message(
                 "assistant",
                 ctx.reply,
-                media=media if media else None,
                 **assistant_kwargs,
             )
         return frame
@@ -436,7 +475,11 @@ class _AppendMessagesModule:
 
 class _BuildOutboundMessageModule:
     slot = "after_reasoning.build_outbound"
-    requires = ("after_reasoning.append_messages", _CTX_SLOT)
+    requires = (
+        "after_reasoning.append_messages",
+        _CTX_SLOT,
+        _ASSISTANT_ATTACHMENT_REFS_SLOT,
+    )
     produces = (_OUTBOUND_SLOT,)
 
     async def run(self, frame: AfterReasoningFrame) -> AfterReasoningFrame:
@@ -470,9 +513,9 @@ class _BuildOutboundMessageModule:
                 metadata["client_message_id"] = raw_client_message_id
             elif ctx.channel == "mobile":
                 raise RuntimeError("本轮 mobile user 消息缺少客户端 ID")
-        media = list(ctx.media)
-        _append_media(
-            media, collect_prefixed_slots(frame.slots, _OUTBOUND_MEDIA_PREFIX)
+        attachment_refs = cast(
+            tuple[AttachmentRef, ...],
+            frame.slots[_ASSISTANT_ATTACHMENT_REFS_SLOT],
         )
         session_message_id: str | None = None
         if frame.input.state.persistence.persist_assistant:
@@ -490,7 +533,7 @@ class _BuildOutboundMessageModule:
             chat_id=ctx.chat_id,
             content=ctx.reply,
             thinking=ctx.thinking,
-            media=media,
+            attachment_refs=attachment_refs,
             metadata=metadata,
             session_message_id=session_message_id,
             control_turn_id=running_turn_id.get(),
@@ -544,6 +587,7 @@ def default_after_reasoning_modules(
         _BuildAfterReasoningCtxModule(),
         _EmitAfterReasoningCtxModule(bus),
         _RunCompositionAfterReasoningCleanupModule(),
+        _ImportAssistantAttachmentsModule(session_services),
         _PersistUserMessageModule(session_services),
         _SealAssistantMetadataModule(),
         _PersistAssistantMessageModule(),
