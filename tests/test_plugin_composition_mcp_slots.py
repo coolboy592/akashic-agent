@@ -651,6 +651,7 @@ async def test_installed_runtime_candidate_isolated_and_commit_failure_restores_
         assert candidate_tool is not None
         candidate_output = await candidate_tool.execute()
         assert candidate_output.startswith(f"2|{candidate_port}|")
+        assert isinstance(candidate_output, str)
         assert "plugin-validation" in candidate_output
         assert manager.current_snapshot is stable_snapshot
         assert _port_live(18000)

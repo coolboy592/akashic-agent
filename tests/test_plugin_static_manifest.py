@@ -4,11 +4,14 @@ import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 
 import agent.plugins.install as install_module
 import agent.plugins.manager as manager_module
+from agent.plugins.generation import PluginGeneration
+from agent.plugins.snapshot import RuntimeSnapshot
 from agent.plugins.install import install_git_plugin
 from agent.plugins.static_manifest import (
     load_static_plugin_manifest,
@@ -364,8 +367,8 @@ def test_static_process_declaration_must_match_c13_root_registry(
 
     with pytest.raises(RuntimeError, match="managed process 声明"):
         manager_module._validate_static_manifest_runtime(  # pyright: ignore[reportPrivateUsage]
-            snapshot,
-            {"calendar": generation},
+            cast(RuntimeSnapshot, snapshot),
+            {"calendar": cast(PluginGeneration, generation)},
         )
 
 

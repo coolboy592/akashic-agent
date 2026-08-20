@@ -6,6 +6,7 @@ import os
 import stat
 from dataclasses import replace
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
@@ -409,7 +410,7 @@ async def test_commit_recovery_finishes_partial_ordered_replace_after_restart(
         target: Path,
         data: bytes,
         *,
-        expected_state: object,
+        expected_state: documents_module._FileState,
     ) -> None:
         nonlocal calls
         calls += 1
@@ -751,9 +752,9 @@ class _NoneLookup:
         invocation_id: str,
         effect_id: str | None,
         idempotency_key: str,
-    ) -> None:
+    ) -> DomainEffectLookup:
         del invocation_id, effect_id, idempotency_key
-        return None
+        return cast(DomainEffectLookup, None)
 
 
 @pytest.mark.asyncio
@@ -764,7 +765,7 @@ async def test_none_lookup_result_is_protocol_error_not_absent(tmp_path: Path) -
         "invocation-1",
         idempotency_key="key-invocation-1",
         effect_id="emotion.state",
-        receipt_lookup=_NoneLookup(),
+        receipt_lookup=cast(Any, _NoneLookup()),
     )
     intent = await documents.prepare_pair(expected, content)
     with pytest.raises(ReceiptIdentityError, match="不能返回 None"):

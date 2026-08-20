@@ -37,6 +37,9 @@ class _RecordingChild:
         self.events.append("prepare")
         return target_lease.snapshot.snapshot_id
 
+    def discard_plan(self, transaction_id, plan):
+        self.events.append(f"discard:{plan}")
+
     async def stop_components(self, transaction_id, old_binding):
         self.events.append(f"stop:{old_binding}")
 
@@ -510,6 +513,9 @@ async def test_initial_stable_activity_prepare_failure_discards_pending_candidat
 
         def prepare_components(self, transaction_id, target_lease, target_catalog):
             raise RuntimeError("private prepare failed")
+
+        def discard_plan(self, transaction_id, plan):
+            return None
 
         async def stop_components(self, transaction_id, old_binding):
             return None

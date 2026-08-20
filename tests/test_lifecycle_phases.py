@@ -1690,7 +1690,7 @@ async def test_after_reasoning_commits_outbound_attachment_binding_atomically(
     assistant = session.messages[-1]
     attachment_ids = assistant.get("attachment_ids")
     assert isinstance(attachment_ids, list) and len(attachment_ids) == 1
-    assert manager.control_store.message_attachment_ids(assistant["id"]) == tuple(
+    assert manager.control_store.message_attachment_ids(cast(str, assistant["id"])) == tuple(
         attachment_ids
     )
     assert result.outbound.attachment_refs[0].artifact_id == attachment_ids[0]
@@ -1942,7 +1942,7 @@ async def test_after_reasoning_persists_mobile_canonical_ids(tmp_path: Path):
     assert messages[0]["attachment_ids"] == [attachment.artifact_id]
     assert messages[0].get("media") in (None, [])
     assert "/proc/" not in json.dumps(messages[0], ensure_ascii=False)
-    assert reloaded.control_store.message_attachment_ids(messages[0]["id"]) == (
+    assert reloaded.control_store.message_attachment_ids(cast(str, messages[0]["id"])) == (
         attachment.artifact_id,
     )
     reloaded.close()

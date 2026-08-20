@@ -3,11 +3,12 @@ from __future__ import annotations
 import asyncio
 import json
 from types import ModuleType, SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
 from agent.plugin_composition.model import FiberState
+from agent.plugin_composition.context import FiberHandle, HealthHandle
 from agent.plugin_composition.proactive import (
     AckCommitted,
     AckFailure,
@@ -26,7 +27,7 @@ from agent.plugins.generation_proactive_host import (
     ProactiveModuleContext,
 )
 from agent.plugins.mcp_generation_host import McpCallResult
-from agent.plugins.snapshot import RuntimeSnapshotLease
+from agent.plugins.snapshot import RuntimeSnapshot, RuntimeSnapshotLease, RuntimeSnapshotStore
 from proactive_v2.frame import new_proactive_frame
 
 
@@ -125,9 +126,9 @@ def _fixture(
         descriptor=source_descriptor,
         generation_id="calendar:generation-1",
         definition=source_definition,
-        owner_fiber=fiber,
+        owner_fiber=cast(FiberHandle, fiber),
         activation_token=fiber.activation_token,
-        health=_Health(),
+        health=cast(HealthHandle, _Health()),
     )
     module_definition = ProactiveModuleDefinition(
         slot="proactive.calendar",
@@ -154,9 +155,9 @@ def _fixture(
         descriptor=module_descriptor,
         generation_id="calendar:generation-1",
         definition=module_definition,
-        owner_fiber=fiber,
+        owner_fiber=cast(FiberHandle, fiber),
         activation_token=fiber.activation_token,
-        health=_Health(),
+        health=cast(HealthHandle, _Health()),
     )
     catalog = ProactiveCatalog(
         {"calendar:calendar": source_binding},
@@ -177,8 +178,12 @@ def _fixture(
         private_proactive_catalog=None,
     )
     store = _Store()
-    target_lease = RuntimeSnapshotLease(store, snapshot)
-    execution_lease = RuntimeSnapshotLease(store, snapshot)
+    target_lease = RuntimeSnapshotLease(
+        cast(RuntimeSnapshotStore, store), cast(RuntimeSnapshot, snapshot)
+    )
+    execution_lease = RuntimeSnapshotLease(
+        cast(RuntimeSnapshotStore, store), cast(RuntimeSnapshot, snapshot)
+    )
     route = _Route()
     adapter = ProactiveActivityAdapter(route)
     activity_catalog = ActivityCatalog(proactive=catalog, background_jobs=None)
@@ -262,7 +267,9 @@ async def test_execution_requires_the_exact_snapshot_lease_and_cancel_propagates
         generations=target.snapshot.generations,
         proactive_component_catalog=target.snapshot.proactive_component_catalog,
     )
-    wrong_lease = RuntimeSnapshotLease(_Store(), wrong_snapshot)
+    wrong_lease = RuntimeSnapshotLease(
+        cast(RuntimeSnapshotStore, _Store()), cast(RuntimeSnapshot, wrong_snapshot)
+    )
     with pytest.raises(RuntimeError, match="identity"):
         await runtime.source("calendar").fetch(wrong_lease)
     assert adapter.source_fetch_invocations == 0

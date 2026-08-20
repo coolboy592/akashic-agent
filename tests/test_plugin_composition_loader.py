@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any, cast
@@ -25,6 +26,7 @@ from agent.plugin_composition import (
     PluginChannels,
     PluginProactiveComponents,
     PluginRuntime,
+    ProviderClientFactory,
     ServiceView,
 )
 from agent.plugins.composable import ComposablePlugin
@@ -693,12 +695,12 @@ async def test_v3_channel_formal_start_rejects_raw_config_drift_before_factory(
 
     provider = ProviderFactory()
 
-    def drift_after_snapshot(snapshot: Any) -> dict[str, ProviderFactory]:
+    def drift_after_snapshot(snapshot: Any) -> Mapping[str, ProviderClientFactory]:
         config_path.write_text(
             "app_id = 'app-1'\napp_secret = 'secret-after-seal'\n",
             encoding="utf-8",
         )
-        return {"feishu": provider}
+        return {"feishu": cast(ProviderClientFactory, provider)}
 
     manager.bind_channel_provider_factory_resolver(drift_after_snapshot)
     with pytest.raises(RuntimeError, match="config revision 已漂移"):
@@ -741,7 +743,7 @@ async def test_v3_channel_candidate_start_failure_restores_closed_stable_owner(
 
     manager.bind_channel_provider_factory_resolver(
         lambda snapshot: {
-            descriptor.name: ProviderFactory()
+            descriptor.name: cast(ProviderClientFactory, ProviderFactory())
             for descriptor in cast(Any, snapshot.channel_registry).descriptors
         }
     )
@@ -834,7 +836,7 @@ async def test_v3_channel_old_restart_failure_keeps_durable_recovery_owner(
 
     manager.bind_channel_provider_factory_resolver(
         lambda snapshot: {
-            descriptor.name: ProviderFactory()
+            descriptor.name: cast(ProviderClientFactory, ProviderFactory())
             for descriptor in cast(Any, snapshot.channel_registry).descriptors
         }
     )
@@ -919,7 +921,7 @@ async def test_v3_channel_old_stop_failure_keeps_stable_closed_until_exact_retry
 
     manager.bind_channel_provider_factory_resolver(
         lambda snapshot: {
-            descriptor.name: ProviderFactory()
+            descriptor.name: cast(ProviderClientFactory, ProviderFactory())
             for descriptor in cast(Any, snapshot.channel_registry).descriptors
         }
     )
@@ -1003,7 +1005,7 @@ async def test_v3_channel_candidate_cleanup_failure_blocks_old_restore_until_ret
 
     manager.bind_channel_provider_factory_resolver(
         lambda snapshot: {
-            descriptor.name: ProviderFactory()
+            descriptor.name: cast(ProviderClientFactory, ProviderFactory())
             for descriptor in cast(Any, snapshot.channel_registry).descriptors
         }
     )
@@ -1087,7 +1089,7 @@ async def test_v3_channel_terminate_failure_retains_exact_owner_until_retry(
 
     manager.bind_channel_provider_factory_resolver(
         lambda snapshot: {
-            descriptor.name: ProviderFactory()
+            descriptor.name: cast(ProviderClientFactory, ProviderFactory())
             for descriptor in cast(Any, snapshot.channel_registry).descriptors
         }
     )
@@ -1898,10 +1900,16 @@ async def test_v3_candidate_rejects_workspace_root_declaration_drift(
     assert stable is not None
     original_clone = manager._clone_candidate_composable
 
-    def clone_with_drift(*args: object, **kwargs: object):
-        clone, module_path, data_dir, config = original_clone(  # type: ignore[arg-type]
-            *args,
-            **kwargs,
+    def clone_with_drift(
+        generation: PluginGeneration,
+        *,
+        candidate_owner: PluginGeneration,
+        attempt_workspace: Path,
+    ) -> tuple[ComposablePlugin, str, Path, object]:
+        clone, module_path, data_dir, config = original_clone(
+            generation,
+            candidate_owner=candidate_owner,
+            attempt_workspace=attempt_workspace,
         )
         clone.workspace_roots = ("drifted",)
         return clone, module_path, data_dir, config

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
+from typing import Any, cast
 
 import pytest
 
@@ -31,7 +32,7 @@ def _event(**changes: object) -> ProactiveFeedbackCommitted:
         "proactive_content_preview": "主动消息",
     }
     values.update(changes)
-    return ProactiveFeedbackCommitted(**values)
+    return ProactiveFeedbackCommitted(**cast(Any, values))
 
 
 def test_feedback_payload_is_frozen_and_preview_bounded() -> None:

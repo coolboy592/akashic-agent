@@ -17,6 +17,7 @@ from agent.plugin_composition import (
     MobileUiRegistry,
 )
 from agent.plugins.generation import MobileUiAsset
+from agent.plugins.generation import PluginGeneration
 from agent.plugins.mobile_ui import (
     MobileUiPluginUnavailable,
     MobileUiQueryTimeout,
@@ -138,7 +139,9 @@ def _provider(*, available: bool = True) -> PluginMobileUiProvider:
     )
     snapshot = RuntimeSnapshot(
         snapshot_id="snapshot-1",
-        generations=MappingProxyType({"sample@github": generation}),
+        generations=MappingProxyType(
+            {"sample@github": cast(PluginGeneration, generation)}
+        ),
         skill_catalog_generation_id=None,
         mobile_ui_registry=MobileUiRegistry({"sample@github": binding}),
         composition_active_plugin_ids=frozenset({"sample@github"}),

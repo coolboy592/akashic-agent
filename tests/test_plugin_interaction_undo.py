@@ -5,6 +5,7 @@ import sqlite3
 import threading
 from datetime import UTC, datetime
 from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 
@@ -104,7 +105,7 @@ async def test_default_memory_failure_keeps_durable_pending_receipt(tmp_path) ->
     message_ids = _seed_interaction(manager)
     _ = manager.get_existing("cli:undo")
     memory = _DefaultMemory(fail=True)
-    coordinator = InteractionUndoCoordinator(manager, memory)
+    coordinator = InteractionUndoCoordinator(cast(Any, manager), cast(Any, memory))
 
     result = await coordinator.undo_latest("cli:undo")
 
@@ -154,7 +155,9 @@ async def test_core_restart_replays_committed_memory_receipt(tmp_path) -> None:
 
     restarted = SessionManager(tmp_path)
     memory = _DefaultMemory()
-    await InteractionUndoCoordinator(restarted, memory).recover_pending()
+    await InteractionUndoCoordinator(
+        cast(Any, restarted), cast(Any, memory)
+    ).recover_pending()
 
     assert memory.calls == [message_ids]
     assert restarted.get_existing("cli:undo").messages == []
@@ -172,7 +175,7 @@ async def test_caller_cancel_waits_for_committed_reconciliation(tmp_path) -> Non
     manager = SessionManager(tmp_path)
     message_ids = _seed_interaction(manager)
     memory = _BlockingDefaultMemory()
-    coordinator = InteractionUndoCoordinator(manager, memory)
+    coordinator = InteractionUndoCoordinator(cast(Any, manager), cast(Any, memory))
 
     task = asyncio.create_task(coordinator.undo_latest("cli:undo"))
     assert await asyncio.to_thread(memory.entered.wait, 5)

@@ -18,6 +18,7 @@ from agent.plugin_composition import (
     PluginRuntime,
 )
 from agent.plugin_composition.mcp_slots import (
+    McpServerRegistry,
     PluginMcpServers,
     _freeze_plugin_mcp_servers,
 )
@@ -104,7 +105,7 @@ async def _registry(
     required_tools: tuple[str, ...] = ("read_tool",),
     candidate_tools: tuple[str, ...] = ("read_tool",),
     candidate_env: dict[str, str] | None = None,
-) -> tuple[CompositionRoot, object]:
+) -> tuple[CompositionRoot, McpServerRegistry]:
     plugin_dir = tmp_path / "calendar"
     plugin_dir.mkdir(exist_ok=True)
     (plugin_dir / script.name).write_text(script.read_text(encoding="utf-8"), encoding="utf-8")
@@ -441,9 +442,9 @@ async def test_start_health_bridge_cancellation_drains_client(tmp_path: Path) ->
     root, registry = await _registry(tmp_path, script)
 
     def cancel_start(
-        _generation: str,
-        _server: str,
-        _healthy: bool,
+        generation_id: str,
+        server_name: str,
+        healthy: bool,
         reason: str,
     ) -> None:
         if reason == "starting":
@@ -509,10 +510,10 @@ async def test_recovery_health_bridge_cancellation_retains_degraded_tombstone(
     root, registry = await _registry(tmp_path, script)
 
     def cancel_epoch_incident(
-        _generation: str,
-        _server: str,
+        generation_id: str,
+        server_name: str,
         kind: str,
-        _message: str,
+        message: str,
     ) -> None:
         if kind == "process_epoch":
             raise asyncio.CancelledError
@@ -587,9 +588,9 @@ async def test_stopped_health_failure_is_diagnostic_not_cleanup_failure(tmp_path
     root, registry = await _registry(tmp_path, script)
 
     def fail_stopped(
-        _generation: str,
-        _server: str,
-        _healthy: bool,
+        generation_id: str,
+        server_name: str,
+        healthy: bool,
         reason: str,
     ) -> None:
         if reason == "stopped":
@@ -689,7 +690,7 @@ async def test_health_bridge_failure_prevents_ready_publication(tmp_path: Path) 
     _write_server(script)
     root, registry = await _registry(tmp_path, script)
 
-    def fail_ready(_generation: str, _server: str, _healthy: bool, reason: str) -> None:
+    def fail_ready(generation_id: str, server_name: str, healthy: bool, reason: str) -> None:
         if reason == "ready":
             raise RuntimeError("health bridge failed")
 

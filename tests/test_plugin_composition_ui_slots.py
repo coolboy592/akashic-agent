@@ -16,6 +16,7 @@ from agent.plugin_composition import (
     PluginUiSlots,
     resolve_mobile_ui_asset,
 )
+from agent.plugin_composition.ui_slots import MobileUiSlot
 from agent.plugins.manager import PluginManager
 from agent.plugins.mobile_ui import (
     MobileUiPluginUnavailable,
@@ -194,7 +195,9 @@ async def test_ui_slots_rejects_symlink_and_async_handler(tmp_path: Path) -> Non
     ("definition", "message"),
     (
         (
-            MobileUiDefinition(module="mobile.js", slots=("unknown.slot",)),
+            MobileUiDefinition(
+                module="mobile.js", slots=(cast(MobileUiSlot, "unknown.slot"),)
+            ),
             "slots 无效",
         ),
         (

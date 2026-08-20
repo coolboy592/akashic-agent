@@ -1,5 +1,6 @@
 import json
 from datetime import UTC, datetime
+from typing import Any, cast
 
 import pytest
 
@@ -8,6 +9,7 @@ from agent.plugin_composition import (
     MCP_SERVERS,
     PROACTIVE_COMPONENTS,
     ChannelFactoryContext,
+    Context,
     CredentialRef,
     DeliveryStatus,
     McpServerDefinition,
@@ -233,7 +235,7 @@ async def test_replay_debug_v3_namespace_declares_typed_source_and_channel(
         PROACTIVE_COMPONENTS: _DeclarationRecorder(),
     }
     await apply(
-        _DeclarationContext(services),
+        cast(Context, _DeclarationContext(services)),
         Config(replay_token=CredentialRef(("replay_token",))),
     )
 
@@ -268,7 +270,7 @@ async def test_replay_debug_v3_namespace_is_inert_without_replay_profile(
     }
 
     assert not is_active(ServiceView.freeze({}))
-    await apply(_DeclarationContext(services), Config())
+    await apply(cast(Context, _DeclarationContext(services)), Config())
     assert all(not recorder.definitions for recorder in services.values())
 
 

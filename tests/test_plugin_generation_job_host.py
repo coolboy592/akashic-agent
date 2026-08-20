@@ -21,6 +21,7 @@ from agent.plugin_composition.background_jobs import (
     RetryPolicy,
 )
 from agent.plugin_composition.model import FiberState
+from agent.plugin_composition.context import FiberHandle, HealthHandle
 from agent.plugins.composable import ComposablePlugin
 from agent.plugins.generation_job_host import (
     BackgroundJobActivityAdapter,
@@ -42,7 +43,9 @@ from agent.plugins.proactive_documents import (
     ProactiveDocuments,
 )
 from agent.plugins.snapshot import (
+    RuntimeSnapshot,
     RuntimeSnapshotLease,
+    RuntimeSnapshotStore,
     bind_runtime_snapshot,
     reset_runtime_snapshot,
 )
@@ -67,8 +70,8 @@ class _Store:
         self.snapshot.lease_count += 1
         self.leases += 1
         return RuntimeSnapshotLease(
-            self,
-            self.snapshot,
+            cast(RuntimeSnapshotStore, self),
+            cast(RuntimeSnapshot, self.snapshot),
             self.candidate_plugin_ids,
         )
 
@@ -82,8 +85,8 @@ class _Store:
         self.snapshot.lease_count += 1
         self.leases += 1
         return RuntimeSnapshotLease(
-            self,
-            self.snapshot,
+            cast(RuntimeSnapshotStore, self),
+            cast(RuntimeSnapshot, self.snapshot),
             source.validation_candidate_plugin_ids,
         )
 
@@ -180,9 +183,9 @@ def _fixture(
         name=definition.name,
         descriptor=descriptor,
         definition=definition,
-        owner_fiber=fiber,
+        owner_fiber=cast(FiberHandle, fiber),
         activation_token=fiber.activation_token,
-        required_health=_Health(),
+        required_health=cast(HealthHandle, _Health()),
     )
     catalog = BackgroundJobCatalog(
         {f"{plugin_id}:merge_pending": binding},
@@ -203,14 +206,14 @@ def _fixture(
     snapshot.lease_count += 1
     store.leases += 1
     target_lease = RuntimeSnapshotLease(
-        store,
-        snapshot,
+        cast(RuntimeSnapshotStore, store),
+        cast(RuntimeSnapshot, snapshot),
         validation_candidate_plugin_ids,
     )
     ledger = JobOutcomeLedger(ledger_path or tmp_path / "outcomes.sqlite")
     adapter = BackgroundJobActivityAdapter(
         EventBus(),
-        store,
+        cast(RuntimeSnapshotStore, store),
         model_provider=provider,
         ledger=ledger,
         clock=clock,
@@ -710,10 +713,12 @@ async def test_missing_job_catalog_materializes_closed_noop_without_worker(tmp_p
         lease_count=1,
     )
     store = _Store(snapshot)
-    target_lease = RuntimeSnapshotLease(cast(Any, store), cast(Any, snapshot))
+    target_lease = RuntimeSnapshotLease(
+        cast(RuntimeSnapshotStore, store), cast(RuntimeSnapshot, snapshot)
+    )
     adapter = BackgroundJobActivityAdapter(
         EventBus(),
-        cast(Any, store),
+        cast(RuntimeSnapshotStore, store),
         ledger=JobOutcomeLedger(tmp_path / "outcomes.sqlite"),
     )
 
@@ -1536,7 +1541,7 @@ async def test_completed_child_failure_prevents_handler_success(tmp_path) -> Non
 async def test_cancel_intent_wins_when_handler_swallows_cancelled_error(tmp_path) -> None:
     started = asyncio.Event()
 
-    async def handler(ctx) -> str:
+    async def handler(ctx) -> str | None:
         started.set()
         try:
             await asyncio.Event().wait()

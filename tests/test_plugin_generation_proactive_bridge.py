@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from types import MappingProxyType, SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -15,7 +15,7 @@ from agent.plugin_composition.proactive import (
 from agent.plugins.generation_activity_host import ActivityBinding, ActivityHost
 from agent.plugins.generation_proactive_bridge import CommittedProactiveBridge
 from agent.plugins.generation_proactive_host import ProactiveRuntimeBinding
-from agent.plugins.snapshot import RuntimeSnapshotLease, get_current_runtime_lease
+from agent.plugins.snapshot import RuntimeSnapshot, RuntimeSnapshotLease, get_current_runtime_lease
 from proactive_v2.config import ProactiveConfig
 from proactive_v2.frame import new_proactive_frame
 from proactive_v2.loop import ProactiveLoop
@@ -229,4 +229,4 @@ def test_snapshot_without_private_binding_fails_loud() -> None:
     )
 
     with pytest.raises(RuntimeError, match="Private proactive Activity binding"):
-        loop._apply_snapshot(snapshot)
+        loop._apply_snapshot(cast(RuntimeSnapshot, snapshot))

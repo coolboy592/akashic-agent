@@ -19,7 +19,7 @@ from agent.looping.ports import LLMConfig
 from agent.looping.session_lane import SessionLaneRegistry
 from agent.plugins.snapshot import bind_runtime_snapshot, reset_runtime_snapshot
 from bus.event_bus import EventBus
-from bus.events import InboundMessage, OutboundMessage, SpawnCompletionItem
+from bus.events import InboundItem, InboundMessage, OutboundMessage, SpawnCompletionItem
 from bus.events_lifecycle import TurnStarted
 from bus.internal_events import SpawnCompletionEvent
 from bus.queue import MessageBus
@@ -535,7 +535,7 @@ async def test_durable_poison_inbound_not_acked_and_offered_to_next_recovery(
     loop._event_bus.on(TurnStarted, started_events.append)
 
     with pytest.raises(TypeError):
-        await loop._run_inbound_turn(consumed)
+        await loop._run_inbound_turn(cast(InboundItem, consumed))
 
     assert started_events == []
     assert loop._active_tasks == {}
@@ -578,7 +578,7 @@ async def test_durable_poison_inbound_not_acked_and_offered_to_next_recovery(
     restarted_loop = _real_path_loop(restarted, core_process)
     restarted_loop._event_bus.on(TurnStarted, started_events.append)
     with pytest.raises(TypeError):
-        await restarted_loop._run_inbound_turn(recovered)
+        await restarted_loop._run_inbound_turn(cast(InboundItem, recovered))
     assert started_events == []
     assert restarted_loop._active_tasks == {}
     assert restarted_loop._active_turn_states == {}

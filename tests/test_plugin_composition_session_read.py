@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
-from typing import cast
+from typing import Any, cast
 
 import pytest
 
@@ -31,7 +31,7 @@ def test_session_read_returns_detached_existing_snapshot() -> None:
     ]
     session = SimpleNamespace(messages=messages, last_consolidated=1)
     compaction = SimpleNamespace(generation=1, consolidated_through_seq=1)
-    service = SessionReadService(lambda _key: (session, compaction))
+    service = SessionReadService(cast(Any, lambda _key: (session, compaction)))
 
     snapshot = service.read("mobile:one")
 
@@ -63,7 +63,7 @@ def test_session_read_missing_and_candidate_boundaries_fail_loud() -> None:
     inconsistent = SimpleNamespace(messages=[], last_consolidated=2)
     active = SimpleNamespace(generation=1, consolidated_through_seq=3)
     with pytest.raises(RuntimeError, match="active compaction generation 不一致"):
-        SessionReadService(lambda _key: (inconsistent, active)).read(
+        SessionReadService(cast(Any, lambda _key: (inconsistent, active))).read(
             "mobile:inconsistent"
         )
 

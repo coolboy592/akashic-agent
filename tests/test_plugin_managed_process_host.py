@@ -243,9 +243,20 @@ async def test_candidate_uses_temporary_port_and_bounded_logs(tmp_path: Path) ->
     _write_http_server(script)
     health: list[tuple[str, str, bool, str]] = []
     incidents: list[tuple[str, str, str, str]] = []
+
+    def record_health(
+        generation_id: str, process_name: str, healthy: bool, reason: str
+    ) -> None:
+        health.append((generation_id, process_name, healthy, reason))
+
+    def record_incident(
+        generation_id: str, process_name: str, kind: str, message: str
+    ) -> None:
+        incidents.append((generation_id, process_name, kind, message))
+
     host = ManagedProcessGenerationHost(
-        on_health=lambda *value: health.append(value),
-        on_incident=lambda *value: incidents.append(value),
+        on_health=record_health,
+        on_incident=record_incident,
         log_max_bytes=64,
         log_max_lines=4,
     )
@@ -301,8 +312,14 @@ async def test_process_exit_recovers_with_new_epoch_without_stale_resurrection(
     pid_log = tmp_path / "recover-pids.txt"
     _write_http_server(script, exit_first=True)
     incidents: list[tuple[str, str, str, str]] = []
+
+    def record_incident(
+        generation_id: str, process_name: str, kind: str, message: str
+    ) -> None:
+        incidents.append((generation_id, process_name, kind, message))
+
     host = ManagedProcessGenerationHost(
-        on_incident=lambda *value: incidents.append(value),
+        on_incident=record_incident,
         recovery_backoff_seconds=(0.01, 0.01),
         recovery_stable_seconds=60,
     )
@@ -327,9 +344,9 @@ async def test_process_exit_recovers_with_new_epoch_without_stale_resurrection(
     await _wait_until(
         recovered,
     )
-    recovered = generation.endpoint("calendar_api")
-    assert recovered.epoch > initial.epoch
-    assert recovered.port != initial.port
+    recovered_endpoint = generation.endpoint("calendar_api")
+    assert recovered_endpoint.epoch > initial.epoch
+    assert recovered_endpoint.port != initial.port
     assert any(item[2] == "process_exit" for item in incidents)
     assert host.health("candidate-recover", "calendar_api")
 
@@ -399,7 +416,9 @@ async def test_health_ready_callback_cancellation_cleans_started_process(
     script = tmp_path / "server.py"
     _write_http_server(script)
 
-    async def cancel_ready(_generation: str, _name: str, healthy: bool, _reason: str) -> None:
+    async def cancel_ready(
+        generation_id: str, process_name: str, healthy: bool, reason: str
+    ) -> None:
         if healthy:
             raise asyncio.CancelledError
 
@@ -421,10 +440,10 @@ async def test_incident_callback_cancellation_cleans_readiness_process(
     _write_http_server(script, ready_status=503)
 
     async def cancel_incident(
-        _generation: str,
-        _name: str,
-        _kind: str,
-        _message: str,
+        generation_id: str,
+        process_name: str,
+        kind: str,
+        message: str,
     ) -> None:
         raise asyncio.CancelledError
 
@@ -451,7 +470,9 @@ async def test_health_callback_failure_is_fail_loud_and_cleans_process(
     script = tmp_path / "server.py"
     _write_http_server(script)
 
-    def fail_ready(_generation: str, _name: str, healthy: bool, _reason: str) -> None:
+    def fail_ready(
+        generation_id: str, process_name: str, healthy: bool, reason: str
+    ) -> None:
         if healthy:
             raise RuntimeError("health bridge unavailable")
 
@@ -569,8 +590,8 @@ async def test_stopped_observer_failure_cannot_retain_cleaned_process(
     _write_http_server(script)
 
     def fail_after_root_dispose(
-        _generation: str,
-        _name: str,
+        generation_id: str,
+        process_name: str,
         healthy: bool,
         reason: str,
     ) -> None:

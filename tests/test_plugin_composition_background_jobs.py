@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -282,7 +283,7 @@ async def test_background_job_name_is_unique_per_owner(
     (
         lambda: IntervalTrigger(0),
         lambda: IntervalTrigger(True),
-        lambda: CoreEventTrigger("drift_finished"),
+        lambda: CoreEventTrigger(cast(CoreEvent, "drift_finished")),
         lambda: BackgroundJobDefinition("bad", (), "run"),
         lambda: BackgroundJobDefinition(
             "bad",
@@ -296,7 +297,7 @@ async def test_background_job_name_is_unique_per_owner(
             "bad",
             (IntervalTrigger(1),),
             "run",
-            programmatic_turns=1,
+            programmatic_turns=cast(bool, 1),
         ),
         lambda: RetryPolicy(max_attempts=0),
         lambda: RetryPolicy(base_delay_seconds=float("nan")),

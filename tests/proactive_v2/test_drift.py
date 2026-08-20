@@ -1733,7 +1733,9 @@ async def test_agent_tick_drift_emits_delivery_result(
 
     gate = MagicMock()
     gate.should_act.return_value = (True, {})
-    actions = [("select_skill", _select_input("explore-curiosity"))]
+    actions: list[tuple[str, dict]] = [
+        ("select_skill", _select_input("explore-curiosity"))
+    ]
     if with_outbound:
         actions.append(("message_push", {"message": "hello from drift"}))
     actions.append(

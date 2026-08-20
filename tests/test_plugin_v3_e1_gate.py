@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -103,7 +104,9 @@ def test_sqlite_state_covers_without_rowid_tables(tmp_path: Path) -> None:
         assert before["integrity"] == "ok"
         assert after["integrity"] == "ok"
         assert diff["deleted_count"] == 0
-        assert any(item.startswith("messages:") for item in diff["inserted"])
+        assert any(
+            item.startswith("messages:") for item in cast(list[str], diff["inserted"])
+        )
     finally:
         sessions.close()
 
@@ -120,21 +123,25 @@ async def test_combined_gate_runs_real_disposable_write_sets(tmp_path: Path) -> 
         passive_webui_report=tmp_path / "missing-plugin-passive-webui-v3.json",
     )
     assert report["status"] == "blocked"
-    scenarios = {item["id"]: item for item in report["scenarios"]}
+    scenarios = {
+        item["id"]: item for item in cast(list[dict[str, object]], report["scenarios"])
+    }
     assert scenarios["runtime_boot_default"]["status"] == "passed"
     assert scenarios["runtime_boot_akasha"]["status"] == "passed"
     assert scenarios["append_only_sessiondb"]["status"] == "passed"
     assert scenarios["plugin_undo"]["status"] == "passed"
     assert scenarios["core_crash_recovery"]["status"] == "passed"
     assert scenarios["passive_prompt_metadata_media"]["status"] == "blocked"
-    crash = scenarios["core_crash_recovery"]["core_process_crash"]
+    crash = cast(
+        dict[str, object], scenarios["core_crash_recovery"]["core_process_crash"]
+    )
     assert crash["child_exit_code"] == 17
     assert report_path.is_file()
     persisted = json.loads(report_path.read_text(encoding="utf-8"))
     assert persisted["status"] == "blocked"
     assert persisted["workspace_persisted"] is False
     external = {
-        item["id"]: item for item in report["plugins"]
+        item["id"]: item for item in cast(list[dict[str, object]], report["plugins"])
         if item["id"] in gate.E1_EXTERNAL_PLUGIN_IDS
     }
     assert set(external) == set(gate.E1_EXTERNAL_PLUGIN_IDS)
