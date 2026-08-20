@@ -375,7 +375,10 @@ class AkashaInspectorReader:
         ).fetchone()
         actual_version = None if row is None else str(row[0])
         if actual_version != INDEX_VERSION:
-            raise ValueError(f"unsupported sparse index version: {actual_version}")
+            raise ValueError(
+                f"unsupported sparse index version: {actual_version}; "
+                "explicit rebuild is required"
+            )
         columns = {
             str(item[1])
             for item in connection.execute("PRAGMA sparse.table_info(sparse_turns)")

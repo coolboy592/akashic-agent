@@ -6,6 +6,7 @@ from .builder import (
     BuildResult,
     EmbeddingAudit,
     EmbeddingIssue,
+    SparseIndexRebuildRequired,
     audit_source_embeddings,
     build_sparse_index,
 )
@@ -16,6 +17,7 @@ __all__ = [
     "BuildResult",
     "EmbeddingAudit",
     "EmbeddingIssue",
+    "SparseIndexRebuildRequired",
     "audit_source_embeddings",
     "build_sparse_index",
 ]

@@ -52,6 +52,7 @@ from core.memory.engine import MemoryQuery, MemoryQueryResult, MemoryScope
 from core.memory.plugin import MemoryPlugin as MemoryPluginProtocol
 from plugins.akasha.application.cycle import MemoryCycle
 from plugins.akasha.application.rebuild import rebuild_memory
+from plugins.akasha.application.runtime import OnlineMemoryRuntime
 from plugins.akasha.config import AkashaConfig, load_akasha_config, render_akasha_config
 from plugins.akasha.dashboard import register as register_dashboard
 from plugins.akasha.domain.features import BurstAwareFeaturePool
@@ -69,6 +70,7 @@ from plugins.akasha.infrastructure.persistence import (
 )
 from plugins.akasha.infrastructure.sparse_index import (
     BuildConfig,
+    SparseIndexRebuildRequired,
     audit_source_embeddings,
     build_sparse_index,
 )
@@ -3119,6 +3121,100 @@ def test_rebuild_akasha_sidecars_backs_up_and_publishes_verified_pair(
     assert manifest["indexVersion"] == "10"
     assert manifest["candidateMemorySha256"]
     assert hashlib.sha256(sessions_path.read_bytes()).hexdigest() == source_sha
+
+
+def test_online_runtime_rebuilds_previous_sparse_index_version(
+    tmp_path: Path,
+) -> None:
+    """Boot rebuilds an obsolete derived index without changing sessions.db."""
+
+    # 1. Freeze one canonical source turn and an obsolete v9 sidecar.
+    sessions_path = tmp_path / "sessions.db"
+    index_path = tmp_path / "memory" / "akasha-v2-index.db"
+    memory_path = tmp_path / "memory" / "akasha.db"
+    _create_sessions(sessions_path)
+    _append_turn(
+        sessions_path,
+        sequence=0,
+        user="alpha request",
+        assistant="beta reply",
+        started=datetime(2026, 8, 5, tzinfo=timezone.utc),
+        with_embeddings=True,
+    )
+    index_path.parent.mkdir(parents=True)
+    with closing(sqlite3.connect(index_path)) as connection, connection:
+        connection.execute("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT)")
+        connection.execute("INSERT INTO metadata VALUES ('index_version', '9')")
+    source_sha = hashlib.sha256(sessions_path.read_bytes()).hexdigest()
+
+    # 2. Boot through the production runtime and verify the derived pair only.
+    runtime = OnlineMemoryRuntime(
+        sessions_path=sessions_path,
+        index_path=index_path,
+        memory_path=memory_path,
+        embedding_model="embedding-model",
+        embedding_dimension=2,
+        config=MemoryConfig(),
+    )
+    runtime.close()
+
+    with closing(sqlite3.connect(index_path)) as connection:
+        assert connection.execute(
+            "SELECT value FROM metadata WHERE key = 'index_version'"
+        ).fetchone() == (INDEX_VERSION,)
+        assert connection.execute("SELECT COUNT(*) FROM sparse_turns").fetchone() == (
+            1,
+        )
+    assert memory_path.is_file()
+    assert hashlib.sha256(sessions_path.read_bytes()).hexdigest() == source_sha
+
+
+def test_online_runtime_keeps_previous_sidecar_when_version_rebuild_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed version rebuild leaves both canonical input and old sidecar intact."""
+
+    # 1. Freeze the source and obsolete sidecar before the injected rebuild failure.
+    sessions_path = tmp_path / "sessions.db"
+    index_path = tmp_path / "memory" / "akasha-v2-index.db"
+    memory_path = tmp_path / "memory" / "akasha.db"
+    _create_sessions(sessions_path)
+    index_path.parent.mkdir(parents=True)
+    with closing(sqlite3.connect(index_path)) as connection, connection:
+        connection.execute("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT)")
+        connection.execute("INSERT INTO metadata VALUES ('index_version', '9')")
+    source_sha = hashlib.sha256(sessions_path.read_bytes()).hexdigest()
+    index_sha = hashlib.sha256(index_path.read_bytes()).hexdigest()
+
+    def fail_rebuild(
+        _source_path: Path,
+        output_path: Path,
+        _config: BuildConfig,
+    ) -> object:
+        if output_path == index_path:
+            raise SparseIndexRebuildRequired("obsolete test index")
+        raise RuntimeError("injected candidate rebuild failure")
+
+    monkeypatch.setattr(
+        "plugins.akasha.application.runtime.build_sparse_index",
+        fail_rebuild,
+    )
+
+    # 2. Startup fails loudly without replacing either protected input.
+    with pytest.raises(RuntimeError, match="candidate rebuild failure"):
+        OnlineMemoryRuntime(
+            sessions_path=sessions_path,
+            index_path=index_path,
+            memory_path=memory_path,
+            embedding_model="embedding-model",
+            embedding_dimension=2,
+            config=MemoryConfig(),
+        )
+
+    assert hashlib.sha256(sessions_path.read_bytes()).hexdigest() == source_sha
+    assert hashlib.sha256(index_path.read_bytes()).hexdigest() == index_sha
+    assert not memory_path.exists()
 
 
 def _write_inspector_config(workspace: Path) -> None:

@@ -35,6 +35,10 @@ class AppendOnlyViolation(RuntimeError):
     """Report that an incremental source contains new historical turns."""
 
 
+class SparseIndexRebuildRequired(ValueError):
+    """Report that a derived sparse index must be rebuilt from its source."""
+
+
 @dataclass(frozen=True)
 class BuildConfig:
     """Configure causal BM25 while leaving feature cardinality unconstrained."""
@@ -250,7 +254,9 @@ def _validate_source(connection: sqlite3.Connection) -> None:
 def _validate_index_version(connection: sqlite3.Connection) -> None:
     row = connection.execute("SELECT value FROM metadata WHERE key='index_version'").fetchone()
     if row is not None and row["value"] != INDEX_VERSION:
-        raise ValueError(f"unsupported sparse index version: {row['value']}")
+        raise SparseIndexRebuildRequired(
+            f"unsupported sparse index version: {row['value']}"
+        )
     if row is None and connection.execute(
         "SELECT COUNT(*) FROM metadata"
     ).fetchone()[0] == 0:
@@ -260,7 +266,7 @@ def _validate_index_version(connection: sqlite3.Connection) -> None:
         for item in connection.execute("PRAGMA table_info(sparse_turns)")
     }
     if "assistant_tool_chain_json" not in columns:
-        raise ValueError(
+        raise SparseIndexRebuildRequired(
             "sparse index lacks assistant tool-chain projection; "
             "explicit rebuild is required"
         )
@@ -269,7 +275,7 @@ def _validate_index_version(connection: sqlite3.Connection) -> None:
     ).fetchone()
     actual = None if projection is None else str(projection["value"])
     if actual != TOOL_CHAIN_PROJECTION_VERSION:
-        raise ValueError(
+        raise SparseIndexRebuildRequired(
             "unsupported assistant tool-chain projection version: "
             f"{actual}; explicit rebuild is required"
         )

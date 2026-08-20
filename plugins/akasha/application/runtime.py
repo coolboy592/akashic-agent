@@ -26,6 +26,7 @@ from ..infrastructure.persistence import (
 from ..infrastructure.sparse_index import (
     AppendOnlyViolation,
     BuildConfig,
+    SparseIndexRebuildRequired,
     build_sparse_index,
 )
 from ..infrastructure.sparse_index.encoding import tokenize
@@ -75,7 +76,11 @@ class OnlineMemoryRuntime:
         self.config = config
         self._writer_lease = WriterLease(memory_path)
         self._state_lock = threading.RLock()
-        self.cycle = self._restore_or_replay()
+        try:
+            self.cycle = self._restore_or_replay()
+        except BaseException:
+            self._writer_lease.close()
+            raise
 
     def close(self) -> None:
         self._writer_lease.close()
@@ -265,7 +270,7 @@ class OnlineMemoryRuntime:
                 self.index_path,
                 self._build_config(),
             )
-        except AppendOnlyViolation as exc:
+        except (AppendOnlyViolation, SparseIndexRebuildRequired) as exc:
             logger.warning(
                 "Akasha sparse source changed; rebuilding derived state: %s",
                 exc,
