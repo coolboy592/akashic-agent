@@ -69,7 +69,11 @@ FailureCallback = Callable[["ChannelCleanupTombstone"], Awaitable[None] | None]
 SnapshotLeaseAcquirer = Callable[[str], "RuntimeSnapshotLease"]
 InboundPublisher = Callable[[InboundEnvelope], Awaitable[None]]
 IdentityResolver = Callable[[str, str], str | None]
-IdentityRememberer = Callable[[str, str, str], Coroutine[object, object, None]]
+IdentityRememberer = Callable[
+    [str, str, str],
+    Coroutine[object, object, object | None],
+]
+IdentityRollbacker = Callable[[object], Coroutine[object, object, bool]]
 ControlInterrupter = Callable[[RawInbound], Awaitable[object]]
 ControlResponseDispatcher = Callable[..., Awaitable[ChannelDeliveryReceipt]]
 PresentationIncidentReporter = Callable[
@@ -896,6 +900,7 @@ class ChannelGenerationHost:
         snapshot_lease_acquirer: SnapshotLeaseAcquirer | None = None,
         identity_resolver: IdentityResolver | None = None,
         identity_rememberer: IdentityRememberer | None = None,
+        identity_rollbacker: IdentityRollbacker | None = None,
         attachment_import: ChannelAttachmentImportPort | None = None,
         attachment_read: ChannelAttachmentReadPort | None = None,
         control_interrupter: ControlInterrupter | None = None,
@@ -918,6 +923,10 @@ class ChannelGenerationHost:
             raise TypeError("identity_resolver 必须可调用")
         if identity_rememberer is not None and not callable(identity_rememberer):
             raise TypeError("identity_rememberer 必须可调用")
+        if identity_rollbacker is not None and identity_rememberer is None:
+            raise TypeError("identity rollbacker 需要 identity rememberer")
+        if identity_rollbacker is not None and not callable(identity_rollbacker):
+            raise TypeError("identity_rollbacker 必须可调用")
         if (attachment_import is None) != (attachment_read is None):
             raise TypeError("attachment import/read ports 必须同时绑定")
         if attachment_import is not None and not callable(
@@ -945,6 +954,7 @@ class ChannelGenerationHost:
         self._inbound_publisher: InboundPublisher | None = None
         self._identity_resolver = identity_resolver
         self._identity_rememberer = identity_rememberer
+        self._identity_rollbacker = identity_rollbacker
         self._attachment_import = attachment_import
         self._attachment_read = attachment_read
         self._control_interrupter = control_interrupter
@@ -1636,6 +1646,8 @@ class ChannelGenerationHost:
         self._begin_presentation_operation(key, allow_closed=False)
         accepted = False
         binding: ChannelBindingLease | None = None
+        envelope: InboundEnvelope | None = None
+        identity_receipt: object | None = None
         try:
             source = acquirer(state.snapshot_id)
             try:
@@ -1664,7 +1676,16 @@ class ChannelGenerationHost:
                     ),
                     name=f"channel-identity-remember:{state.channel_name}",
                 )
-                await _await_task_after_cancellation(identity_task)
+                try:
+                    identity_receipt = await _await_task_after_cancellation(
+                        identity_task
+                    )
+                    if identity_task.cancelled():
+                        raise asyncio.CancelledError
+                except BaseException:
+                    if identity_task.done() and not identity_task.cancelled():
+                        identity_receipt = identity_task.result()
+                    raise
             envelope = InboundEnvelope(
                 message_id=raw.message_id,
                 snapshot_id=binding.snapshot_id,
@@ -1673,17 +1694,47 @@ class ChannelGenerationHost:
                 message=raw.message,
                 lease=binding,
             )
-            try:
-                await publisher(envelope)
-            except BaseException:
-                if envelope.owner is InboundOwner.INGRESS:
-                    await envelope.close(InboundOwner.INGRESS)
-                raise
+            await publisher(envelope)
+            if envelope.owner in (InboundOwner.INGRESS, InboundOwner.CLOSED):
+                raise RuntimeError("Channel inbound publisher 未接管 envelope")
             accepted = True
             while len(state.inbound_message_ids) > 500:
                 expired = state.inbound_message_ids.popleft()
                 state.inbound_message_id_set.remove(expired)
             return True
+        except BaseException as error:
+            cleanup_errors: list[BaseException] = []
+            accepted_elsewhere = envelope is not None and envelope.owner not in (
+                InboundOwner.INGRESS,
+                InboundOwner.CLOSED,
+            )
+            if accepted_elsewhere:
+                accepted = True
+            else:
+                if envelope is not None and envelope.owner is InboundOwner.INGRESS:
+                    close_task = asyncio.create_task(
+                        envelope.close(InboundOwner.INGRESS),
+                        name=f"channel-ingress-close:{state.channel_name}",
+                    )
+                    try:
+                        await _settle_cleanup_task(close_task)
+                    except BaseException as close_error:
+                        cleanup_errors.append(close_error)
+                if identity_receipt is not None:
+                    rollback_task = asyncio.create_task(
+                        self._rollback_identity_write(identity_receipt),
+                        name=f"channel-identity-rollback:{state.channel_name}",
+                    )
+                    try:
+                        await _settle_cleanup_task(rollback_task)
+                    except BaseException as rollback_error:
+                        cleanup_errors.append(rollback_error)
+            if cleanup_errors:
+                raise BaseExceptionGroup(
+                    "Channel inbound acceptance 回滚失败",
+                    [error, *cleanup_errors],
+                ) from error
+            raise
         finally:
             try:
                 if not accepted:
@@ -1696,6 +1747,15 @@ class ChannelGenerationHost:
                         await binding.aclose()
             finally:
                 self._release_presentation_operation(key)
+
+    async def _rollback_identity_write(self, receipt: object) -> None:
+        """精确撤销失败 acceptance 写入且显式暴露 rollback fence 冲突。"""
+
+        rollbacker = self._identity_rollbacker
+        if rollbacker is None:
+            raise RuntimeError("Channel identity rollback runtime port 未绑定")
+        if await rollbacker(receipt) is not True:
+            raise RuntimeError("Channel identity rollback fence 已被并发状态取代")
 
     def _resolve_identity(
         self,
@@ -2470,6 +2530,17 @@ async def _await_task_after_cancellation(task: asyncio.Task[Any]) -> Any:
     if cancelled:
         raise asyncio.CancelledError
     return result
+
+
+async def _settle_cleanup_task(task: asyncio.Task[Any]) -> Any:
+    """Settle one acceptance rollback task before preserving the original failure."""
+
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            continue
+    return task.result()
 
 
 def _task_succeeded(task: asyncio.Task[Any]) -> bool:

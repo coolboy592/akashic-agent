@@ -1491,6 +1491,72 @@ async def test_identity_write_failure_releases_dedupe_claim_before_snapshot_acqu
 
 
 @pytest.mark.asyncio
+async def test_publisher_failure_rolls_back_identity_receipt_and_binding() -> None:
+    snapshot, factories, adapters = await _make_snapshot(
+        capabilities=frozenset(
+            {ChannelCapability.INBOUND, ChannelCapability.OUTBOUND}
+        )
+    )
+    receipt = object()
+    rolled_back: list[object] = []
+    sources: list[_FakeSnapshotLease] = []
+
+    def acquire(snapshot_id: str) -> _FakeSnapshotLease:
+        assert snapshot_id == snapshot.snapshot_id
+        source = _FakeSnapshotLease(snapshot)
+        sources.append(source)
+        return source
+
+    async def remember(
+        _channel: str,
+        _identity: str,
+        _recipient: str,
+    ) -> object:
+        return receipt
+
+    async def rollback(value: object) -> bool:
+        rolled_back.append(value)
+        return True
+
+    async def publish(_envelope: InboundEnvelope) -> None:
+        raise RuntimeError("publisher unavailable")
+
+    host = _host(
+        snapshot_lease_acquirer=acquire,
+        identity_resolver=lambda _channel, _identity: None,
+        identity_rememberer=remember,
+        identity_rollbacker=rollback,
+    )
+    host.bind_inbound_publisher(publish)
+    generation = await host.start(snapshot, factories)
+    generation.open_admission()
+    ingress = tuple(adapters.values())[0].context.ingress
+    assert ingress is not None
+    raw = RawInbound(
+        message_id="publisher-failure",
+        provider_identity="open-id",
+        recipient="chat-id",
+        message=ChannelInboundMessage(
+            channel="feishu",
+            sender="open-id",
+            chat_id="chat-id",
+            content="hello",
+            timestamp=datetime.now(timezone.utc),
+            metadata={},
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="publisher unavailable"):
+        await ingress.admit(raw)
+
+    assert rolled_back == [receipt]
+    assert generation.channel("feishu").in_flight == 0
+    assert len(sources) == 1 and not sources[0].active
+    assert len(sources[0].forks) == 1 and not sources[0].forks[0].active
+    await generation.stop()
+
+
+@pytest.mark.asyncio
 async def test_identity_write_is_owned_by_binding_drain_during_publication() -> None:
     snapshot, factories, adapters = await _make_snapshot(
         capabilities=frozenset(
@@ -1648,6 +1714,28 @@ def test_durable_callbacks_are_mandatory() -> None:
             on_before_start=_noop_record,
             config_revision_checker=None,  # type: ignore[arg-type]
         )
+
+
+@pytest.mark.asyncio
+async def test_identity_rollback_fence_conflict_is_fail_loud() -> None:
+    async def remember(
+        _channel: str,
+        _identity: str,
+        _recipient: str,
+    ) -> object:
+        return object()
+
+    async def rollback(_receipt: object) -> bool:
+        return False
+
+    host = _host(
+        identity_resolver=lambda _channel, _identity: None,
+        identity_rememberer=remember,
+        identity_rollbacker=rollback,
+    )
+
+    with pytest.raises(RuntimeError, match="rollback fence 已被并发状态取代"):
+        await host._rollback_identity_write(object())
 
 
 @pytest.mark.asyncio

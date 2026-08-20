@@ -8,7 +8,7 @@ import sqlite3
 import threading
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
 from typing import Any, Sequence, cast
 from uuid import uuid4
@@ -51,6 +51,24 @@ class SessionAdmissionConflictError(ValueError):
         super().__init__(f"session 正在处理消息，暂时不能删除: {session_key}")
         self.session_key = session_key
         self.audit_id = audit_id
+
+
+@dataclass(frozen=True)
+class ChannelIdentityWriteReceipt:
+    """记录一次可按提交版本精确撤销的 Channel identity 写入。"""
+
+    channel: str
+    identity: str
+    chat_id: str
+    session_key: str
+    committed_created_at: str
+    committed_updated_at: str
+    committed_last_consolidated: int
+    committed_metadata: str
+    previous_identity_chat_id: str | None
+    previous_identity_updated_at: str | None
+    previous_session: tuple[str, str, int, str | None] | None
+    previous_lineage_counts: tuple[int, ...]
 
 
 class SessionCompactionPrepareConflictError(ValueError):
@@ -3828,7 +3846,7 @@ class SessionStore:
         created_at: str,
         updated_at: str,
         metadata: Mapping[str, Any],
-    ) -> str | None:
+    ) -> ChannelIdentityWriteReceipt:
         """Atomically update target Session metadata and the unique identity row."""
 
         metadata_payload = json.dumps(dict(metadata), ensure_ascii=False)
@@ -3837,11 +3855,43 @@ class SessionStore:
                 self._conn.execute("BEGIN IMMEDIATE")
                 previous = self._conn.execute(
                     """
-                    SELECT chat_id FROM channel_identities
+                    SELECT chat_id, updated_at FROM channel_identities
                     WHERE channel = ? AND identity = ?
                     """,
                     (channel, identity),
                 ).fetchone()
+                previous_session = self._conn.execute(
+                    """
+                    SELECT created_at, updated_at, last_consolidated, metadata
+                    FROM sessions
+                    WHERE key = ?
+                    """,
+                    (session_key,),
+                ).fetchone()
+                previous_counts = self._session_lineage_counts_locked(session_key)
+                occupied_versions = {
+                    str(row["updated_at"])
+                    for row in (previous, previous_session)
+                    if row is not None
+                }
+                committed_updated_at = updated_at
+                while committed_updated_at in occupied_versions:
+                    committed_time = datetime.fromisoformat(committed_updated_at)
+                    if committed_time.tzinfo is None:
+                        committed_time = committed_time.replace(tzinfo=UTC)
+                    committed_updated_at = (
+                        committed_time.astimezone(UTC) + timedelta(microseconds=1)
+                    ).isoformat()
+                committed_created_at = (
+                    created_at
+                    if previous_session is None
+                    else str(previous_session["created_at"])
+                )
+                committed_last_consolidated = (
+                    0
+                    if previous_session is None
+                    else int(previous_session["last_consolidated"])
+                )
                 self._conn.execute(
                     """
                     INSERT INTO sessions (
@@ -3851,7 +3901,12 @@ class SessionStore:
                         updated_at = excluded.updated_at,
                         metadata = excluded.metadata
                     """,
-                    (session_key, created_at, updated_at, metadata_payload),
+                    (
+                        session_key,
+                        created_at,
+                        committed_updated_at,
+                        metadata_payload,
+                    ),
                 )
                 self._conn.execute(
                     """
@@ -3861,7 +3916,7 @@ class SessionStore:
                         chat_id = excluded.chat_id,
                         updated_at = excluded.updated_at
                     """,
-                    (channel, identity, chat_id, updated_at),
+                    (channel, identity, chat_id, committed_updated_at),
                 )
                 self._conn.execute(
                     """
@@ -3869,9 +3924,181 @@ class SessionStore:
                     VALUES (?, ?)
                     ON CONFLICT(channel) DO NOTHING
                     """,
-                    (channel, updated_at),
+                    (channel, committed_updated_at),
                 )
-        return None if previous is None else str(previous["chat_id"])
+        return ChannelIdentityWriteReceipt(
+            channel=channel,
+            identity=identity,
+            chat_id=chat_id,
+            session_key=session_key,
+            committed_created_at=committed_created_at,
+            committed_updated_at=committed_updated_at,
+            committed_last_consolidated=committed_last_consolidated,
+            committed_metadata=metadata_payload,
+            previous_identity_chat_id=(
+                None if previous is None else str(previous["chat_id"])
+            ),
+            previous_identity_updated_at=(
+                None if previous is None else str(previous["updated_at"])
+            ),
+            previous_session=(
+                None
+                if previous_session is None
+                else (
+                    str(previous_session["created_at"]),
+                    str(previous_session["updated_at"]),
+                    int(previous_session["last_consolidated"]),
+                    (
+                        None
+                        if previous_session["metadata"] is None
+                        else str(previous_session["metadata"])
+                    ),
+                )
+            ),
+            previous_lineage_counts=previous_counts,
+        )
+
+    def rollback_channel_identity(
+        self,
+        receipt: ChannelIdentityWriteReceipt,
+    ) -> bool:
+        """撤销仍由同一提交版本拥有的 identity/session 写入。"""
+
+        if not isinstance(receipt, ChannelIdentityWriteReceipt):
+            raise TypeError("channel identity rollback receipt 类型无效")
+        with self._lock:
+            with self._conn:
+                self._conn.execute("BEGIN IMMEDIATE")
+                current_identity = self._conn.execute(
+                    """
+                    SELECT chat_id, updated_at FROM channel_identities
+                    WHERE channel = ? AND identity = ?
+                    """,
+                    (receipt.channel, receipt.identity),
+                ).fetchone()
+                current_session = self._conn.execute(
+                    """
+                    SELECT created_at, updated_at, last_consolidated, metadata
+                    FROM sessions WHERE key = ?
+                    """,
+                    (receipt.session_key,),
+                ).fetchone()
+                if (
+                    current_identity is None
+                    or current_session is None
+                    or str(current_identity["chat_id"]) != receipt.chat_id
+                    or str(current_identity["updated_at"])
+                    != receipt.committed_updated_at
+                    or str(current_session["created_at"])
+                    != receipt.committed_created_at
+                    or str(current_session["updated_at"])
+                    != receipt.committed_updated_at
+                    or int(current_session["last_consolidated"])
+                    != receipt.committed_last_consolidated
+                    or str(current_session["metadata"] or "")
+                    != receipt.committed_metadata
+                    or self._session_lineage_counts_locked(receipt.session_key)
+                    != receipt.previous_lineage_counts
+                ):
+                    return False
+
+                # 1. 恢复本 attempt 覆盖前的唯一 identity owner。
+                if receipt.previous_identity_chat_id is None:
+                    self._conn.execute(
+                        """
+                        DELETE FROM channel_identities
+                        WHERE channel = ? AND identity = ?
+                          AND chat_id = ? AND updated_at = ?
+                        """,
+                        (
+                            receipt.channel,
+                            receipt.identity,
+                            receipt.chat_id,
+                            receipt.committed_updated_at,
+                        ),
+                    )
+                else:
+                    self._conn.execute(
+                        """
+                        UPDATE channel_identities
+                        SET chat_id = ?, updated_at = ?
+                        WHERE channel = ? AND identity = ?
+                          AND chat_id = ? AND updated_at = ?
+                        """,
+                        (
+                            receipt.previous_identity_chat_id,
+                            receipt.previous_identity_updated_at,
+                            receipt.channel,
+                            receipt.identity,
+                            receipt.chat_id,
+                            receipt.committed_updated_at,
+                        ),
+                    )
+
+                # 2. 恢复既有 Session，或删除仅由本 attempt 创建的空壳。
+                if receipt.previous_session is None:
+                    self._conn.execute(
+                        """
+                        DELETE FROM sessions
+                        WHERE key = ? AND updated_at = ? AND metadata = ?
+                        """,
+                        (
+                            receipt.session_key,
+                            receipt.committed_updated_at,
+                            receipt.committed_metadata,
+                        ),
+                    )
+                else:
+                    (
+                        previous_created_at,
+                        previous_updated_at,
+                        previous_last_consolidated,
+                        previous_metadata,
+                    ) = receipt.previous_session
+                    self._conn.execute(
+                        """
+                        UPDATE sessions
+                        SET created_at = ?, updated_at = ?,
+                            last_consolidated = ?, metadata = ?
+                        WHERE key = ? AND updated_at = ? AND metadata = ?
+                        """,
+                        (
+                            previous_created_at,
+                            previous_updated_at,
+                            previous_last_consolidated,
+                            previous_metadata,
+                            receipt.session_key,
+                            receipt.committed_updated_at,
+                            receipt.committed_metadata,
+                        ),
+                    )
+        return True
+
+    def _session_lineage_counts_locked(
+        self,
+        session_key: str,
+    ) -> tuple[int, ...]:
+        """读取 rollback fence 需要的 Session 子状态计数。"""
+
+        tables = (
+            "messages",
+            "turns",
+            "session_compactions",
+            "session_compaction_prepares",
+            "session_admissions",
+            "inbound_handoffs",
+            "session_source_mutation_audits",
+            "interaction_memory_reconciliations",
+        )
+        return tuple(
+            int(
+                self._conn.execute(
+                    f"SELECT COUNT(1) FROM {table} WHERE session_key = ?",
+                    (session_key,),
+                ).fetchone()[0]
+            )
+            for table in tables
+        )
 
     def count_messages(self, session_key: str) -> int:
         with self._lock:

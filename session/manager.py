@@ -16,7 +16,11 @@ from agent.prompting import (
     build_context_frame_content,
     build_context_frame_message,
 )
-from session.store import SessionDeleteAudit, SessionStore
+from session.store import (
+    ChannelIdentityWriteReceipt,
+    SessionDeleteAudit,
+    SessionStore,
+)
 
 _TOOL_RESULT_CHAR_BUDGET = 10000
 _STORED_TOOL_RESULT_CHAR_BUDGET = 20000
@@ -695,7 +699,7 @@ class SessionManager:
         identity: str,
         chat_id: str,
         metadata_key: str,
-    ) -> None:
+    ) -> ChannelIdentityWriteReceipt:
         """Atomically move one durable identity to its target Session."""
 
         session_key = f"{channel}:{chat_id}"
@@ -708,7 +712,7 @@ class SessionManager:
             metadata[metadata_key] = identity
 
             # 2. Commit the Session metadata and unique identity owner together.
-            _ = self._store.persist_channel_identity(
+            receipt = self._store.persist_channel_identity(
                 channel=channel,
                 identity=identity,
                 chat_id=chat_id,
@@ -720,5 +724,20 @@ class SessionManager:
 
             # 3. Adopt the committed state only after SQLite succeeds.
             session.metadata = metadata
-            session.updated_at = updated_at
+            session.updated_at = datetime.fromisoformat(receipt.committed_updated_at)
             self._cache[session.key] = session
+            return receipt
+
+    async def rollback_channel_identity(
+        self,
+        receipt: ChannelIdentityWriteReceipt,
+    ) -> bool:
+        """撤销仍由失败 acceptance attempt 拥有的 identity 写入。"""
+
+        if not isinstance(receipt, ChannelIdentityWriteReceipt):
+            raise TypeError("channel identity rollback receipt 类型无效")
+        async with self._lock(receipt.session_key):
+            rolled_back = self._store.rollback_channel_identity(receipt)
+            if rolled_back:
+                self.invalidate(receipt.session_key)
+            return rolled_back

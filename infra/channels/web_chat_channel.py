@@ -871,9 +871,24 @@ class WebChatChannel:
             logger.info("[web_chat] rejected inbound message: %s", error)
             await self._send_error(websocket, request_id, str(error))
             return session_key
+        connection_added = False
         try:
-            await self._add_connection(session_key, websocket)
+            connection_added = await self._add_connection(session_key, websocket)
             await adapter.admit_captured(runtime, raw)
+        except BaseException as error:
+            if connection_added:
+                cleanup_task = asyncio.create_task(
+                    self._remove_connection_attempt(session_key, websocket),
+                    name=f"web-ingress-connection-rollback:{session_key}",
+                )
+                try:
+                    await _settle_cleanup_task(cleanup_task)
+                except BaseException as cleanup_error:
+                    raise BaseExceptionGroup(
+                        "Web ingress connection 回滚失败",
+                        [error, cleanup_error],
+                    ) from error
+            raise
         finally:
             adapter._finish_inbound()
         return session_key
@@ -975,9 +990,27 @@ class WebChatChannel:
             "client_message_id": event.client_message_id,
         })
 
-    async def _add_connection(self, session_key: str, websocket: WebSocket) -> None:
+    async def _add_connection(self, session_key: str, websocket: WebSocket) -> bool:
         async with self._connection_lock:
-            self._connections.setdefault(session_key, set()).add(websocket)
+            sockets = self._connections.setdefault(session_key, set())
+            added = websocket not in sockets
+            sockets.add(websocket)
+            return added
+
+    async def _remove_connection_attempt(
+        self,
+        session_key: str,
+        websocket: WebSocket,
+    ) -> None:
+        """只撤销本次失败 message.send 新增的 socket/session 关系。"""
+
+        async with self._connection_lock:
+            sockets = self._connections.get(session_key)
+            if sockets is None:
+                return
+            sockets.discard(websocket)
+            if not sockets:
+                _ = self._connections.pop(session_key, None)
 
     async def _remove_connection(
         self,
@@ -1103,6 +1136,17 @@ def _normalize_web_request_id(value: object) -> str:
     ):
         raise ValueError("request_id 格式无效")
     return value
+
+
+async def _settle_cleanup_task(task: asyncio.Task[Any]) -> Any:
+    """完成 message.send 精确清理后再恢复原始失败。"""
+
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            continue
+    return task.result()
 
 
 def build_web_channel_definition(channel: WebChatChannel) -> Any:

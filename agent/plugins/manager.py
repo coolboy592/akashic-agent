@@ -94,6 +94,7 @@ from agent.plugins.packages import (
 )
 from infra.channels.base import SessionIdentityIndex
 from infra.channels.artifacts import ChannelAttachmentArtifactStore
+from session.store import ChannelIdentityWriteReceipt
 from agent.plugins.artifacts import (
     ArtifactPointer,
     ArtifactSelector,
@@ -334,6 +335,7 @@ class PluginManager:
             snapshot_lease_acquirer=self._snapshot_store.lease,
             identity_resolver=self._resolve_channel_identity,
             identity_rememberer=self._remember_channel_identity,
+            identity_rollbacker=self._rollback_channel_identity,
             attachment_import=channel_attachment_store,
             attachment_read=channel_attachment_store,
         )
@@ -557,13 +559,20 @@ class PluginManager:
         channel: str,
         provider_identity: str,
         recipient: str,
-    ) -> None:
+    ) -> ChannelIdentityWriteReceipt | None:
         """Persist identity mapping before accepting the inbound envelope."""
 
-        await self._channel_identity_index(channel).remember(
+        return await self._channel_identity_index(channel).remember(
             provider_identity,
             recipient,
         )
+
+    async def _rollback_channel_identity(self, receipt: object) -> bool:
+        """Route one failed acceptance rollback to its exact Channel index."""
+
+        if not isinstance(receipt, ChannelIdentityWriteReceipt):
+            raise TypeError("channel identity rollback receipt 类型无效")
+        return await self._channel_identity_index(receipt.channel).rollback(receipt)
 
     @property
     def channel_generation_host(self) -> ChannelGenerationHost:

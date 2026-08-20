@@ -172,6 +172,79 @@ async def test_session_identity_index_concurrent_move_has_one_durable_owner(
 
 
 @pytest.mark.asyncio
+async def test_session_identity_index_rolls_back_only_new_acceptance_state(
+    tmp_path: Path,
+) -> None:
+    manager = SessionManager(tmp_path)
+    index = SessionIdentityIndex(
+        manager,
+        channel="web",
+        metadata_key="web_identity",
+    )
+    assert index.rebuild() == {}
+    assert manager.channel_identity_migration_completed("web") is True
+
+    receipt = await index.remember("abc", "abc")
+    assert receipt is not None
+    assert await index.rollback(receipt) is True
+
+    assert index.mapping == {}
+    assert manager.get_channel_identities("web") == {}
+    assert manager.control_store.get_session_meta("web:abc") is None
+    assert manager.channel_identity_migration_completed("web") is True
+    assert "web:abc" not in manager._cache
+    manager.close()
+
+
+@pytest.mark.asyncio
+async def test_session_identity_index_rollback_restores_existing_session(
+    tmp_path: Path,
+) -> None:
+    manager = SessionManager(tmp_path)
+    session = manager.get_or_create("web:abc")
+    session.metadata["marker"] = "before"
+    manager.save(session)
+    before = manager.control_store.get_session_meta("web:abc")
+    index = SessionIdentityIndex(
+        manager,
+        channel="web",
+        metadata_key="web_identity",
+    )
+
+    receipt = await index.remember("abc", "abc")
+    assert receipt is not None
+    assert await index.rollback(receipt) is True
+
+    assert manager.control_store.get_session_meta("web:abc") == before
+    assert manager.get_channel_identities("web") == {}
+    assert index.mapping == {}
+    manager.close()
+
+
+@pytest.mark.asyncio
+async def test_session_identity_index_rollback_refuses_superseded_write(
+    tmp_path: Path,
+) -> None:
+    manager = SessionManager(tmp_path)
+    index = SessionIdentityIndex(
+        manager,
+        channel="web",
+        metadata_key="web_identity",
+    )
+
+    first = await index.remember("abc", "abc")
+    second = await index.remember("abc", "abc")
+    assert first is not None and second is not None
+    assert first.committed_updated_at != second.committed_updated_at
+    assert await index.rollback(first) is False
+
+    assert manager.get_channel_identities("web") == {"abc": "abc"}
+    assert manager.control_store.get_session_meta("web:abc") is not None
+    assert index.mapping == {"abc": "abc"}
+    manager.close()
+
+
+@pytest.mark.asyncio
 async def test_session_delete_removes_identity_owner_and_backup_can_restore_it(
     tmp_path: Path,
 ) -> None:

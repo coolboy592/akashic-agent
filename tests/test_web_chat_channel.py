@@ -1185,6 +1185,132 @@ async def test_web_v3_old_inflight_callback_cannot_enter_new_binding(
 
 
 @pytest.mark.asyncio
+async def test_web_bus_closed_rolls_back_identity_session_and_connection(
+    tmp_path: Path,
+) -> None:
+    session_manager = SessionManager(tmp_path / "workspace")
+    manager = PluginManager(
+        plugin_dirs=[tmp_path / "plugins"],
+        event_bus=EventBus(),
+        workspace=tmp_path / "workspace",
+        session_manager=session_manager,
+        installed_cache_root=tmp_path / "cache",
+    )
+    bus = MessageBus()
+    channel = WebChatChannel()
+    await channel.start(cast(Any, SimpleNamespace(
+        bus=bus,
+        session_manager=session_manager,
+        event_bus=EventBus(),
+        push_tool=_PushTool(),
+        attachment_store=AttachmentStore(tmp_path / "uploads"),
+        interrupt_controller=None,
+    )))
+    manager.channel_generation_host.bind_inbound_publisher(bus.publish_channel_inbound)
+    await manager.bind_core_channel_definitions(
+        (build_core_channel_definition(channel),)
+    )
+    adapter = tuple(channel._v3_adapters.values())[0]
+    existing = session_manager.get_or_create("web:existing")
+    existing.metadata["marker"] = "before"
+    session_manager.save(existing)
+    existing_before = session_manager.control_store.get_session_meta("web:existing")
+    existing_socket = _WebSocket()
+    assert await channel._add_connection(
+        "web:existing",
+        cast(Any, existing_socket),
+    ) is True
+    await bus.aclose()
+    try:
+        socket = _WebSocket()
+        with pytest.raises(RuntimeError, match="message bus 已关闭"):
+            await channel._send_user_message(
+                cast(Any, socket),
+                "closed-bus",
+                {"session_id": "web:abc", "text": "hello", "media": []},
+            )
+
+        assert session_manager.get_channel_identities("web") == {}
+        assert session_manager.control_store.get_session_meta("web:abc") is None
+        assert session_manager.channel_identity_migration_completed("web") is True
+        assert "web:abc" not in session_manager._cache
+        assert channel._connections.get("web:abc") is None
+        assert adapter._in_flight == 0
+
+        with pytest.raises(RuntimeError, match="message bus 已关闭"):
+            await channel._send_user_message(
+                cast(Any, existing_socket),
+                "closed-bus-existing",
+                {"session_id": "web:existing", "text": "hello", "media": []},
+            )
+        assert (
+            session_manager.control_store.get_session_meta("web:existing")
+            == existing_before
+        )
+        assert channel._connections["web:existing"] == {existing_socket}
+        assert adapter._in_flight == 0
+    finally:
+        await manager.terminate_all()
+        session_manager.close()
+
+
+@pytest.mark.asyncio
+async def test_web_cancelled_ingress_rolls_back_session_and_connection(
+    tmp_path: Path,
+) -> None:
+    session_manager = SessionManager(tmp_path / "workspace")
+    manager = PluginManager(
+        plugin_dirs=[tmp_path / "plugins"],
+        event_bus=EventBus(),
+        workspace=tmp_path / "workspace",
+        session_manager=session_manager,
+        installed_cache_root=tmp_path / "cache",
+    )
+    publish_started = asyncio.Event()
+    publish_release = asyncio.Event()
+
+    async def publish(_envelope: Any) -> None:
+        publish_started.set()
+        await publish_release.wait()
+
+    channel = WebChatChannel()
+    await channel.start(cast(Any, SimpleNamespace(
+        bus=_Bus(),
+        session_manager=session_manager,
+        event_bus=EventBus(),
+        push_tool=_PushTool(),
+        attachment_store=AttachmentStore(tmp_path / "uploads"),
+        interrupt_controller=None,
+    )))
+    manager.channel_generation_host.bind_inbound_publisher(publish)
+    await manager.bind_core_channel_definitions(
+        (build_core_channel_definition(channel),)
+    )
+    adapter = tuple(channel._v3_adapters.values())[0]
+    try:
+        socket = _WebSocket()
+        send_task = asyncio.create_task(channel._send_user_message(
+            cast(Any, socket),
+            "cancelled-ingress",
+            {"session_id": "web:cancel", "text": "hello", "media": []},
+        ))
+        await publish_started.wait()
+        send_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await send_task
+
+        assert session_manager.get_channel_identities("web") == {}
+        assert session_manager.control_store.get_session_meta("web:cancel") is None
+        assert "web:cancel" not in session_manager._cache
+        assert channel._connections.get("web:cancel") is None
+        assert adapter._in_flight == 0
+    finally:
+        publish_release.set()
+        await manager.terminate_all()
+        session_manager.close()
+
+
+@pytest.mark.asyncio
 async def test_web_v3_ingress_persists_unprefixed_identity_for_exact_session(
     tmp_path: Path,
 ) -> None:

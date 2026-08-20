@@ -7,6 +7,7 @@ from typing import Callable
 from uuid import uuid4
 
 from session.manager import SessionManager
+from session.store import ChannelIdentityWriteReceipt
 
 
 class AttachmentStore:
@@ -121,17 +122,32 @@ class SessionIdentityIndex:
         self.mapping.update(durable)
         return self.mapping.get(normalized)
 
-    async def remember(self, identity: str, chat_id: str) -> None:
+    async def remember(
+        self,
+        identity: str,
+        chat_id: str,
+    ) -> ChannelIdentityWriteReceipt | None:
         normalized = self._normalize(identity)
         if not normalized:
-            return
-        await self._session_manager.remember_channel_identity(
+            return None
+        receipt = await self._session_manager.remember_channel_identity(
             channel=self._channel,
             identity=normalized,
             chat_id=chat_id,
             metadata_key=self._metadata_key,
         )
         self.mapping[normalized] = chat_id
+        return receipt
+
+    async def rollback(self, receipt: ChannelIdentityWriteReceipt) -> bool:
+        """撤销失败 acceptance 尚未被并发状态取代的 identity 写入。"""
+
+        rolled_back = await self._session_manager.rollback_channel_identity(receipt)
+        self.mapping.clear()
+        self.mapping.update(
+            self._session_manager.get_channel_identities(self._channel)
+        )
+        return rolled_back
 
     def _normalize(self, value: str) -> str:
         return self._normalizer((value or "").strip())
