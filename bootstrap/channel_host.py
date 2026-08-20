@@ -152,6 +152,7 @@ class _ChannelResources:
             interrupt_controller=context.interrupt_controller,
             log=context.log,
             command_catalog_provider=context.command_catalog_provider,
+            legacy_outbound_enabled=getattr(context, "legacy_outbound_enabled", True),
         )
 
     def close(self) -> None:

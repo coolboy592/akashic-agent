@@ -128,6 +128,7 @@ class TelegramChannel:
         )
         self._event_bus = event_bus
         self._outbound_bound = False
+        self._legacy_outbound_enabled = True
         self._events_bound = False
         self.user_map = self._identity_index.mapping
         self._conflict_count = 0
@@ -186,10 +187,12 @@ class TelegramChannel:
             self._bus = ctx.bus
             self._event_bus = ctx.event_bus
             self._interrupt_controller = ctx.interrupt_controller
-            ctx.push_tool.register_channel(
-                self.name,
-                deliver=self._deliver_message,
-            )
+            self._legacy_outbound_enabled = getattr(ctx, "legacy_outbound_enabled", True)
+            if self._legacy_outbound_enabled:
+                ctx.push_tool.register_channel(
+                    self.name,
+                    deliver=self._deliver_message,
+                )
         self._bind_runtime()
         self._rebuild_user_map()
         await self._app.initialize()
@@ -205,7 +208,7 @@ class TelegramChannel:
         logger.info(f"TelegramChannel 已启动  已知用户: {len(self.user_map)}")
 
     def _bind_runtime(self) -> None:
-        if not self._outbound_bound:
+        if self._legacy_outbound_enabled and not self._outbound_bound:
             self._bus.subscribe_outbound(self._channel, self._on_response)
             self._outbound_bound = True
         if self._event_bus is not None and not self._events_bound:

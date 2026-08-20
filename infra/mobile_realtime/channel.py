@@ -215,6 +215,7 @@ class MobileRealtimeChannel:
     def __init__(self, runtime: MobileGatewayRuntime) -> None:
         self._runtime = runtime
         self._ctx: ChannelContext | None = None
+        self._legacy_outbound_enabled = True
         self._processing_commands: set[tuple[str, str]] = set()
         self._receipt_completion_failures: set[tuple[str, str]] = set()
         self._active_turn_ids: dict[str, str] = {}
@@ -300,23 +301,26 @@ class MobileRealtimeChannel:
         if self._ctx is not None:
             raise RuntimeError("MobileRealtimeChannel 已启动")
         self._ctx = ctx
+        self._legacy_outbound_enabled = getattr(ctx, "legacy_outbound_enabled", True)
         self._attachments = AttachmentTransferService(
             self._runtime.storage,
             ctx.attachment_store,
             max_attachment_bytes=self._runtime.config.max_attachment_mb * 1024 * 1024,
         )
         self._reconcile_committed_attachment_imports()
-        _ = ctx.bus.subscribe_outbound(self.name, self._on_response)
+        if self._legacy_outbound_enabled:
+            _ = ctx.bus.subscribe_outbound(self.name, self._on_response)
         _ = ctx.event_bus.on(TurnStarted, self._on_turn_started)
         _ = ctx.event_bus.on(StreamDeltaReady, self._on_stream_delta)
         _ = ctx.event_bus.on(ToolCallStarted, self._on_tool_call_started)
         _ = ctx.event_bus.on(ToolCallCompleted, self._on_tool_call_completed)
         _ = ctx.event_bus.on(TurnOutputCompleted, self._on_output_completed)
         _ = ctx.event_bus.on(TurnCommitted, self._on_turn_committed)
-        _ = ctx.push_tool.register_channel(
-            self.name,
-            deliver=self._deliver_message,
-        )
+        if self._legacy_outbound_enabled:
+            _ = ctx.push_tool.register_channel(
+                self.name,
+                deliver=self._deliver_message,
+            )
 
     async def stop(self) -> None:
         """先发布活动 turn 的终态，再释放移动渠道运行态。"""

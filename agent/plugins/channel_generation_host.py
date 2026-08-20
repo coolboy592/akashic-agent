@@ -33,6 +33,8 @@ from agent.plugin_composition.channels import (
     ChannelPresentationPorts,
     ChannelReady,
     ChannelRegistrySnapshot,
+    CommittedChannelCatalog,
+    CoreChannelDefinition,
     CredentialRef,
     ControlReceipt,
     ControlResponseBodies,
@@ -351,6 +353,8 @@ class ChannelBindingLease:
                 delivery_id=envelope.delivery_id,
                 recipient=envelope.recipient,
                 body=envelope.body,
+                attachments=envelope.attachments,
+                metadata=envelope.metadata,
             ),
             retained_binding=self,
         )
@@ -1033,7 +1037,12 @@ class ChannelGenerationHost:
         if target != "formal":
             raise RuntimeError("ChannelGenerationHost 只允许 formal target")
         _text(boot_owner, "boot_owner")
-        registry = committed.channel_registry
+        catalog = getattr(committed, "channel_catalog", None)
+        registry = (
+            catalog.registry
+            if isinstance(catalog, CommittedChannelCatalog)
+            else committed.channel_registry
+        )
         if registry is None:
             raise RuntimeError("committed snapshot 缺少 channel registry")
         snapshot_id = _text(committed.snapshot_id, "snapshot_id")
@@ -1268,10 +1277,19 @@ class ChannelGenerationHost:
         snapshot_id = _text(snapshot.snapshot_id, "snapshot_id")
         key = (snapshot_id, _text(channel_name, "channel_name"))
         state = self._binding(key)
-        generation = snapshot.generations.get(state.plugin_id)
-        if generation is None or generation.generation_id != state.generation_id:
-            raise RuntimeError("Channel binding 与 RuntimeSnapshot generation 不一致")
-        registry = snapshot.channel_registry
+        catalog = getattr(snapshot, "channel_catalog", None)
+        if state.plugin_id == "core":
+            if not isinstance(catalog, CommittedChannelCatalog):
+                raise RuntimeError("Core channel binding 缺少 committed catalog")
+            definition = catalog.definition(state.channel_name)
+            if definition is None or definition.generation_id != state.generation_id:
+                raise RuntimeError("Core channel binding 与 catalog generation 不一致")
+            registry = catalog.registry
+        else:
+            generation = snapshot.generations.get(state.plugin_id)
+            if generation is None or generation.generation_id != state.generation_id:
+                raise RuntimeError("Channel binding 与 RuntimeSnapshot generation 不一致")
+            registry = snapshot.channel_registry
         if registry is None or not any(
             descriptor.name == state.channel_name
             and descriptor.owner == state.plugin_id
@@ -1695,26 +1713,59 @@ class ChannelGenerationHost:
         target: str,
         boot_owner: str,
     ) -> _ChannelBindingState:
-        generation = snapshot.generations.get(descriptor.owner)
-        if generation is None:
-            raise RuntimeError(f"channel owner generation 缺失: {descriptor.owner}")
-        if not isinstance(generation.instance, ComposablePlugin):
-            raise RuntimeError(f"channel owner 不是 ComposablePlugin: {descriptor.owner}")
-        plugin = generation.instance
-        module = plugin.module
-        if not isinstance(module, ModuleType):
-            raise RuntimeError(f"channel owner module 无效: {descriptor.owner}")
-        provenance = _find_provenance(registry, descriptor.owner, generation.generation_id, descriptor.name)
-        if (
-            provenance.source_revision != generation.source_revision
-            or provenance.config_revision
-            != channel_config_revision(generation.config_projection)
-            or provenance.factory_export != descriptor.factory_export
-        ):
+        catalog = getattr(snapshot, "channel_catalog", None)
+        core_definition: CoreChannelDefinition | None = None
+        if descriptor.owner == "core":
+            if not isinstance(catalog, CommittedChannelCatalog):
+                raise RuntimeError("Core channel 缺少 committed catalog")
+            core_definition = catalog.definition(descriptor.name)
+            if core_definition is None:
+                raise RuntimeError(f"Core channel definition 缺失: {descriptor.name}")
+            module = ModuleType(f"akashic_core_channel_{descriptor.name}")
+            provenance = core_definition.provenance
+            config = core_definition.config
+            generation_id = core_definition.generation_id
+            factory: Callable[[ChannelFactoryContext], ChannelAdapter] | None = (
+                core_definition.factory
+            )
+            artifact_pointer = "core"
+            source_revision = core_definition.source_revision
+            raw_config_revision = core_definition.config_revision
+        else:
+            generation = snapshot.generations.get(descriptor.owner)
+            if generation is None:
+                raise RuntimeError(f"channel owner generation 缺失: {descriptor.owner}")
+            if not isinstance(generation.instance, ComposablePlugin):
+                raise RuntimeError(f"channel owner 不是 ComposablePlugin: {descriptor.owner}")
+            plugin = generation.instance
+            module = plugin.module
+            if not isinstance(module, ModuleType):
+                raise RuntimeError(f"channel owner module 无效: {descriptor.owner}")
+            provenance = _find_provenance(
+                registry,
+                descriptor.owner,
+                generation.generation_id,
+                descriptor.name,
+            )
+            if (
+                provenance.source_revision != generation.source_revision
+                or provenance.config_revision
+                != channel_config_revision(generation.config_projection)
+                or provenance.factory_export != descriptor.factory_export
+            ):
+                raise RuntimeError(f"channel factory provenance drift: {descriptor.name}")
+            config = generation.config_projection
+            if not isinstance(config, Mapping):
+                raise RuntimeError(
+                    f"channel generation config projection 无效: {descriptor.owner}"
+                )
+            generation_id = generation.generation_id
+            factory = None
+            artifact_pointer = str(generation.plugin_dir)
+            source_revision = generation.source_revision
+            raw_config_revision = generation.config_revision
+        if provenance.factory_export != descriptor.factory_export:
             raise RuntimeError(f"channel factory provenance drift: {descriptor.name}")
-        config = generation.config_projection
-        if not isinstance(config, Mapping):
-            raise RuntimeError(f"channel generation config projection 无效: {descriptor.owner}")
         binding_token = uuid.uuid4().hex
         descriptor_digest = _descriptor_digest(descriptor)
         _validate_provider_factory(provider_client_factory, descriptor.name)
@@ -1722,13 +1773,13 @@ class ChannelGenerationHost:
             snapshot_id=snapshot.snapshot_id,
             catalog_identity=registry.identity,
             plugin_id=descriptor.owner,
-            generation_id=generation.generation_id,
+            generation_id=generation_id,
             channel_name=descriptor.name,
             capabilities=descriptor.capabilities,
             inbound_identity=descriptor.inbound_identity,
             module=module,
-            artifact_pointer=str(generation.plugin_dir),
-            factory=None,
+            artifact_pointer=artifact_pointer,
+            factory=factory,
             adapter=None,
             provider_client_factory=provider_client_factory,
             binding_token=binding_token,
@@ -1736,9 +1787,9 @@ class ChannelGenerationHost:
             credential_paths=descriptor.credential_paths,
             factory_context=None,
             factory_export=descriptor.factory_export,
-            source_revision=generation.source_revision,
+            source_revision=source_revision,
             config_revision=provenance.config_revision,
-            raw_config_revision=generation.config_revision,
+            raw_config_revision=raw_config_revision,
             descriptor_digest=descriptor_digest,
             target=target,
             boot_owner=boot_owner,
@@ -1770,10 +1821,11 @@ class ChannelGenerationHost:
             self._config_revision_checker(record),
             "config_revision_checker",
         )
-        state.factory = _resolve_sync_factory(
-            state.module,
-            state.factory_export,
-        )
+        if state.factory is None:
+            state.factory = _resolve_sync_factory(
+                state.module,
+                state.factory_export,
+            )
         credentials = _resolve_credentials(state.config, state.credential_paths)
         state.control_port = (
             _ChannelControl(self, key)
@@ -2171,11 +2223,18 @@ def _require_committed_snapshot(snapshot: object) -> Any:
         raise RuntimeError("ChannelGenerationHost 只接受 committed RuntimeSnapshot")
     root = getattr(snapshot, "composition_root", None)
     registry = getattr(snapshot, "channel_registry", None)
+    catalog = getattr(snapshot, "channel_catalog", None)
+    if catalog is not None:
+        if not isinstance(catalog, CommittedChannelCatalog):
+            raise TypeError("channel_catalog 类型无效")
+        if root is not None and catalog.root_instance_token is not root.instance_token:
+            raise RuntimeError("committed channel catalog 不属于 exact composition Root")
+        registry = catalog.registry
     if root is None or registry is None:
         raise RuntimeError("committed snapshot 必须带 exact composition Root/channel registry")
     if registry.root_instance_token is not root.instance_token:
         raise RuntimeError("channel registry 不属于 exact composition Root")
-    if getattr(snapshot, "channel_registry_identity", registry.identity) != registry.identity:
+    if catalog is None and getattr(snapshot, "channel_registry_identity", registry.identity) != registry.identity:
         raise RuntimeError("channel registry identity drift")
     if not isinstance(registry, ChannelRegistrySnapshot):
         raise TypeError("channel_registry 类型无效")

@@ -398,6 +398,7 @@ class QQChannel:
         )
         self._event_bus = event_bus
         self._outbound_bound = False
+        self._legacy_outbound_enabled = True
         self._events_bound = False
         self._trace_states: dict[str, _QQTraceState] = {}
 
@@ -434,10 +435,12 @@ class QQChannel:
             self._bus = ctx.bus
             self._event_bus = ctx.event_bus
             self._interrupt_controller = ctx.interrupt_controller
-            ctx.push_tool.register_channel(
-                self.name,
-                deliver=self._deliver_message,
-            )
+            self._legacy_outbound_enabled = getattr(ctx, "legacy_outbound_enabled", True)
+            if self._legacy_outbound_enabled:
+                ctx.push_tool.register_channel(
+                    self.name,
+                    deliver=self._deliver_message,
+                )
         self._main_loop = asyncio.get_running_loop()
         self._identity_index.rebuild()
         self._bind_events()
@@ -509,7 +512,7 @@ class QQChannel:
         self._api = await self._main_loop.run_in_executor(None, self._bot.run_backend)
         logger.info("[qq] NcatBot 已启动")
 
-        if not self._outbound_bound:
+        if self._legacy_outbound_enabled and not self._outbound_bound:
             self._bus.subscribe_outbound(_CHANNEL, self._on_response)
             self._outbound_bound = True
 

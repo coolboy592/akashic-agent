@@ -57,7 +57,15 @@ from agent.lifecycle.facade import TurnLifecycle
 from bootstrap.providers import build_model_registry, build_providers, build_vl_provider
 from bootstrap.cleanup import run_cleanup_steps
 from bus.event_bus import EventBus
-from bus.events import ChannelMessage
+from bus.events import (
+    ChannelMessage,
+    OutboundMessage,
+    channel_message_from_outbound,
+)
+from bootstrap.core_channel_adapter import (
+    LEGACY_ATTACHMENT_METADATA_KEY,
+    encode_legacy_attachments,
+)
 from bus.processing import ProcessingState
 from bus.queue import MessageBus
 from core.memory.runtime import MemoryRuntime
@@ -84,10 +92,17 @@ async def _dispatch_v3_channel_push(
         source = await plugin_manager.snapshot_store.acquire()
     binding = None
     try:
-        registry = source.snapshot.channel_registry
-        if registry is None or all(
-            descriptor.name != message.channel for descriptor in registry.descriptors
-        ):
+        catalog = source.snapshot.channel_catalog
+        registry = catalog.registry if catalog is not None else source.snapshot.channel_registry
+        descriptor = None if registry is None else next(
+            (
+                item
+                for item in registry.descriptors
+                if item.name == message.channel
+            ),
+            None,
+        )
+        if descriptor is None:
             return None
         binding = plugin_manager.channel_generation_host.acquire_binding(
             source,
@@ -101,16 +116,23 @@ async def _dispatch_v3_channel_push(
                 await binding.aclose()
             raise
 
-    # 2. C14 is text-only; reject attachments before reading any source path.
+    # 2. Plugin v3 remains text-only; Core migration adapters retain old attachment paths.
     if binding is None:
         raise RuntimeError("v3 Channel catalog 存在但 exact binding 未建立")
     delivery_id = uuid4().hex
-    if message.attachments:
+    if message.attachments and descriptor is not None and descriptor.owner != "core":
         await binding.aclose()
         return ChannelDeliveryReceipt(
             delivery_id=delivery_id,
             status=ChannelDeliveryStatus.REJECTED,
             error="v3 Channel 首批迁移不接受附件",
+        )
+
+    metadata = dict(message.metadata)
+    if message.attachments:
+        metadata[LEGACY_ATTACHMENT_METADATA_KEY] = tuple(
+            cast(object, item)
+            for item in encode_legacy_attachments(message.attachments)
         )
 
     # 3. The exact binding remains retained until the one-shot receipt settles.
@@ -126,11 +148,82 @@ async def _dispatch_v3_channel_push(
                 channel=message.channel,
                 recipient=message.chat_id,
                 body=message.content,
-                metadata=cast(Mapping[str, JsonValue], message.metadata),
+                metadata=cast(Mapping[str, JsonValue], metadata),
             ),
             binding,
             passive=passive,
         )
+    finally:
+        await binding.aclose()
+
+
+async def _dispatch_v3_legacy_outbound(
+    plugin_manager: PluginManager,
+    message: OutboundMessage,
+) -> ChannelDeliveryReceipt | None:
+    """Route legacy OutboundMessage producers through an exact committed binding."""
+
+    source = lease_current_runtime_snapshot()
+    if source is None:
+        source = await plugin_manager.snapshot_store.acquire()
+    binding = None
+    try:
+        catalog = source.snapshot.channel_catalog
+        registry = catalog.registry if catalog is not None else source.snapshot.channel_registry
+        descriptor = None if registry is None else next(
+            (item for item in registry.descriptors if item.name == message.channel),
+            None,
+        )
+        if descriptor is None:
+            return None
+        binding = plugin_manager.channel_generation_host.acquire_binding(
+            source,
+            message.channel,
+        )
+    finally:
+        try:
+            await source.release()
+        except BaseException:
+            if binding is not None:
+                await binding.aclose()
+            raise
+
+    if binding is None:
+        raise RuntimeError("legacy v3 catalog 命中但 exact binding 未建立")
+    delivery_id = str(message.metadata.get("delivery_id") or uuid4().hex)
+    channel_message = channel_message_from_outbound(message)
+    metadata = dict(channel_message.metadata)
+    if channel_message.attachments:
+        metadata[LEGACY_ATTACHMENT_METADATA_KEY] = tuple(
+            cast(object, item)
+            for item in encode_legacy_attachments(channel_message.attachments)
+        )
+    envelope = OutboundEnvelope(
+        logical_delivery_id=delivery_id,
+        delivery_id=delivery_id,
+        attempt_sequence=1,
+        snapshot_id=binding.snapshot_id,
+        generation_id=binding.generation_id,
+        binding_token=binding.binding_token,
+        channel=message.channel,
+        recipient=message.chat_id,
+        body=message.content,
+        metadata=cast(Mapping[str, JsonValue], metadata),
+    )
+    try:
+        try:
+            return await plugin_manager.channel_generation_host.dispatch_outbound(
+                envelope,
+                binding,
+            )
+        except asyncio.CancelledError:
+            raise
+        except BaseException as error:
+            return ChannelDeliveryReceipt(
+                delivery_id=delivery_id,
+                status=ChannelDeliveryStatus.UNKNOWN,
+                error=str(error) or type(error).__name__,
+            )
     finally:
         await binding.aclose()
 
@@ -673,6 +766,9 @@ def build_core_runtime(
     )
     bus.bind_channel_outbound_dispatcher(
         plugin_manager.channel_generation_host.dispatch_outbound
+    )
+    bus.bind_legacy_v3_outbound_dispatcher(
+        lambda message: _dispatch_v3_legacy_outbound(plugin_manager, message)
     )
     push_tool.bind_v3_channel_dispatcher(
         lambda message, passive: _dispatch_v3_channel_push(

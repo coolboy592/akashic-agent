@@ -31,6 +31,8 @@ from agent.plugin_composition import (
 from agent.plugin_composition.channels import (
     ChannelFactoryFreezeInput,
     ChannelRegistrySnapshot,
+    CommittedChannelCatalog,
+    CoreChannelDefinition,
     _freeze_plugin_channels,
     channel_config_revision,
 )
@@ -75,6 +77,7 @@ class RuntimeSnapshot:
     mobile_ui_registry_identity: str | None = None
     channel_registry: ChannelRegistrySnapshot | None = None
     channel_registry_identity: str | None = None
+    channel_catalog: CommittedChannelCatalog | None = None
     mcp_server_registry: McpServerRegistry | None = None
     mcp_server_registry_identity: str | None = None
     managed_process_registry: ManagedProcessRegistry | None = None
@@ -140,6 +143,7 @@ class RuntimeSnapshotCompiler:
         workspace_mcp_generation: WorkspaceMcpGeneration | None = None,
         composition_root: CompositionRoot | None = None,
         private_proactive_catalog: PrivateProactiveCatalog | None = None,
+        core_channel_definitions: tuple[CoreChannelDefinition, ...] = (),
         require_composition_ready: bool = True,
     ) -> RuntimeSnapshot:
         ordered = [generations[key] for key in sorted(generations)]
@@ -185,6 +189,7 @@ class RuntimeSnapshotCompiler:
         command_registry: CommandRegistry | None = None
         mobile_ui_registry: MobileUiRegistry | None = None
         channel_registry: ChannelRegistrySnapshot | None = None
+        channel_catalog: CommittedChannelCatalog | None = None
         mcp_server_registry: McpServerRegistry | None = None
         managed_process_registry: ManagedProcessRegistry | None = None
         proactive_component_catalog: ProactiveCatalog | None = None
@@ -380,6 +385,17 @@ class RuntimeSnapshotCompiler:
                     generations,
                 )
                 identity += f"|plugin-tools-v3:{plugin_tool_catalog.identity}"
+        if core_channel_definitions:
+            channel_catalog = CommittedChannelCatalog(
+                plugin_registry=channel_registry,
+                core_definitions=tuple(core_channel_definitions),
+                root_instance_token=(
+                    None
+                    if composition_root is None
+                    else composition_root.instance_token
+                ),
+            )
+            identity += f"|core-channels-v3:{channel_catalog.identity}"
         snapshot_id = hashlib.sha256(identity.encode()).hexdigest()[:16]
         return RuntimeSnapshot(
             snapshot_id=snapshot_id,
@@ -398,6 +414,7 @@ class RuntimeSnapshotCompiler:
             channel_registry_identity=(
                 None if channel_registry is None else channel_registry.identity
             ),
+            channel_catalog=channel_catalog,
             mcp_server_registry=mcp_server_registry,
             mcp_server_registry_identity=(
                 None
@@ -1340,6 +1357,7 @@ class RuntimeSnapshotStore:
                 or snapshot.mobile_ui_registry_identity is not None
                 or snapshot.channel_registry is not None
                 or snapshot.channel_registry_identity is not None
+                or snapshot.channel_catalog is not None
                 or snapshot.mcp_server_registry is not None
                 or snapshot.mcp_server_registry_identity is not None
                 or snapshot.managed_process_registry is not None
@@ -1381,6 +1399,11 @@ class RuntimeSnapshotStore:
             is not root.instance_token
         ):
             raise RuntimeError("RuntimeSnapshot channel registry 不属于 exact Root")
+        if (
+            snapshot.channel_catalog is not None
+            and snapshot.channel_catalog.root_instance_token is not root.instance_token
+        ):
+            raise RuntimeError("RuntimeSnapshot channel catalog 不属于 exact Root")
         if (
             snapshot.mcp_server_registry_identity
             != (

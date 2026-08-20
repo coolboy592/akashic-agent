@@ -51,11 +51,13 @@ class WebChatChannel:
         self._connection_lock = asyncio.Lock()
         self._events_bound = False
         self._outbound_bound = False
+        self._legacy_outbound_enabled = True
 
     async def start(self, ctx: ChannelContext) -> None:
         self._ctx = ctx
         self._attachments = ctx.attachment_store
-        if not self._outbound_bound:
+        self._legacy_outbound_enabled = getattr(ctx, "legacy_outbound_enabled", True)
+        if self._legacy_outbound_enabled and not self._outbound_bound:
             ctx.bus.subscribe_outbound(self.name, self._on_response)
             self._outbound_bound = True
         if not self._events_bound:
@@ -65,10 +67,11 @@ class WebChatChannel:
             ctx.event_bus.on(ToolCallCompleted, self._on_tool_call_completed)
             ctx.event_bus.on(TurnOutputCompleted, self._on_output_completed)
             self._events_bound = True
-        ctx.push_tool.register_channel(
-            self.name,
-            deliver=self._deliver_message,
-        )
+        if self._legacy_outbound_enabled:
+            ctx.push_tool.register_channel(
+                self.name,
+                deliver=self._deliver_message,
+            )
 
     def bind_attachment_store(self, store: AttachmentStore) -> None:
         """在 channel 启动前为独立 Chat API 绑定显式附件目录。"""

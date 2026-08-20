@@ -37,3 +37,4 @@ class ChannelContext:
     interrupt_controller: InterruptController | None
     log: logging.Logger
     command_catalog_provider: Callable[[], tuple[tuple[str, str], ...]] | None = None
+    legacy_outbound_enabled: bool = True

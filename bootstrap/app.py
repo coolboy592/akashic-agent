@@ -490,9 +490,19 @@ class AppRuntime:
                     else None
                 ),
                 interrupt_controller=self.conversation_runtime,
+                legacy_outbound_enabled=plugin_manager is None,
                 extra_channels=extra_channels,
             )
             await self.channel_host.start_all()
+            if plugin_manager is not None:
+                from bootstrap.core_channel_adapter import build_core_channel_definition
+
+                await plugin_manager.bind_core_channel_definitions(
+                    tuple(
+                        build_core_channel_definition(channel)
+                        for channel in self.channel_host.channels
+                    )
+                )
             if self.readiness is not None:
                 self.readiness.mark_stage("channels.ready")
             if plugin_manager is not None:

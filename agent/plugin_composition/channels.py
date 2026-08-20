@@ -817,6 +817,7 @@ class ProviderDeliveryRequest:
     recipient: str
     body: str
     attachments: tuple[AttachmentRef, ...] = ()
+    metadata: Mapping[str, JsonValue] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         _text(self.binding_token, "binding_token")
@@ -829,6 +830,8 @@ class ProviderDeliveryRequest:
             "attachments",
             _attachment_refs(self.attachments, "attachments"),
         )
+        metadata = _freeze_json_mapping(self.metadata)
+        object.__setattr__(self, "metadata", metadata)
 
 
 @dataclass(frozen=True, slots=True)

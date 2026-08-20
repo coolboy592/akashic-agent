@@ -396,6 +396,10 @@ class MessageBus:
             ]
             | None
         ) = None
+        self._legacy_v3_outbound_dispatcher: (
+            Callable[[OutboundMessage], Awaitable[ChannelDeliveryReceipt | None]]
+            | None
+        ) = None
 
     def bind_durable_inbound_store(self, store: DurableInboundStore) -> None:
         """在 channel 启动前绑定一次由 session 持有的 handoff store。"""
@@ -486,6 +490,18 @@ class MessageBus:
         if self._channel_outbound_dispatcher is not None:
             raise RuntimeError("v3 Channel outbound dispatcher 已绑定")
         self._channel_outbound_dispatcher = callback
+
+    def bind_legacy_v3_outbound_dispatcher(
+        self,
+        callback: Callable[[OutboundMessage], Awaitable[ChannelDeliveryReceipt | None]],
+    ) -> None:
+        """Bind the migration bridge for legacy OutboundMessage producers."""
+
+        if not callable(callback):
+            raise TypeError("legacy v3 outbound dispatcher 必须可调用")
+        if self._legacy_v3_outbound_dispatcher is not None:
+            raise RuntimeError("legacy v3 outbound dispatcher 已绑定")
+        self._legacy_v3_outbound_dispatcher = callback
 
     async def publish_inbound(self, msg: InboundItem) -> None:
         """将渠道输入交给 Agent 消费。"""
@@ -1145,6 +1161,12 @@ class MessageBus:
         durable close，之后原 terminal 重投递会被 tombstone 吞掉；只返回 False
         保留 handoff。fire-and-forget 保持既有 fallback 行为。
         """
+
+        v3_dispatcher = self._legacy_v3_outbound_dispatcher
+        if v3_dispatcher is not None:
+            v3_receipt = await v3_dispatcher(msg)
+            if v3_receipt is not None:
+                return v3_receipt.status is ChannelDeliveryStatus.DELIVERED
 
         callbacks = tuple(self._subscribers.get(msg.channel, []))
         delivered = bool(callbacks)

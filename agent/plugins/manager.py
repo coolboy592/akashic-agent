@@ -53,7 +53,11 @@ from agent.plugin_composition import (
 )
 from core.memory.plugin import MemoryTurnRuntimeApi
 from agent.plugin_composition.channels import (
+    CommittedChannelCatalog,
+    CoreChannelDefinition,
     ChannelRegistrySnapshot,
+    CredentialRef,
+    ProviderClient,
     ProviderClientFactory,
 )
 from agent.plugin_composition.mcp_slots import PluginMcpServers
@@ -153,6 +157,27 @@ from infra.persistence.json_store import atomic_save_json
 logger = logging.getLogger(__name__)
 _UNRESOLVED_MEMORY_RUNTIME = object()
 U = TypeVar("U")
+
+
+class _NoopProviderClient:
+    def credential(self, ref: CredentialRef) -> str:
+        raise RuntimeError(f"Core channel 未声明 credential: {'.'.join(ref.path)}")
+
+    async def aclose(self) -> None:
+        return None
+
+
+class _NoopProviderClientFactory:
+    async def create(
+        self,
+        credentials: Mapping[str, CredentialRef],
+    ) -> ProviderClient:
+        if credentials:
+            raise RuntimeError("Core channel 不得解析未声明的 provider credential")
+        return _NoopProviderClient()
+
+    async def aclose(self) -> None:
+        return None
 
 
 def _package_project_root(plugin_dirs: list[Path]) -> Path | None:
@@ -320,6 +345,7 @@ class PluginManager:
         )
         self._active_channel_generation: ChannelGeneration | None = None
         self._active_channel_catalog_identity: str | None = None
+        self._core_channel_definitions: tuple[CoreChannelDefinition, ...] = ()
         self._channel_boot_transactions: set[str] = set()
         self._activity_host: ActivityHost | None = None
         self._drain_transactions: dict[str, str] = {}
@@ -736,7 +762,10 @@ class PluginManager:
 
     @staticmethod
     def _channel_catalog_identity(snapshot: RuntimeSnapshot | None) -> str | None:
-        registry = None if snapshot is None else snapshot.channel_registry
+        if snapshot is None:
+            return None
+        catalog = snapshot.channel_catalog
+        registry = catalog.registry if catalog is not None else snapshot.channel_registry
         return None if registry is None else registry.identity
 
     def _channel_provider_factories(
@@ -745,7 +774,10 @@ class PluginManager:
     ) -> Mapping[str, ProviderClientFactory]:
         """Resolve provider factories only for a non-empty frozen catalog."""
 
-        registry = None if snapshot is None else snapshot.channel_registry
+        if snapshot is None:
+            return {}
+        catalog = snapshot.channel_catalog
+        registry = catalog.registry if catalog is not None else snapshot.channel_registry
         if registry is None or not registry.descriptors:
             return {}
         resolver = self._channel_provider_factory_resolver
@@ -762,11 +794,22 @@ class PluginManager:
     ) -> Mapping[str, ProviderClientFactory]:
         """Build one formal credential owner for every frozen channel."""
 
-        registry = snapshot.channel_registry
+        catalog = snapshot.channel_catalog
+        registry = catalog.registry if catalog is not None else snapshot.channel_registry
         if registry is None:
             return {}
         result: dict[str, ProviderClientFactory] = {}
         for descriptor in registry.descriptors:
+            if descriptor.owner == "core":
+                if catalog is None:
+                    raise RuntimeError("Core channel descriptor 缺少 committed catalog")
+                definition = catalog.definition(descriptor.name)
+                if definition is None:
+                    raise RuntimeError(
+                        f"Core channel definition 缺失: {descriptor.name}"
+                    )
+                result[descriptor.name] = _NoopProviderClientFactory()
+                continue
             generation = snapshot.generations.get(descriptor.owner)
             if generation is None:
                 raise RuntimeError(
@@ -942,6 +985,8 @@ class PluginManager:
     async def _reserve_channel_binding(self, record: ChannelStartRecord) -> None:
         """Persist an exact binding reservation before plugin code can run."""
 
+        if record.plugin_id == "core":
+            return
         generation = self._channel_generation(record.plugin_id, record.generation_id)
         tx_id = self._ensure_runtime_recovery_transaction(generation)
         if self._reload_journal.get(tx_id).phase == "preparing":
@@ -977,6 +1022,8 @@ class PluginManager:
     ) -> None:
         """Fence formal credential resolution to the frozen raw config bytes."""
 
+        if record.plugin_id == "core":
+            return
         generation = self._channel_generation(record.plugin_id, record.generation_id)
         if str(generation.plugin_dir) != record.artifact_pointer:
             raise RuntimeError("channel artifact pointer 已漂移")
@@ -992,6 +1039,14 @@ class PluginManager:
     ) -> None:
         """Persist one retained channel binding without touching plugin Fiber state."""
 
+        if failure.plugin_id == "core":
+            logger.error(
+                "Core channel cleanup pending: channel=%s binding=%s error=%s",
+                failure.channel_name,
+                failure.binding_token,
+                failure.error,
+            )
+            return
         try:
             generation = self._channel_generation(
                 failure.plugin_id,
@@ -1163,10 +1218,39 @@ class PluginManager:
         return self._snapshot_bot_commands(self.current_snapshot)
 
     def stable_channel_catalog(self) -> ChannelRegistrySnapshot | None:
-        """Return the exact committed stable channel declaration catalog."""
+        """Return the exact committed stable merged channel declaration catalog."""
 
         snapshot = self.current_snapshot
-        return None if snapshot is None else snapshot.channel_registry
+        if snapshot is None:
+            return None
+        catalog = snapshot.channel_catalog
+        return catalog.registry if catalog is not None else snapshot.channel_registry
+
+    def stable_committed_channel_catalog(self) -> CommittedChannelCatalog | None:
+        """Return the Core-owned merged catalog for the exact stable snapshot."""
+
+        snapshot = self.current_snapshot
+        return None if snapshot is None else snapshot.channel_catalog
+
+    async def bind_core_channel_definitions(
+        self,
+        definitions: tuple[CoreChannelDefinition, ...],
+    ) -> None:
+        """Commit Core channel projections and publish their exact Host bindings."""
+
+        normalized = tuple(definitions)
+        if any(not isinstance(item, CoreChannelDefinition) for item in normalized):
+            raise TypeError("Core channel definitions 类型无效")
+        if self._core_channel_definitions:
+            raise RuntimeError("Core channel definitions 已绑定")
+        self._core_channel_definitions = normalized
+        current = self.current_snapshot
+        if current is None:
+            return
+        snapshot, _ = await self._compile_topology_snapshot(
+            dict(self._active_generations)
+        )
+        await self._publish_committed_snapshot(snapshot)
 
     @staticmethod
     def _snapshot_bot_commands(
@@ -1440,7 +1524,12 @@ class PluginManager:
                         raise RuntimeError(
                             "boot runtime recovery stable Host 未就绪"
                         )
-                registry = snapshot.channel_registry
+                catalog = snapshot.channel_catalog
+                registry = (
+                    catalog.registry
+                    if catalog is not None
+                    else snapshot.channel_registry
+                )
                 channel_declared = registry is not None and any(
                     descriptor.owner == action.plugin_id
                     for descriptor in registry.descriptors
@@ -1452,8 +1541,7 @@ class PluginManager:
                         or channel_runtime.snapshot_id != snapshot.snapshot_id
                         or self._channel_generation_host.get(snapshot.snapshot_id)
                         is None
-                        or self._active_channel_catalog_identity
-                        != registry.identity
+                        or self._active_channel_catalog_identity != registry.identity
                     ):
                         raise RuntimeError(
                             "boot runtime recovery stable Channel Host 未就绪"
@@ -2684,6 +2772,7 @@ class PluginManager:
                         else composition_root.instance_token
                     ),
                 ),
+                core_channel_definitions=self._core_channel_definitions,
             )
             _validate_static_manifest_runtime(snapshot, generations)
             snapshot.skill_catalog_generation_id = catalog_id
@@ -4992,6 +5081,7 @@ class PluginManager:
                 workspace_mcp_generation=self._active_workspace_mcp,
                 composition_root=composition_root,
                 private_proactive_catalog=private_proactive_catalog,
+                core_channel_definitions=self._core_channel_definitions,
                 require_composition_ready=not reuses_stable_root,
             )
             _validate_static_manifest_runtime(snapshot, generations)
@@ -5887,6 +5977,7 @@ class PluginManager:
                     else self.current_snapshot.composition_root.instance_token
                 ),
             ),
+            core_channel_definitions=self._core_channel_definitions,
         )
         snapshot.tool_registry = self._compile_snapshot_tools(
             self._active_generations,
@@ -5913,8 +6004,13 @@ class PluginManager:
     ) -> None:
         if self._snapshot_store.current is None:
             registry = snapshot.channel_registry
+            catalog = snapshot.channel_catalog
             activity_declared = self._activity_catalog_identity(snapshot) is not None
-            if (registry is not None and registry.descriptors) or activity_declared:
+            if (
+                (registry is not None and registry.descriptors)
+                or (catalog is not None and catalog.descriptors)
+                or activity_declared
+            ):
                 transaction = self._snapshot_store.begin_publish(snapshot)
                 await self._commit_snapshot_with_publication_participants(
                     transaction,
@@ -6771,6 +6867,7 @@ def _replace_snapshot_payload(
         "mobile_ui_registry_identity",
         "channel_registry",
         "channel_registry_identity",
+        "channel_catalog",
         "mcp_server_registry",
         "mcp_server_registry_identity",
         "managed_process_registry",
