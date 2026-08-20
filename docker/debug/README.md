@@ -242,106 +242,57 @@ container
 
 ## 插件变更 Gate
 
-`akashic-plugin-gate` 用于在真实 Runtime 中验证插件系统改动。它不会复用普通调试容器的可写源码挂载或宿主插件缓存。
+pure-v3 发布证据分成静态 fleet、领域组合与四个集中 E2E 批次。所有 Gate
+使用 exact commit 锁、一次性 workspace/plugin-home/HOME 与受控端点，不读写正式
+Akashic workspace、正式凭据或 hua-home 服务。
 
 ```text
-┌─ 宿主
-│  ├─ akasic-agent             只读挂载到 /app
-│  └─ akashic-plugin/*         只读挂载到 /fixtures/plugins
-├─ 容器
-│  ├─ root filesystem          只读
-│  ├─ /tmp                     tmpfs
-│  └─ /sandbox                 唯一持久可写目录
-│     ├─ home/.akashic-plugin/cache
-│     ├─ workspace
-│     └─ reports
-└─ Compose project
-   └─ akashic-plugin-reload-gate
+精确 fleet lock
+      │
+      ├── static fleet ── manifest / api_version=3 / retired exclusions
+      ├── Mobile ────── Python catalog / JS ABI / plugin tests
+      ├── Tool ─────── typed prepare / authorize / result
+      ├── Passive/WebUI ── Citation / Meme / public WebSocket
+      └── E1─E4 ───── grouped behavior / failure / copied-workspace rehearsal
 ```
 
-从宿主运行完整性 Gate：
+静态 fleet 与 Mobile Gate：
 
 ```bash
-python docker/debug/plugin_hot_reload_probe.py --scenario sandbox-integrity
+python docker/debug/plugin_v3_fleet_gate.py \
+  --require-clean-core --require-full-core-history
+python docker/debug/plugin_v3_mobile_gate.py --require-clean-core
 ```
 
-宿主控制器会在 `/tmp` 创建唯一 sandbox，拒绝仓库内路径，再通过独立的 `docker-compose.plugin-gate.yml` 启动容器。普通 `docker-compose.yml` 不受 Gate 环境变量影响。控制器会审计各 Git 仓库状态，并在隔离插件缓存中完成一次写入与更新；Runtime 需要的 `static/` 也覆盖到外部 sandbox，不会写 `/app`。
-
-插件资源作用域场景会安装一次性测试插件，并在真实 `main.py` 的启动和关闭过程中验证订阅、任务与清理回调：
+领域组合 Gate：
 
 ```bash
-python docker/debug/plugin_hot_reload_probe.py \
-  --scenario full-runtime --phase scope
+python docker/debug/plugin_composition_v3_gate.py --require-clean-core
+python docker/debug/plugin_passive_composition_v3_gate.py --require-clean-core
+python docker/debug/plugin_passive_webui_v3_e2e.py --require-clean-core
 ```
 
-原子热重载场景会构造失败源码、有效新代和回切旧代，确认校验期间旧代仍服务，提交后
-request、skill、tool、job、event、MCP 与 service 同时换代，旧代 writer 被 fence，journal
-最终完成：
+集中 E2E 只在能力接线全部完成后运行一轮：
 
 ```bash
-python docker/debug/plugin_hot_reload_probe.py \
-  --scenario full-runtime --phase atomic-reload
+python docker/debug/plugin_v3_e1_gate.py
+python docker/debug/plugin_v3_e2_gate.py --require-clean-core
+python docker/debug/plugin_v3_e3_gate.py --require-clean-core
+python docker/debug/plugin_v3_e4_gate.py \
+  --source-workspace /path/to/source-workspace \
+  --source-config /path/to/config.toml \
+  --plugin-home /path/to/plugin-home
 ```
 
-### Plugin API v2 发布组合 Gate
+E1 覆盖 Default Memory/Akasha、Citation/Meme、Observe、Emotion、Proactive Feedback 与
+Plugin Undo；E2 覆盖 Shell 三件与 MCP/process 插件；E3 覆盖 Channel、Command、
+Proactive source/job 与 GitHub Watcher。E4 不重复逐插件运行，而是从同一 Core head
+的 E1～E3 报告建立覆盖集，再在复制 workspace 中验证 SQLite 完整性、messages
+只追加、plugin-data/artifact/pointer 不变和进程内失败/子进程崩溃恢复。
 
-`plugin-api-v2.lock.json` 固定合同检查器与 21 个外部插件的完整 commit SHA。Gate 只从公开
-GitHub HTTPS 地址获取这些对象，不读取宿主插件 cache、正式 workspace 或正式配置。
-
-```text
-┌─ 静态合同
-│  ├─ 拒绝 API v1 / initialize
-│  ├─ prepare 不得取得 data_dir 或启动 task
-│  └─ lifecycle task 必须归 generation scope
-├─ Host 渠道合同
-│  └─ 固定 Feishu / QQBot 在当前 Core 上执行启动与完整消息投递测试
-└─ Docker Debug
-   ├─ atomic-reload   失败保旧、成功原子切换、WAL 完成
-   ├─ all-plugins     19 个可运行插件逐个热重载和禁用
-   └─ fitbit          monitor 单实例、重载、停机、用户数据不变
-```
-
-本地运行：
-
-```bash
-python docker/debug/plugin_api_v2_gate.py
-```
-
-CI 使用 `--require-clean-core`，并上传 `docker/debug/reports/plugin-api-v2/`。任何锁内仓库缺失、
-SHA 不可获取、静态合同失败、容器退出异常、源码挂载被修改或业务 oracle 不成立都会返回非零
-退出码。
-
-### 移动插件发布组合 Gate
-
-`mobile-plugin-release.lock.json` 固定核心仓库这次发布实际配套的公开插件提交。协作者不需要
-安装插件，也不会读取宿主的 `~/.akashic-plugin`：Gate 在 `/tmp` 创建全新 Git checkout，
-从锁内的 GitHub HTTPS 地址只取精确 SHA。
-
-```text
-┌─ 移动端异步 query
-│  └─ 核心 PluginMobileUiProvider
-│     └─ ThreadPoolExecutor
-│        └─ 插件同步 mobile_ui_query
-├─ 核心拥有的 JS ABI runner
-│  ├─ default export / dashboard / slots / mount
-│  └─ catalog navigation 与插件导出一致
-└─ 插件仓库自己的 UI 行为测试
-   └─ 固定方法、交互、可访问性和错误状态
-```
-
-本地运行：
-
-```bash
-python docker/debug/mobile_plugin_contract_gate.py
-```
-
-CI 额外使用 `--require-clean-core`，防止报告对应的不是可复核源码。Gate 会验证核心仍是
-“异步 provider 在线程池调度同步插件 handler”，并检查每个插件的 Python 签名、方法集合、
-资源预算、JS 导出形态与仓库自带测试。Fitbit 的移动查询是插件同步调用其托管 monitor 的
-本地 HTTP 投影；Fitbit MCP 与 skills 仍由插件安装，不会被错误地解释成 UI query 本身。
-
-远端默认分支更新不会自动否定旧报告；只有主动修改发布锁，或修改核心合同后重新运行，
-才产生新的发布组合。这保证一次通过对应一组不可变源码，同时避免协作者被本地插件状态影响。
+报告中任何 `blocked`、不同 Core head、非 exact lock、未覆盖 fleet 或 cleanup 残留都会令
+最终 rehearsal 非零退出。正式 workspace 备份和 hua-home 切换不属于这些 Gate
+的授权范围。
 
 ## 第一次配置
 
