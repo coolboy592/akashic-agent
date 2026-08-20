@@ -152,7 +152,6 @@ class _ChannelResources:
             interrupt_controller=context.interrupt_controller,
             log=context.log,
             command_catalog_provider=context.command_catalog_provider,
-            legacy_outbound_enabled=getattr(context, "legacy_outbound_enabled", True),
         )
 
     def close(self) -> None:
@@ -174,11 +173,6 @@ class _ScopedBus:
     def __init__(self, target: object, closeables: list[object]) -> None:
         self._target = target
         self._closeables = closeables
-
-    def subscribe_outbound(self, channel: str, callback: object) -> object:
-        subscription = self._target.subscribe_outbound(channel, callback)  # type: ignore[attr-defined]
-        self._closeables.append(subscription)
-        return subscription
 
     def __getattr__(self, name: str) -> object:
         return getattr(self._target, name)
@@ -202,11 +196,6 @@ class _ScopedPushTool:
     def __init__(self, target: object, closeables: list[object]) -> None:
         self._target = target
         self._closeables = closeables
-
-    def register_channel(self, channel: str, **senders: object) -> object:
-        registration = self._target.register_channel(channel, **senders)  # type: ignore[attr-defined]
-        self._closeables.append(registration)
-        return registration
 
     def __getattr__(self, name: str) -> object:
         return getattr(self._target, name)

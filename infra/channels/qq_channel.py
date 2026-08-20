@@ -34,7 +34,6 @@ from bus.events import (
     DeliveryReceipt,
     InboundMessage,
     OutboundMessage,
-    channel_message_from_outbound,
 )
 from bus.events_lifecycle import (
     ToolCallCompleted,
@@ -397,8 +396,6 @@ class QQChannel:
             "external_default"
         )
         self._event_bus = event_bus
-        self._outbound_bound = False
-        self._legacy_outbound_enabled = True
         self._events_bound = False
         self._trace_states: dict[str, _QQTraceState] = {}
 
@@ -435,12 +432,6 @@ class QQChannel:
             self._bus = ctx.bus
             self._event_bus = ctx.event_bus
             self._interrupt_controller = ctx.interrupt_controller
-            self._legacy_outbound_enabled = getattr(ctx, "legacy_outbound_enabled", True)
-            if self._legacy_outbound_enabled:
-                ctx.push_tool.register_channel(
-                    self.name,
-                    deliver=self._deliver_message,
-                )
         self._main_loop = asyncio.get_running_loop()
         self._identity_index.rebuild()
         self._bind_events()
@@ -511,10 +502,6 @@ class QQChannel:
         logger.info("[qq] 正在启动 NcatBot（首次运行需要扫码登录）...")
         self._api = await self._main_loop.run_in_executor(None, self._bot.run_backend)
         logger.info("[qq] NcatBot 已启动")
-
-        if self._legacy_outbound_enabled and not self._outbound_bound:
-            self._bus.subscribe_outbound(_CHANNEL, self._on_response)
-            self._outbound_bound = True
 
     def _bind_events(self) -> None:
         if self._event_bus is None or self._events_bound:
@@ -666,25 +653,6 @@ class QQChannel:
             command="/stop",
         )
         await self.send(chat_id, result.message)
-
-    # ── 出站路由 ──────────────────────────────────────────────────────
-
-    async def _on_response(self, msg: OutboundMessage) -> None:
-        preview = msg.content[:60] + "..." if len(msg.content) > 60 else msg.content
-        api = self._api
-        if api is None:
-            raise RuntimeError("QQChannel 尚未启动")
-        session_key = _session_key_for_chat(msg.chat_id)
-        if not msg.chat_id.startswith(_GROUP_PREFIX):
-            try:
-                await self._send_private_trace(msg.chat_id, session_key, msg)
-            except Exception as e:
-                logger.warning(f"[qq] 私聊 tracing 合并转发失败  chat_id={msg.chat_id}  错误: {e}")
-        logger.info("[qq] 发送回复  chat_id=%s 内容=%r", msg.chat_id, preview)
-        receipt = await self._deliver_message(channel_message_from_outbound(msg))
-        if not receipt.succeeded:
-            raise RuntimeError(receipt.detail or "QQ 消息提交失败")
-        self._trace_states.pop(session_key, None)
 
     async def _send_private_trace(
         self,

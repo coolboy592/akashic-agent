@@ -17,8 +17,6 @@ from bus.events import (
     DeliveryReceipt,
     DeliveryStatus,
     InboundMessage,
-    OutboundMessage,
-    channel_message_from_outbound,
 )
 from bus.events_lifecycle import (
     StreamDeltaReady,
@@ -50,16 +48,10 @@ class WebChatChannel:
         self._media_paths: set[str] = set()
         self._connection_lock = asyncio.Lock()
         self._events_bound = False
-        self._outbound_bound = False
-        self._legacy_outbound_enabled = True
 
     async def start(self, ctx: ChannelContext) -> None:
         self._ctx = ctx
         self._attachments = ctx.attachment_store
-        self._legacy_outbound_enabled = getattr(ctx, "legacy_outbound_enabled", True)
-        if self._legacy_outbound_enabled and not self._outbound_bound:
-            ctx.bus.subscribe_outbound(self.name, self._on_response)
-            self._outbound_bound = True
         if not self._events_bound:
             ctx.event_bus.on(TurnStarted, self._on_turn_started)
             ctx.event_bus.on(StreamDeltaReady, self._on_stream_delta)
@@ -67,11 +59,6 @@ class WebChatChannel:
             ctx.event_bus.on(ToolCallCompleted, self._on_tool_call_completed)
             ctx.event_bus.on(TurnOutputCompleted, self._on_output_completed)
             self._events_bound = True
-        if self._legacy_outbound_enabled:
-            ctx.push_tool.register_channel(
-                self.name,
-                deliver=self._deliver_message,
-            )
 
     def bind_attachment_store(self, store: AttachmentStore) -> None:
         """在 channel 启动前为独立 Chat API 绑定显式附件目录。"""
@@ -502,15 +489,6 @@ class WebChatChannel:
             "turn_id": event.turn_id or self._current_turn_id(event.session_key),
             "client_message_id": event.client_message_id,
         })
-
-    async def _on_response(self, msg: OutboundMessage) -> None:
-        session_key = self._session_key(msg.chat_id)
-        outbound = channel_message_from_outbound(msg)
-        outbound.metadata["_channel_commit_role"] = "passive"
-        receipt = await self._deliver_message(outbound)
-        if not receipt.succeeded:
-            raise RuntimeError(receipt.detail or "Web 消息提交失败")
-        _ = self._active_turn_ids.pop(session_key, None)
 
     async def _add_connection(self, session_key: str, websocket: WebSocket) -> None:
         async with self._connection_lock:

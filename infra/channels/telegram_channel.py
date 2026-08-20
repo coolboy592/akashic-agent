@@ -6,7 +6,6 @@ Telegram Channel
 
 import logging
 import asyncio
-import hashlib
 import html
 import json
 import time
@@ -31,8 +30,6 @@ from bus.events import (
     ChannelMessage,
     DeliveryReceipt,
     InboundMessage,
-    OutboundMessage,
-    channel_message_from_outbound,
 )
 from bus.events_lifecycle import (
     StreamDeltaReady,
@@ -127,8 +124,6 @@ class TelegramChannel:
             MessageHandler(filters.Document.ALL & ~filters.COMMAND, self._on_document)
         )
         self._event_bus = event_bus
-        self._outbound_bound = False
-        self._legacy_outbound_enabled = True
         self._events_bound = False
         self.user_map = self._identity_index.mapping
         self._conflict_count = 0
@@ -187,12 +182,6 @@ class TelegramChannel:
             self._bus = ctx.bus
             self._event_bus = ctx.event_bus
             self._interrupt_controller = ctx.interrupt_controller
-            self._legacy_outbound_enabled = getattr(ctx, "legacy_outbound_enabled", True)
-            if self._legacy_outbound_enabled:
-                ctx.push_tool.register_channel(
-                    self.name,
-                    deliver=self._deliver_message,
-                )
         self._bind_runtime()
         self._rebuild_user_map()
         await self._app.initialize()
@@ -208,9 +197,6 @@ class TelegramChannel:
         logger.info(f"TelegramChannel 已启动  已知用户: {len(self.user_map)}")
 
     def _bind_runtime(self) -> None:
-        if self._legacy_outbound_enabled and not self._outbound_bound:
-            self._bus.subscribe_outbound(self._channel, self._on_response)
-            self._outbound_bound = True
         if self._event_bus is not None and not self._events_bound:
             self._event_bus.on(TurnStarted, self._on_turn_started)
             self._event_bus.on(StreamDeltaReady, self._on_stream_delta)
@@ -809,56 +795,6 @@ class TelegramChannel:
     async def _send_photo_file(self, chat_id: int, image: str) -> object:
         with open(image, "rb") as f:
             return await self._app.bot.send_photo(chat_id=chat_id, photo=f)
-
-    async def _on_response(self, msg: OutboundMessage) -> None:
-        logger.info(
-            "telegram outbound accepted",
-            extra={
-                "akashic_fields": {
-                    "event": "telegram.outbound_accepted",
-                    "output_bytes": len(msg.content.encode("utf-8")),
-                    "content_fp": hashlib.sha256(
-                        msg.content.encode("utf-8")
-                    ).hexdigest()[:16],
-                }
-            },
-        )
-        _ = int(self._resolve_chat_id(msg.chat_id))
-        session_key = f"{self._channel}:{msg.chat_id}"
-        had_live = self._has_live_messages(session_key)
-        has_live_tasks = bool(self._live_tasks_by_session.get(session_key))
-        if has_live_tasks:
-            await self._cancel_live_tasks(session_key)
-        if had_live or self._has_live_messages(session_key):
-            await self._delete_live_message(session_key)
-        final_thinking = self._final_thinking_text(session_key, msg.thinking)
-        if had_live:
-            if final_thinking:
-                await send_thinking_block(
-                    self._app.bot,
-                    msg.chat_id,
-                    final_thinking,
-                    self._telegram_outbound_limiter,
-                )
-            await self._send_final_tool_snapshot(session_key, msg.chat_id)
-        outbound = channel_message_from_outbound(msg)
-        outbound.metadata["_channel_commit_role"] = "passive"
-        receipt = await self._deliver_message(outbound)
-        if final_thinking and not had_live:
-            await send_thinking_block(
-                self._app.bot,
-                msg.chat_id,
-                final_thinking,
-                self._telegram_outbound_limiter,
-            )
-        self._reply_buffers.pop(session_key, None)
-        self._thinking_buffers.pop(session_key, None)
-        _ = self._thinking_live_next_at.pop(session_key, None)
-        _ = self._live_last_lengths.pop(session_key, None)
-        _ = self._tool_lines.pop(session_key, None)
-        _ = self._active_streams.pop(str(msg.chat_id), None)
-        if not receipt.succeeded:
-            raise RuntimeError(receipt.detail or "Telegram 消息提交失败")
 
     async def _safe_send_typing(
         self, context: ContextTypes.DEFAULT_TYPE, chat_id: int

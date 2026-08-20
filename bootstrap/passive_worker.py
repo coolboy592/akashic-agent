@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any, Protocol, TypeVar, cast
 
 from agent.control.errors import (
@@ -27,9 +27,17 @@ from agent.plugin_composition.channels import (
     InboundOwner,
     OutboundEnvelope,
     AttachmentReadLease,
+    ChannelDeliveryReceipt,
 )
-from bus.events import InboundMessage, OutboundMessage, TurnTerminalStatus
+from bus.events import (
+    ChannelMessage,
+    InboundMessage,
+    OutboundMessage,
+    TurnTerminalStatus,
+)
 from bus.queue import MessageBus
+from bus.events import channel_message_from_outbound
+from bootstrap.core_channel_adapter import encode_legacy_channel_message
 from core.common.diagnostic_log import turn_milestone
 
 logger = logging.getLogger(__name__)
@@ -38,6 +46,11 @@ if TYPE_CHECKING:
     from infra.channels.artifacts import ChannelAttachmentArtifactStore
 
 T = TypeVar("T")
+
+ChannelDeliveryDispatcher = Callable[
+    [ChannelMessage, bool],
+    Awaitable[ChannelDeliveryReceipt],
+]
 
 
 class _ModelAttachmentLease(AttachmentReadLease, Protocol):
@@ -60,7 +73,6 @@ async def _complete_critical(awaitable: Awaitable[T]) -> T:
         raise asyncio.CancelledError
     return result
 
-_TERMINAL_DELIVERY_RETRY_DELAYS = (0.05, 0.1)
 _TERMINAL_LANE_RETRY_DELAY = 1.0
 
 
@@ -78,11 +90,13 @@ class PassiveMessageWorker:
         legacy_loop: AgentLoop,
         *,
         attachment_store: ChannelAttachmentArtifactStore | None = None,
+        channel_dispatcher: ChannelDeliveryDispatcher | None = None,
     ) -> None:
         self._bus = bus
         self._runtime = runtime
         self._legacy_loop = legacy_loop
         self._attachment_store = attachment_store
+        self._channel_dispatcher = channel_dispatcher
         self._running = False
         self._lane_queues: dict[
             str,
@@ -91,6 +105,18 @@ class PassiveMessageWorker:
         self._lane_tasks: dict[str, asyncio.Task[None]] = {}
         self._result_tasks: set[asyncio.Task[None]] = set()
         self._channel_result_tasks: dict[asyncio.Task[None], TurnHandle] = {}
+
+    def bind_channel_dispatcher(
+        self,
+        dispatcher: ChannelDeliveryDispatcher,
+    ) -> None:
+        """Bind the committed Channel dispatcher used by legacy ingress projection."""
+
+        if not callable(dispatcher):
+            raise TypeError("passive Channel dispatcher 必须可调用")
+        if self._channel_dispatcher is not None:
+            raise RuntimeError("passive Channel dispatcher 已绑定")
+        self._channel_dispatcher = dispatcher
 
     async def run(self) -> None:
         self._running = True
@@ -312,6 +338,7 @@ class PassiveMessageWorker:
                 metadata=dict(envelope.metadata),
             )
             terminal = self._terminal_outbound(legacy_view, result)
+            terminal_message = channel_message_from_outbound(terminal)
             delivery_id = result.id
             receipt = await self._bus.publish_channel_outbound_awaited(
                 OutboundEnvelope(
@@ -323,8 +350,11 @@ class PassiveMessageWorker:
                     binding_token=envelope.binding_token,
                     channel=envelope.channel,
                     recipient=envelope.chat_id,
-                    body=terminal.content,
-                    metadata=dict(terminal.metadata),
+                    body=terminal_message.content,
+                    metadata=cast(
+                        Any,
+                        encode_legacy_channel_message(terminal_message),
+                    ),
                 ),
                 envelope.lease,
             )
@@ -507,9 +537,10 @@ class PassiveMessageWorker:
                     mode="live",
                 )
             else:
-                # 阶段2：非 mobile 保持 fire-and-forget 发布后收束。
-                await self._bus.publish_outbound(outbound)
-                await self._complete_message(item)
+                if not await self._deliver_terminal(outbound):
+                    raise RuntimeError(
+                        f"Channel terminal delivery 未完成: {item.channel}/{result.id}"
+                    )
         finally:
             try:
                 await self._close_attachment_leases(attachment_leases)
@@ -634,15 +665,18 @@ class PassiveMessageWorker:
         )
 
     async def _deliver_terminal(self, outbound: OutboundMessage) -> bool:
-        """以有界 worker 级退避重投同一权威 terminal。"""
+        """Project one legacy ingress terminal through the committed Channel dispatcher."""
 
-        # 1. 每次调用仍由 MessageBus 拥有渠道内部重试；这里只重投同一 terminal。
-        for attempt in range(len(_TERMINAL_DELIVERY_RETRY_DELAYS) + 1):
-            if await self._bus.publish_outbound_awaited(outbound):
-                return True
-            if attempt < len(_TERMINAL_DELIVERY_RETRY_DELAYS):
-                await asyncio.sleep(_TERMINAL_DELIVERY_RETRY_DELAYS[attempt])
-        return False
+        dispatcher = self._channel_dispatcher
+        if dispatcher is None:
+            raise RuntimeError("Passive terminal exact Channel dispatcher 未绑定")
+        message = channel_message_from_outbound(outbound)
+        receipt = await dispatcher(message, True)
+        if not isinstance(receipt, ChannelDeliveryReceipt):
+            raise TypeError(
+                "Passive terminal Channel dispatcher 必须返回 ChannelDeliveryReceipt"
+            )
+        return receipt.status is ChannelDeliveryStatus.DELIVERED
 
     def _observe_terminal_milestone(
         self,

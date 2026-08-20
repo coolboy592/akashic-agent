@@ -20,10 +20,16 @@ from bus.events import (
     ChannelMessage,
     DeliveryReceipt,
     DeliveryStatus,
+    TurnTerminalStatus,
 )
 
 
 LEGACY_ATTACHMENT_METADATA_KEY = "_core_legacy_attachments"
+LEGACY_THINKING_METADATA_KEY = "_core_legacy_thinking"
+LEGACY_SESSION_MESSAGE_ID_METADATA_KEY = "_core_legacy_session_message_id"
+LEGACY_CONTROL_TURN_ID_METADATA_KEY = "_core_legacy_control_turn_id"
+LEGACY_EXECUTION_ATTEMPT_ID_METADATA_KEY = "_core_legacy_execution_attempt_id"
+LEGACY_TERMINAL_STATUS_METADATA_KEY = "_core_legacy_terminal_status"
 
 
 class CoreLegacyChannelAdapter:
@@ -46,12 +52,31 @@ class CoreLegacyChannelAdapter:
         # 1. Reconstruct the legacy message only inside this migration adapter.
         metadata = dict(request_metadata(request))
         attachments = _decode_legacy_attachments(metadata.pop(LEGACY_ATTACHMENT_METADATA_KEY, ()))
+        thinking = _pop_optional_text(metadata, LEGACY_THINKING_METADATA_KEY)
+        session_message_id = _pop_optional_text(
+            metadata,
+            LEGACY_SESSION_MESSAGE_ID_METADATA_KEY,
+        )
+        control_turn_id = _pop_optional_text(
+            metadata,
+            LEGACY_CONTROL_TURN_ID_METADATA_KEY,
+        )
+        execution_attempt_id = _pop_optional_text(
+            metadata,
+            LEGACY_EXECUTION_ATTEMPT_ID_METADATA_KEY,
+        )
+        terminal_status = _pop_terminal_status(metadata)
         message = ChannelMessage(
             channel=str(getattr(self._channel, "name")),
             chat_id=request.recipient,
             content=request.body,
             attachments=attachments,
+            thinking=thinking,
             metadata=metadata,
+            session_message_id=session_message_id,
+            control_turn_id=control_turn_id,
+            execution_attempt_id=execution_attempt_id,
+            terminal_status=terminal_status,
         )
 
         # 2. The old channel owns provider effects; only its settled receipt crosses v3.
@@ -142,6 +167,63 @@ def encode_legacy_attachments(
     return result
 
 
+def encode_legacy_channel_message(message: ChannelMessage) -> dict[str, object]:
+    """Encode a complete Core ChannelMessage for the migration-only adapter."""
+
+    metadata = dict(message.metadata)
+    if message.attachments:
+        metadata[LEGACY_ATTACHMENT_METADATA_KEY] = encode_legacy_attachments(
+            message.attachments
+        )
+    _set_optional_metadata(metadata, LEGACY_THINKING_METADATA_KEY, message.thinking)
+    _set_optional_metadata(
+        metadata,
+        LEGACY_SESSION_MESSAGE_ID_METADATA_KEY,
+        message.session_message_id,
+    )
+    _set_optional_metadata(
+        metadata,
+        LEGACY_CONTROL_TURN_ID_METADATA_KEY,
+        message.control_turn_id,
+    )
+    _set_optional_metadata(
+        metadata,
+        LEGACY_EXECUTION_ATTEMPT_ID_METADATA_KEY,
+        message.execution_attempt_id,
+    )
+    if message.terminal_status is not None:
+        metadata[LEGACY_TERMINAL_STATUS_METADATA_KEY] = message.terminal_status.value
+    return metadata
+
+
+def _set_optional_metadata(
+    metadata: dict[str, object],
+    key: str,
+    value: str | None,
+) -> None:
+    if value is not None:
+        metadata[key] = value
+
+
+def _pop_optional_text(metadata: dict[str, object], key: str) -> str | None:
+    value = metadata.pop(key, None)
+    if value is not None and not isinstance(value, str):
+        raise TypeError(f"Core migration metadata {key} 必须是字符串")
+    return value
+
+
+def _pop_terminal_status(metadata: dict[str, object]) -> TurnTerminalStatus | None:
+    value = metadata.pop(LEGACY_TERMINAL_STATUS_METADATA_KEY, None)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise TypeError("Core migration terminal_status 必须是字符串")
+    try:
+        return TurnTerminalStatus(value)
+    except ValueError as error:
+        raise ValueError(f"Core migration terminal_status 无效: {value}") from error
+
+
 def _decode_legacy_attachments(value: object) -> tuple[ChannelAttachment, ...]:
     if value in (None, ()):
         return ()
@@ -169,7 +251,13 @@ def _decode_legacy_attachments(value: object) -> tuple[ChannelAttachment, ...]:
 __all__ = [
     "CoreLegacyChannelAdapter",
     "LEGACY_ATTACHMENT_METADATA_KEY",
+    "LEGACY_CONTROL_TURN_ID_METADATA_KEY",
+    "LEGACY_EXECUTION_ATTEMPT_ID_METADATA_KEY",
+    "LEGACY_SESSION_MESSAGE_ID_METADATA_KEY",
+    "LEGACY_TERMINAL_STATUS_METADATA_KEY",
+    "LEGACY_THINKING_METADATA_KEY",
     "build_core_channel_definition",
+    "encode_legacy_channel_message",
     "encode_legacy_attachments",
     "map_legacy_delivery_receipt",
 ]

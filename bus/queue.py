@@ -16,7 +16,7 @@ from agent.plugin_composition.channels import (
     InboundState,
     OutboundEnvelope,
 )
-from bus.events import InboundItem, InboundMessage, OutboundMessage
+from bus.events import InboundItem, InboundMessage
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +25,6 @@ _T = TypeVar("_T")
 _DURABLE_INBOUND_RECOVERY_PAGE_SIZE = 256
 _INBOUND_CLEANUP_RETRY_INITIAL_DELAY = 0.1
 _INBOUND_CLEANUP_RETRY_MAX_DELAY = 5.0
-_OUTBOUND_RETRY_DELAY = 2.0
 
 
 class DurableInboundStore(Protocol):
@@ -141,14 +140,6 @@ class _InboundOwner:
 
     item: InboundItem
     cleanup_pending: bool = False
-
-
-@dataclass
-class _AwaitedOutbound:
-    """携带实际渠道送达后才解析收据的出站封套。"""
-
-    message: OutboundMessage
-    receipt: "asyncio.Future[bool]"
 
 
 class _ChannelBindingOwner(Protocol):
@@ -340,52 +331,24 @@ class ChatLane:
             self._release_state(key, state)
 
 
-class OutboundSubscription:
-    def __init__(
-        self,
-        bus: "MessageBus",
-        channel: str,
-        callback: Callable[[OutboundMessage], Awaitable[None]],
-    ) -> None:
-        self._bus = bus
-        self._channel = channel
-        self._callback = callback
-        self._active = True
-
-    def close(self) -> None:
-        if not self._active:
-            return
-        self._active = False
-        self._bus.unsubscribe_outbound(self._channel, self._callback)
-
-
 class MessageBus:
     """在单用户 Companion 内传递消息，并持有 mobile handoff 的删除责任。"""
 
     def __init__(self, chat_lane: ChatLane | None = None) -> None:
         self._inbound: asyncio.Queue[InboundItem | InboundEnvelope] = asyncio.Queue()
-        self._outbound: asyncio.Queue[
-            OutboundMessage | _AwaitedOutbound | _AwaitedChannelOutbound
-        ] = asyncio.Queue()
+        self._outbound: asyncio.Queue[_AwaitedChannelOutbound] = asyncio.Queue()
         self._inbound_accepted: dict[int, _InboundOwner] = {}
         self._inbound_cleanup_tasks: dict[int, asyncio.Task[None]] = {}
         self._inbound_cleanup_error: BaseException | None = None
         self._recovery_claimed: set[str] = set()
         self._durable_handoff_lock = asyncio.Lock()
-        self._subscribers: dict[
-            str, list[Callable[[OutboundMessage], Awaitable[None]]]
-        ] = {}
         self._chat_lane = chat_lane or ChatLane()
         self._running = False
         self._outbound_dispatch_stopped = False
         self._outbound_dispatch_task: asyncio.Task[None] | None = None
         self._outbound_closed = False
         self._close_task: asyncio.Task[None] | None = None
-        self._delivery_observer: (
-            Callable[[OutboundMessage, bool], Awaitable[None]] | None
-        ) = None
         self._durable_inbound_store: DurableInboundStore | None = None
-        self._pending_outbound_receipts: set[asyncio.Future[bool]] = set()
         self._pending_channel_receipts: set[
             asyncio.Future[ChannelDeliveryReceipt]
         ] = set()
@@ -394,10 +357,6 @@ class MessageBus:
                 [OutboundEnvelope, _ChannelBindingOwner],
                 Awaitable[ChannelDeliveryReceipt],
             ]
-            | None
-        ) = None
-        self._legacy_v3_outbound_dispatcher: (
-            Callable[[OutboundMessage], Awaitable[ChannelDeliveryReceipt | None]]
             | None
         ) = None
 
@@ -466,16 +425,6 @@ class MessageBus:
             )
         )
 
-    def bind_outbound_delivery_observer(
-        self,
-        callback: Callable[[OutboundMessage, bool], Awaitable[None]],
-    ) -> None:
-        """绑定唯一出站送达观察者。"""
-
-        if self._delivery_observer is not None:
-            raise RuntimeError("outbound delivery observer 已绑定")
-        self._delivery_observer = callback
-
     def bind_channel_outbound_dispatcher(
         self,
         callback: Callable[
@@ -490,18 +439,6 @@ class MessageBus:
         if self._channel_outbound_dispatcher is not None:
             raise RuntimeError("v3 Channel outbound dispatcher 已绑定")
         self._channel_outbound_dispatcher = callback
-
-    def bind_legacy_v3_outbound_dispatcher(
-        self,
-        callback: Callable[[OutboundMessage], Awaitable[ChannelDeliveryReceipt | None]],
-    ) -> None:
-        """Bind the migration bridge for legacy OutboundMessage producers."""
-
-        if not callable(callback):
-            raise TypeError("legacy v3 outbound dispatcher 必须可调用")
-        if self._legacy_v3_outbound_dispatcher is not None:
-            raise RuntimeError("legacy v3 outbound dispatcher 已绑定")
-        self._legacy_v3_outbound_dispatcher = callback
 
     async def publish_inbound(self, msg: InboundItem) -> None:
         """将渠道输入交给 Agent 消费。"""
@@ -848,65 +785,36 @@ class MessageBus:
                 item = self._outbound.get_nowait()
             except asyncio.QueueEmpty:
                 return
-            if isinstance(item, _AwaitedChannelOutbound):
-                if not item.receipt.done():
-                    item.receipt.set_result(
-                        _channel_delivery_receipt(
-                            item.envelope,
-                            ChannelDeliveryStatus.REJECTED,
-                            "message bus 已关闭，delivery 尚未执行",
-                        )
+            if not isinstance(item, _AwaitedChannelOutbound):
+                raise RuntimeError("MessageBus outbound queue 含有未授权 legacy item")
+            if not item.receipt.done():
+                item.receipt.set_result(
+                    _channel_delivery_receipt(
+                        item.envelope,
+                        ChannelDeliveryStatus.REJECTED,
+                        "message bus 已关闭，delivery 尚未执行",
                     )
-                self._pending_channel_receipts.discard(item.receipt)
-                if item.passive:
-                    await self._chat_lane.mark_passive_send_done(
-                        item.envelope.channel,
-                        item.envelope.recipient,
-                    )
-                continue
-            if isinstance(item, _AwaitedOutbound):
-                if not item.receipt.done():
-                    item.receipt.set_result(False)
-                self._pending_outbound_receipts.discard(item.receipt)
-                msg = item.message
-            else:
-                msg = item
-            await self._chat_lane.mark_passive_send_done(msg.channel, msg.chat_id)
+                )
+            self._pending_channel_receipts.discard(item.receipt)
+            if item.passive:
+                await self._chat_lane.mark_passive_send_done(
+                    item.envelope.channel,
+                    item.envelope.recipient,
+                )
 
-    async def publish_outbound(self, msg: OutboundMessage) -> None:
-        """将 Agent 输出交给对应渠道发送（fire-and-forget）。"""
-        await self._chat_lane.mark_passive_send_pending(msg.channel, msg.chat_id)
-        try:
-            self._outbound.put_nowait(msg)
-        except BaseException:
-            await self._chat_lane.mark_passive_send_done(msg.channel, msg.chat_id)
-            raise
+    async def publish_outbound(self, msg: object) -> None:
+        """Reject the removed OutboundMessage queue and require an exact envelope."""
 
-    async def publish_outbound_awaited(self, msg: OutboundMessage) -> bool:
-        """发布出站消息并等待实际渠道送达收据；失败或关闭解析为 False。
+        raise RuntimeError(
+            "MessageBus legacy publish_outbound 已删除；请使用 committed Channel OutboundEnvelope"
+        )
 
-        阶段1：消息以收据封套入队，lane pending 与 fire-and-forget 同源登记；
-        阶段2：dispatch_outbound 实际调用订阅者且原始 callback 成功返回后才
-        解析 delivered=True；fallback、无 subscriber、dispatch 取消或 bus 关闭
-        都解析 False；
-        阶段3：收据解析后从 pending 集合移除，aclose 收束全部 pending，不泄漏
-        Future/Task。
-        """
+    async def publish_outbound_awaited(self, msg: object) -> bool:
+        """Reject the removed bool receipt path instead of silently degrading delivery."""
 
-        if self._outbound_dispatch_stopped:
-            return False
-        future: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
-        await self._chat_lane.mark_passive_send_pending(msg.channel, msg.chat_id)
-        try:
-            self._outbound.put_nowait(_AwaitedOutbound(msg, future))
-        except BaseException:
-            await self._chat_lane.mark_passive_send_done(msg.channel, msg.chat_id)
-            if not future.done():
-                future.set_result(False)
-            raise
-        self._pending_outbound_receipts.add(future)
-        future.add_done_callback(self._pending_outbound_receipts.discard)
-        return await future
+        raise RuntimeError(
+            "MessageBus legacy publish_outbound_awaited 已删除；请使用 exact Channel receipt"
+        )
 
     async def publish_channel_outbound_awaited(
         self,
@@ -957,38 +865,8 @@ class MessageBus:
         future.add_done_callback(self._pending_channel_receipts.discard)
         return await _await_channel_receipt_after_cancellation(future)
 
-    def subscribe_outbound(
-        self,
-        channel: str,
-        callback: Callable[[OutboundMessage], Awaitable[None]],
-    ) -> OutboundSubscription:
-        """订阅某 channel 的出站消息"""
-        self._subscribers.setdefault(channel, []).append(callback)
-        return OutboundSubscription(self, channel, callback)
-
-    def unsubscribe_outbound(
-        self,
-        channel: str,
-        callback: Callable[[OutboundMessage], Awaitable[None]],
-    ) -> None:
-        callbacks = self._subscribers.get(channel)
-        if callbacks is None:
-            return
-        try:
-            callbacks.remove(callback)
-        except ValueError:
-            return
-        if not callbacks:
-            del self._subscribers[channel]
-
     async def dispatch_outbound(self) -> None:
-        """后台任务：将出站消息分发给对应 channel 的订阅者。
-
-        发送失败时退避 2s 重试一次；仍失败则向用户发送降级错误通知，不静默丢弃。
-        awaited 封套只在原始 callback 成功返回后解析 delivered=True。
-        finally 只收束当前 in-flight 收据：队列中尚未 dispatch 的项由 aclose
-        排空时收束；observer 异常绝不回滚已解析的 receipt。
-        """
+        """后台任务：把 exact v3 envelope 交给唯一 Channel dispatcher。"""
         if self._outbound_closed:
             return
         current_task = asyncio.current_task()
@@ -1002,7 +880,6 @@ class MessageBus:
         self._outbound_dispatch_task = current_task
         self._running = True
         self._outbound_dispatch_stopped = False
-        in_flight_receipt: asyncio.Future[bool] | None = None
         in_flight_channel: _AwaitedChannelOutbound | None = None
         try:
             while self._running:
@@ -1033,28 +910,10 @@ class MessageBus:
                         channel_item.receipt.set_result(channel_receipt)
                     in_flight_channel = None
                     continue
-                receipt: asyncio.Future[bool] | None = None
-                if isinstance(item, _AwaitedOutbound):
-                    msg = item.message
-                    receipt = item.receipt
-                else:
-                    msg = item
-                in_flight_receipt = receipt
-                delivered = await self._chat_lane.run_passive(
-                    msg.channel,
-                    msg.chat_id,
-                    lambda: self._send_outbound(msg, fallback_allowed=receipt is None),
-                    pending_registered=True,
-                )
-                if receipt is not None and not receipt.done():
-                    receipt.set_result(delivered)
-                if self._delivery_observer is not None:
-                    await self._delivery_observer(msg, delivered)
+                raise RuntimeError("MessageBus outbound queue 含有未授权 legacy item")
         finally:
             self._running = False
             self._outbound_dispatch_stopped = True
-            if in_flight_receipt is not None and not in_flight_receipt.done():
-                in_flight_receipt.set_result(False)
             if in_flight_channel is not None and not in_flight_channel.receipt.done():
                 in_flight_channel.receipt.set_result(
                     _channel_delivery_receipt(
@@ -1088,11 +947,7 @@ class MessageBus:
                 "message bus outbound admission 已关闭",
             )
         if dispatcher is None:
-            return _channel_delivery_receipt(
-                item.envelope,
-                ChannelDeliveryStatus.REJECTED,
-                "v3 Channel outbound dispatcher 未绑定",
-            )
+            raise RuntimeError("v3 Channel outbound dispatcher 未绑定")
         item.provider_started = True
         try:
             receipt = await dispatcher(item.envelope, item.binding)
@@ -1118,91 +973,25 @@ class MessageBus:
 
     async def _reject_outbound_after_close(
         self,
-        item: OutboundMessage | _AwaitedOutbound | _AwaitedChannelOutbound,
+        item: _AwaitedChannelOutbound,
     ) -> None:
         """Settle one item dequeued concurrently with terminal Bus close."""
 
-        if isinstance(item, _AwaitedChannelOutbound):
-            if not item.receipt.done():
-                item.receipt.set_result(
-                    _channel_delivery_receipt(
-                        item.envelope,
-                        ChannelDeliveryStatus.REJECTED,
-                        "message bus outbound admission 已关闭",
-                    )
+        if not isinstance(item, _AwaitedChannelOutbound):
+            raise RuntimeError("MessageBus outbound queue 含有未授权 legacy item")
+        if not item.receipt.done():
+            item.receipt.set_result(
+                _channel_delivery_receipt(
+                    item.envelope,
+                    ChannelDeliveryStatus.REJECTED,
+                    "message bus outbound admission 已关闭",
                 )
-            if item.passive:
-                await self._chat_lane.mark_passive_send_done(
-                    item.envelope.channel,
-                    item.envelope.recipient,
-                )
-            return
-        if isinstance(item, _AwaitedOutbound):
-            if not item.receipt.done():
-                item.receipt.set_result(False)
-            message = item.message
-        else:
-            message = item
-        await self._chat_lane.mark_passive_send_done(
-            message.channel,
-            message.chat_id,
-        )
-
-    async def _send_outbound(
-        self,
-        msg: OutboundMessage,
-        *,
-        fallback_allowed: bool,
-    ) -> bool:
-        """发送原始消息，并区分原消息与降级文案的结果。
-
-        awaited 封套（fallback_allowed=False）在原始 callback 两次失败后严禁
-        再调用同一 callback 发送降级文案：那会把当前 turn 以 fallback 内容
-        durable close，之后原 terminal 重投递会被 tombstone 吞掉；只返回 False
-        保留 handoff。fire-and-forget 保持既有 fallback 行为。
-        """
-
-        v3_dispatcher = self._legacy_v3_outbound_dispatcher
-        if v3_dispatcher is not None:
-            v3_receipt = await v3_dispatcher(msg)
-            if v3_receipt is not None:
-                return v3_receipt.status is ChannelDeliveryStatus.DELIVERED
-
-        callbacks = tuple(self._subscribers.get(msg.channel, []))
-        delivered = bool(callbacks)
-        for cb in callbacks:
-            try:
-                await cb(msg)
-            except Exception as first_err:
-                logger.warning(
-                    "分发消息到 %s 首次失败，%.1fs 后重试: %s",
-                    msg.channel,
-                    _OUTBOUND_RETRY_DELAY,
-                    first_err,
-                )
-                await asyncio.sleep(_OUTBOUND_RETRY_DELAY)
-                try:
-                    await cb(msg)
-                except Exception as second_err:
-                    delivered = False
-                    logger.error(
-                        f"分发消息到 {msg.channel} 重试仍失败，发送降级通知: {second_err}"
-                    )
-                    if not fallback_allowed:
-                        continue
-                    fallback = OutboundMessage(
-                        channel=msg.channel,
-                        chat_id=msg.chat_id,
-                        content="（消息发送失败，请稍后重试）",
-                    )
-                    try:
-                        await cb(fallback)
-                    except Exception:
-                        logger.error(
-                            f"降级通知也失败，消息彻底丢失  channel={msg.channel} "
-                            f"chat_id={msg.chat_id}"
-                        )
-        return delivered
+            )
+        if item.passive:
+            await self._chat_lane.mark_passive_send_done(
+                item.envelope.channel,
+                item.envelope.recipient,
+            )
 
     def stop(self) -> None:
         self._running = False

@@ -218,7 +218,7 @@ async def test_manager_publishes_core_catalog_without_stable_plugins(tmp_path) -
 async def test_core_catalog_message_push_keeps_media_off_legacy_registration(
     tmp_path,
 ) -> None:
-    """Core catalog 命中时 MessagePush 使用 v3 receipt 并保留旧媒体投影。"""
+    """Core catalog 命中时 MessagePush 使用 v3 receipt 并保留媒体投影。"""
 
     manager = PluginManager(
         plugin_dirs=[tmp_path / "plugins"],
@@ -237,13 +237,7 @@ async def test_core_catalog_message_push_keeps_media_off_legacy_registration(
     )
     dispatch_task = asyncio.create_task(bus.dispatch_outbound())
     tool = MessagePushTool(chat_lane=bus.chat_lane)
-    legacy_calls: list[object] = []
-
-    async def legacy(message: object) -> DeliveryReceipt:
-        legacy_calls.append(message)
-        return DeliveryReceipt(DeliveryStatus.SUCCESS)
-
-    _ = tool.register_channel("web", deliver=legacy)
+    assert not hasattr(tool, "register_channel")
     tool.bind_v3_channel_dispatcher(
         lambda message, passive: _dispatch_v3_channel_push(
             manager,
@@ -272,7 +266,6 @@ async def test_core_catalog_message_push_keeps_media_off_legacy_registration(
 
     assert result["status"] == "delivered"
     assert result["retryable"] is False
-    assert legacy_calls == []
     assert channel.received[0].attachments == (
         ChannelAttachment(AttachmentKind.FILE, "/tmp/report.pdf", "report.pdf"),
     )

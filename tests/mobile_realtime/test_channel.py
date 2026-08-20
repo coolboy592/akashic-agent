@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import logging
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -24,6 +25,7 @@ from bus.events import (
     DeliveryStatus,
     OutboundMessage,
     TurnTerminalStatus,
+    channel_message_from_outbound,
 )
 from bus.events_lifecycle import (
     StreamDeltaReady,
@@ -193,14 +195,10 @@ class _FailDeltaRuntime(_Runtime):
 class _Bus:
     def __init__(self) -> None:
         self.inbound: list[object] = []
-        self.outbound: dict[str, object] = {}
         self.pending_handoff = False
 
     async def publish_inbound(self, message: object) -> None:
         self.inbound.append(message)
-
-    def subscribe_outbound(self, channel: str, callback: object) -> None:
-        self.outbound[channel] = callback
 
     def has_pending_mobile_handoff(
         self,
@@ -225,11 +223,23 @@ class _EventBus:
 
 
 class _PushTool:
-    def __init__(self) -> None:
-        self.registered: dict[str, dict[str, object]] = {}
+    pass
 
-    def register_channel(self, channel: str, **senders: object) -> None:
-        self.registered[channel] = senders
+
+def _provider_delivery(channel: MobileRealtimeChannel):
+    """把测试 outbound 映射为正式 Channel provider callback。"""
+
+    async def deliver(message: OutboundMessage | ChannelMessage):
+        if isinstance(message, ChannelMessage):
+            return await channel._deliver_message(message)
+        channel_message = channel_message_from_outbound(message)
+        metadata = dict(channel_message.metadata)
+        metadata["_channel_commit_role"] = "passive"
+        return await channel._deliver_message(
+            replace(channel_message, metadata=metadata)
+        )
+
+    return deliver
 
 
 class _RuntimeInspection:
@@ -1743,7 +1753,7 @@ async def test_session_list_and_history_sync_publish_all_mobile_sessions(
     )
     session.add_message("assistant", "实时回答", media=[str(media_path)])
     manager.save(session)
-    await channel._on_response(
+    await _provider_delivery(channel)(
         OutboundMessage(
             channel="mobile",
             chat_id=session_id.removeprefix("mobile:"),
@@ -1875,7 +1885,7 @@ async def test_remote_media_failure_keeps_final_text(
         raise RemoteMediaError("签名链接已失效")
 
     monkeypatch.setattr("infra.mobile_realtime.channel.snapshot_remote_media", fail)
-    await channel._on_response(
+    await _provider_delivery(channel)(
         OutboundMessage(
             channel="mobile",
             chat_id=session_id.removeprefix("mobile:"),
@@ -1906,7 +1916,7 @@ async def test_final_event_maps_optimistic_user_to_persisted_identity(
     channel = MobileRealtimeChannel(cast(MobileGatewayRuntime, runtime))
     session_id = f"mobile:{uuid4()}"
 
-    await channel._on_response(
+    await _provider_delivery(channel)(
         OutboundMessage(
             channel="mobile",
             chat_id=session_id.removeprefix("mobile:"),
@@ -1940,7 +1950,7 @@ async def test_final_payload_accepts_client_message_id_without_user_message_id(
     session_id = f"mobile:{uuid4()}"
     turn_id = uuid4().hex
     with caplog.at_level(logging.INFO, logger="infra.mobile_realtime.channel"):
-        await channel._on_response(
+        await _provider_delivery(channel)(
             OutboundMessage(
                 channel="mobile",
                 chat_id=session_id.removeprefix("mobile:"),
@@ -1987,8 +1997,8 @@ async def test_typed_interrupted_outbound_publishes_one_durable_terminal(
         terminal_status=TurnTerminalStatus.INTERRUPTED,
     )
 
-    await channel._on_response(outbound)
-    await channel._on_response(outbound)
+    await _provider_delivery(channel)(outbound)
+    await _provider_delivery(channel)(outbound)
 
     terminals = [
         event
@@ -2031,7 +2041,7 @@ async def test_control_reply_never_reuses_previous_message_id(tmp_path: Path) ->
         )
     )
 
-    await channel._on_response(
+    await _provider_delivery(channel)(
         OutboundMessage(
             channel="mobile",
             chat_id=session_id.removeprefix("mobile:"),
@@ -2987,7 +2997,7 @@ async def test_stream_deltas_batch_within_one_frame_window_and_flush_before_tool
             thinking_delta="继续思考",
         )
     )
-    await channel._on_response(
+    await _provider_delivery(channel)(
         OutboundMessage(
             channel="mobile",
             chat_id=session_id.removeprefix("mobile:"),
@@ -3249,7 +3259,7 @@ async def test_dual_field_delta_accepts_thinking_and_answer_without_short_circui
         ]
 
         # 3. 终态：残留批 flush → terminal，正文严格 已接受 delta → message.final。
-        await channel._on_response(
+        await _provider_delivery(channel)(
             OutboundMessage(
                 channel="mobile",
                 chat_id=session_id.removeprefix("mobile:"),
@@ -3338,7 +3348,7 @@ async def test_terminal_and_reconcile_flush_pending_delta_before_terminal_event(
     assert (session_id, turn_id) in channel._delta_batches
 
     # 2. terminal：残留批必须先于 message.final 发布，随后批与定时器都被清理。
-    await channel._on_response(
+    await _provider_delivery(channel)(
         OutboundMessage(
             channel="mobile",
             chat_id=session_id.removeprefix("mobile:"),
@@ -3483,7 +3493,7 @@ async def test_terminal_barrier_flushes_accepted_deltas_then_terminal_and_drops_
     #    message.final；闸门卡住 terminal 发布，让 barrier 临界区真实持锁。
     with caplog.at_level(logging.INFO, logger="infra.mobile_realtime.channel"):
         final_task = asyncio.create_task(
-            channel._on_response(
+            _provider_delivery(channel)(
                 OutboundMessage(
                     channel="mobile",
                     chat_id=session_id.removeprefix("mobile:"),
@@ -3984,7 +3994,7 @@ async def test_post_terminal_flush_duplicate_and_late_events_never_rebuild(
         tmp_path
     )
     key = (session_id, turn_id)
-    await channel._on_response(
+    await _provider_delivery(channel)(
         OutboundMessage(
             channel="mobile",
             chat_id=session_id.removeprefix("mobile:"),
@@ -4099,7 +4109,7 @@ async def test_racing_delta_dropped_so_final_suffix_covers_full_body(
     lock = channel._delta_locks[key]
     await lock.acquire()
     final_task = asyncio.create_task(
-        channel._on_response(
+        _provider_delivery(channel)(
             OutboundMessage(
                 channel="mobile",
                 chat_id=session_id.removeprefix("mobile:"),
@@ -4219,7 +4229,7 @@ async def test_late_a_final_keeps_b_active_and_identity(
     # 1. 迟到的 A final 通过 execution attempt 归属 A；逻辑 Turn 独立投影。
     logical_turn_a = "turn:logical-A"
     with caplog.at_level(logging.INFO, logger="infra.mobile_realtime.channel"):
-        await channel._on_response(
+        await _provider_delivery(channel)(
             OutboundMessage(
                 channel="mobile",
                 chat_id=session_id.removeprefix("mobile:"),
@@ -4392,7 +4402,7 @@ async def test_final_projects_only_explicit_mobile_metadata(tmp_path: Path) -> N
     channel = MobileRealtimeChannel(cast(MobileGatewayRuntime, runtime))
     session_id = f"mobile:{uuid4()}"
 
-    await channel._on_response(
+    await _provider_delivery(channel)(
         OutboundMessage(
             channel="mobile",
             chat_id=session_id.removeprefix("mobile:"),
@@ -4427,7 +4437,7 @@ async def test_nonstreamed_large_unicode_answer_uses_bounded_deltas(
     session_id = f"mobile:{uuid4()}"
     content = ("长回复🙂\n" * 150_000)[:1_000_000]
 
-    await channel._on_response(
+    await _provider_delivery(channel)(
         OutboundMessage(
             channel="mobile",
             chat_id=session_id.removeprefix("mobile:"),
@@ -4480,7 +4490,7 @@ async def test_final_emits_only_missing_streamed_answer_suffix(tmp_path: Path) -
         )
     )
 
-    await channel._on_response(
+    await _provider_delivery(channel)(
         OutboundMessage(
             channel="mobile",
             chat_id=session_id.removeprefix("mobile:"),
@@ -4527,7 +4537,7 @@ async def test_divergent_stream_keeps_final_correction_inline(tmp_path: Path) ->
         )
     )
 
-    await channel._on_response(
+    await _provider_delivery(channel)(
         OutboundMessage(
             channel="mobile",
             chat_id=session_id.removeprefix("mobile:"),
@@ -4568,7 +4578,7 @@ async def test_proactive_sender_uses_mobile_event_path(tmp_path: Path) -> None:
         session_id=f"mobile:{chat_id}",
         created_at=datetime.now(timezone.utc),
     )
-    deliver = cast(Any, push.registered["mobile"]["deliver"])
+    deliver = cast(Any, _provider_delivery(channel))
 
     receipt = await deliver(
         ChannelMessage(
@@ -4613,7 +4623,7 @@ async def test_proactive_metadata_sender_forwards_delivery_id(tmp_path: Path) ->
         )
     )
     chat_id = str(uuid4())
-    deliver = cast(Any, push.registered["mobile"]["deliver"])
+    deliver = cast(Any, _provider_delivery(channel))
 
     receipt = await deliver(
         ChannelMessage(
@@ -4665,7 +4675,7 @@ async def test_proactive_attachment_commits_one_replayable_logical_message(
     source = tmp_path / "photo.png"
     source.write_bytes(b"png-payload")
     chat_id = str(uuid4())
-    deliver = cast(Any, push.registered["mobile"]["deliver"])
+    deliver = cast(Any, _provider_delivery(channel))
 
     receipt = await deliver(
         ChannelMessage(
@@ -4865,7 +4875,7 @@ async def test_terminal_and_stop_clear_send_and_turn_maps(tmp_path: Path) -> Non
 
     # 1. terminal（message.final）只清理 A 的 send/turn maps，
     #    同 session 排队中的 cmid-B 与其他会话条目必须保留。
-    await channel._on_response(
+    await _provider_delivery(channel)(
         OutboundMessage(
             channel="mobile",
             chat_id=session_id.removeprefix("mobile:"),
@@ -4986,7 +4996,7 @@ async def test_terminal_final_publish_fail_once_is_retryable_without_fake_succes
 
     # 1. 第一次：publish 在持久化前抛 OSError——原样上抛、无墓碑、无 cleanup。
     with pytest.raises(OSError):
-        await channel._on_response(outbound)
+        await _provider_delivery(channel)(outbound)
     assert runtime.terminal_attempts == 1
     assert key not in channel._turn_terminals
     assert channel._process_turns[key].client_message_id == "cmid-fail"
@@ -5004,7 +5014,7 @@ async def test_terminal_final_publish_fail_once_is_retryable_without_fake_succes
 
     # 2. 第二次：同 OutboundMessage 重试只补缺失 suffix（已 flush 则不再发），
     #    publish 调用数 2，wire 严格 已接受 delta → message.final，final 恰一。
-    await channel._on_response(outbound)
+    await _provider_delivery(channel)(outbound)
     assert runtime.terminal_attempts == 2
     events = runtime.events
     assert [event["event_type"] for event in events] == [
@@ -5102,7 +5112,7 @@ async def test_terminal_failure_after_batch_flush_retry_does_not_duplicate_delta
     # 1. 第一次：残留批先 flush（"二" 发布），suffix "终" 入批 flush，然后
     #    message.final 持久化前失败。
     with pytest.raises(OSError):
-        await channel._on_response(outbound)
+        await _provider_delivery(channel)(outbound)
     assert [event["event_type"] for event in runtime.events] == [
         "turn.started",
         "answer.delta",
@@ -5119,7 +5129,7 @@ async def test_terminal_failure_after_batch_flush_retry_does_not_duplicate_delta
     )
 
     # 2. 第二次：同一 OutboundMessage 不重复任何已 flush delta，只发布 terminal。
-    await channel._on_response(outbound)
+    await _provider_delivery(channel)(outbound)
     assert runtime.terminal_attempts == 2
     events = runtime.events
     assert [event["event_type"] for event in events] == [
@@ -5204,7 +5214,7 @@ async def test_late_delta_queued_during_terminal_failure_gap_accepted_then_retry
 
     # 1. 第一次 final 持久化前挂起（持锁）；late delta 排队等待同一把锁——
     #    真实 Event/锁编排：不等待锁、不因墓碑直接 drop。
-    final_task = asyncio.create_task(channel._on_response(outbound))
+    final_task = asyncio.create_task(_provider_delivery(channel)(outbound))
     await asyncio.wait_for(runtime.terminal_started.wait(), timeout=5)
     assert key not in channel._turn_terminals
     late_task = asyncio.create_task(
@@ -5232,7 +5242,7 @@ async def test_late_delta_queued_during_terminal_failure_gap_accepted_then_retry
     assert state.final_suffix_emitted == "晚🙂"
 
     # 3. retry：同一 OutboundMessage 真实再次 publish，final 正文完整、恰一次。
-    await channel._on_response(outbound)
+    await _provider_delivery(channel)(outbound)
     assert runtime.terminal_attempts == 2
     finals = [
         event for event in runtime.events if event["event_type"] == "message.final"

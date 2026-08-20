@@ -355,6 +355,12 @@ class AppRuntime:
                 self.conversation_runtime,
                 self.agent_loop,
                 attachment_store=channel_attachment_store,
+                channel_dispatcher=(
+                    lambda message, passive: self.push_tool.dispatch(
+                        message,
+                        commit_role="passive" if passive else "",
+                    )
+                ),
             )
 
             # 1. v3 control 始终通过 exact Channel binding 中断并回送收据。
@@ -383,25 +389,6 @@ class AppRuntime:
             manager.channel_generation_host.bind_control_response_dispatcher(
                 dispatch_v3_control_response
             )
-            if self.restart_coordinator is not None:
-                coordinator = self.restart_coordinator
-
-                async def observe_delivery(
-                    message: Any,
-                    delivered: bool,
-                ) -> None:
-                    turn_id = str(message.control_turn_id or "")
-                    if not turn_id:
-                        return
-                    if delivered:
-                        coordinator.mark_delivered(turn_id)
-                    else:
-                        coordinator.mark_delivery_failed(
-                            turn_id,
-                            "channel callback did not deliver original response",
-                        )
-
-                self.bus.bind_outbound_delivery_observer(observe_delivery)
             if self.config.app_server.enabled:
                 assert app_server_endpoint is not None
                 self.app_server = SocketAppServer(
@@ -488,7 +475,6 @@ class AppRuntime:
                     else None
                 ),
                 interrupt_controller=self.conversation_runtime,
-                legacy_outbound_enabled=plugin_manager is None,
                 extra_channels=extra_channels,
             )
             await self.channel_host.start_all()
