@@ -16,12 +16,17 @@ from agent.plugin_composition.channels import (
     ChannelRuntimePorts,
     ChannelFactoryContext,
     DeliveryStatus as V3DeliveryStatus,
+    InboundOwner,
     ProviderDeliveryRequest,
     RawInbound,
 )
+from agent.plugins.manager import PluginManager
 from bus.events import AttachmentKind, ChannelAttachment, ChannelMessage
+from bus.event_bus import EventBus
+from bus.queue import MessageBus
 from infra.channels.base import AttachmentStore
 from infra.channels.web_chat_channel import UploadTooLargeError, WebChatChannel
+from bootstrap.core_channel_adapter import build_core_channel_definition
 from session.manager import Session, SessionManager
 
 
@@ -1177,3 +1182,106 @@ async def test_web_v3_old_inflight_callback_cannot_enter_new_binding(
     assert [item.message.content for item in old_ingress.messages] == ["旧消息"]
     assert new_ingress.messages == []
     await new.stop()
+
+
+@pytest.mark.asyncio
+async def test_web_v3_ingress_persists_unprefixed_identity_for_exact_session(
+    tmp_path: Path,
+) -> None:
+    """A Web identity and its envelope must name the same durable session."""
+
+    session_manager = SessionManager(tmp_path / "workspace")
+    manager = PluginManager(
+        plugin_dirs=[tmp_path / "plugins"],
+        event_bus=EventBus(),
+        workspace=tmp_path / "workspace",
+        session_manager=session_manager,
+        installed_cache_root=tmp_path / "cache",
+    )
+    bus = MessageBus()
+    channel = WebChatChannel()
+    await channel.start(cast(Any, SimpleNamespace(
+        bus=bus,
+        session_manager=session_manager,
+        event_bus=EventBus(),
+        push_tool=_PushTool(),
+        attachment_store=AttachmentStore(tmp_path / "uploads"),
+        interrupt_controller=None,
+    )))
+    manager.channel_generation_host.bind_inbound_publisher(bus.publish_channel_inbound)
+    await manager.bind_core_channel_definitions(
+        (build_core_channel_definition(channel),)
+    )
+    try:
+        socket = _WebSocket()
+        session_key = await channel._create_session(cast(Any, socket), "create-1")
+        await channel._send_user_message(
+            cast(Any, socket),
+            "request-1",
+            {"session_id": session_key, "text": "hello", "media": []},
+        )
+        envelope = await bus.consume_inbound()
+        assert envelope is not None
+        chat_id = session_key.removeprefix("web:")
+        assert envelope.session_key == session_key
+        assert envelope.message.chat_id == chat_id
+        assert session_manager.get_channel_identities("web") == {chat_id: chat_id}
+        _, admission_id = session_manager.admit_existing(session_key)
+        session_manager.release_admission(admission_id)
+        await bus.release_channel_inbound(envelope, InboundOwner.LANE)
+    finally:
+        await manager.terminate_all()
+        await bus.aclose()
+        session_manager.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("request_id", "session_id", "expected_request_id", "expected_error"),
+    [
+        ("x" * 257, "web:abc", "", "request_id 格式无效"),
+        ("bad\x01id", "web:abc", "", "request_id 格式无效"),
+        ("safe", f"web:{'x' * 253}", "safe", "session_id 格式无效"),
+        ("safe", "web:bad\x01id", "safe", "session_id 格式无效"),
+    ],
+)
+async def test_web_rejects_invalid_external_ids_before_ingress_or_session_write(
+    tmp_path: Path,
+    request_id: str,
+    session_id: str,
+    expected_request_id: str,
+    expected_error: str,
+) -> None:
+    session_manager = SessionManager(tmp_path / "workspace")
+    ingress = _Inbound()
+    channel = WebChatChannel()
+    await channel.start(cast(Any, SimpleNamespace(
+        bus=_Bus(),
+        session_manager=session_manager,
+        event_bus=_EventBus(),
+        push_tool=_PushTool(),
+        attachment_store=AttachmentStore(tmp_path / "uploads"),
+        interrupt_controller=None,
+    )))
+    adapter = await _open_inbound_adapter(channel, ingress)
+    socket = _WebSocket()
+    try:
+        await channel._handle_client_frame(cast(Any, socket), {
+            "type": "message.send",
+            "request_id": request_id,
+            "session_id": session_id,
+            "text": "hello",
+            "media": [],
+        })
+        assert socket.frames == [{
+            "type": "error",
+            "request_id": expected_request_id,
+            "message": expected_error,
+        }]
+        assert ingress.messages == []
+        assert session_manager.get_channel_identities("web") == {}
+        with pytest.raises(KeyError, match="session 不存在"):
+            session_manager.admit_existing("web:abc")
+    finally:
+        await adapter.stop()
+        session_manager.close()

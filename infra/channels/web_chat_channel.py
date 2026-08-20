@@ -49,6 +49,7 @@ from infra.channels.reply_context import build_reply_inbound_text
 logger = logging.getLogger(__name__)
 
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
+MAX_WEB_INBOUND_ID_LENGTH = 256
 
 
 class UploadTooLargeError(ValueError):
@@ -699,7 +700,11 @@ class WebChatChannel:
         payload: dict[str, Any],
     ) -> str:
         frame_type = str(payload.get("type") or "")
-        request_id = str(payload.get("request_id") or "")
+        try:
+            request_id = _normalize_web_request_id(payload.get("request_id"))
+        except ValueError as error:
+            await self._send_error(websocket, "", str(error))
+            return ""
         if frame_type == "session.create":
             return await self._create_session(websocket, request_id)
         if frame_type == "message.send":
@@ -744,7 +749,11 @@ class WebChatChannel:
         """验证并构造 Web exact inbound，再在首个 await 前捕获 binding。"""
 
         ctx = self._require_ctx()
-        session_key = self._normalize_session_id(payload.get("session_id"))
+        try:
+            session_key = self._normalize_session_id(payload.get("session_id"))
+        except ValueError as error:
+            await self._send_error(websocket, request_id, str(error))
+            return ""
         if not session_key:
             session_key = self._session_key(uuid4().hex)
         if "text" not in payload:
@@ -843,9 +852,9 @@ class WebChatChannel:
             )
         chat_id = self._chat_id(session_key)
         raw = RawInbound(
-            message_id=request_id.strip() or uuid4().hex,
-            provider_identity=session_key,
-            recipient=session_key,
+            message_id=request_id or uuid4().hex,
+            provider_identity=chat_id,
+            recipient=chat_id,
             message=ChannelInboundMessage(
                 channel=self.name,
                 sender="web",
@@ -876,7 +885,11 @@ class WebChatChannel:
         payload: dict[str, Any],
     ) -> str:
         ctx = self._require_ctx()
-        session_key = self._normalize_session_id(payload.get("session_id"))
+        try:
+            session_key = self._normalize_session_id(payload.get("session_id"))
+        except ValueError as error:
+            await self._send_error(websocket, request_id, str(error))
+            return ""
         if not session_key:
             await self._send_error(websocket, request_id, "session_id 缺失或无效")
             return ""
@@ -1018,12 +1031,22 @@ class WebChatChannel:
         })
 
     def _normalize_session_id(self, value: object) -> str:
-        text = str(value or "").strip()
-        if not text.startswith(f"{self.name}:"):
+        if value is None or value == "":
             return ""
+        if not isinstance(value, str):
+            raise ValueError("session_id 必须是字符串")
+        text = value
+        if (
+            len(text) > MAX_WEB_INBOUND_ID_LENGTH
+            or text != text.strip()
+            or any(ord(char) < 32 for char in text)
+        ):
+            raise ValueError("session_id 格式无效")
+        if not text.startswith(f"{self.name}:"):
+            raise ValueError("session_id 必须属于当前 Web channel")
         chat_id = text[len(self.name) + 1:]
         if not chat_id:
-            return ""
+            raise ValueError("session_id 缺少 chat id")
         return text
 
     def _session_key(self, chat_id: str) -> str:
@@ -1064,6 +1087,22 @@ def _normalize_v3_content(value: str) -> str:
         "\u2028" if ord(char) in {10, 13} else " " if ord(char) < 32 else char
         for char in value
     )
+
+
+def _normalize_web_request_id(value: object) -> str:
+    """验证客户端 request_id，空值由 exact ingress 分配不可伪造的 id。"""
+
+    if value is None or value == "":
+        return ""
+    if not isinstance(value, str):
+        raise ValueError("request_id 必须是字符串")
+    if (
+        len(value) > MAX_WEB_INBOUND_ID_LENGTH
+        or value != value.strip()
+        or any(ord(char) < 32 for char in value)
+    ):
+        raise ValueError("request_id 格式无效")
+    return value
 
 
 def build_web_channel_definition(channel: WebChatChannel) -> Any:
