@@ -742,6 +742,17 @@ def _wait_for_listener(port: int) -> None:
             time.sleep(0.02)
 
 
+def _wait_for_pid_file(path: Path, deadline: float) -> int:
+    """Wait until a child publishes one complete, parseable PID."""
+
+    while time.monotonic() < deadline:
+        try:
+            return int(path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, ValueError):
+            time.sleep(0.01)
+    raise AssertionError(f"PID 文件未完整发布: {path}")
+
+
 @pytest.mark.skipif(
     not sys.platform.startswith("linux"), reason="依赖 Linux subreaper 与 /proc"
 )
@@ -807,14 +818,8 @@ def test_boot_guardian_reaps_adopted_zombie_while_gateway_runs(
     try:
         # 2. Gateway 仍存活时，adopted child 必须已经从 /proc 消失。
         deadline = time.monotonic() + 3
-        while time.monotonic() < deadline and (
-            not zombie_pid_path.exists() or not gateway_pid_path.exists()
-        ):
-            time.sleep(0.01)
-        assert zombie_pid_path.exists()
-        assert gateway_pid_path.exists()
-        zombie_pid = int(zombie_pid_path.read_text(encoding="utf-8"))
-        gateway_pid = int(gateway_pid_path.read_text(encoding="utf-8"))
+        zombie_pid = _wait_for_pid_file(zombie_pid_path, deadline)
+        gateway_pid = _wait_for_pid_file(gateway_pid_path, deadline)
         while time.monotonic() < deadline and Path(f"/proc/{zombie_pid}").exists():
             time.sleep(0.01)
         assert supervisor_module._pid_exists(gateway_pid)

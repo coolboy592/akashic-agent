@@ -488,6 +488,7 @@ async def test_serve_smoke_loads_config_and_runs_shutdown(monkeypatch, tmp_path)
             "PassiveMessageWorker",
             lambda *args, **kwargs: types.SimpleNamespace(run=_agent_loop_run),
         )
+        monkeypatch.setattr(bus, "dispatch_outbound", _agent_loop_run)
         scheduler.run = _scheduler_run  # type: ignore[assignment]
         observed["scheduler"] = scheduler
         observed["bus"] = bus
