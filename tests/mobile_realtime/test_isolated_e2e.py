@@ -15,7 +15,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from fastapi.testclient import TestClient
 
 from agent.config_models import MobileKeyEncryptionConfig, MobileRealtimeConfig
-from bus.events import InboundMessage, OutboundMessage
+from bus.events import InboundMessage, OutboundMessage, channel_message_from_outbound
 from bus.events_lifecycle import TurnStarted
 from infra.channels.base import AttachmentStore
 from infra.mobile_realtime.attachments import decode_attachment_chunk
@@ -53,8 +53,7 @@ class _EventBus:
 
 
 class _PushTool:
-    def register_channel(self, channel: str, **senders: object) -> None:
-        assert channel == "mobile"
+    pass
 
 
 class _DeterministicAgentBus:
@@ -68,9 +67,6 @@ class _DeterministicAgentBus:
 
     def bind(self, runtime: MobileGatewayRuntime) -> None:
         self._runtime = runtime
-
-    def subscribe_outbound(self, channel: str, callback: object) -> None:
-        assert channel == "mobile"
 
     async def publish_inbound(self, message: object) -> None:
         """按真实持久化顺序生成 turn.started 与 message.final。"""
@@ -106,16 +102,20 @@ class _DeterministicAgentBus:
                 turn_id=turn_id,
             )
         )
-        await runtime.channel._on_response(
-            OutboundMessage(
-                channel="mobile",
-                chat_id=inbound.chat_id,
-                content="隔离网关固定回复",
-                media=[str(self._reply_media)],
-                control_turn_id=turn_id,
-                session_message_id=assistant_message_id,
+        receipt = await runtime.channel._deliver_message(
+            channel_message_from_outbound(
+                OutboundMessage(
+                    channel="mobile",
+                    chat_id=inbound.chat_id,
+                    content="隔离网关固定回复",
+                    media=[str(self._reply_media)],
+                    control_turn_id=turn_id,
+                    session_message_id=assistant_message_id,
+                    metadata={"_channel_commit_role": "passive"},
+                )
             )
         )
+        assert receipt.succeeded
 
     def _require_runtime(self) -> MobileGatewayRuntime:
         if self._runtime is None:

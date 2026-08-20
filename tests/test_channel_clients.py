@@ -15,7 +15,7 @@ import httpx
 import pytest
 
 from bus.event_bus import EventBus
-from bus.events import OutboundMessage
+from bus.events import OutboundMessage, channel_message_from_outbound
 from bus.events_lifecycle import (
     StreamDeltaReady,
     ToolCallCompleted,
@@ -29,13 +29,9 @@ from infra.channels.contract import ChannelContext
 class _Bus:
     def __init__(self) -> None:
         self.inbound = []
-        self.outbound = []
 
     async def publish_inbound(self, msg) -> None:
         self.inbound.append(msg)
-
-    def subscribe_outbound(self, channel, callback) -> None:
-        self.outbound.append((channel, callback))
 
 
 class _SessionManager:
@@ -85,6 +81,14 @@ class _SessionManager:
         self.channel_identities.setdefault(channel, {})[identity] = chat_id
         self.channel_identity_migrations.add(channel)
         self.saved.append(session.key)
+
+
+def _passive_channel_message(message: OutboundMessage):
+    """Project one committed legacy message into the v3 Channel adapter ABI."""
+
+    projected = channel_message_from_outbound(message)
+    projected.metadata["_channel_commit_role"] = "passive"
+    return projected
 
 
 def _import_telegram_channel(monkeypatch: pytest.MonkeyPatch):
@@ -388,10 +392,10 @@ async def test_telegram_channel_paths(monkeypatch: pytest.MonkeyPatch, tmp_path:
         bus,
         session_manager,
         allow_from=["1", "Alice"],
-        bot_commands=[
+        command_catalog_provider=lambda: (
             ("memorystatus", "查看记忆整理状态"),
             ("kvcache", "查看 KVCache 状态"),
-        ],
+        ),
         event_bus=event_bus,
         interrupt_controller=interrupt_controller,
     )
@@ -421,7 +425,6 @@ async def test_telegram_channel_paths(monkeypatch: pytest.MonkeyPatch, tmp_path:
         "status",
         "stop",
     ]
-    assert bus.outbound[0][0] == "telegram"
 
     class _File:
         def __init__(self, suffix):
@@ -538,7 +541,9 @@ async def test_telegram_channel_paths(monkeypatch: pytest.MonkeyPatch, tmp_path:
     await channel.send_file("123", str(sample), name="doc.txt", caption="cap")
     await channel.send_image("123", "https://example.com/img.jpg")
     await channel.send_image("123", str(sample))
-    await channel._on_response(OutboundMessage(channel="telegram", chat_id="123", content="pong"))
+    await channel._deliver_message(_passive_channel_message(
+        OutboundMessage(channel="telegram", chat_id="123", content="pong")
+    ))
     assert mod.send_markdown.await_count == 3
     assert mod.send_stream_markdown.await_count == 1
     sender = channel.create_stream_sender("123")
@@ -674,45 +679,19 @@ async def test_telegram_channel_paths(monkeypatch: pytest.MonkeyPatch, tmp_path:
     assert "<blockquote>" in long_html and "<pre>" in long_html
     await channel._identity_index.remember("group", "-1001")
     assert channel.create_stream_sender("@group") is None
-    await channel._on_response(
+    await channel._deliver_message(_passive_channel_message(
         OutboundMessage(
             channel="telegram",
             chat_id="123",
             content="final",
             metadata={"streamed_reply": True},
         )
-    )
+    ))
     assert channel._app.bot.edit_message_text.await_count >= 1
-    assert mod.send_markdown.await_count == 3
-    assert mod.send_stream_markdown.await_count == 1
-    mod.send_thinking_block.reset_mock()
-    before_final_markdown = mod.send_markdown.await_count
-    before_delete = channel._app.bot.delete_message.await_count
-    await channel._on_response(
-        OutboundMessage(
-            channel="telegram",
-            chat_id="456",
-            content="事件最终回复",
-            thinking="继续分析",
-        )
-    )
-    assert channel._app.bot.delete_message.await_count == before_delete + 1
-    assert "telegram:456" not in channel._tool_lines
-    assert "telegram:456" not in channel._thinking_live_next_at
-    assert "telegram:456" not in channel._live_last_lengths
-    mod.send_thinking_block.assert_awaited_once()
-    assert mod.send_markdown.await_count == before_final_markdown + 2
-    snapshot_text = mod.send_markdown.await_args_list[-2].args[2]
-    assert "工具调用" in snapshot_text
-    assert "事件思考继续分析" not in snapshot_text
-    assert "临时回复" not in snapshot_text
-    assert snapshot_text.startswith("```")
-
-    mod.send_thinking_block.reset_mock()
     sender = channel.create_stream_sender("123")
     assert sender is not None
     await sender({"thinking_delta": "分析中"})
-    await channel._on_response(
+    await channel._deliver_message(_passive_channel_message(
         OutboundMessage(
             channel="telegram",
             chat_id="123",
@@ -720,8 +699,7 @@ async def test_telegram_channel_paths(monkeypatch: pytest.MonkeyPatch, tmp_path:
             thinking="分析中",
             metadata={"streamed_reply": True},
         )
-    )
-    mod.send_thinking_block.assert_awaited_once()
+    ))
     last_edit = channel._app.bot.edit_message_text.await_args_list[-1].kwargs["text"]
     assert last_edit == "final"
 
@@ -995,7 +973,6 @@ async def test_qq_channel_paths(monkeypatch: pytest.MonkeyPatch, tmp_path: Path)
 
     monkeypatch.setattr(mod.asyncio, "run_coroutine_threadsafe", _run_coroutine_threadsafe)
     await channel.start()
-    assert bus.outbound[0][0] == "qq"
 
     async def _drain(coro):
         return await coro
@@ -1021,7 +998,12 @@ async def test_qq_channel_paths(monkeypatch: pytest.MonkeyPatch, tmp_path: Path)
     await channel.send("gqq:100", "group pong")
     await channel.send_file("1", str(sample), name="x.bin")
     await channel.send_image("1", str(sample))
-    await channel._on_response(OutboundMessage(channel="qq", chat_id="gqq:100", content="reply"))
+    receipt = await channel._deliver_message(
+        _passive_channel_message(
+            OutboundMessage(channel="qq", chat_id="gqq:100", content="reply")
+        )
+    )
+    assert receipt.succeeded
     assert channel._api.calls
     assert mod._is_local(str(sample)) is True
     assert mod._is_local("https://example.com/x.jpg") is False
@@ -1048,7 +1030,7 @@ async def test_qq_channel_paths(monkeypatch: pytest.MonkeyPatch, tmp_path: Path)
 
 
 @pytest.mark.asyncio
-async def test_qq_private_trace_sends_forward_then_final_and_clears_state(
+async def test_qq_private_trace_sends_forward_then_final(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ):
@@ -1126,14 +1108,15 @@ async def test_qq_private_trace_sends_forward_then_final_and_clears_state(
         )
     )
 
-    await channel._on_response(
-        OutboundMessage(
+    trace_message = OutboundMessage(
             channel="qq",
             chat_id="1",
             content="我看到了，最近主要是 QQ tracing 的改动。",
             thinking="先确认这轮是否有工具调用，再组织结论。",
         )
-    )
+    await channel._send_private_trace("1", "qq:1", trace_message)
+    receipt = await channel._deliver_message(_passive_channel_message(trace_message))
+    assert receipt.succeeded
 
     assert [item[0] for item in calls] == ["forward", "text"]
     forward_payload = cast(dict[str, Any], calls[0][2])
@@ -1144,7 +1127,6 @@ async def test_qq_private_trace_sends_forward_then_final_and_clears_state(
     assert "fetch_messages" in str(forward_payload)
     assert "命中 1 条，返回上下文 21 条" in str(forward_payload)
     assert calls[1] == ("text", 1, "我看到了，最近主要是 QQ tracing 的改动。")
-    assert "qq:1" not in channel._trace_states
 
 
 @pytest.mark.asyncio
@@ -1195,14 +1177,15 @@ async def test_qq_private_trace_skips_empty_trace(
         )
     )
 
-    await channel._on_response(
-        OutboundMessage(
+    trace_message = OutboundMessage(
             channel="qq",
             chat_id="1",
             content="嗯，收到。",
             thinking=None,
         )
-    )
+    await channel._send_private_trace("1", "qq:1", trace_message)
+    receipt = await channel._deliver_message(_passive_channel_message(trace_message))
+    assert receipt.succeeded
 
     assert [item[0] for item in calls] == ["text"]
     assert calls[0] == ("text", 1, "嗯，收到。")

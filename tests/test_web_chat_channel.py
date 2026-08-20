@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketState
 
 from bootstrap.chat_api import create_chat_app
-from bus.events import OutboundMessage
+from bus.events import AttachmentKind, ChannelAttachment, ChannelMessage
 from infra.channels.base import AttachmentStore
 from infra.channels.web_chat_channel import UploadTooLargeError, WebChatChannel
 from session.manager import Session
@@ -19,13 +19,9 @@ from session.manager import Session
 class _Bus:
     def __init__(self) -> None:
         self.inbound: list[Any] = []
-        self.subscribers: dict[str, Any] = {}
 
     async def publish_inbound(self, msg: Any) -> None:
         self.inbound.append(msg)
-
-    def subscribe_outbound(self, channel: str, callback: Any) -> None:
-        self.subscribers[channel] = callback
 
 
 class _EventBus:
@@ -37,11 +33,7 @@ class _EventBus:
 
 
 class _PushTool:
-    def __init__(self) -> None:
-        self.registered: dict[str, Any] = {}
-
-    def register_channel(self, channel: str, **senders: Any) -> None:
-        self.registered[channel] = senders
+    pass
 
 
 class _WebSocket:
@@ -703,16 +695,21 @@ async def test_web_final_preserves_full_outbound_projection(tmp_path: Path) -> N
     image = tmp_path / "result.png"
     image.write_bytes(b"image")
 
-    await channel._on_response(
-        OutboundMessage(
+    receipt = await channel._deliver_message(
+        ChannelMessage(
             channel="web",
             chat_id="abc",
             content="answer",
             thinking="reasoning",
-            media=[str(image)],
-            metadata={"render": "card", "turn_duration_ms": 17},
+            attachments=(ChannelAttachment(AttachmentKind.IMAGE, str(image)),),
+            metadata={
+                "render": "card",
+                "turn_duration_ms": 17,
+                "_channel_commit_role": "passive",
+            },
         )
     )
+    assert receipt.succeeded
 
     assert socket.frames == [
         {

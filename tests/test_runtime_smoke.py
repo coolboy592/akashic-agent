@@ -8,8 +8,6 @@ from typing import cast, Any
 
 import pytest
 
-from bus.events import ChannelMessage, DeliveryReceipt, DeliveryStatus
-
 import main
 from bootstrap import app as bootstrap_app
 from bootstrap import init_workspace as workspace_init
@@ -481,9 +479,6 @@ async def test_serve_smoke_loads_config_and_runs_shutdown(monkeypatch, tmp_path)
         async def _agent_loop_run():
             return None
 
-        async def _bus_dispatch_outbound():
-            return None
-
         async def _scheduler_run():
             return None
 
@@ -493,7 +488,6 @@ async def test_serve_smoke_loads_config_and_runs_shutdown(monkeypatch, tmp_path)
             "PassiveMessageWorker",
             lambda *args, **kwargs: types.SimpleNamespace(run=_agent_loop_run),
         )
-        bus.dispatch_outbound = _bus_dispatch_outbound  # type: ignore[assignment]
         scheduler.run = _scheduler_run  # type: ignore[assignment]
         observed["scheduler"] = scheduler
         observed["bus"] = bus
@@ -973,7 +967,6 @@ async def test_start_channels_wires_telegram_qq_and_extra_channel(
     tmp_path: Path,
 ) -> None:
     starts: list[str] = []
-    registrations: list[tuple[str, list[str]]] = []
     attachment_roots: list[Path] = []
     mobile_catalogs: list[list[tuple[str, str]]] = []
     fake_telegram = types.ModuleType("infra.channels.telegram_channel")
@@ -986,13 +979,6 @@ async def test_start_channels_wires_telegram_qq_and_extra_channel(
 
         async def start(self, ctx: Any) -> None:
             starts.append("telegram")
-            ctx.push_tool.register_channel(
-                self.name,
-                deliver=self.deliver,
-            )
-
-        async def deliver(self, _message: ChannelMessage) -> DeliveryReceipt:
-            return DeliveryReceipt(DeliveryStatus.SUCCESS)
 
         async def stop(self) -> None:
             starts.append("telegram.stop")
@@ -1017,13 +1003,6 @@ async def test_start_channels_wires_telegram_qq_and_extra_channel(
 
         async def start(self, ctx: Any) -> None:
             starts.append("qq")
-            ctx.push_tool.register_channel(
-                self.name,
-                deliver=self.deliver,
-            )
-
-        async def deliver(self, _message: ChannelMessage) -> DeliveryReceipt:
-            return DeliveryReceipt(DeliveryStatus.SUCCESS)
 
         async def stop(self) -> None:
             starts.append("qq.stop")
@@ -1045,10 +1024,6 @@ async def test_start_channels_wires_telegram_qq_and_extra_channel(
             attachment_roots.append(ctx.attachment_store.root)
             provider = ctx.command_catalog_provider
             mobile_catalogs.append([] if provider is None else list(provider()))
-            ctx.push_tool.register_channel(self.name, deliver=self.deliver)
-
-        async def deliver(self, _message: ChannelMessage) -> DeliveryReceipt:
-            return DeliveryReceipt(DeliveryStatus.SUCCESS)
 
         async def stop(self) -> None:
             starts.append("plugin.stop")
@@ -1062,8 +1037,7 @@ async def test_start_channels_wires_telegram_qq_and_extra_channel(
     monkeypatch.setitem(sys.modules, "infra.channels.qq_channel", fake_qq)
 
     class _PushTool:
-        def register_channel(self, name: str, **kwargs: object) -> None:
-            registrations.append((name, sorted(kwargs)))
+        pass
 
     config = Config(
         provider="openai",
@@ -1101,11 +1075,6 @@ async def test_start_channels_wires_telegram_qq_and_extra_channel(
 
         telegram, qq, plugin = host.channels
         assert starts == ["telegram", "qq", "plugin"]
-        assert registrations == [
-            ("telegram", ["deliver"]),
-            ("qq", ["deliver"]),
-            ("plugin", ["deliver"]),
-        ]
         assert telegram.kwargs["event_bus"] is event_bus
         assert telegram.kwargs["interrupt_controller"] is controller
         assert telegram.kwargs["command_catalog_provider"]() == (

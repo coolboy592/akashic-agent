@@ -25,7 +25,7 @@ from starlette.websockets import WebSocketDisconnect
 
 from agent.config_models import MobileKeyEncryptionConfig, MobileRealtimeConfig
 from agent.plugins.mobile_ui import MobileUiRpcExecutionError
-from bus.events import OutboundMessage
+from bus.events import OutboundMessage, channel_message_from_outbound
 from bus.events_lifecycle import (
     StreamDeltaReady,
     ToolCallCompleted,
@@ -33,6 +33,7 @@ from bus.events_lifecycle import (
     TurnStarted,
 )
 from infra.channels.base import AttachmentStore
+from infra.channels.artifacts import ChannelAttachmentArtifactStore
 from infra.mobile_realtime.attachments import (
     AttachmentChunk,
     AttachmentTransferService,
@@ -1199,9 +1200,6 @@ def test_authenticated_message_send_reaches_agent_event_path_once(
         def __init__(self) -> None:
             self.inbound: list[object] = []
 
-        def subscribe_outbound(self, channel: str, callback: object) -> None:
-            assert channel == "mobile"
-
         async def publish_inbound(self, message: object) -> None:
             from bus.events import InboundMessage
 
@@ -1263,23 +1261,26 @@ def test_authenticated_message_send_reaches_agent_event_path_once(
                     thinking_delta="工具后继续",
                 )
             )
-            await runtime.channel._on_response(
-                OutboundMessage(
-                    channel="mobile",
-                    chat_id=message.chat_id,
-                    content="完成",
-                    thinking="先检查",
-                    control_turn_id=turn_id,
+            receipt = await runtime.channel._deliver_message(
+                channel_message_from_outbound(
+                    OutboundMessage(
+                        channel="mobile",
+                        chat_id=message.chat_id,
+                        content="完成",
+                        thinking="先检查",
+                        control_turn_id=turn_id,
+                        metadata={"_channel_commit_role": "passive"},
+                    )
                 )
             )
+            assert receipt.succeeded
 
     class FakeEventBus:
         def on(self, event_type: type[object], callback: object) -> None:
             return None
 
     class FakePushTool:
-        def register_channel(self, channel: str, **senders: object) -> None:
-            assert channel == "mobile"
+        pass
 
     import asyncio
 
@@ -1728,9 +1729,6 @@ def test_attachment_upload_resumes_and_reaches_agent_media(
         def __init__(self) -> None:
             self.inbound: list[object] = []
 
-        def subscribe_outbound(self, channel: str, callback: object) -> None:
-            assert channel == "mobile"
-
         async def publish_inbound(self, message: object) -> None:
             self.inbound.append(message)
 
@@ -1739,21 +1737,27 @@ def test_attachment_upload_resumes_and_reaches_agent_media(
             return None
 
     class FakePushTool:
-        def register_channel(self, channel: str, **senders: object) -> None:
-            assert channel == "mobile"
+        pass
 
     import asyncio
 
     runtime, _ = asyncio.run(build())
     request.addfinalizer(runtime.close)
     bus = CaptureBus()
+    session_manager = SessionManager(tmp_path / "sessions")
+    runtime.channel.bind_channel_attachment_store(
+        ChannelAttachmentArtifactStore(
+            workspace=session_manager.workspace,
+            session_store=session_manager.control_store,
+        )
+    )
     asyncio.run(
         runtime.channel.start(
             cast(
                 Any,
                 SimpleNamespace(
                     bus=bus,
-                    session_manager=SessionManager(tmp_path / "sessions"),
+                    session_manager=session_manager,
                     event_bus=FakeEventBus(),
                     push_tool=FakePushTool(),
                     interrupt_controller=None,
@@ -1937,8 +1941,16 @@ def test_attachment_upload_resumes_and_reaches_agent_media(
     assert len(bus.inbound) == 1
     assert isinstance(bus.inbound[0], InboundMessage)
     assert bus.inbound[0].content == ""
-    assert len(bus.inbound[0].media) == 1
-    assert Path(bus.inbound[0].media[0]).read_bytes() == content
+    assert bus.inbound[0].media == []
+    artifact_ids = cast(list[str], bus.inbound[0].metadata["attachment_ids"])
+    assert len(artifact_ids) == 1
+    artifact = session_manager.control_store.get_attachment(artifact_ids[0])
+    assert artifact is not None
+    assert artifact.state == "ready"
+    assert artifact.size_bytes == len(content)
+    assert (
+        session_manager.workspace / artifact.storage_key
+    ).read_bytes() == content
 
 
 def test_outbound_attachment_download_replays_binary_before_reply(
@@ -1955,8 +1967,7 @@ def test_outbound_attachment_download_replays_binary_before_reply(
         )
 
     class CapturePushTool:
-        def register_channel(self, channel: str, **senders: object) -> None:
-            assert channel == "mobile"
+        pass
 
     import asyncio
 
@@ -1968,7 +1979,7 @@ def test_outbound_attachment_download_replays_binary_before_reply(
             cast(
                 Any,
                 SimpleNamespace(
-                    bus=SimpleNamespace(subscribe_outbound=lambda *_: None),
+                    bus=SimpleNamespace(),
                     session_manager=SessionManager(tmp_path / "sessions"),
                     event_bus=SimpleNamespace(on=lambda *_: None),
                     push_tool=push,
@@ -2023,14 +2034,17 @@ def test_outbound_attachment_download_replays_binary_before_reply(
         )
     )
     asyncio.run(
-        runtime.channel._on_response(
-            OutboundMessage(
-                channel="mobile",
-                chat_id=chat_id,
-                content="文件已生成",
-                media=[str(source)],
-                control_turn_id=turn_id,
-                session_message_id=str(persisted.messages[-1]["id"]),
+        runtime.channel._deliver_message(
+            channel_message_from_outbound(
+                OutboundMessage(
+                    channel="mobile",
+                    chat_id=chat_id,
+                    content="文件已生成",
+                    media=[str(source)],
+                    control_turn_id=turn_id,
+                    session_message_id=str(persisted.messages[-1]["id"]),
+                    metadata={"_channel_commit_role": "passive"},
+                )
             )
         )
     )

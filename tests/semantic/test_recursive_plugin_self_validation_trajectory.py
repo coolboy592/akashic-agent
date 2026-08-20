@@ -19,6 +19,8 @@ from agent.looping.ports import (
     SessionServices,
 )
 from agent.plugin_composition import TOOL_CATALOG, PluginToolDefinition
+from agent.plugin_composition.channels import ChannelDeliveryReceipt
+from agent.plugin_composition.channels import DeliveryStatus as ChannelDeliveryStatus
 from agent.persona import reset_veda
 from agent.provider import LLMProvider
 from agent.plugins.manager import PluginManager
@@ -30,7 +32,6 @@ from agent.tools.registry import ToolRegistry
 from bootstrap.app import AppRuntime
 from bootstrap.control_execution import execute_control_turn
 from bus.event_bus import EventBus
-from bus.events import DeliveryReceipt, DeliveryStatus
 from bus.queue import MessageBus
 from core.memory.engine import MemoryQueryResult
 from core.memory.markdown import build_markdown_memory_runtime
@@ -242,13 +243,16 @@ async def _run_trajectory(
     sequence = 0
     push_sequence = 0
 
-    async def deliver(_message: object) -> DeliveryReceipt:
+    async def deliver(_message: object, _passive: bool) -> ChannelDeliveryReceipt:
         nonlocal sequence, push_sequence
         sequence += 1
         push_sequence = sequence
-        return DeliveryReceipt(DeliveryStatus.SUCCESS)
+        return ChannelDeliveryReceipt(
+            delivery_id=f"proof-{sequence}",
+            status=ChannelDeliveryStatus.DELIVERED,
+        )
 
-    _ = push.register_channel("proof", deliver)
+    push.bind_v3_channel_dispatcher(deliver)
     tools.register(
         push,
         risk="external-side-effect",
