@@ -17,6 +17,7 @@ from typing import BinaryIO
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from agent.plugin_composition.channels import AttachmentRef
 from infra.channels.base import AttachmentStore
 from infra.mobile_realtime.protocol import FrameId
 from infra.mobile_realtime.storage import (
@@ -282,6 +283,59 @@ class AttachmentTransferService:
             self.cleanup_outbound_candidates(candidates)
             raise
 
+    def register_outbound_ref_batch(
+        self,
+        *,
+        session_id: str,
+        attachments: tuple[tuple[AttachmentRef, bytes], ...],
+        message_id: str | None = None,
+    ) -> tuple[AttachmentRecord, ...]:
+        """Register Core refs after copying their bytes into Mobile-owned artifacts."""
+
+        candidates = self.snapshot_outbound_ref_batch(
+            session_id=session_id,
+            attachments=attachments,
+        )
+        try:
+            return self._storage.create_or_read_outbound_attachments(
+                candidates,
+                message_id=message_id,
+            )
+        except BaseException:
+            self.cleanup_outbound_candidates(candidates)
+            raise
+
+    def snapshot_outbound_ref_batch(
+        self,
+        *,
+        session_id: str,
+        attachments: tuple[tuple[AttachmentRef, bytes], ...],
+    ) -> tuple[AttachmentRecord, ...]:
+        """Create uncommitted Mobile candidates from opaque Core refs and bytes."""
+
+        if not 1 <= len(attachments) <= 10:
+            raise AttachmentRequestError("单条消息附件数量必须在 1..10")
+        candidates: list[AttachmentRecord] = []
+        total_bytes = 0
+        try:
+            for ref, data in attachments:
+                candidate = self._snapshot_outbound_ref_candidate(
+                    session_id=session_id,
+                    ref=ref,
+                    data=data,
+                )
+                candidates.append(candidate)
+                total_bytes += candidate.size_bytes
+                if total_bytes > self._max_attachment_bytes:
+                    raise AttachmentRequestError(
+                        "单条消息附件总量不能超过 "
+                        f"{self._max_attachment_bytes} 字节"
+                    )
+            return tuple(candidates)
+        except BaseException:
+            _remove_paths([Path(record.local_path) for record in candidates])
+            raise
+
     def snapshot_outbound_batch(
         self,
         *,
@@ -382,6 +436,71 @@ class AttachmentTransferService:
             sha256=digest,
             local_path=str(canonical_path),
             transferred_bytes=size_bytes,
+            state="ready",
+            created_at=now,
+            updated_at=now,
+        )
+
+    def _snapshot_outbound_ref_candidate(
+        self,
+        *,
+        session_id: str,
+        ref: AttachmentRef,
+        data: bytes,
+    ) -> AttachmentRecord:
+        """Copy one exact Core artifact lease into a Mobile-owned canonical file."""
+
+        if not isinstance(ref, AttachmentRef):
+            raise TypeError("attachment ref 必须是 AttachmentRef")
+        if not isinstance(data, bytes):
+            raise TypeError("attachment bytes 必须是 bytes")
+        if not 1 <= len(data) <= self._max_attachment_bytes:
+            raise AttachmentRequestError(
+                f"附件大小必须在 1..{self._max_attachment_bytes} 字节"
+            )
+        if len(data) != ref.size_bytes:
+            raise AttachmentStateError(
+                f"Core attachment 大小与 ref 不一致: {len(data)} != {ref.size_bytes}"
+            )
+        if hashlib.sha256(data).hexdigest() != ref.sha256:
+            raise AttachmentStateError("Core attachment SHA-256 与 ref 不一致")
+        filename = _validate_filename(ref.filename or f"{ref.artifact_id}.bin")
+        content_type = _validate_content_type(ref.media_type or "application/octet-stream")
+        suffix = Path(filename).suffix
+        if not suffix or len(suffix) > 16:
+            suffix = ".bin"
+        canonical_path = self._attachment_store.create_persistent_path(
+            "mobile_outbound_ref_",
+            suffix,
+        )
+        try:
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+            descriptor = os.open(canonical_path, flags, 0o600)
+            try:
+                with os.fdopen(descriptor, "wb", closefd=False) as stream:
+                    written = stream.write(data)
+                    if written != len(data):
+                        raise OSError(f"outbound ref 写入不完整: {written}/{len(data)}")
+                    stream.flush()
+                    os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            canonical_path.chmod(0o444)
+        except BaseException:
+            canonical_path.unlink(missing_ok=True)
+            raise
+        now = _utc_now()
+        return AttachmentRecord(
+            attachment_id=_new_outbound_attachment_id(),
+            device_id=None,
+            session_id=session_id,
+            direction="outbound",
+            filename=filename,
+            content_type=content_type,
+            size_bytes=len(data),
+            sha256=ref.sha256,
+            local_path=str(canonical_path),
+            transferred_bytes=len(data),
             state="ready",
             created_at=now,
             updated_at=now,

@@ -16,9 +16,23 @@ from time import monotonic
 from typing import TYPE_CHECKING, cast
 from uuid import UUID, uuid4
 
-from agent.plugin_composition.channels import AttachmentKind, AttachmentRef
+from agent.plugin_composition.channels import (
+    AttachmentKind,
+    AttachmentReadLease,
+    AttachmentRef,
+    ChannelAttachmentReadPort,
+    ChannelCommitRole,
+    ChannelFactoryContext,
+    ChannelReady,
+    DeliveryStatus as ProviderDeliveryStatus,
+    ProviderDeliveryReceipt,
+    ProviderDeliveryRequest,
+    StopReceipt,
+)
 
 from bus.events import (
+    AttachmentKind as BusAttachmentKind,
+    ChannelAttachment,
     ChannelMessage,
     DeliveryReceipt,
     DeliveryStatus,
@@ -136,6 +150,53 @@ class _ProcessTurnState:
     first_answer_published: bool = False
     client_message_id: str = ""
     final_suffix_emitted: str = ""
+
+
+class MobileV3ChannelAdapter:
+    """Expose one already-started Mobile channel through the native v3 ABI."""
+
+    def __init__(
+        self,
+        channel: "MobileRealtimeChannel",
+        context: ChannelFactoryContext,
+    ) -> None:
+        self._channel = channel
+        self._context = context
+        self._started = False
+        self._stopped = False
+
+    async def start(self) -> ChannelReady:
+        """Open the v3 binding without starting a second Mobile provider owner."""
+
+        if self._started:
+            raise RuntimeError("Mobile v3 adapter 已启动")
+        if self._stopped:
+            raise RuntimeError("Mobile v3 adapter 已停止")
+        self._started = True
+        return ChannelReady(self._context.binding_token)
+
+    async def deliver(
+        self,
+        request: ProviderDeliveryRequest,
+    ) -> ProviderDeliveryReceipt:
+        """Route a typed request directly to the Mobile durable outbound owner."""
+
+        if not self._started or self._stopped:
+            raise RuntimeError("Mobile v3 adapter 尚未处于可投递状态")
+        if request.binding_token != self._context.binding_token:
+            raise RuntimeError("Mobile v3 delivery binding token 不匹配")
+        return await self._channel.deliver_v3(
+            request,
+            attachment_read=self._context.attachment_read,
+        )
+
+    async def stop(self) -> StopReceipt:
+        """Close only this binding; ChannelHost remains Mobile provider owner."""
+
+        if self._stopped:
+            return StopReceipt(self._context.binding_token, resources_closed=True)
+        self._stopped = True
+        return StopReceipt(self._context.binding_token, resources_closed=True)
 
 
 _DELTA_FLUSH_BYTES = 4 * 1024
@@ -750,6 +811,297 @@ class MobileRealtimeChannel:
             session_id=session_id,
             payload=payload,
         )
+
+    def build_v3_adapter(
+        self,
+        context: ChannelFactoryContext,
+    ) -> MobileV3ChannelAdapter:
+        """Build a binding-scoped adapter without transferring Mobile lifecycle ownership."""
+
+        if context.binding_token.strip() == "":
+            raise ValueError("Mobile v3 binding token 不能为空")
+        if self._ctx is None or self._attachments is None:
+            raise RuntimeError("MobileRealtimeChannel 必须先由 ChannelHost 启动")
+        return MobileV3ChannelAdapter(self, context)
+
+    async def deliver_v3(
+        self,
+        request: ProviderDeliveryRequest,
+        *,
+        attachment_read: ChannelAttachmentReadPort | None,
+    ) -> ProviderDeliveryReceipt:
+        """Deliver one typed request while keeping Core artifacts opaque to Mobile."""
+
+        if not isinstance(request, ProviderDeliveryRequest):
+            raise TypeError("Mobile v3 只接受 ProviderDeliveryRequest")
+        self._raise_delta_failure()
+        session_id = self._session_id(request.recipient)
+        if not self._runtime.storage.list_active_devices():
+            return ProviderDeliveryReceipt(
+                request.delivery_id,
+                ProviderDeliveryStatus.REJECTED,
+                error="Mobile 没有可接收消息的已配对设备",
+            )
+        try:
+            attachment_bytes = await self._read_v3_attachments(
+                request.attachments,
+                attachment_read,
+            )
+        except (
+            AttachmentRequestError,
+            AttachmentStateError,
+            OSError,
+            TypeError,
+            ValueError,
+        ) as error:
+            return ProviderDeliveryReceipt(
+                request.delivery_id,
+                ProviderDeliveryStatus.REJECTED,
+                error=str(error),
+            )
+        if request.commit_role is ChannelCommitRole.PASSIVE:
+            return await self._deliver_v3_passive(
+                request,
+                session_id=session_id,
+                attachment_bytes=attachment_bytes,
+            )
+        return await self._deliver_v3_direct(
+            request,
+            session_id=session_id,
+            attachment_bytes=attachment_bytes,
+        )
+
+    async def _deliver_v3_direct(
+        self,
+        request: ProviderDeliveryRequest,
+        *,
+        session_id: str,
+        attachment_bytes: tuple[tuple[AttachmentRef, bytes], ...],
+    ) -> ProviderDeliveryReceipt:
+        """Commit one proactive event and optional Mobile-owned attachment batch."""
+
+        metadata = cast(dict[str, object], _plain_json(request.metadata))
+        _ = metadata.setdefault("source", "message_push")
+        control_turn_id = request.control_turn_id or f"turn:{uuid4().hex}"
+        payload: dict[str, object] = {
+            "content": request.body,
+            "attachments": [],
+            "metadata": metadata,
+            "control_turn_id": control_turn_id,
+        }
+        if request.thinking:
+            payload["thinking"] = request.thinking
+        if request.reply_to:
+            payload["reply_to"] = request.reply_to
+        if request.session_message_id:
+            payload["message_id"] = request.session_message_id
+        if request.execution_attempt_id:
+            payload["execution_attempt_id"] = request.execution_attempt_id
+        if request.terminal_status:
+            payload["terminal_status"] = request.terminal_status.value
+        delivery_id = metadata.get("delivery_id")
+        if delivery_id is not None:
+            if not isinstance(delivery_id, str) or not delivery_id or len(delivery_id) > 128:
+                return ProviderDeliveryReceipt(
+                    request.delivery_id,
+                    ProviderDeliveryStatus.REJECTED,
+                    error="mobile proactive delivery_id 无效",
+                )
+            payload["delivery_id"] = delivery_id
+        try:
+            candidates = (
+                await asyncio.to_thread(
+                    self._require_attachments().snapshot_outbound_ref_batch,
+                    session_id=session_id,
+                    attachments=attachment_bytes,
+                )
+                if attachment_bytes
+                else ()
+            )
+        except (
+            AttachmentRequestError,
+            AttachmentStateError,
+            OSError,
+            TypeError,
+            ValueError,
+        ) as error:
+            return ProviderDeliveryReceipt(
+                request.delivery_id,
+                ProviderDeliveryStatus.REJECTED,
+                error=str(error),
+            )
+        try:
+            if attachment_bytes:
+                _ = await self._runtime.publish_event_with_outbound_attachments(
+                    candidates=candidates,
+                    session_id=session_id,
+                    payload_builder=lambda records: self._v3_attachment_payload(
+                        payload,
+                        records,
+                    ),
+                )
+            else:
+                await self._runtime.publish_event(
+                    event_type="message.proactive",
+                    session_id=session_id,
+                    payload=payload,
+                )
+        except asyncio.CancelledError:
+            raise
+        except BaseException as error:
+            # The provider may have committed before reporting an unexpected error;
+            # do not delete candidates and turn an unknown effect into a false retry.
+            logger.error(
+                "mobile v3 durable outbound effect unknown: delivery_id=%s error=%s",
+                request.delivery_id,
+                error,
+                exc_info=True,
+            )
+            return ProviderDeliveryReceipt(
+                request.delivery_id,
+                ProviderDeliveryStatus.UNKNOWN,
+                error=str(error),
+            )
+        return ProviderDeliveryReceipt(
+            request.delivery_id,
+            ProviderDeliveryStatus.DELIVERED,
+        )
+
+    async def _deliver_v3_passive(
+        self,
+        request: ProviderDeliveryRequest,
+        *,
+        session_id: str,
+        attachment_bytes: tuple[tuple[AttachmentRef, bytes], ...],
+    ) -> ProviderDeliveryReceipt:
+        """Project passive v3 refs into the existing Mobile terminal owner."""
+
+        if attachment_bytes and request.session_message_id is None:
+            return ProviderDeliveryReceipt(
+                request.delivery_id,
+                ProviderDeliveryStatus.REJECTED,
+                error="Mobile passive 附件缺少已持久化的 assistant message_id",
+            )
+        try:
+            records: tuple[AttachmentRecord, ...] = ()
+            if attachment_bytes:
+                try:
+                    records = await asyncio.to_thread(
+                        self._require_attachments().register_outbound_ref_batch,
+                        session_id=session_id,
+                        attachments=attachment_bytes,
+                        message_id=request.session_message_id,
+                    )
+                except (
+                    AttachmentRequestError,
+                    AttachmentStateError,
+                    OSError,
+                    TypeError,
+                    ValueError,
+                ) as error:
+                    return ProviderDeliveryReceipt(
+                        request.delivery_id,
+                        ProviderDeliveryStatus.REJECTED,
+                        error=str(error),
+                    )
+            message = ChannelMessage(
+                channel=self.name,
+                chat_id=request.recipient,
+                content=request.body,
+                attachments=tuple(
+                    ChannelAttachment(
+                        BusAttachmentKind.IMAGE
+                        if record.content_type.startswith("image/")
+                        else BusAttachmentKind.FILE,
+                        record.local_path,
+                        record.filename,
+                    )
+                    for record in records
+                ),
+                thinking=request.thinking,
+                reply_to=request.reply_to,
+                metadata=cast(dict[str, object], _plain_json(request.metadata)),
+                session_message_id=request.session_message_id,
+                control_turn_id=request.control_turn_id,
+                execution_attempt_id=request.execution_attempt_id,
+                terminal_status=(
+                    TurnTerminalStatus(request.terminal_status.value)
+                    if request.terminal_status is not None
+                    else None
+                ),
+            )
+            receipt = await self._deliver_passive_message(message)
+        except asyncio.CancelledError:
+            raise
+        except BaseException as error:
+            logger.error(
+                "mobile v3 passive effect unknown: delivery_id=%s error=%s",
+                request.delivery_id,
+                error,
+                exc_info=True,
+            )
+            return ProviderDeliveryReceipt(
+                request.delivery_id,
+                ProviderDeliveryStatus.UNKNOWN,
+                error=str(error),
+            )
+        if receipt.status is not DeliveryStatus.SUCCESS:
+            return ProviderDeliveryReceipt(
+                request.delivery_id,
+                ProviderDeliveryStatus.UNKNOWN,
+                error=receipt.detail or "mobile passive delivery 未完成",
+            )
+        return ProviderDeliveryReceipt(
+            request.delivery_id,
+            ProviderDeliveryStatus.DELIVERED,
+        )
+
+    async def _read_v3_attachments(
+        self,
+        refs: tuple[AttachmentRef, ...],
+        attachment_read: ChannelAttachmentReadPort | None,
+    ) -> tuple[tuple[AttachmentRef, bytes], ...]:
+        """Read exact Core leases and close every lease before Mobile persistence."""
+
+        if not refs:
+            return ()
+        if attachment_read is None:
+            raise AttachmentStateError("Mobile v3 附件请求缺少 attachment_read port")
+        leases: list[AttachmentReadLease] = []
+        try:
+            for ref in refs:
+                lease = await attachment_read.acquire(ref)
+                if not callable(getattr(lease, "read_bytes", None)):
+                    raise TypeError("Mobile v3 attachment lease 无效")
+                leases.append(cast(AttachmentReadLease, lease))
+            result: list[tuple[AttachmentRef, bytes]] = []
+            max_bytes = self._runtime.config.max_attachment_mb * 1024 * 1024
+            for ref, lease in zip(refs, leases, strict=True):
+                data = await lease.read_bytes(max_bytes=max_bytes)
+                result.append((ref, data))
+            return tuple(result)
+        finally:
+            if leases:
+                failures = await asyncio.gather(
+                    *(lease.aclose() for lease in reversed(leases)),
+                    return_exceptions=True,
+                )
+                errors = [failure for failure in failures if isinstance(failure, Exception)]
+                if errors:
+                    raise ExceptionGroup("Mobile v3 attachment lease cleanup 失败", errors)
+                if any(isinstance(failure, BaseException) for failure in failures):
+                    raise asyncio.CancelledError
+
+    @staticmethod
+    def _v3_attachment_payload(
+        payload: dict[str, object],
+        records: tuple[AttachmentRecord, ...],
+    ) -> dict[str, object]:
+        """Build a durable event payload from committed Mobile attachment rows."""
+
+        result = dict(payload)
+        result["attachments"] = [attachment_descriptor(record) for record in records]
+        return result
 
     async def send_stream(self, chat_id: str, message: str) -> None:
         await self.send(chat_id, message)
@@ -3056,6 +3408,27 @@ class MobileRealtimeChannel:
         if self._attachments is None:
             raise RuntimeError("MobileRealtimeChannel 附件服务尚未启动")
         return self._attachments
+
+
+def build_v3_adapter(
+    channel: MobileRealtimeChannel,
+    context: ChannelFactoryContext,
+) -> MobileV3ChannelAdapter:
+    """Return the native v3 adapter for an already-started Mobile channel."""
+
+    return channel.build_v3_adapter(context)
+
+
+def _plain_json(value: object) -> object:
+    """Materialize frozen provider JSON before passing it to protocol encoding."""
+
+    if isinstance(value, Mapping):
+        mapping = cast(Mapping[object, object], value)
+        return {str(key): _plain_json(item) for key, item in mapping.items()}
+    if isinstance(value, (tuple, list)):
+        sequence = cast(tuple[object, ...] | list[object], value)
+        return [_plain_json(item) for item in sequence]
+    return value
 
 
 def _command_hash(frame: ClientCommand) -> str:

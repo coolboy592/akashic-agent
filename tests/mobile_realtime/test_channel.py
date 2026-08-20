@@ -17,6 +17,13 @@ import infra.mobile_realtime.gateway as gateway_module
 
 from agent.config_models import MobileRealtimeConfig
 from agent.control.models import TurnRecord, TurnStatus
+from agent.plugin_composition.channels import (
+    AttachmentKind as V3AttachmentKind,
+    AttachmentRef,
+    ChannelFactoryContext,
+    DeliveryStatus as V3DeliveryStatus,
+    ProviderDeliveryRequest,
+)
 from infra.mobile_realtime.runtime_inspection import RuntimeInspectionService
 from bus.events import (
     AttachmentKind,
@@ -226,6 +233,82 @@ class _PushTool:
     pass
 
 
+class _ProviderFactory:
+    async def create(self, _credentials: object) -> object:
+        raise AssertionError("Mobile native adapter 不应创建 provider client")
+
+    async def aclose(self) -> None:
+        return None
+
+
+class _ReadLease:
+    def __init__(self, ref: AttachmentRef, data: bytes) -> None:
+        self.ref = ref
+        self._data = data
+        self.closed = False
+
+    async def read_bytes(self, *, max_bytes: int) -> bytes:
+        if len(self._data) > max_bytes:
+            raise ValueError("read limit")
+        return self._data
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+class _ReadPort:
+    def __init__(self, data: dict[str, bytes]) -> None:
+        self._data = data
+        self.leases: list[_ReadLease] = []
+
+    async def acquire(self, ref: AttachmentRef) -> _ReadLease:
+        lease = _ReadLease(ref, self._data[ref.artifact_id])
+        self.leases.append(lease)
+        return lease
+
+
+async def _started_native_mobile_channel(
+    tmp_path: Path,
+    *,
+    active_device: bool = True,
+) -> tuple[MobileRealtimeChannel, MobileRealtimeStorage, SessionManager]:
+    storage = MobileRealtimeStorage(tmp_path / "mobile.db")
+    if active_device:
+        _register_device(storage, "device-1")
+    manager = SessionManager(tmp_path / "workspace")
+    channel = MobileRealtimeChannel(cast(MobileGatewayRuntime, _Runtime(storage)))
+    await channel.start(
+        cast(
+            Any,
+            SimpleNamespace(
+                bus=_Bus(),
+                session_manager=manager,
+                event_bus=_EventBus(),
+                push_tool=_PushTool(),
+                interrupt_controller=None,
+                attachment_store=AttachmentStore(tmp_path / "uploads"),
+            ),
+        )
+    )
+    return channel, storage, manager
+
+
+def _native_context(
+    read_port: _ReadPort | None = None,
+) -> ChannelFactoryContext:
+    return ChannelFactoryContext(
+        snapshot_id="snapshot-1",
+        generation_id="generation-1",
+        binding_token="binding-1",
+        config={},
+        credentials={},
+        provider_client_factory=cast(Any, _ProviderFactory()),
+        ingress=None,
+        identity=None,
+        attachment_read=read_port,
+    )
+
+
 def _provider_delivery(channel: MobileRealtimeChannel):
     """把测试 outbound 映射为正式 Channel provider callback。"""
 
@@ -240,6 +323,128 @@ def _provider_delivery(channel: MobileRealtimeChannel):
         )
 
     return deliver
+
+
+@pytest.mark.asyncio
+async def test_native_v3_mobile_adapter_rejects_without_active_device(
+    tmp_path: Path,
+) -> None:
+    channel, storage, manager = await _started_native_mobile_channel(
+        tmp_path,
+        active_device=False,
+    )
+    adapter = channel.build_v3_adapter(_native_context())
+    ready = await adapter.start()
+    receipt = await adapter.deliver(
+        ProviderDeliveryRequest(
+            binding_token=ready.binding_token,
+            delivery_id="delivery-no-device",
+            recipient=f"mobile:{uuid4()}",
+            body="hello",
+        )
+    )
+    assert receipt.status is V3DeliveryStatus.REJECTED
+    assert receipt.error is not None
+    assert await adapter.stop() == await adapter.stop()
+    await channel.stop()
+    manager.close()
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_native_v3_mobile_adapter_reads_opaque_ref_and_commits_one_event(
+    tmp_path: Path,
+) -> None:
+    channel, storage, manager = await _started_native_mobile_channel(tmp_path)
+    data = b"native-mobile-attachment"
+    ref = AttachmentRef(
+        artifact_id="core-artifact-1",
+        kind=V3AttachmentKind.FILE,
+        filename="report.txt",
+        media_type="text/plain",
+        size_bytes=len(data),
+        sha256=hashlib.sha256(data).hexdigest(),
+    )
+    read_port = _ReadPort({ref.artifact_id: data})
+    adapter = channel.build_v3_adapter(_native_context(read_port))
+    await adapter.start()
+    session_id = f"mobile:{uuid4()}"
+    receipt = await adapter.deliver(
+        ProviderDeliveryRequest(
+            binding_token="binding-1",
+            delivery_id="delivery-with-attachment",
+            recipient=session_id,
+            body="attached",
+            attachments=(ref,),
+            metadata={
+                "delivery_id": "delivery-with-attachment",
+                "nested": {"ordinal": 1},
+            },
+        )
+    )
+    assert receipt.status is V3DeliveryStatus.DELIVERED
+    assert read_port.leases and all(lease.closed for lease in read_port.leases)
+    durable = storage.read_durable_events(
+        "device-1",
+        after_event_seq=0,
+        limit=10,
+    )
+    assert len(durable) == 1
+    envelope = json.loads(durable[0].envelope_json)
+    descriptor = envelope["payload"]["attachments"][0]
+    assert descriptor["filename"] == "report.txt"
+    assert descriptor["sha256"] == ref.sha256
+    assert envelope["payload"]["metadata"]["nested"] == {"ordinal": 1}
+    assert ref.artifact_id not in durable[0].envelope_json
+    record = storage.read_attachment(descriptor["attachment_id"])
+    assert record is not None
+    assert Path(record.local_path).read_bytes() == data
+    await adapter.stop()
+    await channel.stop()
+    manager.close()
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_native_v3_mobile_adapter_reports_unknown_if_durable_call_raises(
+    tmp_path: Path,
+) -> None:
+    class _FailingRuntime(_Runtime):
+        async def publish_event(self, **_event: object) -> None:
+            raise OSError("durable write outcome unknown")
+
+    storage = MobileRealtimeStorage(tmp_path / "mobile.db")
+    _register_device(storage, "device-1")
+    manager = SessionManager(tmp_path / "workspace")
+    channel = MobileRealtimeChannel(cast(MobileGatewayRuntime, _FailingRuntime(storage)))
+    await channel.start(
+        cast(
+            Any,
+            SimpleNamespace(
+                bus=_Bus(),
+                session_manager=manager,
+                event_bus=_EventBus(),
+                push_tool=_PushTool(),
+                interrupt_controller=None,
+                attachment_store=AttachmentStore(tmp_path / "uploads"),
+            ),
+        )
+    )
+    adapter = channel.build_v3_adapter(_native_context())
+    await adapter.start()
+    receipt = await adapter.deliver(
+        ProviderDeliveryRequest(
+            binding_token="binding-1",
+            delivery_id="delivery-unknown",
+            recipient=f"mobile:{uuid4()}",
+            body="unknown",
+        )
+    )
+    assert receipt.status is V3DeliveryStatus.UNKNOWN
+    await adapter.stop()
+    await channel.stop()
+    manager.close()
+    storage.close()
 
 
 class _RuntimeInspection:
