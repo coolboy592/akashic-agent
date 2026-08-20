@@ -15,7 +15,16 @@
 
 ## P0 · 插件组合内核
 
-- 按[插件 v3 最终迁移地图](design/plugin-v3-final-migration-map.md)先合并 foundation parent chain #395→#397→#398→#399→#400→#401，再完成 #425～#431。Tool lane 合入三个 pure-v3 source 与 #432；被动 lane 合入 #433～#438、Citation/Meme source，再合入 #439～#441，并在 exact heads 上重跑 Tool、Citation/Meme composition 与 WebUI E2E。随后迁移剩余 23 个已跟踪插件；channel command catalog、MCP/process/channel/proactive/mobile seam 只随第一个真实 consumer 建立，不把 v2 固定 `telegram_bot_commands()/jobs()/channels()/mcp_servers()/proactive_*()` 方法复制进 v3。最后一个 consumer 迁走前保留并标注 v2 owner；按 A～I 小批次删除 owner，full-fleet pure-v3 Gate 通过后最后执行 J，删除 v2 lock/Gate。
+- 按 [0037 pure-v3 决策](decisions/0037-plugin-runtime-is-pure-v3.md) 完成最后收口：把 Core 内建
+  Channel 投影接入 committed catalog/Host，完成 full-fleet E3，再按
+  [生产替代清单](design/plugin-v3-production-readiness-checklist.md) A～I 物理删除剩余 v2
+  production owner。只允许 Default/Wake 六个 exact builtin 通过 Core-private proactive bridge；
+  外部插件不得获得这个入口。Computer Use Linux 与 Context Pressure 已退出 fleet，
+  不为它们保留兼容面，但既有 plugin-data 不删除。
+- 最终只在同一 clean head 集中运行 static fleet、Mobile、Tool/Passive composition、
+  WebUI 和 E1～E4。E3 必须使用 fixed-clock/model/recording sink 与本地受控 Git 远端；
+  E4 只读取 E1～E3 exact-head 报告并操作复制 workspace。任何 blocked scenario、v2 consumer、
+  非同 head 报告或清理残留都不得声称可替代线上 Akashic；hua-home 切换仍需单独授权。
 
 ## P0 · 独立语义验收
 
