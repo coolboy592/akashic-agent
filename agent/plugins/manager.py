@@ -2093,6 +2093,14 @@ class PluginManager:
             )
             plugin_id = f"{result.plugin_name}@{result.marketplace}"
             status = self.candidate_status()
+            if install_cancelled or reconcile_cancelled:
+                if (
+                    result.staged_candidate
+                    and status["candidate_plugin_id"] == plugin_id
+                    and status["candidate_state"] == "latest_ready"
+                ):
+                    _ = await self._drop_ready(plugin_id)
+                raise asyncio.CancelledError
             if result.staged_candidate and (
                 status["candidate_plugin_id"] != plugin_id
                 or status["candidate_state"] != "latest_ready"
@@ -2107,8 +2115,6 @@ class PluginManager:
                     f"tx={status['candidate_reload_tx_id']} "
                     f"error={status['candidate_error']}"
                 )
-            if install_cancelled or reconcile_cancelled:
-                raise asyncio.CancelledError
             return result, status
 
     def annotate_reload(self, tx_id: str, details: dict[str, object]) -> None:

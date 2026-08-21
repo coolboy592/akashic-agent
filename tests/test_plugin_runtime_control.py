@@ -400,7 +400,13 @@ async def test_runtime_install_and_watcher_share_candidate_owner(
     assert not (manager.installed_plugins_home / "cache" / "lab" / "beta").exists()
     assert not isinstance(watcher, BaseException)
     assert manager.candidate_status()["candidate_plugin_id"] == "alpha@lab"
-    await manager.drop_candidate("alpha@lab")
+    await manager.switch_ready("alpha@lab")
+    alpha_entrypoint = sources["alpha"] / "plugin.py"
+    alpha_entrypoint.write_text(
+        alpha_entrypoint.read_text(encoding="utf-8") + "\n",
+        encoding="utf-8",
+    )
+    _commit(sources["alpha"])
 
     entered = threading.Event()
     release = threading.Event()
@@ -413,7 +419,7 @@ async def test_runtime_install_and_watcher_share_candidate_owner(
 
     monkeypatch.setattr("agent.plugins.manager.install_git_plugin", blocking_install)
     cancelled_install = asyncio.create_task(
-        app._install_plugin(str(sources["beta"]), "lab", "", [])
+        app._install_plugin(str(sources["alpha"]), "lab", "", [])
     )
     assert await asyncio.to_thread(entered.wait, 5)
     cancelled_install.cancel()
@@ -424,9 +430,13 @@ async def test_runtime_install_and_watcher_share_candidate_owner(
     with pytest.raises(asyncio.CancelledError):
         await cancelled_install
     _ = await waiting_watcher
-    assert manager.candidate_status()["candidate_plugin_id"] == "beta@lab"
-    assert manager.candidate_status()["candidate_state"] == "latest_ready"
-    await manager.drop_candidate("beta@lab")
+    cancelled_status = manager.candidate_status()
+    assert cancelled_status["candidate_plugin_id"] == "alpha@lab"
+    assert cancelled_status["candidate_state"] == "aborted"
+    assert (
+        cancelled_status["latest_snapshot_id"]
+        == cancelled_status["stable_snapshot_id"]
+    )
     await manager.terminate_all()
     await bus.aclose()
 
