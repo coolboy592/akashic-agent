@@ -2604,10 +2604,7 @@ class PluginManager:
             _validate_static_manifest_runtime(snapshot, generations)
             snapshot.skill_catalog_generation_id = catalog_id
             snapshot.plugin_skill_index = catalog.normal_plugins
-            snapshot.tool_registry = self._compile_snapshot_tools(
-                generations,
-                snapshot.plugin_tool_catalog,
-            )
+            self._refresh_composition_runtime_tools(snapshot)
             return snapshot, catalog_id
         except BaseException:
             self._skill_host.close(catalog_id)

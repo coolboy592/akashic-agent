@@ -17,6 +17,16 @@ from agent.plugin_composition import (
     McpServerDefinition,
     PluginRuntime,
 )
+from agent.plugin_composition.channels import (
+    ChannelCapability,
+    ChannelFactoryContext,
+    ChannelReady,
+    CoreChannelDefinition,
+    DeliveryStatus,
+    ProviderDeliveryReceipt,
+    ProviderDeliveryRequest,
+    StopReceipt,
+)
 from agent.plugin_composition.mcp_slots import (
     PluginMcpServers,
     _freeze_plugin_mcp_servers,
@@ -298,6 +308,38 @@ def _manager(
     )
 
 
+class _CoreChannelAdapter:
+    def __init__(self, binding_token: str) -> None:
+        self._binding_token = binding_token
+
+    async def start(self) -> ChannelReady:
+        return ChannelReady(self._binding_token)
+
+    async def deliver(
+        self,
+        request: ProviderDeliveryRequest,
+    ) -> ProviderDeliveryReceipt:
+        return ProviderDeliveryReceipt(request.delivery_id, DeliveryStatus.DELIVERED)
+
+    async def stop(self) -> StopReceipt:
+        return StopReceipt(self._binding_token, resources_closed=True)
+
+
+def _core_channel_definition() -> CoreChannelDefinition:
+    def factory(context: ChannelFactoryContext) -> _CoreChannelAdapter:
+        return _CoreChannelAdapter(context.binding_token)
+
+    return CoreChannelDefinition(
+        name="web",
+        capabilities=frozenset({ChannelCapability.OUTBOUND}),
+        factory=factory,
+        inbound_identity=None,
+        source_revision="core-native-v3",
+        config_revision="core-native-v3",
+        generation_id="core-native-v3",
+    )
+
+
 def _port_live(port: int) -> bool:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
         return probe.connect_ex(("127.0.0.1", port)) == 0
@@ -502,6 +544,34 @@ async def test_static_manifest_is_admission_source_and_reconciles_mcp_root(
     assert candidate.static_manifest is not None
     await manager.discard_prepared("calendar")
     await manager.terminate_all()
+    assert not _port_live(18000)
+
+
+@pytest.mark.asyncio
+async def test_core_channel_rebind_preserves_live_mcp_tools(tmp_path: Path) -> None:
+    _ = _write_static_manager_plugin(tmp_path, "1")
+    manager = _manager(
+        tmp_path,
+        tool_registry=ToolRegistry(follow_runtime_snapshot=False),
+    )
+
+    try:
+        await manager.load_all()
+        await manager.bind_core_channel_definitions((_core_channel_definition(),))
+
+        snapshot = manager.current_snapshot
+        assert snapshot is not None and snapshot.tool_registry is not None
+        tool = snapshot.tool_registry.get_tool("mcp_calendar__get_events")
+        assert tool is not None
+        assert await tool.execute() == "|".join(
+            (
+                "formal",
+                "18000",
+                str(tmp_path / "workspace/plugin-data/calendar-builtin"),
+            )
+        )
+    finally:
+        await manager.terminate_all()
     assert not _port_live(18000)
 
 
