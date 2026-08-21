@@ -6,6 +6,10 @@ from pathlib import Path
 from typing import Literal
 
 from agent.plugins.artifacts import ArtifactSelector, read_pointers, resolve_pointer
+from agent.plugins.static_manifest import (
+    StaticPluginManifest,
+    load_static_plugin_manifest,
+)
 
 
 @dataclass(frozen=True)
@@ -14,6 +18,8 @@ class ResolvedPluginSource:
     source_type: Literal["builtin", "installed"]
     marketplace: str = ""
     plugin_name: str = ""
+    entrypoint: str = "plugin.py"
+    static_manifest: StaticPluginManifest | None = None
 
 
 def resolve_plugin_sources(
@@ -40,10 +46,20 @@ def resolve_plugin_sources(
             if normalized in seen:
                 continue
             seen.add(normalized)
+            static_manifest = _load_optional_static_manifest(normalized)
             discovered.append(
                 ResolvedPluginSource(
                     plugin_root=normalized,
                     source_type="builtin",
+                    plugin_name=(
+                        static_manifest.name if static_manifest is not None else ""
+                    ),
+                    entrypoint=(
+                        static_manifest.entrypoint
+                        if static_manifest is not None
+                        else "plugin.py"
+                    ),
+                    static_manifest=static_manifest,
                 )
             )
     return discovered
@@ -86,36 +102,32 @@ def _iter_installed_plugin_roots(
             has_pointers, selected = _resolve_installed_pointer(plugin_dir, selector)
             if has_pointers:
                 if selected is not None:
+                    static_manifest = _require_installed_plugin_root(selected)
+                    _validate_installed_identity(
+                        plugin_dir.name,
+                        static_manifest,
+                    )
                     result.append(
                         ResolvedPluginSource(
                             plugin_root=selected,
                             source_type="installed",
                             marketplace=marketplace_dir.name,
                             plugin_name=plugin_dir.name,
+                            entrypoint=static_manifest.entrypoint,
+                            static_manifest=static_manifest,
                         )
                     )
                 continue
-            version_dirs: list[Path] = []
-            for child in sorted(plugin_dir.iterdir()):
-                if child.name.startswith("."):
-                    continue
-                _require_safe_cache_segment(child, "version")
-                _require_cache_directory(child, "version")
-                version_dirs.append(child)
-            if len(version_dirs) > 1:
-                paths = ", ".join(str(path) for path in version_dirs)
-                raise ValueError(f"installed cache 可见版本冲突: {paths}")
-            if len(version_dirs) != 1:
-                continue
-            _require_plugin_root(version_dirs[0])
-            result.append(
-                ResolvedPluginSource(
-                    plugin_root=version_dirs[0],
-                    source_type="installed",
-                    marketplace=marketplace_dir.name,
-                    plugin_name=plugin_dir.name,
-                )
+            visible = tuple(
+                child
+                for child in sorted(plugin_dir.iterdir())
+                if not child.name.startswith(".")
             )
+            if visible:
+                paths = ", ".join(str(path) for path in visible)
+                raise ValueError(
+                    f"installed cache 含不受支持的旧版可见目录: {paths}"
+                )
     return result
 
 
@@ -144,19 +156,41 @@ def _require_safe_cache_segment(path: Path, label: str) -> None:
         raise ValueError(f"installed cache {label} 路径段无效: {path}")
 
 
-def _require_plugin_root(path: Path) -> None:
-    plugin_file = path / "plugin.py"
-    if plugin_file.is_symlink():
-        raise ValueError(f"installed cache plugin.py 不能是符号链接: {plugin_file}")
-    if not plugin_file.is_file():
-        if not path.exists():
-            raise FileNotFoundError(f"installed cache 版本扫描期间已变化: {path}")
-        raise ValueError(f"installed cache 缺少 plugin.py: {plugin_file}")
+def _require_installed_plugin_root(path: Path) -> StaticPluginManifest:
+    manifest_path = path / "akashic.plugin.toml"
+    if manifest_path.exists() or manifest_path.is_symlink():
+        return load_static_plugin_manifest(path)
+    if not path.exists():
+        raise FileNotFoundError(f"installed cache 版本扫描期间已变化: {path}")
+    raise ValueError(f"installed cache 缺少静态 v3 manifest: {manifest_path}")
+
+
+def _load_optional_static_manifest(path: Path) -> StaticPluginManifest | None:
+    manifest_path = path / "akashic.plugin.toml"
+    if not manifest_path.exists() and not manifest_path.is_symlink():
+        return None
+    return load_static_plugin_manifest(path)
+
+
+def _validate_installed_identity(
+    cache_name: str,
+    manifest: StaticPluginManifest,
+) -> None:
+    if manifest.name != cache_name:
+        raise ValueError(
+            "installed cache 插件目录与静态 manifest name 不一致: "
+            f"directory={cache_name} manifest={manifest.name}"
+        )
 
 
 def _is_plugin_root(path: Path) -> bool:
     if path.is_symlink() or not path.is_dir():
         return False
+    manifest_path = path / "akashic.plugin.toml"
+    if manifest_path.exists() or manifest_path.is_symlink():
+        _ = load_static_plugin_manifest(path)
+        return True
+    # Built-ins may keep the conventional plugin.py entrypoint without an install manifest.
     plugin_file = path / "plugin.py"
     return not plugin_file.is_symlink() and plugin_file.is_file()
 

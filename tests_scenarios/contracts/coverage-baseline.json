@@ -1,7 +1,7 @@
 {
   "acceptedGaps": [],
   "base": "683b4791b0c25e3e899d65fe7c028514240414b3",
-  "catalogDigest": "98d030091096d2040917947f5c98a8febf8c73a96653098779f0e2cb4853040c",
+  "catalogDigest": "15d304b570f946b780262978655d8df1adb1838ec937f1f95506f250ffb6234f",
   "purpose": "approved_contract_mapping",
   "coveredP0": {
     "companion_control": [
@@ -43,7 +43,8 @@
       "mcp_process_lifecycle"
     ],
     "memory": [
-      "memory_persistence_contract"
+      "memory_persistence_contract",
+      "plugin_domain_observe_events"
     ],
     "migrations": [
       "contract_catalog",
@@ -55,7 +56,8 @@
     "plugin": [
       "plugin_generation_contract",
       "plugin_uninstall_drain_finality",
-      "mcp_process_lifecycle"
+      "mcp_process_lifecycle",
+      "plugin_domain_observe_events"
     ],
     "recursive_plugin_validation": [
       "recursive_plugin_self_validation_contract"

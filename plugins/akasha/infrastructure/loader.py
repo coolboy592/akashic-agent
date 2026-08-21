@@ -13,7 +13,10 @@ from zoneinfo import ZoneInfo
 import numpy as np
 
 from ..domain.model import Turn, TurnFeedback
-from .sparse_index.schema import INDEX_VERSION
+from .sparse_index.schema import (
+    INDEX_VERSION,
+    TOOL_CHAIN_PROJECTION_VERSION,
+)
 
 
 def load_turns(index_path: Path, max_turns: int | None = None) -> list[Turn]:
@@ -99,6 +102,15 @@ def _validate_index(connection: sqlite3.Connection) -> None:
     missing = required - actual
     if missing:
         raise ValueError(f"sparse index is missing tables: {sorted(missing)}")
+    columns = {
+        str(item[1])
+        for item in connection.execute("PRAGMA table_info(sparse_turns)")
+    }
+    if "assistant_tool_chain_json" not in columns:
+        raise ValueError(
+            "sparse index lacks assistant tool-chain projection; "
+            "explicit rebuild is required"
+        )
     row = connection.execute(
         "SELECT value FROM metadata WHERE key='index_version'"
     ).fetchone()
@@ -106,6 +118,15 @@ def _validate_index(connection: sqlite3.Connection) -> None:
         actual_version = None if row is None else str(row[0])
         raise ValueError(
             f"unsupported sparse index version: {actual_version}"
+        )
+    projection = connection.execute(
+        "SELECT value FROM metadata WHERE key='tool_chain_projection_version'"
+    ).fetchone()
+    actual_projection = None if projection is None else str(projection[0])
+    if actual_projection != TOOL_CHAIN_PROJECTION_VERSION:
+        raise ValueError(
+            "unsupported assistant tool-chain projection version: "
+            f"{actual_projection}; explicit rebuild is required"
         )
 
 

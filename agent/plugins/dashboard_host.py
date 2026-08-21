@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import hashlib
+import inspect
 import logging
 import re
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from collections.abc import Sequence
 from pathlib import Path
 from types import ModuleType
@@ -20,7 +22,11 @@ from starlette.convertors import (
 )
 from starlette.routing import Match
 
+from agent.plugin_composition import DashboardContext
+from agent.plugin_composition.model import resolve_declared_workspace_root
+from agent.plugins.composable import ComposablePlugin
 from agent.plugins.generation import PluginGeneration
+from agent.plugins.scope import PluginScope
 from agent.plugins.snapshot import (
     RuntimeSnapshot,
     RuntimeSnapshotStore,
@@ -40,6 +46,11 @@ class DashboardBinding:
     plugin_id: str
     app: FastAPI
     routes: tuple[APIRoute, ...]
+    runtime_workspace: Path | None = None
+    runtime_data_root: Path | None = None
+    validation: bool = False
+    module_name: str = ""
+    _scope: PluginScope | None = field(default=None, repr=False)
 
     def matches(self, scope: dict[str, Any]) -> bool:
         return any(route.matches(scope)[0] is Match.FULL for route in self.routes)
@@ -49,16 +60,10 @@ class PluginDashboardHost:
     def __init__(
         self,
         *,
-        workspace: Path,
-        memory_admin: object,
-        memory_store: object,
         core_routes: tuple[object, ...],
     ) -> None:
-        self._workspace = workspace
-        self._memory_admin = memory_admin
-        self._memory_store = memory_store
         self._core_routes = _core_routes(core_routes)
-        self._bindings: dict[str, DashboardBinding] = {}
+        self._bindings: dict[tuple[str, Path], DashboardBinding] = {}
         self._unavailable: set[str] = set()
 
     def prepare_snapshot(self, snapshot: RuntimeSnapshot) -> None:
@@ -75,18 +80,56 @@ class PluginDashboardHost:
     ) -> None:
         bindings: list[DashboardBinding] = []
         occupied = list(self._core_routes)
+        active_generations = {
+            generation.plugin_id for generation in snapshot.active_generations()
+        }
         for generation in snapshot.generations.values():
+            if not isinstance(generation.instance, ComposablePlugin):
+                raise RuntimeError(
+                    f"Dashboard 只接受 v3 generation: {generation.plugin_id}"
+                )
+            if generation.plugin_id not in active_generations:
+                continue
             module_path = generation.contributions.dashboard_module
             generation_id = generation.generation_id
             if module_path is None or generation_id in self._unavailable:
                 continue
-            binding = self._bindings.get(generation_id)
+            root = snapshot.composition_root
+            if root is None:
+                raise RuntimeError(
+                    f"v3 Dashboard 缺少 composition Root: {generation.plugin_id}"
+                )
+            runtime = root.plugin_runtime(generation.plugin_id)
+            runtime_workspace = runtime.workspace.resolve(strict=False)
+            data_root = runtime.data_dir.resolve(strict=False)
+            workspace_roots = runtime.workspace_roots
+            validation = data_root != generation.data_dir.resolve(strict=False)
+            if validation:
+                runtime_workspace.mkdir(parents=True, exist_ok=True)
+            binding_key = (generation_id, runtime_workspace)
+            binding = self._bindings.get(binding_key)
             if binding is None:
+                binding_scope = generation.scope
+                if validation:
+                    binding_scope = PluginScope(
+                        f"{generation.plugin_id}:dashboard-validation"
+                    )
+                    generation.scope.defer(
+                        "validation_dashboard",
+                        lambda binding_scope=binding_scope: (
+                            _close_dashboard_scope(binding_scope)
+                        ),
+                    )
                 try:
                     binding = self._build_binding(
                         generation,
                         module_path,
                         occupied=occupied,
+                        workspace=runtime_workspace,
+                        data_root=data_root,
+                        workspace_roots=workspace_roots,
+                        scope=binding_scope,
+                        validation=validation,
                     )
                 except Exception as error:
                     if not tolerate_failures or not isinstance(
@@ -111,14 +154,14 @@ class PluginDashboardHost:
                         error,
                     )
                     continue
-                self._bindings[generation_id] = binding
+                self._bindings[binding_key] = binding
 
                 def remove_binding(
-                    generation_id: str = generation_id,
+                    binding_key: tuple[str, Path] = binding_key,
                 ) -> None:
-                    _ = self._bindings.pop(generation_id, None)
+                    _ = self._bindings.pop(binding_key, None)
 
-                generation.scope.defer(
+                binding_scope.defer(
                     "dashboard",
                     remove_binding,
                 )
@@ -128,17 +171,56 @@ class PluginDashboardHost:
             occupied.extend(binding.routes)
         snapshot.dashboard_bindings = tuple(bindings)
 
+    async def release_validation(self, snapshot: RuntimeSnapshot) -> None:
+        """Close candidate-only dashboard resources before formal rebuild."""
+
+        # 1. Candidate bindings own a child scope so promotion can retire them early.
+        bindings = tuple(
+            binding
+            for binding in snapshot.dashboard_bindings
+            if isinstance(binding, DashboardBinding) and binding.validation
+        )
+        failures = []
+        for binding in reversed(bindings):
+            scope = binding._scope
+            if scope is None:
+                raise RuntimeError(
+                    f"candidate dashboard 缺少隔离 scope: {binding.plugin_id}"
+                )
+            failures.extend(await scope.aclose())
+
+        # 2. A formal snapshot must never retain a validation-workspace binding.
+        snapshot.dashboard_bindings = tuple(
+            binding
+            for binding in snapshot.dashboard_bindings
+            if not isinstance(binding, DashboardBinding) or not binding.validation
+        )
+        if failures:
+            details = ", ".join(
+                f"{failure.resource}: {failure.error}" for failure in failures
+            )
+            raise RuntimeError(f"candidate dashboard 清理失败: {details}")
+
     def _build_binding(
         self,
         generation: PluginGeneration,
         module_path: Path,
         *,
         occupied: list[APIRoute],
+        workspace: Path,
+        data_root: Path,
+        workspace_roots: tuple[str, ...],
+        scope: PluginScope,
+        validation: bool,
     ) -> DashboardBinding:
         app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
-        app.state.memory_admin = self._memory_admin
-        app.state.memory_store = self._memory_store
-        name = f"{generation.module_path}.dashboard"
+        suffix = (
+            ""
+            if not validation
+            else "_validation_"
+            + hashlib.sha256(str(workspace).encode()).hexdigest()[:12]
+        )
+        name = f"{generation.module_path}.dashboard{suffix}"
         module = ModuleType(name)
         module.__file__ = str(module_path)
         module.__package__ = generation.module_path
@@ -153,13 +235,39 @@ class PluginDashboardHost:
             if not callable(register):
                 raise RuntimeError(f"dashboard module 缺少 register: {module_path}")
             enabled = getattr(module, "plugin_enabled", None)
-            closeables = (
-                []
-                if callable(enabled) and not enabled(app)
-                else _closeables(register(app, module_path.parent, self._workspace))
+            if enabled is not None and not callable(enabled):
+                raise RuntimeError("v3 dashboard plugin_enabled 必须是可调用对象")
+            dashboard_context = DashboardContext(
+                plugin_id=generation.plugin_id,
+                plugin_dir=module_path.parent,
+                data_root=data_root,
+                validation=validation,
+                _workspace_roots=tuple(
+                    (name, resolve_declared_workspace_root(workspace, name))
+                    for name in workspace_roots
+                ),
             )
+            enabled_result = True
+            if callable(enabled):
+                enabled_result = enabled(dashboard_context)
+                _reject_dashboard_awaitable(
+                    enabled_result,
+                    operation="plugin_enabled",
+                )
+            if not isinstance(enabled_result, bool):
+                raise RuntimeError("v3 dashboard plugin_enabled 必须返回 bool")
+            registered = None
+            if enabled_result:
+                registered = register(app, dashboard_context)
+                _reject_dashboard_awaitable(
+                    registered,
+                    operation="register",
+                )
+            closeables: list[object] = []
+            if enabled_result:
+                closeables = _dashboard_closeables(registered)
             for index, closeable in enumerate(closeables):
-                generation.scope.defer(
+                scope.defer(
                     f"dashboard_closeable:{index}",
                     getattr(closeable, "close"),
                 )
@@ -170,6 +278,11 @@ class PluginDashboardHost:
                 plugin_id=generation.plugin_id,
                 app=app,
                 routes=routes,
+                runtime_workspace=workspace,
+                runtime_data_root=data_root,
+                validation=validation,
+                module_name=name,
+                _scope=scope,
             )
             _require_routes_available(binding, occupied)
         except BaseException:
@@ -179,8 +292,39 @@ class PluginDashboardHost:
         def remove_module() -> None:
             _ = sys.modules.pop(name, None)
 
-        generation.scope.defer("dashboard_module", remove_module)
+        scope.defer("dashboard_module", remove_module)
         return binding
+
+
+def _reject_dashboard_awaitable(value: object, *, operation: str) -> None:
+    """关闭不受支持的 awaitable，并让 v3 Dashboard ABI 错误显式失败。"""
+
+    if not inspect.isawaitable(value):
+        return
+    close = getattr(value, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception as error:
+            raise RuntimeError(
+                f"v3 dashboard {operation} 不支持 async，且 awaitable 关闭失败"
+            ) from error
+    raise RuntimeError(f"v3 dashboard {operation} 不支持 async")
+
+
+def _dashboard_closeables(value: object) -> list[object]:
+    """严格归一化 v3 register 返回的受 scope 管理资源。"""
+
+    if value is None:
+        return []
+    values = value if isinstance(value, (list, tuple)) else (value,)
+    closeables = list(values)
+    for index, item in enumerate(closeables):
+        if not callable(getattr(item, "close", None)):
+            raise RuntimeError(
+                f"v3 dashboard register 返回值不是 closeable: index={index}"
+            )
+    return closeables
 
 
 class SnapshotDashboardMiddleware:
@@ -206,9 +350,13 @@ class SnapshotDashboardMiddleware:
         await self._app(scope, receive, send)  # type: ignore[operator]
 
 
-def _closeables(value: object) -> list[object]:
-    values = value if isinstance(value, list) else [value]
-    return [item for item in values if callable(getattr(item, "close", None))]
+async def _close_dashboard_scope(scope: PluginScope) -> None:
+    failures = await scope.aclose()
+    if failures:
+        details = ", ".join(
+            f"{failure.resource}: {failure.error}" for failure in failures
+        )
+        raise RuntimeError(f"candidate dashboard 清理失败: {details}")
 
 
 def _plugin_routes(routes: Sequence[object]) -> tuple[APIRoute, ...]:

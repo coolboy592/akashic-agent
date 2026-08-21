@@ -192,6 +192,9 @@ async def execute_control_turn(
             "thinking": outbound.thinking,
             "replyTo": outbound.reply_to,
             "media": list(outbound.media),
+            "attachmentIds": [
+                ref.artifact_id for ref in outbound.attachment_refs
+            ],
             "metadata": dict(outbound.metadata),
             "sessionMessageId": outbound.session_message_id,
         },

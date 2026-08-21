@@ -6,19 +6,55 @@ from contextvars import ContextVar, Token
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Literal, cast
+from typing import Literal
 
-from agent.lifecycle.phase import topo_sort_modules
-from agent.mcp.generation import WorkspaceMcpGeneration
 from agent.plugins.generation import PluginGeneration
-from agent.plugins.jobs import RegisteredPluginJob, plugin_job_key
-from agent.plugins.specs import RegisteredProactiveSource, proactive_source_key
+from agent.plugins.private_proactive import PrivateProactiveCatalog
 from agent.tools.registry import ToolRegistry
-from agent.tool_hooks import ToolHook
 from agent.skills import SkillIndex
-from bus.event_bus import Handler
-from infra.channels.contract import Channel
-
+from agent.plugin_composition import (
+    CHANNELS,
+    COMMANDS,
+    BACKGROUND_JOBS,
+    TOOL_CATALOG,
+    MANAGED_PROCESSES,
+    MCP_SERVERS,
+    PROACTIVE_COMPONENTS,
+    CommandRegistry,
+    CompositionError,
+    CompositionRoot,
+    MobileUiRegistry,
+    UI_SLOTS,
+    TopologyView,
+)
+from agent.plugin_composition.channels import (
+    ChannelFactoryFreezeInput,
+    ChannelRegistrySnapshot,
+    CommittedChannelCatalog,
+    CoreChannelDefinition,
+    _freeze_plugin_channels,
+    channel_config_revision,
+)
+from agent.plugin_composition.mcp_slots import (
+    McpServerRegistry,
+    _freeze_plugin_mcp_servers,
+)
+from agent.plugin_composition.process_slots import (
+    ManagedProcessRegistry,
+    _freeze_plugin_managed_processes,
+)
+from agent.plugin_composition.proactive import (
+    ProactiveCatalog,
+    _freeze_plugin_proactive_components,
+)
+from agent.plugin_composition.background_jobs import (
+    BackgroundJobCatalog,
+    _freeze_plugin_background_jobs,
+)
+from agent.plugin_composition.tool_catalog import (
+    PluginToolCatalog,
+    _freeze_plugin_tools,
+)
 SnapshotState = Literal[
     "compiled",
     "validating",
@@ -28,36 +64,40 @@ SnapshotState = Literal[
 ]
 RuntimeSelector = Literal["stable", "latest"]
 
+
 @dataclass
 class RuntimeSnapshot:
     snapshot_id: str
     generations: Mapping[str, PluginGeneration]
-    before_turn_modules: tuple[object, ...]
-    before_reasoning_modules: tuple[object, ...]
-    prompt_render_modules: tuple[object, ...]
-    before_step_modules: tuple[object, ...]
-    after_step_modules: tuple[object, ...]
-    after_reasoning_modules: tuple[object, ...]
-    after_turn_modules: tuple[object, ...]
-    jobs: Mapping[str, RegisteredPluginJob]
-    proactive_sources: Mapping[str, RegisteredProactiveSource]
-    proactive_modules: tuple[object, ...]
-    proactive_lifecycles: tuple[object, ...]
-    proactive_module_factories: tuple[object, ...]
-    proactive_runtime_factories: tuple[object, ...]
-    tool_hooks: tuple[ToolHook, ...]
-    channels: Mapping[str, Channel]
     skill_catalog_generation_id: str | None
-    mcp_catalog_generation_ids: Mapping[str, str]
-    workspace_mcp_generation: WorkspaceMcpGeneration | None = None
-    managed_services: Mapping[str, Mapping[str, object]] = field(
-        default_factory=lambda: MappingProxyType({})
-    )
     dashboard_bindings: tuple[object, ...] = ()
+    mobile_ui_registry: MobileUiRegistry | None = None
+    mobile_ui_registry_identity: str | None = None
+    channel_registry: ChannelRegistrySnapshot | None = None
+    channel_registry_identity: str | None = None
+    channel_catalog: CommittedChannelCatalog | None = None
+    mcp_server_registry: McpServerRegistry | None = None
+    mcp_server_registry_identity: str | None = None
+    managed_process_registry: ManagedProcessRegistry | None = None
+    managed_process_registry_identity: str | None = None
+    proactive_component_catalog: ProactiveCatalog | None = None
+    proactive_component_catalog_identity: str | None = None
+    private_proactive_catalog: PrivateProactiveCatalog | None = None
+    private_proactive_catalog_identity: str | None = None
+    background_job_catalog: BackgroundJobCatalog | None = None
+    background_job_catalog_identity: str | None = None
+    plugin_tool_catalog: PluginToolCatalog | None = None
+    plugin_tool_catalog_identity: str | None = None
     tool_registry: ToolRegistry | None = None
     plugin_skill_index: SkillIndex | None = None
-    event_handlers: Mapping[type[object], tuple[Handler[object], ...]] = field(
-        default_factory=lambda: MappingProxyType({})
+    command_registry: CommandRegistry | None = None
+    composition_root: CompositionRoot | None = None
+    composition_topology: TopologyView | None = None
+    composition_active_plugin_ids: frozenset[str] | None = None
+    composition_validation_identity: str | None = None
+    composition_validation_root_token: object | None = field(
+        default=None,
+        repr=False,
     )
     state: SnapshotState = "compiled"
     lease_count: int = 0
@@ -65,10 +105,13 @@ class RuntimeSnapshot:
     _store_token: object | None = field(default=None, repr=False)
 
     def active_generations(self) -> tuple[PluginGeneration, ...]:
+        if self.generations and self.composition_active_plugin_ids is None:
+            raise RuntimeError("RuntimeSnapshot 缺少 Root active plugin projection")
+        active_plugin_ids = self.composition_active_plugin_ids or frozenset()
         return tuple(
             generation
             for generation in self.generations.values()
-            if plugin_is_active(generation.instance, plugin_id=generation.plugin_id)
+            if generation.plugin_id in active_plugin_ids
         )
 
     def claim(self, store_token: object) -> None:
@@ -77,106 +120,33 @@ class RuntimeSnapshot:
         self._store_token = store_token
 
 
-def plugin_is_active(instance: object, *, plugin_id: str) -> bool:
-    checker = getattr(instance, "is_active", None)
-    if not callable(checker):
-        return True
-    try:
-        return bool(checker())
-    except Exception as error:
-        raise RuntimeError(f"插件 active 状态检查失败: {plugin_id}") from error
-
-
 @dataclass(frozen=True)
 class SnapshotTransaction:
     previous: RuntimeSnapshot | None
     candidate: RuntimeSnapshot
 
 
-@dataclass(frozen=True)
-class _SnapshotModuleOrder:
-    module: object
-    slot: str
-    requires: tuple[str, ...]
-
-
 class RuntimeSnapshotCompiler:
-    _PHASE_FIELDS = (
-        "before_turn_modules",
-        "before_reasoning_modules",
-        "prompt_render_modules",
-        "before_step_modules",
-        "after_step_modules",
-        "after_reasoning_modules",
-        "after_turn_modules",
-    )
-
     def compile(
         self,
         generations: Mapping[str, PluginGeneration],
         *,
         catalog_generation: PluginGeneration | None = None,
         snapshot_revision: str = "",
-        workspace_mcp_generation: WorkspaceMcpGeneration | None = None,
+        composition_root: CompositionRoot | None = None,
+        private_proactive_catalog: PrivateProactiveCatalog | None = None,
+        core_channel_definitions: tuple[CoreChannelDefinition, ...] = (),
+        require_composition_ready: bool = True,
     ) -> RuntimeSnapshot:
         ordered = [generations[key] for key in sorted(generations)]
         if any(generation.plugin_id != key for key, generation in generations.items()):
             raise RuntimeError("RuntimeSnapshot generation key 与 plugin_id 不一致")
-        phases: dict[str, tuple[object, ...]] = {}
-        for field_name in self._PHASE_FIELDS:
-            modules = tuple(
-                module
-                for generation in ordered
-                for module in getattr(generation.contributions, field_name)
-            )
-            phases[field_name] = self.order_plugin_modules(modules)
-        jobs = self._compile_jobs(ordered)
-        sources = self._compile_sources(ordered)
-        proactive_modules = tuple(
-            module
-            for generation in ordered
-            for module in generation.contributions.proactive_modules
-        )
-        proactive_lifecycles = tuple(
-            lifecycle
-            for generation in ordered
-            for lifecycle in generation.contributions.proactive_lifecycles
-        )
-        proactive_module_factories = tuple(
-            factory
-            for generation in ordered
-            for factory in generation.contributions.proactive_module_factories
-        )
-        proactive_runtime_factories = tuple(
-            factory
-            for generation in ordered
-            for factory in generation.contributions.proactive_runtime_factories
-        )
-        channels: dict[str, Channel] = {}
-        for generation in ordered:
-            for channel in generation.contributions.channels:
-                name = str(channel.name).strip()
-                if not name or name in channels:
-                    raise RuntimeError(f"RuntimeSnapshot Channel 名称冲突: {name}")
-                channels[name] = channel
         catalog_owner = catalog_generation or next(
             (generation for generation in reversed(ordered) if generation.skill_catalog),
             None,
         )
         if catalog_owner is not None and generations.get(catalog_owner.plugin_id) is not catalog_owner:
             raise RuntimeError("RuntimeSnapshot catalog owner 不属于 generations")
-        mcp_catalogs = {
-            generation.plugin_id: generation.mcp_catalog.generation_id
-            for generation in ordered
-            if generation.mcp_catalog is not None
-        }
-        managed_services = {
-            generation.plugin_id: MappingProxyType(
-                dict(generation.contributions.managed_services)
-            )
-            for generation in ordered
-            if generation.contributions.managed_services
-        }
         identity = "|".join(
             f"{generation.plugin_id}:{generation.generation_id}:"
             f"{generation.source_revision}:{generation.config_revision}"
@@ -187,102 +157,395 @@ class RuntimeSnapshotCompiler:
             if catalog_owner is not None and catalog_owner.skill_catalog is not None
             else ""
         )
-        identity += "|mcp:" + "|".join(
-            f"{plugin_id}:{generation_id}"
-            for plugin_id, generation_id in sorted(mcp_catalogs.items())
-        )
-        identity += "|workspace-mcp:" + (
-            workspace_mcp_generation.generation_id
-            if workspace_mcp_generation is not None
-            else ""
-        )
         identity += f"|snapshot:{snapshot_revision}"
+        if private_proactive_catalog is not None:
+            if composition_root is None:
+                raise RuntimeError(
+                    "RuntimeSnapshot private proactive catalog 缺少 Root Context"
+                )
+            if (
+                private_proactive_catalog.root_instance_token
+                is not composition_root.instance_token
+            ):
+                raise RuntimeError(
+                    "RuntimeSnapshot private proactive catalog 不属于 exact Root"
+                )
+            identity += f"|private-proactive:{private_proactive_catalog.identity}"
+        composition_topology: TopologyView | None = None
+        composition_active_plugin_ids: frozenset[str] | None = None
+        command_registry: CommandRegistry | None = None
+        mobile_ui_registry: MobileUiRegistry | None = None
+        channel_registry: ChannelRegistrySnapshot | None = None
+        channel_catalog: CommittedChannelCatalog | None = None
+        mcp_server_registry: McpServerRegistry | None = None
+        managed_process_registry: ManagedProcessRegistry | None = None
+        proactive_component_catalog: ProactiveCatalog | None = None
+        background_job_catalog: BackgroundJobCatalog | None = None
+        plugin_tool_catalog: PluginToolCatalog | None = None
+        if composition_root is not None:
+            receipt = composition_root.receipt()
+            if require_composition_ready and not receipt.ready:
+                raise RuntimeError(
+                    "RuntimeSnapshot 插件组合拓扑未就绪: "
+                    f"required_pending={receipt.required_pending}, "
+                    f"required_degraded={receipt.required_degraded}, "
+                    f"incident_overflowed={receipt.incident_overflowed}, "
+                    f"external_effects={receipt.external_effects}"
+                )
+            composition_topology = composition_root.topology_view()
+            composition_active_plugin_ids = composition_root.active_plugin_ids()
+            identity += f"|composition:{composition_topology.identity}"
+            ui_slots = composition_root.context.get(UI_SLOTS)
+            if ui_slots is not None:
+                freeze = getattr(ui_slots, "freeze", None)
+                if not callable(freeze):
+                    raise RuntimeError(
+                        "RuntimeSnapshot UI Slots Service 缺少 freeze"
+                    )
+                frozen_registry = freeze()
+                if not isinstance(frozen_registry, MobileUiRegistry):
+                    raise RuntimeError(
+                        "RuntimeSnapshot UI Slots freeze 返回值无效"
+                    )
+                mobile_ui_registry = frozen_registry
+                identity += f"|mobile-ui:{mobile_ui_registry.identity}"
+            commands = composition_root.context.get(COMMANDS)
+            if commands is not None:
+                command_registry = commands.freeze()
+                identity += f"|commands:{command_registry.catalog_digest}"
+            channel_declarations = composition_root.context.get(CHANNELS)
+            if channel_declarations is not None:
+                channel_registry = _freeze_plugin_channels(
+                    channel_declarations,
+                    composition_root.instance_token,
+                    factory_provenance_by_owner={
+                        generation.plugin_id: ChannelFactoryFreezeInput(
+                            generation_id=generation.generation_id,
+                            source_revision=generation.source_revision,
+                            config_revision=channel_config_revision(
+                                generation.config_projection
+                            ),
+                        )
+                        for generation in ordered
+                    },
+                )
+                frozen_channels: set[tuple[str, str]] = set()
+                for descriptor in channel_registry.descriptors:
+                    generation = generations.get(descriptor.owner)
+                    if generation is None:
+                        raise RuntimeError(
+                            "RuntimeSnapshot channel owner 不属于 generations: "
+                            f"{descriptor.owner}"
+                        )
+                    manifest = generation.static_manifest
+                    if manifest is None:
+                        if descriptor.credential_paths:
+                            raise RuntimeError(
+                                "RuntimeSnapshot channel credential 缺少静态 manifest 声明: "
+                                f"{descriptor.owner}:{descriptor.name}"
+                            )
+                        continue
+                    declared = dict(manifest.channel_credentials).get(
+                        descriptor.name,
+                        (),
+                    )
+                    if declared != descriptor.credential_paths:
+                        raise RuntimeError(
+                            "RuntimeSnapshot channel credential 声明与静态 manifest 不一致: "
+                            f"{descriptor.owner}:{descriptor.name}"
+                        )
+                    frozen_channels.add((descriptor.owner, descriptor.name))
+                assert composition_active_plugin_ids is not None
+                for generation in ordered:
+                    manifest = generation.static_manifest
+                    if (
+                        manifest is None
+                        or generation.plugin_id not in composition_active_plugin_ids
+                    ):
+                        continue
+                    for channel_name, _paths in manifest.channel_credentials:
+                        if (generation.plugin_id, channel_name) not in frozen_channels:
+                            raise RuntimeError(
+                                "RuntimeSnapshot 静态 channel credential 没有对应 Root 声明: "
+                                f"{generation.plugin_id}:{channel_name}"
+                            )
+                identity += f"|channels-v3:{channel_registry.identity}"
+            elif any(
+                generation.static_manifest is not None
+                and generation.static_manifest.channel_credentials
+                and composition_active_plugin_ids is not None
+                and generation.plugin_id in composition_active_plugin_ids
+                for generation in ordered
+            ):
+                raise RuntimeError(
+                    "RuntimeSnapshot 静态 channel credential 缺少 Root channel registry"
+                )
+            process_declarations = composition_root.context.get(MANAGED_PROCESSES)
+            if process_declarations is not None:
+                frozen_processes = _freeze_plugin_managed_processes(
+                    process_declarations,
+                    composition_root.instance_token,
+                )
+                for descriptor in frozen_processes.descriptors:
+                    if descriptor.owner not in generations:
+                        raise RuntimeError(
+                            "RuntimeSnapshot managed process owner 不属于 generations: "
+                            f"{descriptor.owner}"
+                        )
+                managed_process_registry = frozen_processes
+                identity += f"|managed-process-v3:{frozen_processes.identity}"
+            mcp_servers = composition_root.context.get(MCP_SERVERS)
+            if mcp_servers is not None:
+                frozen_mcp = _freeze_plugin_mcp_servers(
+                    mcp_servers,
+                    composition_root.instance_token,
+                )
+                for descriptor in frozen_mcp.descriptors:
+                    generation = generations.get(descriptor.owner)
+                    if generation is None:
+                        raise RuntimeError(
+                            "RuntimeSnapshot MCP owner 不属于 generations: "
+                            f"{descriptor.owner}"
+                        )
+                    for endpoint in descriptor.endpoint_env:
+                        process = (
+                            None
+                            if managed_process_registry is None
+                            else managed_process_registry.get(endpoint.process)
+                        )
+                        if (
+                            process is None
+                            or process.descriptor.owner != descriptor.owner
+                        ):
+                            raise RuntimeError(
+                                "RuntimeSnapshot MCP endpoint 缺少同 owner managed process: "
+                                f"{descriptor.owner}:{descriptor.name} -> "
+                                f"{endpoint.process}"
+                            )
+                mcp_server_registry = frozen_mcp
+                identity += f"|mcp-v3:{frozen_mcp.identity}"
+            proactive_components = composition_root.context.get(PROACTIVE_COMPONENTS)
+            if proactive_components is not None:
+                proactive_component_catalog = _freeze_plugin_proactive_components(
+                    proactive_components,
+                    composition_root.instance_token,
+                    {
+                        generation.plugin_id: generation.generation_id
+                        for generation in ordered
+                    },
+                )
+                self._validate_proactive_component_catalog(
+                    proactive_component_catalog,
+                    generations,
+                    mcp_server_registry,
+                )
+                identity += (
+                    f"|proactive-components-v3:{proactive_component_catalog.identity}"
+                )
+            background_jobs = composition_root.context.get(BACKGROUND_JOBS)
+            if background_jobs is not None:
+                background_job_catalog = _freeze_plugin_background_jobs(
+                    background_jobs,
+                    composition_root.instance_token,
+                    {
+                        generation.plugin_id: generation.generation_id
+                        for generation in ordered
+                    },
+                )
+                self._validate_background_job_catalog(
+                    background_job_catalog,
+                    generations,
+                )
+                identity += f"|background-jobs-v3:{background_job_catalog.identity}"
+            plugin_tools = composition_root.context.get(TOOL_CATALOG)
+            if plugin_tools is not None:
+                plugin_tool_catalog = _freeze_plugin_tools(
+                    plugin_tools,
+                    composition_root.instance_token,
+                    {
+                        generation.plugin_id: generation.generation_id
+                        for generation in ordered
+                    },
+                )
+                self._validate_plugin_tool_catalog(
+                    plugin_tool_catalog,
+                    generations,
+                )
+                identity += f"|plugin-tools-v3:{plugin_tool_catalog.identity}"
+        if core_channel_definitions:
+            channel_catalog = CommittedChannelCatalog(
+                plugin_registry=channel_registry,
+                core_definitions=tuple(core_channel_definitions),
+                root_instance_token=(
+                    None
+                    if composition_root is None
+                    else composition_root.instance_token
+                ),
+            )
+            identity += f"|core-channels-v3:{channel_catalog.identity}"
         snapshot_id = hashlib.sha256(identity.encode()).hexdigest()[:16]
         return RuntimeSnapshot(
             snapshot_id=snapshot_id,
             generations=MappingProxyType(dict(generations)),
-            jobs=MappingProxyType(jobs),
-            proactive_sources=MappingProxyType(sources),
-            proactive_modules=proactive_modules,
-            proactive_lifecycles=proactive_lifecycles,
-            proactive_module_factories=proactive_module_factories,
-            proactive_runtime_factories=proactive_runtime_factories,
-            tool_hooks=(),
-            channels=MappingProxyType(channels),
             skill_catalog_generation_id=(
                 catalog_owner.skill_catalog.generation_id
                 if catalog_owner is not None and catalog_owner.skill_catalog is not None
                 else None
             ),
-            mcp_catalog_generation_ids=MappingProxyType(mcp_catalogs),
-            workspace_mcp_generation=workspace_mcp_generation,
-            managed_services=MappingProxyType(managed_services),
+            mobile_ui_registry=mobile_ui_registry,
+            mobile_ui_registry_identity=(
+                None if mobile_ui_registry is None else mobile_ui_registry.identity
+            ),
+            channel_registry=channel_registry,
+            channel_registry_identity=(
+                None if channel_registry is None else channel_registry.identity
+            ),
+            channel_catalog=channel_catalog,
+            mcp_server_registry=mcp_server_registry,
+            mcp_server_registry_identity=(
+                None
+                if mcp_server_registry is None
+                else mcp_server_registry.identity
+            ),
+            managed_process_registry=managed_process_registry,
+            managed_process_registry_identity=(
+                None
+                if managed_process_registry is None
+                else managed_process_registry.identity
+            ),
+            proactive_component_catalog=proactive_component_catalog,
+            proactive_component_catalog_identity=(
+                None
+                if proactive_component_catalog is None
+                else proactive_component_catalog.identity
+            ),
+            private_proactive_catalog=private_proactive_catalog,
+            private_proactive_catalog_identity=(
+                None
+                if private_proactive_catalog is None
+                else private_proactive_catalog.identity
+            ),
+            background_job_catalog=background_job_catalog,
+            background_job_catalog_identity=(
+                None
+                if background_job_catalog is None
+                else background_job_catalog.identity
+            ),
+            plugin_tool_catalog=plugin_tool_catalog,
+            plugin_tool_catalog_identity=(
+                None if plugin_tool_catalog is None else plugin_tool_catalog.identity
+            ),
             plugin_skill_index=(
                 catalog_owner.skill_catalog.normal_plugins
                 if catalog_owner is not None and catalog_owner.skill_catalog is not None
                 else None
             ),
-            before_turn_modules=phases["before_turn_modules"],
-            before_reasoning_modules=phases["before_reasoning_modules"],
-            prompt_render_modules=phases["prompt_render_modules"],
-            before_step_modules=phases["before_step_modules"],
-            after_step_modules=phases["after_step_modules"],
-            after_reasoning_modules=phases["after_reasoning_modules"],
-            after_turn_modules=phases["after_turn_modules"],
+            command_registry=command_registry,
+            composition_root=composition_root,
+            composition_topology=composition_topology,
+            composition_active_plugin_ids=composition_active_plugin_ids,
         )
 
     @staticmethod
-    def order_plugin_modules(modules: tuple[object, ...]) -> tuple[object, ...]:
-        slots = {
-            str(slot)
-            for slot in (getattr(module, "slot", None) for module in modules)
-            if isinstance(slot, str) and slot
-        }
-        bindings = [
-            _SnapshotModuleOrder(
-                module=module,
-                slot=str(getattr(module, "slot", "")),
-                requires=tuple(
-                    str(required)
-                    for required in getattr(module, "requires", ())
-                    if str(required) in slots
-                ),
+    def _validate_proactive_component_catalog(
+        catalog: ProactiveCatalog,
+        generations: Mapping[str, PluginGeneration],
+        mcp_registry: McpServerRegistry | None,
+    ) -> None:
+        """Validate exact generation routes without executing a source or module."""
+
+        # 1. Every binding belongs to the generation compiled into this snapshot.
+        for binding in (*catalog.sources.values(), *catalog.modules.values()):
+            generation = generations.get(binding.owner)
+            if (
+                generation is None
+                or generation.generation_id != binding.generation_id
+            ):
+                raise RuntimeError(
+                    "RuntimeSnapshot proactive binding 不属于 exact generation: "
+                    f"{binding.owner}:{binding.generation_id}"
+                )
+
+        # 2. Source tools reference the same owner's committed MCP contract.
+        for binding in catalog.sources.values():
+            descriptor = binding.descriptor
+            server = None if mcp_registry is None else mcp_registry.get(
+                descriptor.mcp_server
             )
-            for module in modules
-        ]
-        ordered = cast(list[_SnapshotModuleOrder], topo_sort_modules(bindings))
-        return tuple(binding.module for binding in ordered)
+            if server is None or server.descriptor.owner != descriptor.owner:
+                raise RuntimeError(
+                    "RuntimeSnapshot proactive source 缺少同 owner MCP server: "
+                    f"{descriptor.owner}:{descriptor.name} -> {descriptor.mcp_server}"
+                )
+            required = set(server.descriptor.required_tools)
+            if descriptor.fetch_tool not in required:
+                raise RuntimeError(
+                    "RuntimeSnapshot proactive fetch tool 不在 MCP contract: "
+                    f"{descriptor.owner}:{descriptor.fetch_tool}"
+                )
+            if descriptor.ack_tool:
+                if descriptor.ack_tool not in required:
+                    raise RuntimeError(
+                        "RuntimeSnapshot proactive ack tool 不在 MCP contract: "
+                        f"{descriptor.owner}:{descriptor.ack_tool}"
+                    )
+                if descriptor.ack_tool in server.descriptor.candidate_read_only_tools:
+                    raise RuntimeError(
+                        "RuntimeSnapshot proactive ack tool 不得进入 candidate allowlist: "
+                        f"{descriptor.owner}:{descriptor.ack_tool}"
+                    )
+
+        # 3. Frame lifecycle is Core-owned and produced capabilities are unique.
+        produced: dict[str, str] = {}
+        for binding in catalog.modules.values():
+            descriptor = binding.descriptor
+            if descriptor.lifecycle_id != "default.proactive.frame.v1":
+                raise RuntimeError(
+                    "RuntimeSnapshot proactive lifecycle 未注册: "
+                    f"{descriptor.lifecycle_id}"
+                )
+            for capability in descriptor.produces:
+                previous = produced.setdefault(capability, descriptor.slot)
+                if previous != descriptor.slot:
+                    raise RuntimeError(
+                        "RuntimeSnapshot proactive capability producer 冲突: "
+                        f"{capability} ({previous}, {descriptor.slot})"
+                    )
 
     @staticmethod
-    def _compile_jobs(
-        generations: list[PluginGeneration],
-    ) -> dict[str, RegisteredPluginJob]:
-        jobs: dict[str, RegisteredPluginJob] = {}
-        for generation in generations:
-            catalog = generation.job_catalog
-            if catalog is None:
-                continue
-            for key, job in catalog.jobs.items():
-                if key in jobs or key != plugin_job_key(job):
-                    raise RuntimeError(f"RuntimeSnapshot Job 稳定键冲突: {key}")
-                jobs[key] = job
-        return jobs
+    def _validate_background_job_catalog(
+        catalog: BackgroundJobCatalog,
+        generations: Mapping[str, PluginGeneration],
+    ) -> None:
+        """Validate every background job against its exact generation."""
 
+        for binding in catalog.values():
+            generation = generations.get(binding.plugin_id)
+            if (
+                generation is None
+                or generation.generation_id != binding.generation_id
+            ):
+                raise RuntimeError(
+                    "RuntimeSnapshot background job 不属于 exact generation: "
+                    f"{binding.plugin_id}:{binding.generation_id}"
+                )
     @staticmethod
-    def _compile_sources(
-        generations: list[PluginGeneration],
-    ) -> dict[str, RegisteredProactiveSource]:
-        sources: dict[str, RegisteredProactiveSource] = {}
-        for generation in generations:
-            catalog = generation.proactive_catalog
-            if catalog is None:
-                continue
-            for key, source in catalog.sources.items():
-                if key in sources or key != proactive_source_key(source):
-                    raise RuntimeError(f"RuntimeSnapshot proactive 稳定键冲突: {key}")
-                sources[key] = source
-        return sources
+    def _validate_plugin_tool_catalog(
+        catalog: PluginToolCatalog,
+        generations: Mapping[str, PluginGeneration],
+    ) -> None:
+        """Validate every Tool binding against its exact generation."""
 
+        for binding in catalog.values():
+            generation = generations.get(binding.plugin_id)
+            if (
+                generation is None
+                or generation.generation_id != binding.generation_id
+            ):
+                raise RuntimeError(
+                    "RuntimeSnapshot plugin Tool 不属于 exact generation: "
+                    f"{binding.plugin_id}:{binding.generation_id}"
+                )
 
 # 插件生命周期边界：一个 turn、job、event 或 proactive tick 必须始终使用同一
 # snapshot；旧 generation 只有在全部 lease 释放后才能 retire 和清理。
@@ -356,6 +619,25 @@ def get_current_runtime_snapshot() -> RuntimeSnapshot | None:
     return binding.lease.snapshot
 
 
+def get_lifecycle_runtime_snapshot() -> RuntimeSnapshot | None:
+    """Resolve a lifecycle snapshot while rejecting inherited or stale bindings."""
+
+    binding = _current_runtime_binding.get()
+    if binding is None:
+        return None
+    if binding.owner_task is not asyncio.current_task():
+        raise CompositionError(
+            "RUNTIME_SNAPSHOT_BINDING_MISMATCH",
+            "lifecycle 必须在绑定 RuntimeSnapshot lease 的 owner task 中运行",
+        )
+    if not binding.lease.active:
+        raise CompositionError(
+            "RUNTIME_SNAPSHOT_BINDING_INACTIVE",
+            "lifecycle 不能使用已释放的 RuntimeSnapshot lease",
+        )
+    return binding.lease.snapshot
+
+
 def lease_current_runtime_snapshot() -> RuntimeSnapshotLease | None:
     lease = get_current_runtime_lease()
     return lease.fork() if lease is not None else None
@@ -381,6 +663,7 @@ class RuntimeSnapshotStore:
         self._latest: RuntimeSnapshot | None = None
         self._snapshots: dict[str, RuntimeSnapshot] = {}
         self._pending: SnapshotTransaction | None = None
+        self._provisional: SnapshotTransaction | None = None
         self._on_drained = on_drained
         self._token = object()
         self._condition = asyncio.Condition()
@@ -411,6 +694,12 @@ class RuntimeSnapshotStore:
         return self._pending.candidate
 
     @property
+    def pending_transaction(self) -> SnapshotTransaction | None:
+        """Expose the exact pending owner for its caller's failure cleanup."""
+
+        return self._pending
+
+    @property
     def retained_snapshot_ids(self) -> tuple[str, ...]:
         return tuple(sorted(self._snapshots))
 
@@ -430,9 +719,9 @@ class RuntimeSnapshotStore:
             for snapshot in self._snapshots.values()
         )
 
-    def workspace_mcp_is_referenced_elsewhere(
+    def composition_is_referenced_elsewhere(
         self,
-        generation: WorkspaceMcpGeneration,
+        root: CompositionRoot,
         *,
         excluding_snapshot_id: str,
     ) -> bool:
@@ -442,13 +731,18 @@ class RuntimeSnapshotStore:
                 snapshot.state in {"validating", "committed"}
                 or snapshot.lease_count > 0
             )
-            and snapshot.workspace_mcp_generation is generation
+            and snapshot.composition_root is root
             for snapshot in self._snapshots.values()
         )
 
     def install(self, snapshot: RuntimeSnapshot) -> None:
-        if self._current is not None or self._pending is not None:
+        if (
+            self._current is not None
+            or self._pending is not None
+            or self._provisional is not None
+        ):
             raise RuntimeError("RuntimeSnapshotStore 已安装初始快照")
+        self._validate_composition(snapshot)
         self._adopt(snapshot)
         snapshot.state = "committed"
         self._current = snapshot
@@ -461,12 +755,13 @@ class RuntimeSnapshotStore:
         *,
         admission_gated: bool = False,
     ) -> SnapshotTransaction:
-        if self._pending is not None:
+        if self._pending is not None or self._provisional is not None:
             raise RuntimeError("已有 RuntimeSnapshot 发布事务")
         if self.unpromoted_candidate is not None:
             raise RuntimeError("已有 RuntimeSnapshot 候选等待 promote/discard")
         if candidate.snapshot_id in self._snapshots:
             raise RuntimeError(f"RuntimeSnapshot 已存在: {candidate.snapshot_id}")
+        self._validate_composition(candidate)
         self._adopt(candidate)
         transaction = SnapshotTransaction(previous=self._current, candidate=candidate)
         candidate.state = "validating"
@@ -483,6 +778,7 @@ class RuntimeSnapshotStore:
         after_open: Callable[[], None] | None = None,
     ) -> None:
         self._require_pending(transaction)
+        self._validate_composition(transaction.candidate)
         if before_open is not None:
             before_open()
         transaction.candidate.state = "committed"
@@ -509,6 +805,7 @@ class RuntimeSnapshotStore:
 
         # 1. Open only the explicitly selected candidate.
         self._require_pending(transaction)
+        self._validate_composition(transaction.candidate)
         if before_open is not None:
             before_open()
         transaction.candidate.state = "committed"
@@ -517,6 +814,121 @@ class RuntimeSnapshotStore:
         self._pending = None
 
         # 2. Wake latest waiters while stable readers stay on the previous snapshot.
+        async with self._condition:
+            self._condition.notify_all()
+
+    async def commit_provisional(
+        self,
+        transaction: SnapshotTransaction,
+    ) -> None:
+        """Stage a closed candidate without exposing it as the published stable."""
+
+        # 1. Validate and close both sides before the external publication step.
+        self._require_pending(transaction)
+        self._validate_composition(transaction.candidate)
+        transaction.candidate.state = "committed"
+        transaction.candidate.accepting_leases = False
+        if transaction.previous is not None:
+            transaction.previous.accepting_leases = False
+
+        # 2. Keep discovery pinned to the old stable while retaining the target.
+        self._latest = transaction.candidate
+        self._pending = None
+        self._provisional = transaction
+        async with self._condition:
+            self._condition.notify_all()
+
+    async def promote_latest_provisional(self) -> SnapshotTransaction:
+        """Stage a sealed latest candidate without exposing it as stable."""
+
+        # 1. Validate the exact closed latest candidate before moving the pointer.
+        if self._provisional is not None:
+            raise RuntimeError("已有 RuntimeSnapshot provisional 发布事务")
+        candidate = self.unpromoted_candidate
+        if candidate is None:
+            raise RuntimeError("没有等待 promote 的 RuntimeSnapshot 候选")
+        if candidate.accepting_leases:
+            raise RuntimeError("promote 前必须先暂停 candidate lease admission")
+        self._validate_composition(candidate, require_validation=True)
+
+        # 2. Keep the old stable visible but closed until the external step settles.
+        previous = self._current
+        if previous is not None:
+            previous.accepting_leases = False
+        transaction = SnapshotTransaction(previous=previous, candidate=candidate)
+        self._latest = candidate
+        candidate.accepting_leases = False
+        self._provisional = transaction
+        async with self._condition:
+            self._condition.notify_all()
+        return transaction
+
+    async def finalize_provisional(
+        self,
+        transaction: SnapshotTransaction,
+        *,
+        before_open: Callable[[], None] | None = None,
+        after_open: Callable[[], None] | None = None,
+    ) -> None:
+        """Open a provisional stable and retire its rollback snapshot."""
+
+        # 1. Complete fallible projection work while the old stable stays visible.
+        self._require_provisional(transaction)
+        self._validate_composition(transaction.candidate)
+        if before_open is not None:
+            before_open()
+
+        # 2. Switch the stable pointer synchronously around the owner callback.
+        transaction.candidate.state = "committed"
+        previous = transaction.previous
+        self._current = transaction.candidate
+        try:
+            if after_open is not None:
+                after_open()
+        except BaseException:
+            self._current = previous
+            raise
+
+        # 3. Open the new stable only after all publication work succeeded.
+        transaction.candidate.accepting_leases = True
+        if previous is not None:
+            previous.state = "retired"
+            previous.accepting_leases = False
+        self._provisional = None
+        if previous is not None:
+            self._schedule_drain(previous)
+        async with self._condition:
+            self._condition.notify_all()
+
+    async def rollback_provisional(
+        self,
+        transaction: SnapshotTransaction,
+        *,
+        keep_candidate_latest: bool,
+        reopen_previous: bool = True,
+    ) -> None:
+        """Restore the previous stable before disposing or retrying the candidate."""
+
+        # 1. Reopen the old pointer; the candidate was never publicly current.
+        self._require_provisional(transaction)
+        candidate = transaction.candidate
+        previous = transaction.previous
+        if self._current is not previous:
+            raise RuntimeError("RuntimeSnapshot provisional stable 指针已漂移")
+        if previous is not None:
+            previous.state = "committed"
+            previous.accepting_leases = reopen_previous
+        self._provisional = None
+
+        # 2. Either retain latest for normal discard or restore the pending transaction.
+        candidate.accepting_leases = False
+        if keep_candidate_latest:
+            candidate.state = "committed"
+            self._latest = candidate
+        else:
+            candidate.state = "validating"
+            self._latest = previous
+            self._pending = transaction
         async with self._condition:
             self._condition.notify_all()
 
@@ -529,11 +941,14 @@ class RuntimeSnapshotStore:
         """Atomically make the ready latest snapshot stable and retire the old stable."""
 
         # 1. Switch the public pointer without rebuilding the validated snapshot.
+        if self._provisional is not None:
+            raise RuntimeError("RuntimeSnapshot provisional 发布事务尚未结束")
         candidate = self.unpromoted_candidate
         if candidate is None:
             raise RuntimeError("没有等待 promote 的 RuntimeSnapshot 候选")
         if candidate.accepting_leases:
             raise RuntimeError("promote 前必须先暂停 candidate lease admission")
+        self._validate_composition(candidate, require_validation=True)
         if before_open is not None:
             before_open()
         previous = self._current
@@ -571,6 +986,8 @@ class RuntimeSnapshotStore:
         """Discard the ready latest snapshot without changing stable."""
 
         # 1. Remove candidate admission once; retries resume its failed drain.
+        if self._provisional is not None:
+            raise RuntimeError("RuntimeSnapshot provisional 发布事务尚未结束")
         candidate = self.unpromoted_candidate
         if candidate is None:
             if expected is None or expected.state != "aborted":
@@ -594,12 +1011,17 @@ class RuntimeSnapshotStore:
             self._condition.notify_all()
         return candidate
 
-    async def abort(self, transaction: SnapshotTransaction) -> None:
+    async def abort(
+        self,
+        transaction: SnapshotTransaction,
+        *,
+        reopen_previous: bool = True,
+    ) -> None:
         self._require_pending(transaction)
         transaction.candidate.state = "aborted"
         transaction.candidate.accepting_leases = False
         if self._current is transaction.previous and transaction.previous is not None:
-            transaction.previous.accepting_leases = True
+            transaction.previous.accepting_leases = reopen_previous
         self._pending = None
         self._schedule_drain(transaction.candidate)
         await self._await_drain_tasks((transaction.candidate.snapshot_id,))
@@ -635,6 +1057,38 @@ class RuntimeSnapshotStore:
             raise RuntimeError("等待 promote 的 RuntimeSnapshot 候选不一致")
         candidate.accepting_leases = False
         return candidate
+
+    def seal_candidate_validation(self, expected: RuntimeSnapshot) -> None:
+        """Seal the Core-observed receipt after validation leases have drained."""
+
+        candidate = self.unpromoted_candidate
+        if candidate is None or candidate is not expected:
+            raise RuntimeError("等待封存验证回执的 RuntimeSnapshot 候选不一致")
+        if candidate.accepting_leases or candidate.lease_count:
+            raise RuntimeError("封存验证回执前必须暂停并排空 candidate lease")
+        self._seal_composition_validation(candidate)
+
+    def seal_pending_validation(self, expected: RuntimeSnapshot) -> None:
+        """封存尚未公开的 direct candidate 组合验证事实。"""
+
+        candidate = self.pending_candidate
+        if candidate is None or candidate is not expected:
+            raise RuntimeError("等待封存验证回执的 pending candidate 不一致")
+        self._seal_composition_validation(candidate)
+
+    def _seal_composition_validation(self, candidate: RuntimeSnapshot) -> None:
+        """在无 lease 的隔离 Root 上保存不可变验证证明。"""
+
+        if candidate.accepting_leases or candidate.lease_count:
+            raise RuntimeError("封存验证回执前必须暂停并排空 candidate lease")
+        self._validate_composition(candidate)
+        root = candidate.composition_root
+        candidate.composition_validation_identity = (
+            None if root is None else root.validation_identity()
+        )
+        candidate.composition_validation_root_token = (
+            None if root is None else root.instance_token
+        )
 
     async def wait_for_no_leases(self, snapshot: RuntimeSnapshot) -> None:
         async with self._condition:
@@ -674,7 +1128,7 @@ class RuntimeSnapshotStore:
                 await self._condition.wait()
 
     async def close(self) -> None:
-        if self._pending is not None:
+        if self._pending is not None or self._provisional is not None:
             raise RuntimeError("RuntimeSnapshot 发布事务尚未结束")
         leased = [
             snapshot.snapshot_id
@@ -717,12 +1171,23 @@ class RuntimeSnapshotStore:
             raise RuntimeError("RuntimeSnapshot 暂停接收新 lease")
         return self._claim_lease(snapshot)
 
+    def retain_publication_target(
+        self,
+        transaction: SnapshotTransaction,
+    ) -> RuntimeSnapshotLease:
+        """Retain the closed exact target for one Core publication participant."""
+
+        if self._pending is not transaction and self._provisional is not transaction:
+            raise RuntimeError("RuntimeSnapshot publication target 已失效")
+        candidate = transaction.candidate
+        if self._snapshots.get(candidate.snapshot_id) is not candidate:
+            raise RuntimeError("RuntimeSnapshot publication target 未被 Store 持有")
+        return self._claim_lease(candidate)
+
     def _claim_lease(self, snapshot: RuntimeSnapshot) -> RuntimeSnapshotLease:
         snapshot.lease_count += 1
         for generation in snapshot.generations.values():
             generation.lease_count += 1
-        if snapshot.workspace_mcp_generation is not None:
-            snapshot.workspace_mcp_generation.lease_count += 1
         return RuntimeSnapshotLease(
             self,
             snapshot,
@@ -736,8 +1201,6 @@ class RuntimeSnapshotStore:
         snapshot.lease_count += 1
         for generation in snapshot.generations.values():
             generation.lease_count += 1
-        if snapshot.workspace_mcp_generation is not None:
-            snapshot.workspace_mcp_generation.lease_count += 1
         return RuntimeSnapshotLease(
             self,
             snapshot,
@@ -763,8 +1226,6 @@ class RuntimeSnapshotStore:
         snapshot.lease_count -= 1
         for generation in snapshot.generations.values():
             generation.lease_count -= 1
-        if snapshot.workspace_mcp_generation is not None:
-            snapshot.workspace_mcp_generation.lease_count -= 1
         self._schedule_drain(snapshot)
         async with self._condition:
             self._condition.notify_all()
@@ -839,8 +1300,218 @@ class RuntimeSnapshotStore:
         if self._pending is not transaction:
             raise RuntimeError("RuntimeSnapshot 发布事务已失效")
 
+    def _require_provisional(self, transaction: SnapshotTransaction) -> None:
+        if self._provisional is not transaction:
+            raise RuntimeError("RuntimeSnapshot provisional 发布事务已失效")
+
     def _adopt(self, snapshot: RuntimeSnapshot) -> None:
         snapshot.claim(self._token)
+
+    @staticmethod
+    def _validate_composition(
+        snapshot: RuntimeSnapshot,
+        *,
+        require_validation: bool = False,
+    ) -> None:
+        root = snapshot.composition_root
+        if root is None:
+            if (
+                snapshot.composition_topology is not None
+                or snapshot.mobile_ui_registry is not None
+                or snapshot.mobile_ui_registry_identity is not None
+                or snapshot.channel_registry is not None
+                or snapshot.channel_registry_identity is not None
+                or snapshot.channel_catalog is not None
+                or snapshot.mcp_server_registry is not None
+                or snapshot.mcp_server_registry_identity is not None
+                or snapshot.managed_process_registry is not None
+                or snapshot.managed_process_registry_identity is not None
+                or snapshot.proactive_component_catalog is not None
+                or snapshot.proactive_component_catalog_identity is not None
+                or snapshot.private_proactive_catalog is not None
+                or snapshot.private_proactive_catalog_identity is not None
+                or snapshot.background_job_catalog is not None
+                or snapshot.background_job_catalog_identity is not None
+                or snapshot.plugin_tool_catalog is not None
+                or snapshot.plugin_tool_catalog_identity is not None
+            ):
+                raise RuntimeError(
+                    "RuntimeSnapshot composition identity 缺少 Root Context"
+                )
+            return
+        if (
+            snapshot.mobile_ui_registry_identity
+            != (
+                None
+                if snapshot.mobile_ui_registry is None
+                else snapshot.mobile_ui_registry.identity
+            )
+        ):
+            raise RuntimeError("RuntimeSnapshot Mobile UI descriptor 在编译后发生变化")
+        if (
+            snapshot.channel_registry_identity
+            != (
+                None
+                if snapshot.channel_registry is None
+                else snapshot.channel_registry.identity
+            )
+        ):
+            raise RuntimeError("RuntimeSnapshot channel descriptor 在编译后发生变化")
+        if (
+            snapshot.channel_registry is not None
+            and snapshot.channel_registry.root_instance_token
+            is not root.instance_token
+        ):
+            raise RuntimeError("RuntimeSnapshot channel registry 不属于 exact Root")
+        if (
+            snapshot.channel_catalog is not None
+            and snapshot.channel_catalog.root_instance_token is not root.instance_token
+        ):
+            raise RuntimeError("RuntimeSnapshot channel catalog 不属于 exact Root")
+        if (
+            snapshot.mcp_server_registry_identity
+            != (
+                None
+                if snapshot.mcp_server_registry is None
+                else snapshot.mcp_server_registry.identity
+            )
+        ):
+            raise RuntimeError("RuntimeSnapshot MCP descriptor 在编译后发生变化")
+        if (
+            snapshot.mcp_server_registry is not None
+            and snapshot.mcp_server_registry.root_instance_token
+            is not root.instance_token
+        ):
+            raise RuntimeError("RuntimeSnapshot MCP registry 不属于 exact Root")
+        if (
+            snapshot.managed_process_registry_identity
+            != (
+                None
+                if snapshot.managed_process_registry is None
+                else snapshot.managed_process_registry.identity
+            )
+        ):
+            raise RuntimeError(
+                "RuntimeSnapshot managed process descriptor 在编译后发生变化"
+            )
+        if (
+            snapshot.managed_process_registry is not None
+            and snapshot.managed_process_registry.root_instance_token
+            is not root.instance_token
+        ):
+            raise RuntimeError(
+                "RuntimeSnapshot managed process registry 不属于 exact Root"
+            )
+        if (
+            snapshot.proactive_component_catalog_identity
+            != (
+                None
+                if snapshot.proactive_component_catalog is None
+                else snapshot.proactive_component_catalog.identity
+            )
+        ):
+            raise RuntimeError(
+                "RuntimeSnapshot proactive catalog 在编译后发生变化"
+            )
+        if (
+            snapshot.proactive_component_catalog is not None
+            and snapshot.proactive_component_catalog.root_instance_token
+            is not root.instance_token
+        ):
+            raise RuntimeError(
+                "RuntimeSnapshot proactive catalog 不属于 exact Root"
+            )
+        if (
+            snapshot.private_proactive_catalog_identity
+            != (
+                None
+                if snapshot.private_proactive_catalog is None
+                else snapshot.private_proactive_catalog.identity
+            )
+        ):
+            raise RuntimeError("RuntimeSnapshot private proactive catalog 在编译后发生变化")
+        if (
+            snapshot.private_proactive_catalog is not None
+            and snapshot.private_proactive_catalog.root_instance_token
+            is not root.instance_token
+        ):
+            raise RuntimeError(
+                "RuntimeSnapshot private proactive catalog 不属于 exact Root"
+            )
+        if (
+            snapshot.background_job_catalog_identity
+            != (
+                None
+                if snapshot.background_job_catalog is None
+                else snapshot.background_job_catalog.identity
+            )
+        ):
+            raise RuntimeError(
+                "RuntimeSnapshot background job catalog 在编译后发生变化"
+            )
+        if (
+            snapshot.background_job_catalog is not None
+            and snapshot.background_job_catalog.root_instance_token
+            is not root.instance_token
+        ):
+            raise RuntimeError(
+                "RuntimeSnapshot background job catalog 不属于 exact Root"
+            )
+        if (
+            snapshot.plugin_tool_catalog_identity
+            != (
+                None
+                if snapshot.plugin_tool_catalog is None
+                else snapshot.plugin_tool_catalog.identity
+            )
+        ):
+            raise RuntimeError(
+                "RuntimeSnapshot plugin Tool catalog 在编译后发生变化"
+            )
+        if (
+            snapshot.plugin_tool_catalog is not None
+            and snapshot.plugin_tool_catalog.root_instance_token
+            is not root.instance_token
+        ):
+            raise RuntimeError(
+                "RuntimeSnapshot plugin Tool catalog 不属于 exact Root"
+            )
+        topology = snapshot.composition_topology
+        if topology is None:
+            raise RuntimeError("RuntimeSnapshot composition Root 缺少 TopologyView")
+        receipt = root.receipt()
+        if receipt.incident_overflowed or receipt.external_effects:
+            raise RuntimeError(
+                "RuntimeSnapshot 插件组合拓扑未就绪: "
+                f"required_pending={receipt.required_pending}, "
+                f"required_degraded={receipt.required_degraded}, "
+                f"incident_overflowed={receipt.incident_overflowed}, "
+                f"external_effects={receipt.external_effects}"
+            )
+        if not receipt.ready:
+            raise RuntimeError(
+                "RuntimeSnapshot 插件组合拓扑未就绪: "
+                f"required_pending={receipt.required_pending}, "
+                f"required_degraded={receipt.required_degraded}, "
+                f"incident_overflowed={receipt.incident_overflowed}, "
+                f"external_effects={receipt.external_effects}"
+            )
+        if root.topology_identity() != topology.identity:
+            raise RuntimeError("RuntimeSnapshot 插件组合拓扑在编译后发生变化")
+        if root.composition_revision != topology.composition_revision:
+            raise RuntimeError("RuntimeSnapshot 插件组合拓扑在编译后发生过结构变化")
+        if require_validation:
+            if (
+                snapshot.composition_validation_identity is None
+                or snapshot.composition_validation_root_token is None
+            ):
+                raise RuntimeError("RuntimeSnapshot 插件组合候选缺少 Core 验证回执")
+            if (
+                snapshot.composition_validation_root_token is root.instance_token
+                and root.validation_identity()
+                != snapshot.composition_validation_identity
+            ):
+                raise RuntimeError("RuntimeSnapshot 插件组合验证回执在封存后发生变化")
 
     def _selected(self, selector: RuntimeSelector) -> RuntimeSnapshot | None:
         if selector == "stable":

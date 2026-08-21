@@ -8,10 +8,13 @@ from typing import Any, cast
 
 from agent.config import Config
 from agent.plugins.artifacts import read_pointers, resolve_pointer
-from agent.plugins.base import Plugin
+from agent.plugins.composable import ComposablePlugin
 from agent.plugins.manifest import load_plugin_manifest, plugins_root
-from agent.plugins.registry import plugin_registry
-from agent.plugins.specs import McpServerSpec
+from agent.plugins.static_manifest import (
+    StaticPluginManifest,
+    load_static_plugin_manifest,
+    validate_module_exports,
+)
 
 
 def run_plugin_doctor(
@@ -77,12 +80,21 @@ def _inspect_plugin(
         plugin_id == "default_memory" and memory_engine != "default"
     )
     if stable_root is not None:
-        checks.append(_check("install", "ok", f"stable plugin.py: {stable_root}"))
+        checks.append(
+            _check(
+                "install",
+                "ok",
+                f"stable {_entrypoint_label(stable_root)}: {stable_root}",
+            )
+        )
         try:
-            plugin_class = _load_plugin_class(stable_root)
+            declaration = _load_plugin_declaration(
+                stable_root,
+                require_static="@" in plugin_id,
+            )
             checks.extend(
                 _check_capabilities(
-                    plugin_class,
+                    declaration,
                     stable_root,
                     workspace,
                     projection_root=projection_root,
@@ -95,11 +107,18 @@ def _inspect_plugin(
         checks.append(_check("install", "error", "未找到插件目录"))
     else:
         checks.append(
-            _check("install", "ok", f"latest candidate plugin.py: {latest_root}")
+            _check(
+                "install",
+                "ok",
+                f"latest candidate {_entrypoint_label(latest_root)}: {latest_root}",
+            )
         )
         try:
-            candidate_class = _load_plugin_class(latest_root)
-            checks.extend(_check_candidate_declaration(candidate_class, latest_root))
+            declaration = _load_plugin_declaration(
+                latest_root,
+                require_static="@" in plugin_id,
+            )
+            checks.extend(_check_candidate_declaration(declaration, latest_root))
             checks.extend(
                 _check_empty_projection(
                     workspace,
@@ -135,7 +154,7 @@ def _find_plugin_roots(
     name, separator, marketplace = plugin_id.partition("@")
     if not separator:
         root = Path(__file__).resolve().parents[2] / "plugins" / name
-        resolved = root if (root / "plugin.py").exists() else None
+        resolved = root if _plugin_root_has_entrypoint(root) else None
         return resolved, resolved, resolved
 
     # 2. 新安装布局以原子 pointer 为准；投影只能跟随 stable。
@@ -148,23 +167,45 @@ def _find_plugin_roots(
             base,
         )
 
-    # 3. 没有 pointer state 时兼容单个 legacy 可见版本目录。
-    versions = (
-        sorted(path for path in base.iterdir() if path.is_dir())
-        if base.is_dir()
-        else []
-    )
-    root = versions[-1] if versions and (versions[-1] / "plugin.py").exists() else None
-    return root, root, base
+    # 3. 外部插件只认原子 pointer，不扫描旧版可见目录。
+    return None, None, base
 
 
-def _load_plugin_class(plugin_root: Path) -> type[Plugin]:
+def _plugin_root_has_entrypoint(root: Path) -> bool:
+    """Recognize builtin plugin.py and static-manifest custom entrypoints."""
+
+    manifest_path = root / "akashic.plugin.toml"
+    if manifest_path.exists() or manifest_path.is_symlink():
+        manifest = load_static_plugin_manifest(root)
+        return (root / manifest.entrypoint).is_file()
+    return (root / "plugin.py").is_file()
+
+
+def _entrypoint_label(root: Path) -> str:
+    manifest_path = root / "akashic.plugin.toml"
+    if manifest_path.exists() or manifest_path.is_symlink():
+        return load_static_plugin_manifest(root).entrypoint
+    return "plugin.py"
+
+
+def _load_plugin_declaration(
+    plugin_root: Path,
+    *,
+    require_static: bool,
+) -> ComposablePlugin:
+    """读取并校验一个 v3 namespace。"""
+
+    static_manifest = _load_optional_static_manifest(plugin_root)
+    if require_static and static_manifest is None:
+        raise ValueError(f"installed v3 插件缺少静态 manifest: {plugin_root}")
     module_name = f"akasic_plugin_doctor_{uuid.uuid4().hex}"
-    path = plugin_root / "plugin.py"
+    path = plugin_root / (
+        static_manifest.entrypoint if static_manifest is not None else "plugin.py"
+    )
     spec = importlib.util.spec_from_file_location(
         module_name,
         path,
-        submodule_search_locations=[str(plugin_root)],
+        submodule_search_locations=[str(path.parent)],
     )
     if spec is None or spec.loader is None:
         raise ImportError(f"无法加载 {path}")
@@ -172,19 +213,34 @@ def _load_plugin_class(plugin_root: Path) -> type[Plugin]:
     sys.modules[module_name] = module
     try:
         spec.loader.exec_module(module)
-        plugin_class = plugin_registry.get_class(module_name)
-        if plugin_class is None:
-            raise ValueError("plugin.py 未声明 Plugin 子类")
-        if not issubclass(plugin_class, Plugin):
-            raise TypeError("plugin.py 注册的类型不是 Plugin 子类")
-        return cast(type[Plugin], plugin_class)
+        if static_manifest is not None and getattr(module, "api_version", None) != 3:
+            raise ValueError("静态 v3 manifest 与 module api_version 不一致")
+        if getattr(module, "api_version", None) != 3:
+            raise ValueError("plugin.py 必须声明 api_version = 3")
+        if static_manifest is not None:
+            validate_module_exports(
+                static_manifest,
+                module,
+                plugin_root=plugin_root,
+            )
+        return ComposablePlugin.from_module(module)
     finally:
-        plugin_registry.remove_plugin(module_name)
         _ = sys.modules.pop(module_name, None)
 
 
+def _load_optional_static_manifest(
+    plugin_root: Path,
+) -> StaticPluginManifest | None:
+    """读取可选的 v3 static manifest；内建源码插件可以没有 manifest。"""
+
+    path = plugin_root / "akashic.plugin.toml"
+    if not path.exists() and not path.is_symlink():
+        return None
+    return load_static_plugin_manifest(plugin_root)
+
+
 def _check_capabilities(
-    plugin_class: type[Plugin],
+    declaration: ComposablePlugin,
     plugin_root: Path,
     workspace: Path,
     *,
@@ -195,13 +251,13 @@ def _check_capabilities(
     for label, roots, target, subpath in (
         (
             "skills",
-            plugin_class.skill_roots(),
+            _declared_skill_roots(declaration, drift=False),
             workspace / "skills",
             ("skills",),
         ),
         (
             "drift_skills",
-            plugin_class.drift_skill_roots(),
+            _declared_skill_roots(declaration, drift=True),
             workspace / "drift" / "skills",
             ("drift", "skills"),
         ),
@@ -228,22 +284,25 @@ def _check_capabilities(
                 f"misdirected={misdirected} stale={stale}",
             )
         )
-    servers = plugin_class.mcp_servers()
-    invalid = [item for item in servers if not isinstance(item, McpServerSpec)]
+    servers = _declared_mcp_servers(plugin_root)
     checks.append(
-        _check("mcp", "error" if invalid else "ok", f"servers={len(servers)}")
+        _check(
+            "mcp",
+            "ok",
+            f"declared_servers={len(servers)} names={list(servers)}",
+        )
     )
     return checks
 
 
 def _check_candidate_declaration(
-    plugin_class: type[Plugin],
+    declaration: ComposablePlugin,
     plugin_root: Path,
 ) -> list[dict[str, str]]:
     checks: list[dict[str, str]] = []
     for label, roots in (
-        ("candidate_skills", plugin_class.skill_roots()),
-        ("candidate_drift_skills", plugin_class.drift_skill_roots()),
+        ("candidate_skills", _declared_skill_roots(declaration, drift=False)),
+        ("candidate_drift_skills", _declared_skill_roots(declaration, drift=True)),
     ):
         missing = [raw for raw in roots if not (plugin_root / raw).is_dir()]
         checks.append(
@@ -253,16 +312,34 @@ def _check_candidate_declaration(
                 f"roots={len(roots)} missing={missing}",
             )
         )
-    servers = plugin_class.mcp_servers()
-    invalid = [item for item in servers if not isinstance(item, McpServerSpec)]
+    servers = _declared_mcp_servers(plugin_root)
     checks.append(
         _check(
             "candidate_mcp",
-            "error" if invalid else "ok",
-            f"servers={len(servers)}",
+            "ok",
+            f"declared_servers={len(servers)} names={list(servers)}",
         )
     )
     return checks
+
+
+def _declared_skill_roots(
+    declaration: ComposablePlugin,
+    *,
+    drift: bool,
+) -> tuple[str, ...]:
+    return declaration.drift_skill_roots if drift else declaration.skill_roots
+
+
+def _declared_mcp_servers(
+    plugin_root: Path,
+) -> tuple[str, ...]:
+    """Return import-free MCP names declared by the artifact."""
+
+    manifest = _load_optional_static_manifest(plugin_root)
+    if manifest is None:
+        return ()
+    return tuple(server.name for server in manifest.mcp_servers)
 
 
 def _check_empty_projection(

@@ -33,6 +33,45 @@ python docker/debug/gate.py plan --base origin/main
 
 公开 Gate 不安装也不枚举私有插件，不依赖外部私有验证或 provider 身份；公开报告是当前仓库的合并依据。
 
+## Citation + Meme 纯 v3 组合 Gate
+
+`plugin_passive_composition_v3_gate.py` 从锁文件 fresh checkout 纯 v3 Citation、Meme
+与公共插件合同，在临时 workspace 中通过真实 `PluginManager.load_all()` 发布 stable
+snapshot。Gate 只从该 snapshot lease 执行 prompt、回复预处理和清理事件，并验证
+Service/Fiber 依赖、Skill、Dashboard、workspace asset 零改写和终止回收。
+
+```text
+┌─ Citation Fiber ── provide citation.protocol ───────────────┐
+│  ├─ prompt protocol                                        │
+│  ├─ citation metadata                                      │
+│  └─ final protocol cleanup                                 │
+│                                                            ▼
+└─────────────────────────────── Meme Fiber (required inject)
+                                 ├─ prompt catalog
+                                 ├─ reply media decoration
+                                 ├─ meme-manage Skill
+                                 └─ Dashboard + workspace/memes
+```
+
+```bash
+python docker/debug/plugin_passive_composition_v3_gate.py --require-clean-core
+```
+
+证据写入 `docker/debug/reports/plugin-passive-composition-v3/gate.json`。运行期间只写
+临时 checkout、临时 workspace 与被 Git 忽略的报告目录，不读取或修改正式 workspace。
+
+同一组 exact commits 还必须通过完整 WebUI runtime：Gate 用 installed stable artifact
+布局启动 supervised Gateway，只保留 WebUI channel，经公开 WebSocket 完成一轮回复，再从
+公开 HTTP 读取消息、媒体、Dashboard 与 capability。它同时核对模型 prompt 中
+Citation→Meme 顺序、SessionDB、artifact 前后摘要以及 Compose 零残留。
+
+```bash
+python docker/debug/plugin_passive_webui_v3_e2e.py --require-clean-core
+```
+
+证据写入 `docker/debug/reports/plugin-passive-webui-v3/gate.json`；模型响应由 Compose 私网内
+的 deterministic model-gate 提供，不调用外部生产 provider。
+
 ### Shell execution 固定 Runtime 场景
 
 `shell_execution_contract` 在 change-gate 的只读 Arch Linux runtime 中运行，不读取
@@ -73,9 +112,10 @@ failure，并检查 RSS、fd、线程与 DB 非终态阈值。
 每次运行的证据位于
 `docker/debug/reports/programmatic-control/<run-id>/`。
 
-## Akasha V2 在线与重放等价 Gate
+## Akasha memory engine 在线与重放等价 Gate
 
-Akasha 专用 Gate 复用同一个只读 runtime 容器，但开启 `memory.engine = "akasha"`。
+这个名字保留历史脚本路径，但验证对象是 Core memory-engine factory，不是已经删除的
+v2 Plugin ABI。Gate 复用同一个只读 runtime 容器，并开启 `memory.engine = "akasha"`。
 scripted model-gate 只控制模型回复和 `recall_memory` 工具选择；embedding 使用显式
 `--source-config` 中的真实 provider。配置及凭据只进入权限为 `0600` 的唯一 `/tmp`
 sandbox，运行结束后删除，不写日志和报告。
@@ -105,41 +145,21 @@ python scripts/check_yoyo_migrations.py --base origin/main
 新增 migration 前按 [Yoyo 迁移维护手册](../../docs/design/git-migration-authoring.md)补齐
 真实状态变换与相应 case。不再构造 Git cursor、固定 baseline、repair 清单或专用容器 Gate。
 
-## Runtime 扩展生命周期验收门
+## v3 MCP / managed-process 验收门
 
-workspace MCP 和 agent restart 共用 `docker-compose.control-gate.yml`，但每次运行都会创建
-独立 Compose project 与 sandbox。Gate 复制当前 tracked 和 non-ignored untracked 源码，记录
-Git HEAD、工作树状态、源码摘要、容器 `/app` 摘要与 image ID；运行结束后按 Compose project
-label 检查容器、网络和卷均无残留。
-
-```text
-┌─ workspace MCP Gate
-│  ├─ v1 → v2 → watched-content reload
-│  ├─ 旧 turn lease 与新 generation 隔离
-│  ├─ 坏声明整批 rollback、修复后自动恢复
-│  └─ 删除声明后工具与真实 MCP 进程全部退出
-└─ restart + MCP 组合 Gate
-   ├─ tool_search → agent_restart → terminal delivery
-   ├─ Supervisor 固定、每 boot 一个 Guardian、Gateway/boot ID 更换
-   ├─ MCP 热更后跨进程重启恢复，旧 MCP PID 退出
-   ├─ 裸 exit 75、stale readiness、断线、TERM 与 owner SIGKILL 矩阵
-   └─ 20 轮 FD、线程、zombie 与非终态 turn 资源门禁
-```
-
-本地合并前运行：
+MCP 与 managed process 只能由插件静态 manifest 声明，经过 exact Root-local
+`McpServerRegistry` / `ManagedProcessRegistry` 冻结，再由对应 generation host 物化。
+workspace 手工 TOML、watcher/admin 和独立热重载路径已删除；Gate 不读取正式 workspace。
 
 ```bash
-python docker/debug/workspace_mcp_reload_probe.py
+python docker/debug/plugin_v3_fleet_gate.py
+python docker/debug/plugin_composition_v3_gate.py --require-clean-core
 python docker/debug/restart_probe.py --soak
 ```
 
-验收以两个 host `gate.json` 的 `status=passed` 为准，不能只使用容器内
-`restart-gate.json`。两份报告必须来自同一 HEAD、相同 source digest；CI 还要求工作树为空。
-owner 故障矩阵分别杀死 Supervisor 和 Guardian，要求剩余 owner 清空 Gateway、MCP 与
-double-fork 后代；未知 PID 和不属于当前 boot 的端口不构成 kill 授权。
-20 轮 soak 的阈值为 supervisor FD 增量不超过 2、线程增量为 0，child FD 增量不超过 4、
-线程增量不超过 2；supervisor 与新 child 的 sampled RSS 增量及内核记录的 HWM 增量分别
-不超过 64 MiB，并要求无 zombie、无 `queued/in_progress` turn。
+每个报告必须记录同一源码 HEAD、manifest/artifact digest、候选与 stable generation、真实
+MCP handshake/readiness、进程/stdio cleanup 和无残留资源；不能用旧 workspace MCP probe
+替代 v3 插件 Gate。
 
 确定性模型 sidecar 的控制协议：
 
@@ -203,106 +223,62 @@ container
 
 ## 插件变更 Gate
 
-`akashic-plugin-gate` 用于在真实 Runtime 中验证插件系统改动。它不会复用普通调试容器的可写源码挂载或宿主插件缓存。
+pure-v3 发布证据分成静态 fleet、领域组合与四个集中 E2E 批次。所有 Gate
+使用 exact commit 锁、一次性 workspace/plugin-home/HOME 与受控端点，不读写正式
+Akashic workspace、正式凭据或 hua-home 服务。
 
 ```text
-┌─ 宿主
-│  ├─ akasic-agent             只读挂载到 /app
-│  └─ akashic-plugin/*         只读挂载到 /fixtures/plugins
-├─ 容器
-│  ├─ root filesystem          只读
-│  ├─ /tmp                     tmpfs
-│  └─ /sandbox                 唯一持久可写目录
-│     ├─ home/.akashic-plugin/cache
-│     ├─ workspace
-│     └─ reports
-└─ Compose project
-   └─ akashic-plugin-reload-gate
+精确 fleet lock
+      │
+      ├── static fleet ── manifest / api_version=3 / retired exclusions
+      ├── Mobile ────── Python catalog / JS ABI / plugin tests
+      ├── Tool ─────── typed prepare / authorize / result
+      ├── Passive/WebUI ── Citation / Meme / public WebSocket
+      └── E1─E4 ───── grouped behavior / failure / copied-workspace rehearsal
 ```
 
-从宿主运行完整性 Gate：
+静态 fleet 与 Mobile Gate：
 
 ```bash
-python docker/debug/plugin_hot_reload_probe.py --scenario sandbox-integrity
+python docker/debug/plugin_v3_fleet_gate.py \
+  --require-clean-core --require-full-core-history
+python docker/debug/plugin_v3_mobile_gate.py --require-clean-core
 ```
 
-宿主控制器会在 `/tmp` 创建唯一 sandbox，拒绝仓库内路径，再通过独立的 `docker-compose.plugin-gate.yml` 启动容器。普通 `docker-compose.yml` 不受 Gate 环境变量影响。控制器会审计各 Git 仓库状态，并在隔离插件缓存中完成一次写入与更新；Runtime 需要的 `static/` 也覆盖到外部 sandbox，不会写 `/app`。
-
-插件资源作用域场景会安装一次性测试插件，并在真实 `main.py` 的启动和关闭过程中验证订阅、任务与清理回调：
+领域组合 Gate：
 
 ```bash
-python docker/debug/plugin_hot_reload_probe.py \
-  --scenario full-runtime --phase scope
+python docker/debug/plugin_composition_v3_gate.py --require-clean-core
+python docker/debug/plugin_passive_composition_v3_gate.py --require-clean-core
+python docker/debug/plugin_passive_webui_v3_e2e.py --require-clean-core
 ```
 
-原子热重载场景会构造失败源码、有效新代和回切旧代，确认校验期间旧代仍服务，提交后
-request、skill、tool、job、event、MCP 与 service 同时换代，旧代 writer 被 fence，journal
-最终完成：
+集中 E2E 只在能力接线全部完成后运行一轮：
 
 ```bash
-python docker/debug/plugin_hot_reload_probe.py \
-  --scenario full-runtime --phase atomic-reload
+python docker/debug/plugin_v3_e1_gate.py
+python docker/debug/plugin_v3_e2_gate.py --require-clean-core
+python docker/debug/plugin_v3_e3_gate.py --require-clean-core
+python docker/debug/plugin_v3_e4_gate.py \
+  --source-workspace /path/to/source-workspace \
+  --source-config /path/to/config.toml \
+  --plugin-home /path/to/plugin-home
 ```
 
-### Plugin API v2 发布组合 Gate
+所有集中 Gate 默认使用 Python/操作系统选择的临时目录；E1～E4 可通过 `--tmp-root`
+显式选择已有目录。测试源码不绑定维护者 HOME、正式 workspace 或一次性试运行路径。
 
-`plugin-api-v2.lock.json` 固定合同检查器与 21 个外部插件的完整 commit SHA。Gate 只从公开
-GitHub HTTPS 地址获取这些对象，不读取宿主插件 cache、正式 workspace 或正式配置。
+E1 覆盖 Default Memory/Akasha、Citation/Meme、Observe、Emotion、Proactive Feedback 与
+Plugin Undo；E2 覆盖 Shell 三件与 MCP/process 插件；E3 覆盖 Channel、Command、
+Proactive source/job 与 GitHub Watcher。E4 不重复逐插件运行，而是从同一 Core head
+的 E1～E3 报告建立覆盖集，再在复制 workspace 中验证 SQLite 完整性、messages
+只追加、plugin-data 权威文件与 artifact/pointer 不变，以及进程内失败/子进程崩溃恢复。
+SQLite 在线备份可能在只读源旁创建或触碰 `-wal`/`-shm`/`-journal` 运行 sidecar；
+E4 不把这些可重建 sidecar 计入 plugin-data 身份，但仍逐字节固定主数据库和其他文件。
 
-```text
-┌─ 静态合同
-│  ├─ 拒绝 API v1 / initialize
-│  ├─ prepare 不得取得 data_dir 或启动 task
-│  └─ lifecycle task 必须归 generation scope
-├─ Host 渠道合同
-│  └─ 固定 Feishu / QQBot 在当前 Core 上执行启动与完整消息投递测试
-└─ Docker Debug
-   ├─ atomic-reload   失败保旧、成功原子切换、WAL 完成
-   ├─ all-plugins     19 个可运行插件逐个热重载和禁用
-   └─ fitbit          monitor 单实例、重载、停机、用户数据不变
-```
-
-本地运行：
-
-```bash
-python docker/debug/plugin_api_v2_gate.py
-```
-
-CI 使用 `--require-clean-core`，并上传 `docker/debug/reports/plugin-api-v2/`。任何锁内仓库缺失、
-SHA 不可获取、静态合同失败、容器退出异常、源码挂载被修改或业务 oracle 不成立都会返回非零
-退出码。
-
-### 移动插件发布组合 Gate
-
-`mobile-plugin-release.lock.json` 固定核心仓库这次发布实际配套的公开插件提交。协作者不需要
-安装插件，也不会读取宿主的 `~/.akashic-plugin`：Gate 在 `/tmp` 创建全新 Git checkout，
-从锁内的 GitHub HTTPS 地址只取精确 SHA。
-
-```text
-┌─ 移动端异步 query
-│  └─ 核心 PluginMobileUiProvider
-│     └─ ThreadPoolExecutor
-│        └─ 插件同步 mobile_ui_query
-├─ 核心拥有的 JS ABI runner
-│  ├─ default export / dashboard / slots / mount
-│  └─ catalog navigation 与插件导出一致
-└─ 插件仓库自己的 UI 行为测试
-   └─ 固定方法、交互、可访问性和错误状态
-```
-
-本地运行：
-
-```bash
-python docker/debug/mobile_plugin_contract_gate.py
-```
-
-CI 额外使用 `--require-clean-core`，防止报告对应的不是可复核源码。Gate 会验证核心仍是
-“异步 provider 在线程池调度同步插件 handler”，并检查每个插件的 Python 签名、方法集合、
-资源预算、JS 导出形态与仓库自带测试。Fitbit 的移动查询是插件同步调用其托管 monitor 的
-本地 HTTP 投影；Fitbit MCP 与 skills 仍由插件安装，不会被错误地解释成 UI query 本身。
-
-远端默认分支更新不会自动否定旧报告；只有主动修改发布锁，或修改核心合同后重新运行，
-才产生新的发布组合。这保证一次通过对应一组不可变源码，同时避免协作者被本地插件状态影响。
+报告中任何 `blocked`、不同 Core head、非 exact lock、未覆盖 fleet 或 cleanup 残留都会令
+最终 rehearsal 非零退出。正式 workspace 备份和 hua-home 切换不属于这些 Gate
+的授权范围。
 
 ## 第一次配置
 

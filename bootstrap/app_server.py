@@ -31,12 +31,13 @@ async def run_stdio_app_server(config: Config, workspace: Path) -> None:
             http_resources,
             clear_stale_session_admissions=True,
         )
-        await core.start()
 
         async def execute(request: TurnRequest):
             return await execute_control_turn(core.loop, core.event_bus, request)
 
         runtime = ConversationRuntime(core.session_manager.control_store, execute)
+        core.bind_conversation_runtime(runtime)
+        await core.start()
         service = ControlService(
             runtime,
             core.session_manager,

@@ -18,6 +18,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from agent.config_models import Config
 from agent.plugins.manager import PluginManager
+from agent.plugins.generation_activity_host import ActivityHost
+from agent.plugins.generation_private_proactive_host import PrivateProactiveHost
+from agent.plugins.generation_proactive_host import ProactiveActivityAdapter
+from agent.plugins.generation_proactive_bridge import CommittedProactiveBridge
 from agent.provider import LLMResponse, ToolCall
 from agent.tools.message_push import MessagePushTool
 from agent.tools.registry import ToolRegistry
@@ -444,13 +448,24 @@ async def tick(
         return DeliveryReceipt(DeliveryStatus.SUCCESS)
 
     push.register_channel("sandbox", deliver=deliver)
+    activity_host = ActivityHost(
+        (
+            ProactiveActivityAdapter(plugins.composition_generation_host),
+            PrivateProactiveHost(lifecycle),
+        )
+    )
+    plugins.bind_activity_host(activity_host)
     await plugins.load_all()
-    runtime_sources = plugins.proactive_sources
     if isinstance(provider, SandboxProvider):
+        snapshot = plugins.current_snapshot
+        if snapshot is None:
+            raise RuntimeError("主动沙盒缺少 committed snapshot")
+        bridge = CommittedProactiveBridge(activity_host)
+        runtime = bridge.runtime_for(snapshot)
         feed_sources = [
             source
-            for source in plugins.proactive_sources
-            if source.spec.server == "feed"
+            for source in bridge.registered_sources(runtime)
+            if source.plugin_id == "feed@github"
         ]
         if len(feed_sources) != 1:
             raise RuntimeError(
@@ -463,7 +478,6 @@ async def tick(
             if lifecycle == "wake"
             else f"{source.plugin_id}:{source.spec.id}:{EVENT_ID}"
         )
-        runtime_sources = feed_sources
     snapshot = plugins.current_snapshot
     snapshot_tools = snapshot.tool_registry if snapshot is not None else None
     registered_names = (
@@ -474,11 +488,6 @@ async def tick(
         for name in registered_names
     ):
         raise RuntimeError("Feed MCP 未连接")
-    if len(plugins.proactive_runtime_factories) != 1:
-        raise RuntimeError("主动 Runtime factory 数量异常")
-    if len(plugins.proactive_module_factories) != 3:
-        raise RuntimeError("主动 Module factory 未完整加载")
-
     loop = ProactiveLoop(
         session_manager=sessions,
         provider=cast(Any, provider),
@@ -490,11 +499,8 @@ async def tick(
         rng=random.Random(1 if lifecycle == "wake" else 0),
         shared_tools=snapshot_tools or tools,
         event_bus=event_bus,
-        proactive_modules=plugins.proactive_modules,
-        proactive_lifecycles=plugins.proactive_lifecycles,
-        proactive_module_factories=plugins.proactive_module_factories,
-        proactive_runtime_factories=plugins.proactive_runtime_factories,
-        proactive_sources=runtime_sources,
+        runtime_snapshot_store=plugins.snapshot_store,
+        activity_host=activity_host,
     )
     try:
         await loop._proactive_kernel.start()

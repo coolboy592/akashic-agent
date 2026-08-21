@@ -4,7 +4,7 @@ import json
 import logging
 from typing import Any, Callable
 
-from agent.tool_hooks import ToolExecutionRequest
+from agent.tools.events import ToolExecutionRequest
 from core.common.diagnostic_log import diagnostic_line
 from proactive_v2.config import ProactiveConfig
 from plugins.default_proactive.context import AgentTickContext

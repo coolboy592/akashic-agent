@@ -6,7 +6,7 @@ export function rowToMessage(row: MessageRow): ChatMessage {
     id: String(row.id),
     role: row.role,
     content: row.content,
-    attachments: mediaToAttachments(row.media),
+    attachments: mergeAttachments(mediaToAttachments(row.media), mediaToAttachments(row.attachments)),
     blocks: row.role === "assistant" ? rowBlocks(row) : [],
     durationMs: numberValue(row.turn_duration_ms),
     createdAt: row.timestamp,
@@ -26,14 +26,13 @@ export function isVisibleChatRow(row: MessageRow): boolean {
 }
 
 export function uploadedFileToAttachment(file: UploadedFile): MessageAttachment {
-  const filename = file.filename || filenameFromPath(file.upload_path);
+  const filename = file.filename || "附件";
   return {
-    id: file.upload_path,
+    id: file.artifact_id,
     type: "file",
     filename,
-    mediaType: guessMediaType(filename),
-    url: file.upload_url || mediaUrl(file.upload_path),
-    path: file.upload_path,
+    mediaType: file.media_type || guessMediaType(filename),
+    url: file.upload_url || artifactUrl(file.artifact_id),
   };
 }
 
@@ -55,19 +54,30 @@ export function mergeAttachments(
 
 export function mediaToAttachments(media: unknown): MessageAttachment[] {
   if (!Array.isArray(media)) return [];
-  return media
-    .filter((item): item is string => typeof item === "string" && item.trim().length > 0)
-    .map((path, index) => {
+  return media.flatMap((item, index) => {
+    if (typeof item === "string" && item.trim().length > 0) {
+      // 历史 messages.extra.media 只读投影仍允许旧绝对路径。
+      const path = item;
       const filename = filenameFromPath(path);
-      return {
+      return [{
         id: `${path}:${index}`,
         type: "file",
         filename,
         mediaType: guessMediaType(filename),
         url: mediaUrl(path),
         path,
-      };
-    });
+      } satisfies MessageAttachment];
+    }
+    const descriptor = artifactDescriptor(item);
+    if (!descriptor) return [];
+    return [{
+      id: descriptor.artifact_id,
+      type: "file",
+      filename: descriptor.filename || "附件",
+      mediaType: descriptor.media_type || guessMediaType(descriptor.filename || ""),
+      url: descriptor.url || artifactUrl(descriptor.artifact_id),
+    } satisfies MessageAttachment];
+  });
 }
 
 export function blocksWithFinalThinking(blocks: AgentBlock[], thinking: string | undefined): AgentBlock[] {
@@ -155,6 +165,32 @@ function numberValue(value: unknown): number | undefined {
 
 function mediaUrl(path: string): string {
   return `/api/chat/media?path=${encodeURIComponent(path)}`;
+}
+
+function artifactUrl(artifactId: string): string {
+  return `/api/chat/artifacts/${encodeURIComponent(artifactId)}`;
+}
+
+type ArtifactDescriptor = {
+  artifact_id: string;
+  kind?: "file" | "image";
+  filename?: string | null;
+  media_type?: string | null;
+  size_bytes?: number;
+  sha256?: string;
+  url?: string;
+};
+
+function artifactDescriptor(value: unknown): ArtifactDescriptor | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const item = value as Record<string, unknown>;
+  if (typeof item.artifact_id !== "string" || !item.artifact_id.trim()) return null;
+  if (item.kind !== undefined && item.kind !== "file" && item.kind !== "image") return null;
+  if (item.filename !== undefined && item.filename !== null && typeof item.filename !== "string") return null;
+  if (item.media_type !== undefined && item.media_type !== null && typeof item.media_type !== "string") return null;
+  if (item.url !== undefined
+    && (typeof item.url !== "string" || !item.url.startsWith("/api/chat/artifacts/"))) return null;
+  return item as ArtifactDescriptor;
 }
 
 function filenameFromPath(path: string): string {

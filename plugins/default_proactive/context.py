@@ -48,6 +48,14 @@ class AgentTickContext:
     cache_prompt_tokens: int = 0
     cache_hit_tokens: int = 0
     cache_seen: bool = False
+    # Durable Drift identity; tick_id remains a short diagnostic correlation key.
+    event_id: str = field(default_factory=lambda: f"drift:{uuid4().hex}")
+
+    @property
+    def drift_event_id(self) -> str:
+        """Expose the durable event identity under its Drift-specific name."""
+
+        return self.event_id
 
     def record_llm_cache(
         self,

@@ -39,9 +39,6 @@ from session.compaction_runtime import CompactionProjection
 from session.manager import Session
 from session.store import CompactionHead
 
-_TEST_CONTEXT_PRESSURE_STOP_THRESHOLD_TOKENS = 1
-
-
 class _ProviderContextBudget:
     context_window = 1_000_000
 
@@ -59,33 +56,6 @@ class _ProviderContextBudget:
         if not messages:
             return 0
         return max(1, len(json.dumps(messages, ensure_ascii=False)) // 3)
-
-
-class ContextPressureStopModule:
-    slot = "context_pressure.stop"
-    requires = ("after_step.copy_input", "step:ctx")
-    produces = (
-        "step:early_stop_reason",
-        "step:telemetry:context_pressure_tokens",
-        "step:telemetry:context_pressure_threshold",
-    )
-
-    async def run(self, frame: object) -> object:
-        raw_slots = getattr(frame, "slots", None)
-        if not isinstance(raw_slots, dict):
-            return frame
-        slots = cast(dict[str, object], raw_slots)
-        ctx = slots.get("step:ctx")
-        if not isinstance(ctx, AfterStepCtx) or not ctx.has_more:
-            return frame
-        if ctx.context_tokens_estimate <= _TEST_CONTEXT_PRESSURE_STOP_THRESHOLD_TOKENS:
-            return frame
-        slots["step:early_stop_reason"] = "context_pressure"
-        slots["step:telemetry:context_pressure_tokens"] = ctx.context_tokens_estimate
-        slots["step:telemetry:context_pressure_threshold"] = (
-            _TEST_CONTEXT_PRESSURE_STOP_THRESHOLD_TOKENS
-        )
-        return frame
 
 
 class _DummyTool(Tool):
@@ -717,52 +687,6 @@ def test_default_reasoner_zero_max_iterations_is_unlimited():
 
     assert result.reply == "final"
     assert len(tool.calls) == 3
-
-
-def test_default_reasoner_stops_on_context_pressure_after_tool_batch(monkeypatch):
-    provider = _Provider(
-        [
-            LLMResponse(
-                content="", tool_calls=[ToolCall("c1", "inflate_probe", {"value": 1})]
-            ),
-            LLMResponse(content="阶段性回复", tool_calls=[]),
-        ]
-    )
-    tools = ToolRegistry()
-    tools.register(_InflateTool(), always_on=True)
-    reasoner = _build_reasoner(
-        llm=cast(
-            Any,
-            LLMServices(
-                provider=cast(Any, provider),
-                light_provider=cast(Any, provider),
-            ),
-        ),
-        llm_config=LLMConfig(
-            model="m",
-            max_iterations=0,
-            max_tokens=512,
-        ),
-        tools=tools,
-        discovery=ToolDiscoveryState(),
-        tool_search_enabled=False,
-    )
-    reasoner.add_after_step_plugin_modules([ContextPressureStopModule()])
-
-    result = asyncio.run(
-        _run_with_compaction_gate(reasoner, [{"role": "user", "content": "hi"}])
-    )
-
-    assert result.reply == "阶段性回复"
-    assert len(provider.calls) == 2
-    assert provider.calls[1]["tools"] == []
-    summary_messages = json.dumps(provider.calls[1]["messages"], ensure_ascii=False)
-    assert "[收尾原因] context_pressure" in summary_messages
-    assert "已经使用了哪些工具或操作" in summary_messages
-    assert "当前已经做到哪一步" in summary_messages
-    assert "还缺什么信息或步骤" in summary_messages
-    assert "inflate_probe" in summary_messages
-    assert len(result.tool_chain) == 1
 
 
 def test_default_reasoner_context_pressure_policy_lives_in_after_step_plugin(
@@ -1479,7 +1403,7 @@ def test_empty_content_without_thinking_no_retry():
     assert len(provider.calls) == 1
 
 
-def test_default_reasoner_reuses_snapshot_step_phases(monkeypatch):
+def test_default_reasoner_uses_one_default_step_phase_pair():
     provider = _Provider([LLMResponse(content="done", tool_calls=[])])
     tools = ToolRegistry()
     tools.register(_DummyTool(), always_on=True)
@@ -1495,33 +1419,12 @@ def test_default_reasoner_reuses_snapshot_step_phases(monkeypatch):
         discovery=ToolDiscoveryState(),
         tool_search_enabled=False,
     )
-    snapshot = SimpleNamespace(
-        snapshot_id="snapshot-1",
-        before_step_modules=(),
-        after_step_modules=(),
-    )
-    current_snapshot = [snapshot]
-    monkeypatch.setattr(
-        "agent.core.passive_turn.get_current_runtime_snapshot",
-        lambda: current_snapshot[0],
-    )
-
     first = reasoner._runtime_step_phases()
     second = reasoner._runtime_step_phases()
 
     assert second == first
     assert second[0] is first[0]
     assert second[1] is first[1]
-
-    current_snapshot[0] = SimpleNamespace(
-        snapshot_id="snapshot-2",
-        before_step_modules=(),
-        after_step_modules=(),
-    )
-    next_snapshot_phases = reasoner._runtime_step_phases()
-
-    assert next_snapshot_phases[0] is not first[0]
-    assert next_snapshot_phases[1] is not first[1]
 
 
 # ── 首 token 观测：turn-first 里程碑 ─────────────────────────────────

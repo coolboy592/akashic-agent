@@ -6,19 +6,7 @@ import pytest
 
 from agent.config import Config
 from agent.plugins.manager import PluginManager
-from agent.plugins.registry import plugin_registry
 from bus.event_bus import EventBus
-
-
-@pytest.fixture(autouse=True)
-def _clean_registry():
-    plugin_registry._handlers._handlers.clear()
-    plugin_registry._classes.clear()
-    plugin_registry._instances.clear()
-    yield
-    plugin_registry._handlers._handlers.clear()
-    plugin_registry._classes.clear()
-    plugin_registry._instances.clear()
 
 
 def _write_typed_plugin(root: Path) -> None:
@@ -27,7 +15,10 @@ def _write_typed_plugin(root: Path) -> None:
     (plugin_dir / "plugin.py").write_text(
         """
 from pydantic import BaseModel
-from agent.plugins import Plugin
+
+api_version = 3
+name = "typed"
+version = "1.0.0"
 
 
 class TypedConfig(BaseModel):
@@ -35,20 +26,14 @@ class TypedConfig(BaseModel):
     max_results: int = 5
 
 
-class TypedPlugin(Plugin):
-    name = "typed"
-    ConfigModel = TypedConfig
+Config = TypedConfig
+
+
+async def apply(ctx, config):
+    return None
 """.strip(),
         encoding="utf-8",
     )
-
-
-def _get_instance(name: str):
-    for instance in plugin_registry._instances.values():
-        if getattr(instance, "name", None) == name:
-            return instance
-    raise KeyError(name)
-
 
 @pytest.mark.asyncio
 async def test_plugin_config_model_validates_and_injects_config(tmp_path: Path):
@@ -70,9 +55,13 @@ async def test_plugin_config_model_validates_and_injects_config(tmp_path: Path):
 
     await manager.load_all()
 
-    config = _get_instance("typed").context.config
+    generation = manager.generation("typed")
+    assert generation is not None
+    config = generation.config
+    assert isinstance(config, generation.instance.module.Config)
     assert config.api_key == "secret"
     assert config.max_results == 9
+    await manager.terminate_all()
 
 
 @pytest.mark.asyncio
@@ -93,6 +82,7 @@ async def test_plugin_config_model_failure_skips_plugin(tmp_path: Path):
     await manager.load_all()
 
     assert manager.loaded_count == 0
+    await manager.terminate_all()
 
 
 def test_config_load_ignores_plugin_owned_sections(tmp_path: Path, monkeypatch):

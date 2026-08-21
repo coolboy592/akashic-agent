@@ -17,7 +17,7 @@ from plugins.akasha.application.rebuild import rebuild_memory
 from plugins.akasha.config import (
     AkashaConfig,
     load_akasha_config,
-    resolve_workspace_path,
+    resolve_memory_path,
 )
 from plugins.akasha.infrastructure.loader import load_turns
 from plugins.akasha.infrastructure.persistence import (
@@ -120,12 +120,12 @@ def _active_akasha(context: MigrationContext) -> ActiveAkasha | None:
     plugin_config = load_akasha_config(plugin_path)
     paths = AkashaPaths(
         sessions=context.workspace / "sessions.db",
-        index=resolve_workspace_path(
-            context.workspace,
+        index=resolve_memory_path(
+            context.workspace / "memory",
             plugin_config.index_path,
         ),
-        memory=resolve_workspace_path(
-            context.workspace,
+        memory=resolve_memory_path(
+            context.workspace / "memory",
             plugin_config.db_path,
         ),
     )

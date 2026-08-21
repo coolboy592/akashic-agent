@@ -5,6 +5,10 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Literal, cast
 
+from agent.plugins.static_manifest import (
+    STATIC_MANIFEST_FILENAME,
+    load_static_plugin_manifest,
+)
 from infra.persistence.json_store import atomic_save_json, load_json
 
 ArtifactSelector = Literal["stable", "latest"]
@@ -91,11 +95,10 @@ def resolve_pointer(plugin_base: Path, pointer: ArtifactPointer) -> Path | None:
         return None
     relative = PurePosixPath(pointer.path)
     parts = relative.parts
-    valid_legacy = len(parts) == 1 and _safe_segment(parts[0])
     valid_artifact = (
         len(parts) == 2 and parts[0] == ".artifacts" and _safe_segment(parts[1])
     )
-    if relative.is_absolute() or not (valid_legacy or valid_artifact):
+    if relative.is_absolute() or not valid_artifact:
         raise ValueError(f"插件 artifact pointer 越界: {pointer.path}")
     target = plugin_base.joinpath(*parts)
     current = plugin_base
@@ -105,9 +108,10 @@ def resolve_pointer(plugin_base: Path, pointer: ArtifactPointer) -> Path | None:
             raise ValueError(f"插件 artifact pointer 不能经过符号链接: {current}")
     if not target.is_dir():
         raise FileNotFoundError(f"插件 artifact pointer 目标不存在: {target}")
-    plugin_file = target / "plugin.py"
-    if plugin_file.is_symlink() or not plugin_file.is_file():
-        raise ValueError(f"插件 artifact 缺少普通 plugin.py: {plugin_file}")
+    manifest_path = target / STATIC_MANIFEST_FILENAME
+    if not manifest_path.exists() and not manifest_path.is_symlink():
+        raise ValueError(f"installed v3 artifact 缺少静态 manifest: {target}")
+    _ = load_static_plugin_manifest(target)
     return target
 
 

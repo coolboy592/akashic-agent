@@ -1,8 +1,24 @@
 from __future__ import annotations
 
-from agent.plugins import Plugin
 from plugins.wake_proactive.modules import build_wake_drift_modules
 from plugins.wake_proactive.runtime import WakeRuntime
+
+
+api_version = 3
+name = "wake_drift_flow"
+version = "3.0.0"
+desc = "Wake drift flow private island"
+author = "Akashic Core"
+inject = ()
+skill_roots = ()
+drift_skill_roots = ()
+workspace_roots = ()
+
+
+def apply(ctx: object, config: object) -> None:
+    """Keep the private drift descriptor side-effect free during composition."""
+
+    _ = ctx, config
 
 
 class WakeDriftModuleFactory:
@@ -12,11 +28,3 @@ class WakeDriftModuleFactory:
         if not isinstance(runtime, WakeRuntime):
             raise RuntimeError("wake drift flow 收到未知 Runtime")
         return build_wake_drift_modules(runtime)
-
-
-class WakeDriftFlowPlugin(Plugin):
-    api_version = 2
-    name = "wake_drift_flow"
-
-    def proactive_module_factories(self) -> list[object]:
-        return [WakeDriftModuleFactory()]

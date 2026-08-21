@@ -15,6 +15,7 @@ export interface MessageRow {
   content: string;
   timestamp?: string;
   media?: unknown;
+  attachments?: unknown;
   tool_chain?: unknown;
   reasoning_content?: unknown;
   turn_duration_ms?: unknown;
@@ -48,7 +49,11 @@ export interface WebShellState {
 
 export interface UploadedFile {
   filename: string;
-  upload_path: string;
+  artifact_id: string;
+  kind: "file" | "image";
+  media_type?: string | null;
+  size_bytes: number;
+  sha256: string;
   upload_url?: string;
 }
 
@@ -220,10 +225,21 @@ function responseItems(payload: unknown, endpoint: string): Record<string, unkno
 
 function uploadedFileResponse(payload: unknown): UploadedFile {
   const body = recordValue(payload);
-  if (!body || typeof body.filename !== "string" || typeof body.upload_path !== "string" || !body.upload_path) {
+  if (!body
+    || typeof body.filename !== "string"
+    || typeof body.artifact_id !== "string"
+    || !body.artifact_id
+    || (body.kind !== "file" && body.kind !== "image")
+    || (body.media_type !== undefined && body.media_type !== null && typeof body.media_type !== "string")
+    || typeof body.size_bytes !== "number"
+    || !Number.isInteger(body.size_bytes)
+    || body.size_bytes < 0
+    || typeof body.sha256 !== "string"
+    || !/^[0-9a-f]{64}$/.test(body.sha256)) {
     throw new Error("上传接口返回格式无效");
   }
-  if (body.upload_url !== undefined && typeof body.upload_url !== "string") {
+  if (body.upload_url !== undefined
+    && (typeof body.upload_url !== "string" || !body.upload_url.startsWith("/api/chat/artifacts/"))) {
     throw new Error("上传接口返回了无效 URL");
   }
   return body as unknown as UploadedFile;

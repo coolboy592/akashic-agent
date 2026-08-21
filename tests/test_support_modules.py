@@ -1,5 +1,4 @@
 from __future__ import annotations
-from contextlib import suppress
 from typing import Any, cast
 
 import asyncio
@@ -19,50 +18,27 @@ from agent.prompting import PromptSectionRender, SYSTEM_CONTEXT_FRAME_MARKER
 from agent.tools.base import Tool
 from agent.tools.memorize import MemorizeTool
 from agent.tools.message_push import MessagePushTool
+from agent.plugin_composition.channels import (
+    ChannelDeliveryReceipt,
+    DeliveryStatus as ChannelDeliveryStatus,
+)
 from agent.tools.registry import ToolMeta, ToolRegistry
 from agent.tools.web_search import WebSearchTool
 from bus.events import (
+    AttachmentKind,
+    ChannelAttachment,
     ChannelMessage,
-    DeliveryReceipt,
-    DeliveryStatus,
     InboundMessage,
     OutboundMessage,
 )
 from bus.queue import ChatLane, MessageBus
 from core.common import timekit
-from infra.channels.delivery import deliver_message_parts
 from infra.persistence.json_store import atomic_save_json, load_json, save_json
 from memory2.memorizer import Memorizer
 from memory2.store import MemoryStore2
 from plugins.default_memory.engine import DefaultMemoryEngine
 from prompts.agent import build_agent_behavior_rules_prompt
 from prompts.completion import VERIFIABLE_COMPLETION_RULES
-
-
-def _register_text_channel(
-    tool: MessagePushTool,
-    channel: str,
-    sender: Any,
-) -> None:
-    async def unsupported_file(
-        _chat_id: str,
-        _path: str,
-        _name: str | None,
-    ) -> None:
-        raise AssertionError("text-only 测试不应发送文件")
-
-    async def unsupported_image(_chat_id: str, _path: str) -> None:
-        raise AssertionError("text-only 测试不应发送图片")
-
-    async def deliver(message: ChannelMessage) -> DeliveryReceipt:
-        return await deliver_message_parts(
-            message,
-            send_text=sender,
-            send_file=unsupported_file,
-            send_image=unsupported_image,
-        )
-
-    _ = tool.register_channel(channel, deliver=deliver)
 
 
 def test_inbound_message_default_timestamp_is_aware_utc() -> None:
@@ -143,288 +119,85 @@ class _DummyTool(Tool):
 
 
 @pytest.mark.asyncio
-async def test_message_push_tool_covers_success_failure_and_fallbacks():
+async def test_message_push_dispatches_exact_v3_receipt_and_media():
     tool = MessagePushTool()
-    sent = {"text": [], "stream_text": [], "file": [], "image": []}
+    seen: list[tuple[ChannelMessage, bool]] = []
 
-    async def text(chat_id: str, message: str) -> None:
-        sent["text"].append((chat_id, message))
-
-    async def stream_text(chat_id: str, message: str) -> None:
-        sent["stream_text"].append((chat_id, message))
-
-    async def file(chat_id: str, path: str, name: str | None) -> None:
-        sent["file"].append((chat_id, path, name))
-
-    async def image(chat_id: str, path: str) -> None:
-        sent["image"].append((chat_id, path))
-
-    async def deliver(message: ChannelMessage) -> DeliveryReceipt:
-        return await deliver_message_parts(
-            message,
-            send_text=stream_text,
-            send_file=file,
-            send_image=image,
+    async def dispatch(message: ChannelMessage, passive: bool) -> ChannelDeliveryReceipt:
+        seen.append((message, passive))
+        return ChannelDeliveryReceipt(
+            delivery_id="delivery-1",
+            status=ChannelDeliveryStatus.DELIVERED,
+            provider_ids=("provider-1",),
         )
 
-    _ = tool.register_channel("telegram", deliver=deliver)
-    result = await tool.execute(
-        target_channel="telegram",
-        target_chat_id=123,
-        message="hello",
-        file="/tmp/demo.txt",
-        image="https://img",
-    )
-
-    assert result == "消息已发送"
-    assert sent["text"] == []
-    assert sent["stream_text"] == [("123", "hello")]
-    assert sent["file"] == [("123", "/tmp/demo.txt", "demo.txt")]
-    assert sent["image"] == [("123", "https://img")]
-
-    assert await tool.execute(target_channel="telegram", target_chat_id=1) == (
-        "错误：message、file、image 至少提供一个"
-    )
-    assert "未注册" in await tool.execute(
-        target_channel="qq", target_chat_id=1, message="x"
-    )
-
-    async def unsupported_file(
-        _chat_id: str,
-        _path: str,
-        _name: str | None,
-    ) -> None:
-        raise RuntimeError("渠道 'limited' 不支持发送文件")
-
-    async def unsupported_image(_chat_id: str, _path: str) -> None:
-        raise RuntimeError("渠道 'limited' 不支持发送图片")
-
-    async def limited_deliver(message: ChannelMessage) -> DeliveryReceipt:
-        return await deliver_message_parts(
-            message,
-            send_text=text,
-            send_file=unsupported_file,
-            send_image=unsupported_image,
+    tool.bind_v3_channel_dispatcher(dispatch)
+    result = json.loads(
+        await tool.execute(
+            target_channel="telegram",
+            target_chat_id=123,
+            message="hello",
+            file="/tmp/demo.txt",
+            image="https://img",
         )
-
-    _ = tool.register_channel("limited", deliver=limited_deliver)
-    limited = await tool.execute(
-        target_channel="limited",
-        target_chat_id=1,
-        file="/tmp/a.txt",
-        image="/tmp/a.png",
     )
-    assert "不支持发送文件" in limited
 
-    async def broken(chat_id: str, message: str) -> None:
-        raise RuntimeError("send failed")
-
-    _register_text_channel(tool, "broken", broken)
-    assert "发送失败" in await tool.execute(
-        target_channel="broken", target_chat_id=1, message="x"
+    assert result == {
+        "delivery_id": "delivery-1",
+        "status": "delivered",
+        "retryable": False,
+        "provider_ids": ["provider-1"],
+        "error": None,
+    }
+    assert not hasattr(tool, "register_channel")
+    assert seen[0][1] is False
+    assert seen[0][0].attachments == (
+        ChannelAttachment(AttachmentKind.FILE, "/tmp/demo.txt", "demo.txt"),
+        ChannelAttachment(AttachmentKind.IMAGE, "https://img"),
     )
 
 
 @pytest.mark.asyncio
-async def test_message_push_routes_internal_metadata_only_to_capable_sender():
+async def test_message_push_missing_committed_dispatcher_fails_loud() -> None:
     tool = MessagePushTool()
-    calls: list[ChannelMessage] = []
 
-    async def deliver(message: ChannelMessage) -> DeliveryReceipt:
-        calls.append(message)
-        return DeliveryReceipt(DeliveryStatus.SUCCESS)
-
-    _ = tool.register_channel("mobile", deliver=deliver)
-
-    result = await tool.execute(
-        target_channel="mobile",
-        target_chat_id="123",
-        message="hello",
-        _outbound_metadata={"delivery_id": "delivery-1"},
-    )
-
-    assert result == "消息已发送"
-    assert calls[0].chat_id == "123"
-    assert calls[0].content == "hello"
-    assert calls[0].metadata == {"delivery_id": "delivery-1"}
+    with pytest.raises(RuntimeError, match="committed Channel dispatcher 未绑定"):
+        await tool.execute(
+            target_channel="telegram",
+            target_chat_id="1",
+            message="hello",
+        )
 
 
 @pytest.mark.asyncio
-async def test_message_push_reports_partial_after_text_commit() -> None:
+async def test_message_push_passive_role_is_forwarded_to_committed_dispatcher() -> None:
     tool = MessagePushTool()
-    committed: list[str] = []
+    passive_roles: list[bool] = []
 
-    async def text(_chat_id: str, message: str) -> None:
-        committed.append(message)
-
-    async def file(
-        _chat_id: str,
-        _path: str,
-        _name: str | None,
-    ) -> None:
-        raise OSError("attachment unavailable")
-
-    async def image(_chat_id: str, _path: str) -> None:
-        raise AssertionError("测试消息没有图片")
-
-    async def deliver(message: ChannelMessage) -> DeliveryReceipt:
-        return await deliver_message_parts(
-            message,
-            send_text=text,
-            send_file=file,
-            send_image=image,
+    async def dispatch(
+        _message: ChannelMessage,
+        passive: bool,
+    ) -> ChannelDeliveryReceipt:
+        passive_roles.append(passive)
+        return ChannelDeliveryReceipt(
+            delivery_id="delivery-passive",
+            status=ChannelDeliveryStatus.UNKNOWN,
+            error="provider outcome unknown",
         )
 
-    _ = tool.register_channel("telegram", deliver=deliver)
-
-    result = await tool.execute(
-        target_channel="telegram",
-        target_chat_id="1",
-        message="正文",
-        file="/tmp/report.pdf",
-    )
-
-    assert result == "消息部分送达：attachment unavailable"
-    assert committed == ["正文"]
-
-
-@pytest.mark.asyncio
-async def test_message_push_non_passive_waits_for_passive_reply():
-    bus = MessageBus()
-    tool = MessagePushTool(chat_lane=bus.chat_lane)
-    events: list[str] = []
-    allow_passive_send = asyncio.Event()
-
-    async def on_outbound(msg: OutboundMessage) -> None:
-        events.append(f"passive:start:{msg.content}")
-        await allow_passive_send.wait()
-        events.append(f"passive:end:{msg.content}")
-
-    async def text(chat_id: str, message: str) -> None:
-        events.append(f"non_passive:{message}")
-
-    bus.subscribe_outbound("cli", on_outbound)
-    _register_text_channel(tool, "cli", text)
-    dispatch_task = asyncio.create_task(bus.dispatch_outbound())
-    try:
-        inbound = InboundMessage(
-            channel="cli",
-            sender="user",
-            chat_id="1",
-            content="hello",
-        )
-        await bus.publish_inbound(inbound)
-        await bus.publish_outbound(
-            OutboundMessage(channel="cli", chat_id="1", content="reply")
-        )
-        await bus.complete_inbound(inbound)
-        push_task = asyncio.create_task(
-            tool.execute(
-                target_channel="cli",
-                target_chat_id="1",
-                message="drift",
-            )
-        )
-
-        await asyncio.sleep(0.01)
-        assert events == ["passive:start:reply"]
-        assert not push_task.done()
-        allow_passive_send.set()
-
-        result = await asyncio.wait_for(push_task, timeout=1)
-
-        assert result == "消息已发送"
-        assert events == [
-            "passive:start:reply",
-            "passive:end:reply",
-            "non_passive:drift",
-        ]
-    finally:
-        bus.stop()
-        dispatch_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await dispatch_task
-
-
-@pytest.mark.asyncio
-async def test_message_push_non_passive_resumes_after_silent_passive_turn():
-    bus = MessageBus()
-    tool = MessagePushTool(chat_lane=bus.chat_lane)
-    events: list[str] = []
-
-    async def text(chat_id: str, message: str) -> None:
-        events.append(message)
-
-    _register_text_channel(tool, "cli", text)
-    inbound = InboundMessage(
-        channel="cli",
-        sender="user",
-        chat_id="1",
-        content="hello",
-    )
-    await bus.publish_inbound(inbound)
-    push_task = asyncio.create_task(
-        tool.execute(
-            target_channel="cli",
+    tool.bind_v3_channel_dispatcher(dispatch)
+    result = json.loads(
+        await tool.execute(
+            target_channel="mobile",
             target_chat_id="1",
-            message="scheduler",
+            message="final",
+            _commit_role="passive",
         )
     )
 
-    await asyncio.sleep(0.01)
-    assert not push_task.done()
-
-    await bus.complete_inbound(inbound)
-    result = await asyncio.wait_for(push_task, timeout=1)
-
-    assert result == "消息已发送"
-    assert events == ["scheduler"]
-
-
-@pytest.mark.asyncio
-async def test_message_push_non_passive_same_chat_keeps_fifo_order():
-    bus = MessageBus()
-    tool = MessagePushTool(chat_lane=bus.chat_lane)
-    events: list[str] = []
-    release_first = asyncio.Event()
-
-    async def text(chat_id: str, message: str) -> None:
-        events.append(f"start:{message}")
-        if message == "first":
-            await release_first.wait()
-        events.append(f"end:{message}")
-
-    _register_text_channel(tool, "cli", text)
-    first = asyncio.create_task(
-        tool.execute(
-            target_channel="cli",
-            target_chat_id="1",
-            message="first",
-        )
-    )
-    await asyncio.sleep(0)
-    second = asyncio.create_task(
-        tool.execute(
-            target_channel="cli",
-            target_chat_id="1",
-            message="second",
-        )
-    )
-
-    await asyncio.sleep(0.01)
-    assert events == ["start:first"]
-    assert not second.done()
-    release_first.set()
-
-    await asyncio.gather(first, second)
-
-    assert events == [
-        "start:first",
-        "end:first",
-        "start:second",
-        "end:second",
-    ]
-    assert bus.chat_lane._states == {}
+    assert passive_roles == [True]
+    assert result["status"] == "unknown"
+    assert result["retryable"] is False
 
 
 @pytest.mark.asyncio
@@ -473,104 +246,6 @@ async def test_chat_lane_releases_idle_state_after_send_error():
 
 
 @pytest.mark.asyncio
-async def test_message_push_default_call_waits_for_passive_lane():
-    bus = MessageBus()
-    tool = MessagePushTool(chat_lane=bus.chat_lane)
-    events: list[str] = []
-
-    async def text(chat_id: str, message: str) -> None:
-        events.append(message)
-
-    _register_text_channel(tool, "cli", text)
-    inbound = InboundMessage(channel="cli", sender="user", chat_id="1", content="hello")
-    await bus.publish_inbound(inbound)
-    push_task = asyncio.create_task(
-        tool.execute(target_channel="cli", target_chat_id="1", message="inline")
-    )
-
-    await asyncio.sleep(0.01)
-    assert not push_task.done()
-
-    await bus.complete_inbound(inbound)
-    result = await asyncio.wait_for(push_task, timeout=1)
-
-    assert result == "消息已发送"
-    assert events == ["inline"]
-
-
-@pytest.mark.asyncio
-async def test_message_push_passive_role_does_not_wait_for_passive_lane():
-    bus = MessageBus()
-    tool = MessagePushTool(chat_lane=bus.chat_lane)
-    events: list[str] = []
-
-    async def text(chat_id: str, message: str) -> None:
-        events.append(message)
-
-    _register_text_channel(tool, "cli", text)
-    await bus.publish_inbound(
-        InboundMessage(channel="cli", sender="user", chat_id="1", content="hello")
-    )
-
-    result = await asyncio.wait_for(
-        tool.execute(
-            target_channel="cli",
-            target_chat_id="1",
-            message="inline",
-            _commit_role="passive",
-        ),
-        timeout=1,
-    )
-
-    assert result == "消息已发送"
-    assert events == ["inline"]
-
-
-@pytest.mark.asyncio
-async def test_message_push_passive_role_serializes_actual_same_chat_send():
-    bus = MessageBus()
-    tool = MessagePushTool(chat_lane=bus.chat_lane)
-    events: list[str] = []
-    first_started = asyncio.Event()
-    release_first = asyncio.Event()
-
-    async def text(chat_id: str, message: str) -> None:
-        events.append(f"start:{message}")
-        if message == "first":
-            first_started.set()
-            await release_first.wait()
-        events.append(f"end:{message}")
-
-    _register_text_channel(tool, "cli", text)
-    first = asyncio.create_task(
-        tool.execute(target_channel="cli", target_chat_id="1", message="first")
-    )
-    await first_started.wait()
-    passive = asyncio.create_task(
-        tool.execute(
-            target_channel="cli",
-            target_chat_id="1",
-            message="passive",
-            _commit_role="passive",
-        )
-    )
-
-    await asyncio.sleep(0.01)
-    assert events == ["start:first"]
-    assert not passive.done()
-    release_first.set()
-    await asyncio.gather(first, passive)
-
-    assert events == [
-        "start:first",
-        "end:first",
-        "start:passive",
-        "end:passive",
-    ]
-    assert bus.chat_lane._states == {}
-
-
-@pytest.mark.asyncio
 async def test_message_push_passive_send_does_not_consume_queued_outbound_pending():
     lane = ChatLane()
     events: list[str] = []
@@ -598,33 +273,6 @@ async def test_message_push_passive_send_does_not_consume_queued_outbound_pendin
 
     assert events == ["push", "outbound", "active"]
     assert lane._states == {}
-
-
-@pytest.mark.asyncio
-async def test_message_bus_outbound_snapshot_survives_subscription_close():
-    bus = MessageBus()
-    delivered: list[str] = []
-    first_subscription = None
-
-    async def first_callback(_msg: OutboundMessage) -> None:
-        delivered.append("first")
-        assert first_subscription is not None
-        first_subscription.close()
-
-    async def second_callback(_msg: OutboundMessage) -> None:
-        delivered.append("second")
-
-    first_subscription = bus.subscribe_outbound("cli", first_callback)
-    bus.subscribe_outbound("cli", second_callback)
-
-    await bus._send_outbound(
-        OutboundMessage("cli", "1", "first"), fallback_allowed=True
-    )
-    await bus._send_outbound(
-        OutboundMessage("cli", "1", "second"), fallback_allowed=True
-    )
-
-    assert delivered == ["first", "second", "second"]
 
 
 @pytest.mark.asyncio
@@ -1290,34 +938,13 @@ def test_context_builder_reproduces_temporal_conflict_baseline(
 
 
 @pytest.mark.asyncio
-async def test_message_bus_covers_flows(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-):
+async def test_message_bus_rejects_removed_legacy_outbound_paths():
     bus = MessageBus()
-    await bus.publish_inbound(InboundMessage("telegram", "u", "1", "hello"))
-    inbound = await bus.consume_inbound()
-    assert inbound.session_key == "telegram:1"
-
-    sent: list[str] = []
-    attempts = {"count": 0}
-
-    async def callback(msg: OutboundMessage) -> None:
-        attempts["count"] += 1
-        if attempts["count"] == 1:
-            raise RuntimeError("first")
-        sent.append(msg.content)
-
-    bus.subscribe_outbound("telegram", callback)
-    task = asyncio.create_task(bus.dispatch_outbound())
-    await bus.publish_outbound(OutboundMessage("telegram", "1", "payload"))
-    for _ in range(300):
-        if sent:
-            break
-        await asyncio.sleep(0.01)
-    bus.stop()
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    assert sent == ["payload"]
+    with pytest.raises(RuntimeError, match="legacy publish_outbound 已删除"):
+        await bus.publish_outbound(OutboundMessage("telegram", "1", "payload"))
+    with pytest.raises(RuntimeError, match="legacy publish_outbound_awaited 已删除"):
+        await bus.publish_outbound_awaited(
+            OutboundMessage("telegram", "1", "payload")
+        )
     assert bus.inbound_size == 0
     assert bus.outbound_size == 0

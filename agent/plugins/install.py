@@ -1,17 +1,14 @@
 from __future__ import annotations
 
-import importlib.util
 import os
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
-import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
 
 from agent.plugins.artifacts import (
     ArtifactPointer,
@@ -28,11 +25,14 @@ from agent.plugins.manifest import (
     remove_plugin_manifest_entry,
     set_plugin_enabled,
     upsert_plugin_manifest,
+    validate_workspace_plugin_data_path,
     plugins_root,
     workspace_plugin_data_dir,
 )
-from agent.plugins.registry import plugin_registry
-from agent.plugins.specs import McpServerSpec
+from agent.plugins.static_manifest import (
+    StaticPluginManifest,
+    load_static_plugin_manifest,
+)
 
 
 @dataclass(frozen=True)
@@ -52,6 +52,7 @@ class _CacheActivation:
     plugin_base: Path
     previous_pointers: ArtifactPointers | None
     created_artifact: bool
+    created_data_dir: bool
 
     def rollback(self) -> None:
         """撤销已发布 cache，并恢复发布前的可运行版本。"""
@@ -63,6 +64,10 @@ class _CacheActivation:
         target_root = self.result.installed_path
         if self.created_artifact and (target_root.exists() or target_root.is_symlink()):
             _remove_path(target_root)
+
+        # 3. 安装未提交时不留下本事务新建的正式 plugin-data 空目录。
+        if self.created_data_dir:
+            _remove_created_data_dir(self.result.data_path)
 
     def finalize(self) -> None:
         """Immutable artifacts require no destructive post-commit cleanup."""
@@ -188,20 +193,16 @@ def install_git_plugin(
         source_revision = _run_git(["rev-parse", "HEAD"], cwd=clone_root)
         if re.fullmatch(r"[0-9a-f]{40}", source_revision) is None:
             raise RuntimeError(f"插件 Git HEAD 无效: {source_revision}")
-        plugin_class = _load_plugin_class(clone_root)
-        plugin_name = _validate_path_segment(
-            getattr(plugin_class, "name", None),
-            "插件 name",
-        )
+        static_manifest = load_static_plugin_manifest(clone_root)
+        plugin_name = _validate_path_segment(static_manifest.name, "插件 name")
         plugin_version = _validate_path_segment(
-            getattr(plugin_class, "version", None),
+            static_manifest.version,
             "插件 version",
         )
-        mcp_servers = _load_mcp_specs(plugin_class)
         activation = _activate_plugin_version(
             plugin_name=plugin_name,
             plugin_version=plugin_version,
-            mcp_servers=mcp_servers,
+            static_manifest=static_manifest,
             marketplace=marketplace,
             clone_root=clone_root,
             cache_root=cache_root,
@@ -291,7 +292,7 @@ def _activate_plugin_version(
     *,
     plugin_name: str,
     plugin_version: str,
-    mcp_servers: list[McpServerSpec],
+    static_manifest: StaticPluginManifest,
     marketplace: str,
     clone_root: Path,
     cache_root: Path,
@@ -302,15 +303,15 @@ def _activate_plugin_version(
 ) -> _CacheActivation:
     """Prepare one immutable artifact and publish it as latest."""
 
-    # 1. 创建受保护的数据目录和 cache 父目录
+    # 1. 校验正式数据身份，但在依赖 staging 成功前不创建它。
     data_path = data_root / f"{plugin_name}-{marketplace}"
-    ensure_workspace_plugin_data_dir(data_path, workspace)
+    validate_workspace_plugin_data_path(data_path, workspace)
     plugin_base = cache_root / plugin_name
     _ensure_directory(plugin_base)
     visible_versions = _cache_version_dirs(plugin_base)
-    if len(visible_versions) > 1:
+    if visible_versions:
         paths = ", ".join(str(path) for path in visible_versions)
-        raise ValueError(f"插件 cache 可见版本冲突: {paths}")
+        raise ValueError(f"插件 cache 含不受支持的旧版可见目录: {paths}")
     previous_pointers = read_pointers(plugin_base)
     if (
         previous_pointers is not None
@@ -319,9 +320,11 @@ def _activate_plugin_version(
         raise RuntimeError(
             f"插件已有 latest 等待 promote/discard: {plugin_name}@{marketplace}"
         )
-    stable = previous_pointers.stable if previous_pointers is not None else None
-    if stable is None:
-        stable = ArtifactPointer(visible_versions[0].name if visible_versions else None)
+    stable = (
+        previous_pointers.stable
+        if previous_pointers is not None
+        else ArtifactPointer(None)
+    )
     stage_latest = stage_candidate
 
     artifacts_root = plugin_base / ".artifacts"
@@ -337,10 +340,11 @@ def _activate_plugin_version(
         tempfile.mkdtemp(dir=cache_root, prefix=f".{plugin_name}-install-")
     )
     created_artifact = False
+    created_data_dir = False
     try:
         # 2. 在不可发现的 staging 目录复制代码并准备依赖，旧版本保持可见
         _ = shutil.copytree(clone_root, staging_root, dirs_exist_ok=True)
-        _prepare_plugin_mcp_runtimes(staging_root, mcp_servers)
+        _prepare_static_python_runtimes(staging_root, static_manifest)
 
         # 3. Artifact 只创建一次；一次原子写发布完整 stable/latest pair。
         if target_root.exists():
@@ -352,6 +356,8 @@ def _activate_plugin_version(
         else:
             os.replace(staging_root, target_root)
             created_artifact = True
+        created_data_dir = not data_path.exists()
+        ensure_workspace_plugin_data_dir(data_path, workspace)
         latest = relative_artifact_pointer(plugin_base, target_root)
         candidate_staged = stage_latest and stable != latest
         _ = write_pointers(
@@ -365,6 +371,8 @@ def _activate_plugin_version(
             _remove_path(target_root)
         if staging_root.exists() or staging_root.is_symlink():
             _remove_path(staging_root)
+        if created_data_dir:
+            _remove_created_data_dir(data_path)
         raise
 
     result = PluginInstallResult(
@@ -381,7 +389,21 @@ def _activate_plugin_version(
         plugin_base=plugin_base,
         previous_pointers=previous_pointers,
         created_artifact=created_artifact,
+        created_data_dir=created_data_dir,
     )
+
+
+def _remove_created_data_dir(path: Path) -> None:
+    """Remove only an empty plugin-data directory owned by this transaction."""
+
+    try:
+        path.rmdir()
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise RuntimeError(
+            f"安装回滚无法删除新建 plugin-data 空目录: {path}"
+        ) from error
 
 
 def _restore_pointers(
@@ -401,7 +423,7 @@ def _restore_pointers(
 
 
 def _cache_version_dirs(plugin_base: Path) -> list[Path]:
-    """列出可被 watcher 发现的旧版本目录。"""
+    """列出不能再参与安装或发布的旧版可见目录。"""
 
     result: list[Path] = []
     for child in sorted(plugin_base.iterdir()):
@@ -478,147 +500,21 @@ def _validate_source_tree(root: Path) -> None:
                 raise ValueError(f"插件 source 符号链接形成循环: {path} -> {resolved}")
 
 
-def _prepare_plugin_mcp_runtimes(
+def _prepare_static_python_runtimes(
     plugin_root: Path,
-    servers: list[McpServerSpec],
+    manifest: StaticPluginManifest,
 ) -> None:
-    for server in servers:
-        _prepare_single_mcp_server(plugin_root=plugin_root, server=server)
+    """Stage all manifest-declared Python runtimes before publishing an artifact."""
 
-
-def _prepare_single_mcp_server(
-    *,
-    plugin_root: Path,
-    server: McpServerSpec,
-) -> None:
-    command_items = list(server.command)
-    if not _is_python_command(command_items[0]):
-        return
-    runtime_root = _resolve_mcp_runtime_root(plugin_root, server.cwd, command_items)
-    if runtime_root is None:
-        return
-    requirements = runtime_root / "requirements.txt"
-    if not requirements.exists() or requirements.is_symlink():
-        return
-    _ = _ensure_python_runtime(runtime_root, requirements, server.name)
-
-
-def _resolve_mcp_runtime_root(
-    plugin_root: Path,
-    cwd_raw: str,
-    command_items: list[str],
-) -> Path | None:
-    candidates: list[Path] = []
-    if len(command_items) >= 2:
-        script_path = Path(command_items[1])
-        if _looks_like_plugin_path(command_items[1]):
-            script_candidate = (
-                script_path if script_path.is_absolute() else plugin_root / script_path
-            )
-            resolved_script = script_candidate.resolve(strict=False)
-            _require_plugin_path(plugin_root, resolved_script, "MCP command")
-            candidates.append(script_candidate.parent)
-    if cwd_raw:
-        cwd_path = Path(cwd_raw)
-        cwd_candidate = cwd_path if cwd_path.is_absolute() else plugin_root / cwd_path
-        _require_plugin_path(
-            plugin_root,
-            cwd_candidate.resolve(strict=False),
-            "MCP cwd",
+    # 1. Each requirements parent owns its own immutable .venv.
+    for index, runtime in enumerate(manifest.python):
+        requirements = plugin_root / runtime.requirements
+        runtime_root = requirements.parent
+        _ = _ensure_python_runtime(
+            runtime_root,
+            requirements,
+            f"{manifest.name} python[{index}]",
         )
-        candidates.append(cwd_candidate)
-    candidates.append(plugin_root)
-    for candidate in candidates:
-        if (candidate / "requirements.txt").exists():
-            return candidate
-    return None
-
-
-def _looks_like_plugin_path(value: str) -> bool:
-    return (
-        Path(value).is_absolute()
-        or "/" in value
-        or "\\" in value
-        or value.startswith(".")
-    )
-
-
-def _require_plugin_path(plugin_root: Path, path: Path, label: str) -> None:
-    plugin_root = plugin_root.resolve(strict=False)
-    path = path.resolve(strict=False)
-    try:
-        _ = path.relative_to(plugin_root)
-    except ValueError as error:
-        raise ValueError(f"插件 {label} 越界: {path}") from error
-
-
-def _load_plugin_class(plugin_root: Path) -> type:
-    plugin_path = plugin_root / "plugin.py"
-    if not plugin_path.exists():
-        raise ValueError("插件缺少 plugin.py")
-    module_name = f"akasic_plugin_install_{uuid.uuid4().hex}"
-    spec = importlib.util.spec_from_file_location(
-        module_name,
-        plugin_path,
-        submodule_search_locations=[str(plugin_root)],
-    )
-    if spec is None or spec.loader is None:
-        raise ImportError(f"无法加载插件文件: {plugin_path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    try:
-        spec.loader.exec_module(module)
-        plugin_class = plugin_registry.get_class(module_name)
-        if plugin_class is None:
-            raise ValueError("plugin.py 未声明 Plugin 子类")
-        return plugin_class
-    finally:
-        plugin_registry.remove_module_tree(module_name)
-        for imported_name in tuple(sys.modules):
-            if imported_name == module_name or imported_name.startswith(
-                f"{module_name}."
-            ):
-                _ = sys.modules.pop(imported_name, None)
-
-
-def _load_mcp_specs(plugin_class: type) -> list[McpServerSpec]:
-    provider = getattr(plugin_class, "mcp_servers", None)
-    if not callable(provider):
-        raise ValueError("插件缺少 mcp_servers() 声明")
-    raw = cast(Callable[[], object], provider)()
-    if not isinstance(raw, list):
-        raise ValueError("mcp_servers() 必须返回 list")
-    raw_items = cast(list[object], raw)
-    result: list[McpServerSpec] = []
-    names: set[str] = set()
-    for item in raw_items:
-        if (
-            not isinstance(item, McpServerSpec)
-            or not isinstance(item.name, str)
-            or not item.name
-            or not item.command
-            or not isinstance(item.command, tuple)
-            or not isinstance(item.cwd, str)
-            or not isinstance(item.env, dict)
-            or not isinstance(item.candidate_read_only_tools, tuple)
-            or not all(isinstance(value, str) and value for value in item.command)
-            or not all(
-                isinstance(key, str) and isinstance(value, str)
-                for key, value in item.env.items()
-            )
-            or not all(
-                isinstance(value, str) and value
-                for value in item.candidate_read_only_tools
-            )
-            or len(set(item.candidate_read_only_tools))
-            != len(item.candidate_read_only_tools)
-        ):
-            raise ValueError(f"MCP server 声明无效: {item!r}")
-        if item.name in names:
-            raise ValueError(f"MCP server 名称重复: {item.name}")
-        names.add(item.name)
-        result.append(item)
-    return result
 
 
 def _ensure_python_runtime(
@@ -648,11 +544,6 @@ def _venv_python_path(venv_dir: Path) -> Path:
         if os.name == "nt"
         else venv_dir / "bin" / "python"
     )
-
-
-def _is_python_command(value: str) -> bool:
-    name = Path(value).name.lower()
-    return name in {"python", "python3", "python.exe"}
 
 
 def _run_git(args: list[str], cwd: Path | None = None) -> str:

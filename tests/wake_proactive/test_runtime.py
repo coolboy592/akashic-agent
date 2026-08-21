@@ -16,7 +16,11 @@ from agent.plugins.specs import ProactiveSourceSpec, RegisteredProactiveSource
 from agent.persona import reset_veda
 from agent.provider import LLMResponse, ToolCall
 from core.clock import ReplayClock
-from plugins.wake_proactive.plugin import WakeProactivePlugin, WakeRuntimeFactory
+from plugins.wake_proactive.plugin import (
+    WakeProactiveModuleFactory,
+    WakeRuntimeFactory,
+    build_wake_lifecycle,
+)
 from plugins.wake_proactive.context import WakeContext
 from plugins.wake_proactive.prompt import build_messages
 from plugins.wake_proactive.runtime import WakeRuntime, select_content_page
@@ -303,7 +307,7 @@ async def test_content_vertical_slice_filters_investigates_and_shares(
     )
 
     lifecycle = ProactiveLifecycleBuilder().build(
-        cast(ProactiveLifecycleSpec, WakeProactivePlugin().proactive_lifecycles()[0]),
+        cast(ProactiveLifecycleSpec, build_wake_lifecycle()),
         runtime.build_modules(),
     )
     result = await lifecycle.run(frame)
@@ -1145,10 +1149,9 @@ def test_replay_last_user_time_cannot_see_future_message(tmp_path, request):
 
 
 def test_plugin_exposes_complete_wake_lifecycle():
-    plugin = WakeProactivePlugin()
-    assert plugin.proactive_lifecycles()[0].id == "wake"
-    assert isinstance(plugin.proactive_runtime_factories()[0], WakeRuntimeFactory)
-    assert plugin.proactive_module_factories()[0].lifecycle_id == "wake"
+    assert build_wake_lifecycle().id == "wake"
+    assert WakeRuntimeFactory().lifecycle_id == "wake"
+    assert WakeProactiveModuleFactory().lifecycle_id == "wake"
 
 
 def test_future_message_embeddings_do_not_affect_current_interest(tmp_path, request):

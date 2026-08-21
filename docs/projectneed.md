@@ -659,6 +659,14 @@ Core 只负责通用传输、认证、revision、generation lease、调度、取
 
 install 成功只表示候选可验证。至少一个匹配当前候选的 attached child 正常完成、没有 revert 且 parent 正常结束时，Core 才在 lease 释放后自动提交；无验证、child/parent 非正常终结或身份漂移必须丢弃。独占 managed service 使用 Core 分配的隔离端口和 plugin-data 副本；插件必须声明并读取 `validation_port_env`，否则 fail-loud。Channel 正式 ownership 只在 turn 后切换。cache artifact 按 source revision/tree digest 不可变保存，旧代码保留到提交、readiness、恢复检查和 lease 排空完成。
 
+### PLG-014 新插件使用开放组合能力并保留 Core 晋升
+
+新插件只通过 generation Root 下的 Context、Service、Inject、Fiber 和 Effect 组合能力；Job、Channel、Prompt、Tool、UI、MCP、存储和外部效果由各自领域 Service 定义，Core 不维护新的固定插件能力总表。`inject` 只表达 Fiber 激活所必需的硬依赖；可选能力由使用点查询，或由不阻塞 Root readiness 的嵌套 Fiber 承载。listener、后台 task 和其他注册随所属 Fiber 逆序回收，依赖消失、重启和卸载后不得残留。
+
+通用事件只有五种 dispatch 合同：`emit` 同步串行并立即传播失败；`serial` 逐个等待且只有显式 `Bail` 可以短路；`parallel` 只接收异步 listener，并发执行、等待全部 settle 后聚合失败；`transform` 按注册顺序把同类型 immutable payload 显式变换成下一份；`observe` 调用全部 observer、等待异步 settle，并把普通失败隔离成 Incident 而不改写最终事实。listener 只使用同一 generation 内稳定注册顺序，不增加 priority、listener dependency DAG 或通用 waterfall。同步并发由有界 Executor Service 执行插件显式提交的纯同步任务；工作线程不得取得 Context、Fiber 或 Core 权限。
+
+组合拓扑只能生成候选能力，不能自行声明成功或晋升。Core 继续唯一拥有 artifact、generation identity、候选隔离、readiness、行为验证回执、stable/latest、snapshot lease、父 Turn 授权、晋升、丢弃和恢复日志。旧插件在逐个完成能力等价回放前保持原 lifecycle 与顺序；迁移完成后删除对应 legacy 分支，不为每个旧插件长期保留适配器。
+
 ## 11. Workspace、文件和进程
 
 ### WSP-001 Workspace 可写状态显式归属
@@ -829,7 +837,7 @@ Schedule 在整个 workspace 维度默认最多同时存在 10 个 active job。
 
 ### SEC-006 Mobile receipt 与 plugin lease 保留
 
-completed mobile receipt 从 `completed_at` 起保留 7 天，并受每设备 10,000 条和 64 MiB 高水位保护。高水位先清理已过期 completed；仍满时只拒绝当前新 command，不能删除有效 receipt 或结束 runtime。processing 不能按 TTL 盲删，必须根据真实外部效果恢复为 completed、可安全重试或 `outcome_unknown`。超时 plugin query 在真实 worker 结束前持续占用 quota 和 generation lease。
+有副作用或持久结果的 Mobile command 必须保存 receipt；completed receipt 从 `completed_at` 起保留 7 天，并受每设备 10,000 条和 64 MiB 高水位保护。只读取当前快照的启动查询不保存 receipt，重试时重新读取当前状态。高水位先清理已过期 completed；仍满时只拒绝当前需要 receipt 的新 command，不能删除有效 receipt 或结束 runtime。processing 不能按 TTL 盲删，必须根据真实外部效果恢复为 completed、可安全重试或 `outcome_unknown`。超时 plugin query 在真实 worker 结束前持续占用 quota 和 generation lease。
 
 ### SEC-007 Shell 与 Subagent 准入有界
 

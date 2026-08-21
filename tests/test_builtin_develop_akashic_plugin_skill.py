@@ -23,9 +23,9 @@ def test_develop_akashic_plugin_is_discoverable_builtin(tmp_path: Path) -> None:
     for trigger in (
         "创建",
         "编写",
-        "验证插件",
-        "验证 skill",
-        "递归自验证",
+        "验证 Akashic v3 插件",
+        "插件内 Skill/MCP",
+        "递归自验证时使用",
     ):
         assert trigger in record.description
 
@@ -37,14 +37,13 @@ def test_develop_akashic_plugin_preserves_validation_contract(tmp_path: Path) ->
     assert body is not None
     for contract in (
         "canonical source",
-        "不要直接编辑 `~/.akashic-plugin/cache`",
-        "不要指定 `--runtime`",
-        "默认不沉淀语义记忆",
-        "不能只问“你能否看到”",
+        "不要直接编辑安装 cache",
+        "不要指定 runtime",
+        "attached programmatic child",
+        "只问“是否可见”",
         "message_push",
         "attached child",
-        "safe candidate self-validation unavailable",
-        "才告诉用户任务完成",
+        "只有以下事实同时成立才报告完成",
     ):
         assert contract in body
 
@@ -65,31 +64,31 @@ def test_develop_akashic_plugin_references_are_complete() -> None:
     assert "references/self-validation.md" in body
     assert "references/runtime-diagnostics.md" in body
     for contract in (
-        "@tool",
-        "@on_prompt_render(priority=100)",
-        "PromptSectionRender",
-        ".venv/bin/python",
-        "普通实例方法",
-        "skill_roots()",
-        "SkillsLoader",
-        "plugin-doctor",
+        "akashic.plugin.toml",
+        "apply(ctx, config)",
+        "ServiceKey",
+        "TOOL_CATALOG",
+        "PluginToolDefinition",
+        "skill_roots",
+        "Context",
+        "CHANNELS",
     ):
         assert contract in authoring
     for contract in (
-        "成功前不要预先做全量诊断考古",
-        "不要创建空 `requirements.txt`",
-        "source test → commit → install",
+        "成功只表示候选已准备",
+        "只有确有 Python 依赖时才声明",
+        "source test → commit/push → plugin-install",
     ):
         assert contract in body
     for contract in (
         "plugin-install",
-        "不得添加 `--runtime latest`",
+        "stable、candidate generation、lease、排空、提交、恢复和 Channel 切换由 Core 管理",
         "write_stdin",
         "plugin-revert",
-        "validation_port_env",
-        "semantic write set == 0",
-        "非 read-only Tool/MCP 默认禁用",
-        "目标渠道是否另写自己的 durable event",
+        "port_env",
+        "semantic write set 为零",
+        "candidate 的写型 Tool/MCP",
+        "Channel 必须有 stop/start ownership 证据",
     ):
         assert contract in validation
     for contract in (

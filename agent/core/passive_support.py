@@ -3,8 +3,9 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections.abc import Mapping
 from datetime import datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from agent.core.types import HistoryMessage, to_tool_call_groups
 from agent.prompting import (
@@ -170,6 +171,22 @@ def update_session_runtime_metadata(
     tool_chain: list[dict],
 ) -> None:
     md = session.metadata if isinstance(session.metadata, dict) else {}  # type: ignore[union-attr]
+    session.metadata = build_session_runtime_metadata(  # type: ignore[union-attr]
+        md,
+        tools_used=tools_used,
+        tool_chain=tool_chain,
+    )
+
+
+def build_session_runtime_metadata(
+    metadata: Mapping[str, Any],
+    *,
+    tools_used: list[str],
+    tool_chain: list[dict],
+) -> dict[str, Any]:
+    """构造当前 Turn 成功提交后应发布的 Session metadata。"""
+
+    md = dict(metadata)
     call_count = sum(
         len(group.get("calls") or [])
         for group in tool_chain
@@ -178,7 +195,7 @@ def update_session_runtime_metadata(
 
     md["last_turn_tool_calls_count"] = call_count
     md["last_turn_ts"] = datetime.now().astimezone().isoformat()
-    session.metadata = md  # type: ignore[union-attr]
+    return md
 
 
 def log_preview(value: object, limit: int = _LOG_PREVIEW_LIMIT) -> str:

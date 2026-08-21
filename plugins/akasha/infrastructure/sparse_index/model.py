@@ -25,6 +25,7 @@ class CanonicalTurn:
     remember_target_turn_ids: tuple[str, ...]
     forget_target_turn_ids: tuple[str, ...]
     remember_boost: float
+    assistant_tool_chain_json: str | None = None
 
 
 @dataclass(frozen=True)

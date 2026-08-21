@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 from pathlib import Path
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from typing import TypeVar, cast
@@ -288,7 +289,20 @@ def assert_recursive_candidate_ready(
     if len(push_items) != 1:
         raise AssertionError("DeliveryReceipt 未写入 child 工具 trace")
     push_data = cast(Mapping[str, object], push_items[0]["data"])
-    if push_data.get("status") != "success" or push_data.get("resultPreview") != "消息已发送":
+    push_preview = push_data.get("resultPreview")
+    if not isinstance(push_preview, str):
+        raise AssertionError("message_push 未持久化 typed receipt JSON")
+    try:
+        push_receipt = json.loads(push_preview)
+    except json.JSONDecodeError as exc:
+        raise AssertionError("message_push 未持久化 typed receipt JSON") from exc
+    if (
+        push_data.get("status") != "success"
+        or not isinstance(push_receipt, Mapping)
+        or push_receipt.get("status") != "delivered"
+        or not isinstance(push_receipt.get("delivery_id"), str)
+        or not push_receipt["delivery_id"]
+    ):
         raise AssertionError("DeliveryReceipt 未写入 child 工具 trace")
     if observation.get("push_target_history_before") != observation.get(
         "push_target_history_after"
@@ -425,7 +439,10 @@ def assert_mcp_reservoir_contract(observation: Mapping[str, object]) -> None:
 
 def assert_schedule_capacity_contract(observation: Mapping[str, object]) -> None:
     """断言第 11 个 Schedule add 不改变已有任务。"""
-    if observation.get("active_jobs", 0) > 10 and observation.get("operation_accepted") is True:
+    active_jobs = observation.get("active_jobs", 0)
+    if not isinstance(active_jobs, int):
+        raise AssertionError("Schedule active_jobs 不是整数")
+    if active_jobs > 10 and observation.get("operation_accepted") is True:
         raise AssertionError("Schedule 超过默认 10 个仍被接受")
     assert_companion_capacity(observation)
 

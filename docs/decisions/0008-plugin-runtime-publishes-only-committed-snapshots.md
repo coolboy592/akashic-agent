@@ -1,8 +1,12 @@
 # 0008 · 插件运行时只发布已提交快照
 
-- 状态：accepted
+- 状态：superseded
 - 日期：2026-07-28
 - 关联条款：PLG-001～PLG-008、GOV-005、TST-006～TST-008
+- superseded by：[0037](0037-plugin-runtime-is-pure-v3.md)
+
+> 0037 取代了本记录的 API v2 选择与 legacy host 结论。已提交快照、
+> stable/latest、generation lease、journal 和 Core 晋升 owner 等发布不变量继续有效。
 
 ## 背景
 

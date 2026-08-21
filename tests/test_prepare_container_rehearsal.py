@@ -10,6 +10,7 @@ import pytest
 
 from scripts.container_rehearsal import workspace_snapshot
 from scripts.container_rehearsal.model import SnapshotDriftError
+from scripts.container_rehearsal.policy import excluded_reason
 from scripts.container_rehearsal.prepare import prepare_rehearsal
 from scripts.container_rehearsal.sqlite_snapshot import verify_session_media_references
 
@@ -258,6 +259,21 @@ def test_prepare_rehearsal_rejects_included_external_symlink_atomically(
 
     assert not target.exists()
     assert list(tmp_path.glob(".candidate.preparing-*")) == []
+
+
+def test_nested_drift_skill_projection_exclusion_is_scoped() -> None:
+    assert excluded_reason(
+        Path("opportunity-v1/drift/skills/self-improvement"),
+        is_symlink=True,
+    ) == "rebuildable_skill_projection"
+    assert excluded_reason(
+        Path("opportunity-v1/drift/skills/regular-file"),
+        is_symlink=False,
+    ) is None
+    assert excluded_reason(
+        Path("opportunity-v1/assets/escape"),
+        is_symlink=True,
+    ) is None
 
 
 def test_file_created_during_database_backup_retries_whole_snapshot(

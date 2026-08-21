@@ -15,7 +15,13 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from fastapi.testclient import TestClient
 
 from agent.config_models import MobileKeyEncryptionConfig, MobileRealtimeConfig
-from bus.events import InboundMessage, OutboundMessage
+from agent.plugin_composition.channels import (
+    ChannelFactoryContext,
+    ChannelInboundMessage,
+    ChannelRuntimePorts,
+    RawInbound,
+)
+from bus.events import OutboundMessage, channel_message_from_outbound
 from bus.events_lifecycle import TurnStarted
 from infra.channels.base import AttachmentStore
 from infra.mobile_realtime.attachments import decode_attachment_chunk
@@ -28,6 +34,40 @@ from infra.mobile_realtime.gateway import (
 from infra.mobile_realtime.key_protection import KeyProtectionError
 from infra.mobile_realtime.storage import DeviceRecord
 from session.manager import SessionManager
+
+
+async def _attach_open_mobile_v3(
+    channel: Any,
+    ingress: Any,
+    *,
+    binding_token: str,
+) -> Any:
+    """Attach one exact v3 ingress and open admission for this fixture."""
+
+    context = ChannelFactoryContext(
+        snapshot_id="isolated-e2e-snapshot",
+        generation_id="isolated-e2e-generation",
+        binding_token=binding_token,
+        config={},
+        credentials={},
+        provider_client_factory=cast(Any, object()),
+        ingress=ingress,
+        identity=None,
+    )
+    adapter = channel.build_v3_adapter(context)
+    adapter.attach_runtime(
+        ChannelRuntimePorts(
+            snapshot_id=context.snapshot_id,
+            generation_id=context.generation_id,
+            binding_token=context.binding_token,
+            ingress=context.ingress,
+            identity=context.identity,
+            attachment_import=context.attachment_import,
+        )
+    )
+    assert (await adapter.start()).binding_token == binding_token
+    adapter.open_admission()
+    return adapter
 
 
 class _EphemeralMasterKeys:
@@ -53,8 +93,7 @@ class _EventBus:
 
 
 class _PushTool:
-    def register_channel(self, channel: str, **senders: object) -> None:
-        assert channel == "mobile"
+    pass
 
 
 class _DeterministicAgentBus:
@@ -65,20 +104,41 @@ class _DeterministicAgentBus:
         self._reply_media = reply_media
         self._runtime: MobileGatewayRuntime | None = None
         self.inbound_count = 0
+        self.legacy_publish_calls = 0
 
     def bind(self, runtime: MobileGatewayRuntime) -> None:
         self._runtime = runtime
 
-    def subscribe_outbound(self, channel: str, callback: object) -> None:
-        assert channel == "mobile"
-
     async def publish_inbound(self, message: object) -> None:
+        self.legacy_publish_calls += 1
+        raise AssertionError("Mobile v3 fixture 不得调用 legacy publish_inbound")
+
+    async def reserve_mobile_channel_handoff(self, raw: RawInbound) -> bool:
+        assert isinstance(raw, RawInbound)
+        assert raw.message.metadata["mobile_v3_handoff"] is True
+        return True
+
+    async def defer_mobile_channel_handoff(self, handoff_id: str) -> None:
+        raise AssertionError(f"unexpected deferred Mobile v3 handoff: {handoff_id}")
+
+    def has_pending_mobile_handoff(
+        self,
+        *,
+        session_key: str,
+        client_message_id: str,
+    ) -> bool:
+        return False
+
+    async def admit(self, raw: RawInbound) -> bool:
         """按真实持久化顺序生成 turn.started 与 message.final。"""
 
         # 1. 持久化同一个 client_message_id，模拟生命周期入库结果
-        inbound = cast(InboundMessage, message)
+        assert isinstance(raw, RawInbound)
+        inbound = raw.message
+        assert isinstance(inbound, ChannelInboundMessage)
         runtime = self._require_runtime()
-        session = self._manager.get_or_create(inbound.session_key)
+        session_id = cast(str, inbound.metadata["session_key_override"])
+        session = self._manager.get_or_create(session_id)
         client_message_id = cast(str, inbound.metadata["client_message_id"])
         session.add_message(
             "user",
@@ -98,7 +158,7 @@ class _DeterministicAgentBus:
         # 2. 通过真实移动渠道发布可恢复事件
         await runtime.channel._on_turn_started(
             TurnStarted(
-                session_key=inbound.session_key,
+                session_key=session_id,
                 channel="mobile",
                 chat_id=inbound.chat_id,
                 content=inbound.content,
@@ -106,16 +166,21 @@ class _DeterministicAgentBus:
                 turn_id=turn_id,
             )
         )
-        await runtime.channel._on_response(
-            OutboundMessage(
-                channel="mobile",
-                chat_id=inbound.chat_id,
-                content="隔离网关固定回复",
-                media=[str(self._reply_media)],
-                control_turn_id=turn_id,
-                session_message_id=assistant_message_id,
+        receipt = await runtime.channel._deliver_message(
+            channel_message_from_outbound(
+                OutboundMessage(
+                    channel="mobile",
+                    chat_id=inbound.chat_id,
+                    content="隔离网关固定回复",
+                    media=[str(self._reply_media)],
+                    control_turn_id=turn_id,
+                    session_message_id=assistant_message_id,
+                    metadata={"_channel_commit_role": "passive"},
+                )
             )
         )
+        assert receipt.succeeded
+        return True
 
     def _require_runtime(self) -> MobileGatewayRuntime:
         if self._runtime is None:
@@ -263,6 +328,13 @@ def test_isolated_gateway_recovers_lost_frames_and_keeps_history_idempotent(
                     attachment_store=AttachmentStore(root / "attachments"),
                 ),
             )
+        )
+    )
+    adapter = asyncio.run(
+        _attach_open_mobile_v3(
+            runtime.channel,
+            bus,
+            binding_token="isolated-e2e-fixture",
         )
     )
 
@@ -432,6 +504,7 @@ def test_isolated_gateway_recovers_lost_frames_and_keeps_history_idempotent(
             assert len(refreshed_items) == 4
             assert len(mirror) == 4
             assert bus.inbound_count == 1
+            assert bus.legacy_publish_calls == 0
 
         # 6. 所有持久化路径必须位于 pytest 隔离根目录
         assert (root / "gateway" / "mobile.db").is_file()
@@ -439,6 +512,7 @@ def test_isolated_gateway_recovers_lost_frames_and_keeps_history_idempotent(
         assert (root / "attachments").is_dir()
         assert all(root in path.parents for path in root.rglob("*"))
     finally:
+        asyncio.run(adapter.stop())
         asyncio.run(runtime.channel.stop())
         manager.close()
         runtime.close()

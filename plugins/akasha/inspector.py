@@ -15,9 +15,11 @@ from zoneinfo import ZoneInfo
 
 import numpy as np
 
-from agent.plugins.manifest import builtin_plugin_data_dir
-
-from .config import load_akasha_config, resolve_workspace_path
+from .config import AkashaConfig, resolve_memory_path
+from .infrastructure.sparse_index.schema import (
+    INDEX_VERSION,
+    TOOL_CHAIN_PROJECTION_VERSION,
+)
 
 _LOCAL_TZ = ZoneInfo("Asia/Shanghai")
 
@@ -42,47 +44,81 @@ class _DenseSnapshot:
     assistant_present: np.ndarray
 
 
-def resolve_inspector_paths(workspace: Path) -> InspectorPaths:
-    """Resolve current V2 sidecars from the active workspace config."""
+def resolve_inspector_paths(
+    *,
+    memory_root: Path,
+    config: AkashaConfig,
+) -> InspectorPaths:
+    """Resolve immutable Akasha sidecars from explicit roots and config."""
 
-    config_path = (
-        builtin_plugin_data_dir("akasha", workspace)
-        / "config.local.toml"
-    )
-    config = load_akasha_config(config_path)
+    config.validate()
     return InspectorPaths(
-        memory=resolve_workspace_path(workspace, config.db_path),
-        index=resolve_workspace_path(workspace, config.index_path),
+        memory=resolve_memory_path(memory_root, config.db_path),
+        index=resolve_memory_path(memory_root, config.index_path),
     )
 
 
 class AkashaInspectorReader:
     """Expose historical cue, activation, completion, and prompt evidence."""
 
-    def __init__(self, workspace: Path) -> None:
-        self.workspace = workspace
-        config_path = (
-            builtin_plugin_data_dir("akasha", workspace)
-            / "config.local.toml"
+    def __init__(
+        self,
+        *,
+        memory_root: Path,
+        config: AkashaConfig,
+    ) -> None:
+        self.config = config
+        self.paths = resolve_inspector_paths(
+            memory_root=memory_root,
+            config=config,
         )
-        self.config = load_akasha_config(config_path)
-        self.paths = InspectorPaths(
-            memory=resolve_workspace_path(
-                workspace,
-                self.config.db_path,
-            ),
-            index=resolve_workspace_path(
-                workspace,
-                self.config.index_path,
-            ),
-        )
+        self.memory_root = memory_root.resolve(strict=False)
         self._dense_lock = threading.RLock()
         self._dense_snapshot: _DenseSnapshot | None = None
+
+    def _is_fresh_empty(self) -> bool:
+        """Return whether no learned state exists yet, allowing a valid empty index."""
+
+        if self.paths.memory.exists():
+            return False
+        if not self.paths.index.exists():
+            return True
+
+        # 1. Recognize the empty sparse projection emitted for a fresh session DB.
+        with closing(
+            sqlite3.connect(
+                f"file:{self.paths.index}?mode=ro",
+                uri=True,
+            )
+        ) as connection:
+            row = connection.execute(
+                "SELECT value FROM metadata WHERE key='index_version'"
+            ).fetchone()
+            if row is None or str(row[0]) != INDEX_VERSION:
+                return False
+            projection = connection.execute(
+                "SELECT value FROM metadata "
+                "WHERE key='tool_chain_projection_version'"
+            ).fetchone()
+            if projection is None or str(projection[0]) != (
+                TOOL_CHAIN_PROJECTION_VERSION
+            ):
+                return False
+            columns = {
+                str(item[1])
+                for item in connection.execute("PRAGMA table_info(sparse_turns)")
+            }
+            if "assistant_tool_chain_json" not in columns:
+                return False
+            count = connection.execute(
+                "SELECT COUNT(*) FROM sparse_turns"
+            ).fetchone()
+            return count is not None and int(count[0]) == 0
 
     def get_overview(self) -> dict[str, object]:
         """Return the number and time range of committed retrieval events."""
 
-        if not self.paths.memory.exists() and not self.paths.index.exists():
+        if self._is_fresh_empty():
             return {
                 "available": True,
                 "total": 0,
@@ -90,8 +126,7 @@ class AkashaInspectorReader:
                 "earliest_at": None,
             }
         with closing(self._connect()) as connection:
-            row = connection.execute(
-                """
+            row = connection.execute("""
                 SELECT
                     COUNT(*) AS total,
                     MAX(turn.started_at) AS latest_at,
@@ -99,8 +134,7 @@ class AkashaInspectorReader:
                 FROM memory_events AS event
                 JOIN turn_nodes AS turn
                   ON turn.node_id = event.current_turn_node_id
-                """
-            ).fetchone()
+                """).fetchone()
         return {
             "available": True,
             "total": int(row["total"]),
@@ -117,6 +151,9 @@ class AkashaInspectorReader:
         page_size: int = 50,
     ) -> tuple[list[dict[str, object]], int]:
         """List committed retrievals in reverse causal order."""
+
+        if self._is_fresh_empty():
+            return [], 0
 
         # 1. Build filters only from validated HTTP or mobile inputs.
         where: list[str] = []
@@ -204,13 +241,14 @@ class AkashaInspectorReader:
             ).fetchall()
         items = [dict(row) for row in rows]
         for item in items:
-            item["recall_capture_available"] = bool(
-                item["recall_capture_available"]
-            )
+            item["recall_capture_available"] = bool(item["recall_capture_available"])
         return items, total
 
     def get_turn(self, query_id: str) -> dict[str, object] | None:
         """Return one retrieval with seeds, paths, prompt lanes, and learning."""
+
+        if self._is_fresh_empty():
+            return None
 
         # 1. Read the persisted causal evidence for this query turn.
         with closing(self._connect()) as connection:
@@ -221,17 +259,13 @@ class AkashaInspectorReader:
             seeds = self._load_seeds(connection, node_id)
             activations = self._load_activations(connection, node_id)
             completions = self._load_completions(connection, node_id)
-        tool_left, tool_right = _tool_recall_lanes(
-            run.pop("tool_chain_json")
-        )
+        tool_left, tool_right = _tool_recall_lanes(run.pop("tool_chain_json"))
 
         # 2. Reconstruct the host-visible lanes from frozen prior turns.
         dense = self._dense_items(node_id)
         dense_ids = {str(item["query_id"]) for item in dense}
         right = [
-            item
-            for item in completions
-            if str(item["query_id"]) not in dense_ids
+            item for item in completions if str(item["query_id"]) not in dense_ids
         ][: self.config.context_recall_limit]
         dense = _sort_by_time(dense)
         right = _sort_by_time(right)
@@ -268,6 +302,9 @@ class AkashaInspectorReader:
     ) -> dict[str, object] | None:
         """Return the latest committed retrieval for one session."""
 
+        if self._is_fresh_empty():
+            return None
+
         with closing(self._connect()) as connection:
             row = connection.execute(
                 """
@@ -290,6 +327,9 @@ class AkashaInspectorReader:
     ) -> dict[str, object] | None:
         """Resolve one persisted assistant message to its retrieval event."""
 
+        if self._is_fresh_empty():
+            return None
+
         with closing(self._connect()) as connection:
             row = connection.execute(
                 """
@@ -307,21 +347,57 @@ class AkashaInspectorReader:
     def _connect(self) -> sqlite3.Connection:
         """Open both sidecars read-only for one coherent inspection query."""
 
+        # 1. Open the learned-state sidecar before attaching the sparse projection.
         connection = sqlite3.connect(
             f"file:{self.paths.memory}?mode=ro",
             uri=True,
         )
-        connection.row_factory = sqlite3.Row
-        _ = connection.execute(
-            "ATTACH DATABASE ? AS sparse",
-            (f"file:{self.paths.index}?mode=ro",),
-        )
-        _ = connection.execute(
-            "ATTACH DATABASE ? AS sessions",
-            (f"file:{self.workspace / 'sessions.db'}?mode=ro",),
-        )
-        _ = connection.execute("PRAGMA query_only = ON")
+        try:
+            # 2. Validate the exact projection before returning an owned handle.
+            connection.row_factory = sqlite3.Row
+            _ = connection.execute(
+                "ATTACH DATABASE ? AS sparse",
+                (f"file:{self.paths.index}?mode=ro",),
+            )
+            self._validate_sidecar_schema(connection)
+            _ = connection.execute("PRAGMA query_only = ON")
+        except BaseException:
+            connection.close()
+            raise
         return connection
+
+    @staticmethod
+    def _validate_sidecar_schema(connection: sqlite3.Connection) -> None:
+        """Reject sidecars that cannot reproduce the Inspector tool lane."""
+
+        row = connection.execute(
+            "SELECT value FROM sparse.metadata WHERE key='index_version'"
+        ).fetchone()
+        actual_version = None if row is None else str(row[0])
+        if actual_version != INDEX_VERSION:
+            raise ValueError(
+                f"unsupported sparse index version: {actual_version}; "
+                "explicit rebuild is required"
+            )
+        columns = {
+            str(item[1])
+            for item in connection.execute("PRAGMA sparse.table_info(sparse_turns)")
+        }
+        if "assistant_tool_chain_json" not in columns:
+            raise ValueError(
+                "sparse index lacks assistant tool-chain projection; "
+                "explicit rebuild is required"
+            )
+        projection = connection.execute(
+            "SELECT value FROM sparse.metadata "
+            "WHERE key='tool_chain_projection_version'"
+        ).fetchone()
+        actual_projection = None if projection is None else str(projection[0])
+        if actual_projection != TOOL_CHAIN_PROJECTION_VERSION:
+            raise ValueError(
+                "unsupported assistant tool-chain projection version: "
+                f"{actual_projection}; explicit rebuild is required"
+            )
 
     @staticmethod
     def _load_run(
@@ -340,7 +416,7 @@ class AkashaInspectorReader:
                 turn.started_at AS ts,
                 sparse_turn.user_text AS query_text,
                 sparse_turn.assistant_text,
-                assistant.tool_chain AS tool_chain_json,
+                sparse_turn.assistant_tool_chain_json AS tool_chain_json,
                 event.time_prior,
                 event.continuation,
                 COALESCE(activation.pushes, event.pushes) AS pushes,
@@ -394,8 +470,6 @@ class AkashaInspectorReader:
               ON turn.node_id = event.current_turn_node_id
             JOIN sparse.sparse_turns AS sparse_turn
               ON sparse_turn.turn_id = turn.turn_id
-            LEFT JOIN sessions.messages AS assistant
-              ON assistant.id = turn.assistant_message_id
             LEFT JOIN activation_runs AS activation
               ON activation.query_turn_node_id = turn.node_id
             LEFT JOIN recall_runs AS recall
@@ -410,9 +484,7 @@ class AkashaInspectorReader:
         item["activation_capture_available"] = bool(
             item["activation_capture_available"]
         )
-        item["recall_capture_available"] = bool(
-            item["recall_capture_available"]
-        )
+        item["recall_capture_available"] = bool(item["recall_capture_available"])
         return item
 
     @staticmethod
@@ -445,9 +517,7 @@ class AkashaInspectorReader:
         return [
             {
                 **dict(row),
-                "assistant_preview": _assistant_preview(
-                    str(row["assistant_text"])
-                ),
+                "assistant_preview": _assistant_preview(str(row["assistant_text"])),
                 "channels": _json_list(
                     row["channels_json"],
                     "event_seeds.channels_json",
@@ -491,9 +561,7 @@ class AkashaInspectorReader:
         return [
             {
                 **dict(row),
-                "assistant_preview": _assistant_preview(
-                    str(row["assistant_text"])
-                ),
+                "assistant_preview": _assistant_preview(str(row["assistant_text"])),
                 "graph_only": bool(row["is_graph_only"]),
                 "dominant_path": _json_list(
                     row["dominant_path_json"],
@@ -540,9 +608,7 @@ class AkashaInspectorReader:
         return [
             {
                 **dict(row),
-                "assistant_preview": _assistant_preview(
-                    str(row["assistant_text"])
-                ),
+                "assistant_preview": _assistant_preview(str(row["assistant_text"])),
                 "sources": _json_list(
                     row["sources_json"],
                     "recall_items.sources_json",
@@ -570,19 +636,15 @@ class AkashaInspectorReader:
         user_scores = snapshot.user[:query_node_id] @ query
         assistant_scores = snapshot.assistant[:query_node_id] @ query
         user_scores[~snapshot.user_present[:query_node_id]] = -np.inf
-        assistant_scores[
-            ~snapshot.assistant_present[:query_node_id]
-        ] = -np.inf
+        assistant_scores[~snapshot.assistant_present[:query_node_id]] = -np.inf
         scores = np.maximum(user_scores, assistant_scores)
 
         # 2. Apply the engine's score-desc, node-id-asc tie break.
         nodes = np.arange(query_node_id)
         ranked = np.lexsort((nodes, -scores))
-        selected = [
-            int(node)
-            for node in ranked
-            if math.isfinite(float(scores[node]))
-        ][:5]
+        selected = [int(node) for node in ranked if math.isfinite(float(scores[node]))][
+            :5
+        ]
         return [
             {
                 **snapshot.turns[node],
@@ -613,8 +675,7 @@ class AkashaInspectorReader:
 
         # 1. Read stable graph order and both indexed message vectors.
         with closing(self._connect()) as connection:
-            rows = connection.execute(
-                """
+            rows = connection.execute("""
                 SELECT
                     turn.node_id,
                     turn.turn_id AS query_id,
@@ -638,8 +699,7 @@ class AkashaInspectorReader:
                   ON assistant_dense.turn_id = turn.turn_id
                  AND assistant_dense.field = 'assistant'
                 ORDER BY turn.node_id
-                """
-            ).fetchall()
+                """).fetchall()
         _require_contiguous_nodes(rows)
         dimension = _dense_dimension(rows)
 
@@ -665,9 +725,7 @@ class AkashaInspectorReader:
                 "ts": row["ts"],
                 "user_text": row["user_text"],
                 "assistant_text": row["assistant_text"],
-                "assistant_preview": _assistant_preview(
-                    str(row["assistant_text"])
-                ),
+                "assistant_preview": _assistant_preview(str(row["assistant_text"])),
             }
             for row in rows
         )
@@ -690,24 +748,39 @@ def mobile_summary(item: dict[str, object]) -> dict[str, object]:
         "query_preview": _clip(str(item["query_text"]), 180),
         "ts": item["ts"],
         "seed_count": item["seed_count"],
-        "activation_capture_available": item[
-            "activation_capture_available"
-        ],
-        "recall_capture_available": item[
-            "recall_capture_available"
-        ],
+        "activation_capture_available": item["activation_capture_available"],
+        "recall_capture_available": item["recall_capture_available"],
         "activation_count": item["activation_count"],
         "left_count": item["left_count"],
         "right_count": item["right_count"],
         "pushes": item["pushes"],
         "residual_l1": item["residual_l1"],
-        "left": item["left"],
-        "right": item["right"],
+        "left": _mobile_detail_lane(item["left"]),
+        "right": _mobile_detail_lane(item["right"]),
         "tool_left_count": item["tool_left_count"],
         "tool_right_count": item["tool_right_count"],
-        "tool_left": item["tool_left"],
-        "tool_right": item["tool_right"],
+        "tool_left": _mobile_detail_lane(item["tool_left"]),
+        "tool_right": _mobile_detail_lane(item["tool_right"]),
     }
+
+
+def _mobile_detail_lane(value: object) -> list[dict[str, object]]:
+    """Project one Inspector lane into the bounded Mobile card shape."""
+
+    # 1. Keep only fields rendered by the mobile detail view.
+    rows = cast(list[dict[str, object]], value)
+    projected: list[dict[str, object]] = []
+    for row in rows:
+        visible = {
+            "user_preview": _clip(str(row["user_text"]), 100),
+            "assistant_preview": _clip(str(row["assistant_preview"]), 50),
+            "ts": row["ts"],
+        }
+        score = row.get("score")
+        if score is not None:
+            visible["score"] = score
+        projected.append(visible)
+    return projected
 
 
 def _tool_recall_lanes(
@@ -919,8 +992,4 @@ def _render_lane(
 
 def _parse_time(value: str) -> datetime:
     parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    return (
-        parsed.replace(tzinfo=_LOCAL_TZ)
-        if parsed.tzinfo is None
-        else parsed
-    )
+    return parsed.replace(tzinfo=_LOCAL_TZ) if parsed.tzinfo is None else parsed

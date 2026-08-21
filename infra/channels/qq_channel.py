@@ -2,7 +2,7 @@
 QQ Channel
 
 通过 NcatBot（NapCat Python SDK）接入 QQ 私聊和群聊消息。
-消息流向：QQ → NcatBot → MessageBus → AgentLoop → MessageBus → QQ
+消息流向：QQ → NcatBot → Core v3 Channel ingress → AgentLoop → Core v3 outbound → QQ
 
 chat_id 约定：
   私聊："{user_id}"           （如 "987654321"）
@@ -18,6 +18,7 @@ import asyncio
 import base64
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 import html
 import importlib
 import logging
@@ -28,13 +29,23 @@ from typing import Any, cast
 
 from agent.config_models import QQGroupConfig
 from agent.looping.interrupt import InterruptController
+from agent.plugin_composition.channels import (
+    AttachmentKind,
+    AttachmentRef,
+    ChannelAdapter,
+    ChannelFactoryContext,
+    ChannelInboundMessage,
+    ChannelRuntimePorts,
+    InboundIdentity,
+    ProviderDeliveryRequest,
+    RawInbound,
+    StopReceipt,
+)
 from bus.event_bus import EventBus
 from bus.events import (
     ChannelMessage,
     DeliveryReceipt,
-    InboundMessage,
     OutboundMessage,
-    channel_message_from_outbound,
 )
 from bus.events_lifecycle import (
     ToolCallCompleted,
@@ -42,7 +53,7 @@ from bus.events_lifecycle import (
     TurnStarted,
 )
 from bus.queue import MessageBus
-from infra.channels.base import AttachmentStore, SessionIdentityIndex
+from infra.channels.base import SessionIdentityIndex
 from infra.channels.contract import ChannelContext
 from infra.channels.delivery import deliver_message_parts
 from infra.channels.group_filter import (
@@ -50,6 +61,7 @@ from infra.channels.group_filter import (
     GroupMessageFilter,
     strip_at_segments,
 )
+from infra.channels.native_delivery import NativeChannelDeliveryAdapter
 from core.net.http import HttpRequester, RequestBudget, get_default_http_requester
 from session.manager import SessionManager
 
@@ -68,6 +80,15 @@ MAX_QQ_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_QQ_TOTAL_IMAGE_BYTES = 20 * 1024 * 1024
 
 
+def _normalize_v3_content(value: str) -> str:
+    """Keep provider text while replacing Core-forbidden control characters."""
+
+    return "".join(
+        "\u2028" if ord(char) in {10, 13} else " " if ord(char) < 32 else char
+        for char in value
+    )
+
+
 @dataclass
 class _QQTraceLine:
     tool_name: str
@@ -83,8 +104,108 @@ class _QQTraceState:
     tool_lines: list[_QQTraceLine] = field(default_factory=list)
 
 
-def _session_key_for_chat(chat_id: str) -> str:
-    return f"{_CHANNEL}:{chat_id}"
+class _QQInboundRuntime:
+    """Gate main-loop QQ callbacks on one exact formal Core binding."""
+
+    def __init__(self) -> None:
+        self._ports: ChannelRuntimePorts | None = None
+        self._open = False
+        self._wake = asyncio.Event()
+        self._futures: set[Any] = set()
+
+    def attach(self, ports: ChannelRuntimePorts) -> None:
+        if self._open:
+            raise RuntimeError("QQ v3 ingress 已打开")
+        if ports.ingress is None:
+            raise RuntimeError("QQ v3 ingress 缺少 Core ingress")
+        self._ports = ports
+        self._open = False
+        self._wake.clear()
+
+    def open(self) -> None:
+        if self._ports is None:
+            raise RuntimeError("QQ v3 ingress 尚未 attach")
+        self._open = True
+        self._wake.set()
+
+    def close(self) -> None:
+        self._open = False
+        self._ports = None
+        self._wake.set()
+
+    def track_future(self, future: Any) -> None:
+        self._futures.add(future)
+        future.add_done_callback(self._futures.discard)
+        future.add_done_callback(self._report_failure)
+
+    @staticmethod
+    def _report_failure(future: Any) -> None:
+        if future.cancelled():
+            return
+        try:
+            error = future.exception()
+        except BaseException as exc:
+            logger.error("[qq] v3 入站任务状态读取失败: %s", exc)
+            return
+        if error is not None:
+            logger.error("[qq] v3 入站任务失败", exc_info=error)
+
+    async def wait_quiescent(self) -> None:
+        futures = tuple(self._futures)
+        if futures:
+            await asyncio.gather(
+                *(asyncio.wrap_future(future) for future in futures),
+                return_exceptions=True,
+            )
+
+    async def wait_open(self) -> ChannelRuntimePorts:
+        ports = self._ports
+        if ports is None:
+            raise RuntimeError("QQ v3 ingress 尚未 attach")
+        await self._wake.wait()
+        if not self._open or self._ports is not ports:
+            raise RuntimeError("QQ v3 ingress admission 已关闭")
+        return ports
+
+    def require_open(self, ports: ChannelRuntimePorts) -> None:
+        if not self._open or self._ports is not ports:
+            raise RuntimeError("QQ v3 ingress admission 已关闭")
+
+    async def admit(
+        self,
+        raw: RawInbound,
+        *,
+        ports: ChannelRuntimePorts | None = None,
+    ) -> bool:
+        if ports is None:
+            ports = await self.wait_open()
+        if ports.ingress is None:
+            raise RuntimeError("QQ v3 ingress 缺少 Core ingress")
+        if not self._open or self._ports is not ports:
+            return False
+        return await ports.ingress.admit(raw)
+
+    async def import_bytes(
+        self,
+        data: bytes,
+        *,
+        kind: AttachmentKind,
+        filename: str | None,
+        media_type: str | None,
+        ports: ChannelRuntimePorts | None = None,
+    ) -> AttachmentRef:
+        if ports is None:
+            ports = await self.wait_open()
+        if ports.attachment_import is None:
+            raise RuntimeError("QQ v3 attachment import 缺少 Core port")
+        if not self._open or self._ports is not ports:
+            raise RuntimeError("QQ v3 attachment import admission 已关闭")
+        return await ports.attachment_import.import_bytes(
+            data,
+            kind=kind,
+            filename=filename,
+            media_type=media_type,
+        )
 
 
 def _truncate_trace_text(text: str, limit: int) -> str:
@@ -264,58 +385,14 @@ def _extract_cq_images(raw: str) -> tuple[str, list[str]]:
     return text, urls
 
 
-async def _download_to_temp(
-    urls: list[str],
-    requester: HttpRequester,
-    attachments: AttachmentStore,
-    diagnostics: list[str] | None = None,
-) -> list[str]:
-    """下载图片到临时文件，返回本地路径列表"""
-    if not urls:
-        return []
-    diagnostics = diagnostics if diagnostics is not None else []
-    if len(urls) > MAX_QQ_IMAGE_COUNT:
-        diagnostics.append(
-            f"image_count_exceeded: received={len(urls)} limit={MAX_QQ_IMAGE_COUNT}"
-        )
-    accepted_total = 0
-    paths: list[str] = []
-    ext_map = {
-        "image/jpeg": ".jpg",
-        "image/png": ".png",
-        "image/gif": ".gif",
-        "image/webp": ".webp",
-    }
-    for index, url in enumerate(urls[:MAX_QQ_IMAGE_COUNT]):
-        if accepted_total >= MAX_QQ_TOTAL_IMAGE_BYTES:
-            diagnostics.append(
-                f"image_total_limit_reached: limit={MAX_QQ_TOTAL_IMAGE_BYTES}"
-            )
-            break
-        try:
-            url = html.unescape(url)  # 还原 &amp; 等 HTML 实体
-            remaining = MAX_QQ_TOTAL_IMAGE_BYTES - accepted_total
-            item_limit = min(MAX_QQ_IMAGE_BYTES, remaining)
-            content, ct = await _read_qq_image(
-                url,
-                requester,
-                max_bytes=item_limit,
-            )
-            if not ct.startswith("image/"):
-                raise ValueError(f"不支持的媒体类型: {ct}")
-            ext = ext_map.get(ct, ".jpg")
-            path = attachments.write_bytes(
-                content,
-                prefix="akashic_qq_",
-                suffix=ext,
-            )
-            paths.append(str(path))
-            accepted_total += len(content)
-        except Exception as exc:
-            reason = f"media[{index}] failed: {exc}"
-            diagnostics.append(reason)
-            logger.warning("[qq] 图片下载失败  url=%s  错误: %s", url[:80], exc)
-    return paths
+def _qq_message_id(event: object) -> str | None:
+    """Extract the provider-owned message identity without fabricating one."""
+
+    for name in ("message_id", "message_seq"):
+        value = getattr(event, name, None)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return None
 
 
 async def _read_qq_image(
@@ -352,6 +429,8 @@ async def _read_qq_image(
 
 
 class QQChannel:
+    v3_inbound_identity = InboundIdentity.PROVIDER_MESSAGE_ID
+
     name = _CHANNEL
 
     def __init__(
@@ -378,7 +457,6 @@ class QQChannel:
         self._websocket_open_timeout_seconds = float(websocket_open_timeout_seconds)
         self._interrupt_controller = interrupt_controller
         self._workspace = session_manager.workspace
-        self._attachments = AttachmentStore(session_manager.workspace / "uploads")
         self._trace_actor_name_cache: str | None = None
         self._identity_index = SessionIdentityIndex(
             session_manager,
@@ -397,9 +475,9 @@ class QQChannel:
             "external_default"
         )
         self._event_bus = event_bus
-        self._outbound_bound = False
         self._events_bound = False
         self._trace_states: dict[str, _QQTraceState] = {}
+        self._v3_inbound_runtime = _QQInboundRuntime()
 
         self._bot = BotClient()
         self._api = None
@@ -434,10 +512,6 @@ class QQChannel:
             self._bus = ctx.bus
             self._event_bus = ctx.event_bus
             self._interrupt_controller = ctx.interrupt_controller
-            ctx.push_tool.register_channel(
-                self.name,
-                deliver=self._deliver_message,
-            )
         self._main_loop = asyncio.get_running_loop()
         self._identity_index.rebuild()
         self._bind_events()
@@ -455,7 +529,7 @@ class QQChannel:
             raw: str = event.raw_message
             text, img_urls = _extract_cq_images(raw)
             if text.strip() == "/stop":
-                self._submit_to_main_loop(self._handle_stop_private(user_id))
+                self._submit_to_main_loop(self._handle_stop_private(user_id), track=False)
                 return
             preview = text[:60] + "..." if len(text) > 60 else text
             logger.info(
@@ -464,7 +538,16 @@ class QQChannel:
 
             self.user_map[user_id] = user_id
 
-            self._submit_to_main_loop(self._handle_private(user_id, text, img_urls))
+            self._submit_to_main_loop(
+                self._handle_private(
+                    user_id,
+                    text,
+                    img_urls,
+                    message_id=_qq_message_id(event),
+                    event=event,
+                ),
+                track=True,
+            )
 
         @cast(Any, self._bot.on_group_message())
         async def _(event) -> None:
@@ -490,7 +573,10 @@ class QQChannel:
             raw = strip_at_segments(event.raw_message)
             text, img_urls = _extract_cq_images(raw)
             if text.strip() == "/stop":
-                self._submit_to_main_loop(self._handle_stop_group(group_id, user_id))
+                self._submit_to_main_loop(
+                    self._handle_stop_group(group_id, user_id),
+                    track=False,
+                )
                 return
             preview = text[:60] + "..." if len(text) > 60 else text
             logger.info(
@@ -498,7 +584,15 @@ class QQChannel:
             )
 
             self._submit_to_main_loop(
-                self._handle_group(group_id, user_id, text, img_urls)
+                self._handle_group(
+                    group_id,
+                    user_id,
+                    text,
+                    img_urls,
+                    message_id=_qq_message_id(event),
+                    event=event,
+                ),
+                track=True,
             )
 
         @cast(Any, self._bot.on_startup())
@@ -508,10 +602,6 @@ class QQChannel:
         logger.info("[qq] 正在启动 NcatBot（首次运行需要扫码登录）...")
         self._api = await self._main_loop.run_in_executor(None, self._bot.run_backend)
         logger.info("[qq] NcatBot 已启动")
-
-        if not self._outbound_bound:
-            self._bus.subscribe_outbound(_CHANNEL, self._on_response)
-            self._outbound_bound = True
 
     def _bind_events(self) -> None:
         if self._event_bus is None or self._events_bound:
@@ -578,29 +668,170 @@ class QQChannel:
     # ── 入站处理 ──────────────────────────────────────────────────────
 
     async def _handle_private(
-        self, user_id: str, content: str, img_urls: list[str] | None = None
+        self,
+        user_id: str,
+        content: str,
+        img_urls: list[str] | None = None,
+        *,
+        message_id: str | None = None,
+        event: object | None = None,
     ) -> None:
         """私聊入站：chat_id = user_id"""
-        await self._identity_index.remember(user_id, user_id)
-        media_diagnostics: list[str] = []
-        media = await _download_to_temp(
+        await self._handle_private_v3(
+            user_id,
+            content,
             img_urls or [],
-            self._http_requester,
-            self._attachments,
-            media_diagnostics,
+            message_id=message_id,
+            event=event,
         )
-        metadata: dict[str, Any] = {"chat_type": "private"}
-        if media_diagnostics:
-            metadata["media_diagnostics"] = media_diagnostics
-        await self._bus.publish_inbound(
-            InboundMessage(
-                channel=_CHANNEL,
-                sender=user_id,
-                chat_id=user_id,
-                content=content,
-                media=media,
-                metadata=metadata,
+
+    @staticmethod
+    def _v3_timestamp(event: object | None) -> datetime:
+        value = None if event is None else getattr(event, "time", None)
+        if value is None and event is not None:
+            value = getattr(event, "timestamp", None)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return datetime.fromtimestamp(value, tz=timezone.utc)
+        if isinstance(value, datetime):
+            if value.tzinfo is None or value.utcoffset() is None:
+                return value.replace(tzinfo=timezone.utc)
+            return value
+        return datetime.now(timezone.utc)
+
+    async def _download_v3_images(
+        self,
+        img_urls: list[str],
+        *,
+        ports: ChannelRuntimePorts,
+    ) -> tuple[AttachmentRef, ...]:
+        """Import provider images through the exact Core attachment port."""
+
+        if not img_urls:
+            return ()
+        runtime = self._v3_inbound_runtime
+        refs: list[AttachmentRef] = []
+        total = 0
+        for index, raw_url in enumerate(img_urls[:MAX_QQ_IMAGE_COUNT]):
+            runtime.require_open(ports)
+            if total >= MAX_QQ_TOTAL_IMAGE_BYTES:
+                raise ValueError("QQ 图片总大小超过 v3 上限")
+            url = html.unescape(raw_url)
+            remaining = MAX_QQ_TOTAL_IMAGE_BYTES - total
+            payload, media_type = await _read_qq_image(
+                url,
+                self._http_requester,
+                max_bytes=min(MAX_QQ_IMAGE_BYTES, remaining),
             )
+            if not media_type.startswith("image/"):
+                raise ValueError(f"不支持的媒体类型: {media_type}")
+            suffix = {
+                "image/jpeg": ".jpg",
+                "image/png": ".png",
+                "image/gif": ".gif",
+                "image/webp": ".webp",
+            }.get(media_type, ".img")
+            refs.append(
+                await runtime.import_bytes(
+                    payload,
+                    kind=AttachmentKind.IMAGE,
+                    filename=f"qq_image_{index + 1}{suffix}",
+                    media_type=media_type,
+                    ports=ports,
+                )
+            )
+            total += len(payload)
+        if len(img_urls) > MAX_QQ_IMAGE_COUNT:
+            logger.warning(
+                "[qq] v3 入站图片已截断 count=%d limit=%d",
+                len(img_urls),
+                MAX_QQ_IMAGE_COUNT,
+            )
+        return tuple(refs)
+
+    async def _admit_v3(
+        self,
+        *,
+        message_id: str | None,
+        event: object | None,
+        sender: str,
+        chat_id: str,
+        content: str,
+        metadata: dict[str, Any],
+        attachments: tuple[AttachmentRef, ...],
+        ports: ChannelRuntimePorts,
+    ) -> None:
+        if not message_id:
+            raise ValueError("QQ v3 入站缺少 provider message_id")
+        raw = RawInbound(
+            message_id=message_id,
+            provider_identity=sender,
+            recipient=chat_id,
+            message=ChannelInboundMessage(
+                channel=self.name,
+                sender=sender,
+                chat_id=chat_id,
+                content=_normalize_v3_content(content),
+                timestamp=self._v3_timestamp(event),
+                metadata=metadata,
+                attachments=attachments,
+            ),
+        )
+        accepted = await self._v3_inbound_runtime.admit(raw, ports=ports)
+        if not accepted:
+            logger.debug("[qq] v3 ingress closed or duplicate message_id=%s", message_id)
+
+    async def _handle_private_v3(
+        self,
+        user_id: str,
+        content: str,
+        img_urls: list[str],
+        *,
+        message_id: str | None,
+        event: object | None,
+    ) -> None:
+        """Admit one QQ private message after exact Core attachment import."""
+
+        ports = await self._v3_inbound_runtime.wait_open()
+        attachments = await self._download_v3_images(img_urls, ports=ports)
+        await self._admit_v3(
+            message_id=message_id,
+            event=event,
+            sender=user_id,
+            chat_id=user_id,
+            content=content,
+            metadata={"chat_type": "private"},
+            attachments=attachments,
+            ports=ports,
+        )
+
+    async def _handle_group_v3(
+        self,
+        group_id: str,
+        user_id: str,
+        content: str,
+        img_urls: list[str],
+        *,
+        message_id: str | None,
+        event: object | None,
+    ) -> None:
+        """Admit one QQ group message after exact Core attachment import."""
+
+        ports = await self._v3_inbound_runtime.wait_open()
+        chat_id = f"{_GROUP_PREFIX}{group_id}"
+        attachments = await self._download_v3_images(img_urls, ports=ports)
+        await self._admit_v3(
+            message_id=message_id,
+            event=event,
+            sender=user_id,
+            chat_id=chat_id,
+            content=content,
+            metadata={
+                "chat_type": "group",
+                "group_id": group_id,
+                "sender_id": user_id,
+            },
+            attachments=attachments,
+            ports=ports,
         )
 
     async def _handle_stop_private(self, user_id: str) -> None:
@@ -620,36 +851,18 @@ class QQChannel:
         user_id: str,
         content: str,
         img_urls: list[str] | None = None,
+        *,
+        message_id: str | None = None,
+        event: object | None = None,
     ) -> None:
         """群聊入站：chat_id = gqq:{group_id}，session 按群共享"""
-        chat_id = f"{_GROUP_PREFIX}{group_id}"
-        session = self._session_manager.get_or_create(f"{_CHANNEL}:{chat_id}")
-        if "group_id" not in session.metadata:
-            session.metadata["group_id"] = group_id
-            await self._session_manager.save_async(session)
-        media_diagnostics: list[str] = []
-        media = await _download_to_temp(
+        await self._handle_group_v3(
+            group_id,
+            user_id,
+            content,
             img_urls or [],
-            self._http_requester,
-            self._attachments,
-            media_diagnostics,
-        )
-        metadata: dict[str, Any] = {
-            "chat_type": "group",
-            "group_id": group_id,
-            "sender_id": user_id,
-        }
-        if media_diagnostics:
-            metadata["media_diagnostics"] = media_diagnostics
-        await self._bus.publish_inbound(
-            InboundMessage(
-                channel=_CHANNEL,
-                sender=user_id,
-                chat_id=chat_id,
-                content=content,
-                media=media,
-                metadata=metadata,
-            )
+            message_id=message_id,
+            event=event,
         )
 
     async def _handle_stop_group(self, group_id: str, user_id: str) -> None:
@@ -663,25 +876,6 @@ class QQChannel:
             command="/stop",
         )
         await self.send(chat_id, result.message)
-
-    # ── 出站路由 ──────────────────────────────────────────────────────
-
-    async def _on_response(self, msg: OutboundMessage) -> None:
-        preview = msg.content[:60] + "..." if len(msg.content) > 60 else msg.content
-        api = self._api
-        if api is None:
-            raise RuntimeError("QQChannel 尚未启动")
-        session_key = _session_key_for_chat(msg.chat_id)
-        if not msg.chat_id.startswith(_GROUP_PREFIX):
-            try:
-                await self._send_private_trace(msg.chat_id, session_key, msg)
-            except Exception as e:
-                logger.warning(f"[qq] 私聊 tracing 合并转发失败  chat_id={msg.chat_id}  错误: {e}")
-        logger.info("[qq] 发送回复  chat_id=%s 内容=%r", msg.chat_id, preview)
-        receipt = await self._deliver_message(channel_message_from_outbound(msg))
-        if not receipt.succeeded:
-            raise RuntimeError(receipt.detail or "QQ 消息提交失败")
-        self._trace_states.pop(session_key, None)
 
     async def _send_private_trace(
         self,
@@ -807,13 +1001,48 @@ class QQChannel:
             send_image=self.send_image,
         )
 
+    def build_v3_adapter(self, context: ChannelFactoryContext) -> ChannelAdapter:
+        """Build a Core adapter over this already-started QQ provider owner."""
+
+        return QQV3ChannelAdapter(self, context)
+
+    def _attach_v3_inbound(self, ports: ChannelRuntimePorts) -> None:
+        self._v3_inbound_runtime.attach(ports)
+
+    def _open_v3_inbound(self) -> None:
+        self._v3_inbound_runtime.open()
+
+    def _close_v3_inbound(self) -> None:
+        self._v3_inbound_runtime.close()
+
+    async def _drain_v3_inbound(self) -> None:
+        await self._v3_inbound_runtime.wait_quiescent()
+
     def _require_main_loop(self) -> asyncio.AbstractEventLoop:
         if self._main_loop is None:
             raise RuntimeError("QQ main loop 未就绪")
         return self._main_loop
 
-    def _submit_to_main_loop(self, coro: Coroutine[object, object, None]) -> None:
-        asyncio.run_coroutine_threadsafe(coro, self._require_main_loop())
+    def _submit_to_main_loop(
+        self,
+        coro: Coroutine[object, object, None],
+        *,
+        track: bool,
+    ) -> None:
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                coro,
+                self._require_main_loop(),
+            )
+        except BaseException:
+            coro.close()
+            raise
+        if track:
+            try:
+                self._v3_inbound_runtime.track_future(future)
+            except BaseException:
+                future.cancel()
+                raise
 
     async def _run_on_bot_loop(
         self, coro: Coroutine[object, object, object]
@@ -822,6 +1051,85 @@ class QQChannel:
             raise RuntimeError("QQ bot loop 未就绪")
         future = asyncio.run_coroutine_threadsafe(coro, self._bot_loop)
         return await asyncio.wrap_future(future)
+
+
+class QQV3ChannelAdapter(NativeChannelDeliveryAdapter):
+    """Deliver Core requests through an already-started QQChannel."""
+
+    def __init__(self, channel: QQChannel, context: ChannelFactoryContext) -> None:
+        self._channel = channel
+        super().__init__(
+            context,
+            channel_name=channel.name,
+            validate_recipient=self._validate_recipient,
+            send_text=self._send_text,
+            send_attachment=self._send_attachment,
+        )
+
+    def attach_runtime(self, ports: ChannelRuntimePorts) -> None:
+        """Bind provider callbacks to one exact formal Core ingress."""
+
+        self._channel._attach_v3_inbound(ports)
+
+    def open_admission(self) -> None:
+        """Release provider callbacks after formal snapshot publication."""
+
+        self._channel._open_v3_inbound()
+
+    def close_admission(self) -> None:
+        """Stop provider callbacks before Host drains Core operations."""
+
+        self._channel._close_v3_inbound()
+
+    async def stop(self) -> StopReceipt:
+        self._channel._close_v3_inbound()
+        await self._channel._drain_v3_inbound()
+        return await super().stop()
+
+    def _validate_recipient(self, recipient: str) -> None:
+        if recipient.startswith(_GROUP_PREFIX):
+            group_id = recipient[len(_GROUP_PREFIX) :]
+            if not group_id.isdigit() or int(group_id) <= 0:
+                raise ValueError(f"QQ 群聊 recipient 无效: {recipient}")
+            return
+        if not recipient.isdigit() or int(recipient) <= 0:
+            raise ValueError(f"QQ 私聊 recipient 无效: {recipient}")
+
+    async def _send_text(self, request: ProviderDeliveryRequest) -> None:
+        await self._channel.send(request.recipient, request.body)
+
+    async def _send_attachment(
+        self,
+        request: ProviderDeliveryRequest,
+        ref: AttachmentRef,
+        payload: bytes,
+    ) -> None:
+        api = self._channel._api
+        if api is None:
+            raise RuntimeError("QQChannel 尚未启动")
+        uri = "base64://" + base64.b64encode(payload).decode("ascii")
+        recipient = request.recipient
+        if ref.kind.value == "image":
+            if recipient.startswith(_GROUP_PREFIX):
+                group_id = int(recipient[len(_GROUP_PREFIX) :])
+                await self._channel._run_on_bot_loop(
+                    api.send_group_image(group_id, uri)
+                )
+            else:
+                await self._channel._run_on_bot_loop(
+                    api.send_private_image(int(recipient), uri)
+                )
+            return
+        filename = ref.filename or ref.artifact_id
+        if recipient.startswith(_GROUP_PREFIX):
+            group_id = int(recipient[len(_GROUP_PREFIX) :])
+            await self._channel._run_on_bot_loop(
+                api.send_group_file(group_id, uri, filename)
+            )
+        else:
+            await self._channel._run_on_bot_loop(
+                api.send_private_file(int(recipient), uri, filename)
+            )
 
 
 def _is_local(path: str) -> bool:

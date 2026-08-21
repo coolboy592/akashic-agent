@@ -3,6 +3,7 @@ from typing import Any, cast
 
 import json
 import sqlite3
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,9 +23,12 @@ from agent.tools.registry import ToolRegistry
 from agent.tools.shell import ShellTaskStopTool, ShellTool, ShellWriteStdinTool
 from agent.tools.unified_exec import ShellProcessManager, UnknownExecutionError
 from agent.looping.ports import SessionServices
+from agent.plugin_composition.channels import (
+    ChannelDeliveryReceipt,
+    DeliveryStatus as ChannelDeliveryStatus,
+)
 from agent.turns.orchestrator import TurnOrchestrator, TurnOrchestratorDeps
 from agent.turns.outbound import OutboundDispatch
-from bus.events import DeliveryReceipt, DeliveryStatus
 from plugins.default_proactive.context import AgentTickContext
 from plugins.drift_flow.runtime import DriftTurnPipeline, DriftTurnPipelineDeps
 from plugins.drift_flow.state import DriftStateStore
@@ -82,6 +86,84 @@ def test_drift_commit_result_corrects_staged_message_result(tmp_path: Path):
     store.update_last_message_result("silent")
 
     assert store.load_drift()["recent_runs"][-1]["message_result"] == "silent"
+
+
+def test_drift_event_id_is_durable_and_independent_of_short_tick_id(tmp_path: Path):
+    store = DriftStateStore(tmp_path)
+    first = AgentTickContext(tick_id="forced-collision", session_key="session")
+    second = AgentTickContext(tick_id="forced-collision", session_key="session")
+
+    first_event_id = store.save_finish(
+        event_id=first.event_id,
+        skill_used="first",
+        status="completed",
+        briefing="first run",
+        message_result="staged",
+        scratchpad_update=None,
+        global_note_update=None,
+        now_utc=datetime(2026, 8, 17, 1, tzinfo=timezone.utc),
+    )
+    second_event_id = store.save_finish(
+        event_id=second.event_id,
+        skill_used="second",
+        status="paused",
+        briefing="second run",
+        message_result="silent",
+        scratchpad_update=None,
+        global_note_update=None,
+        now_utc=datetime(2026, 8, 17, 2, tzinfo=timezone.utc),
+    )
+
+    assert first_event_id == first.event_id
+    assert second_event_id == second.event_id
+    assert first_event_id != second_event_id
+    assert first_event_id != f"drift:{first.tick_id}"
+
+    restarted = DriftStateStore(tmp_path)
+    payload = restarted.load_run_event(first_event_id)
+    assert payload is not None
+    assert payload["event_id"] == first_event_id
+    assert payload["skill_name"] == "first"
+
+    first.drift_selected_skill = "first"
+    first.drift_finish_status = "completed"
+    first.drift_finish_briefing = "first run"
+    events: list[Any] = []
+    pipeline = _make_drift_pipeline(
+        store=restarted,
+        tool_deps=DriftToolDeps(
+            drift_dir=tmp_path,
+            store=restarted,
+            shared_tools=_build_shared_tools(),
+            event_bus=SimpleNamespace(enqueue=events.append),
+        ),
+    )
+    pipeline.record_commit_result(first, False)
+
+    assert events[0].event_id == first_event_id
+    assert restarted.load_run_event(first_event_id)["message_result"] == "silent"
+
+
+def test_drift_runs_schema_backfills_legacy_event_ids(tmp_path: Path):
+    store = DriftStateStore(tmp_path)
+    store.save_finish(
+        skill_used="legacy",
+        status="completed",
+        briefing="old",
+        message_result="silent",
+        scratchpad_update=None,
+        global_note_update=None,
+        now_utc=datetime(2026, 8, 17, tzinfo=timezone.utc),
+    )
+    with closing(sqlite3.connect(store.db_file)) as connection:
+        run_id = int(connection.execute("SELECT id FROM runs").fetchone()[0])
+        connection.execute("DROP INDEX idx_runs_event_id")
+        connection.execute("ALTER TABLE runs DROP COLUMN event_id")
+        connection.commit()
+
+    migrated = DriftStateStore(tmp_path)
+    row = migrated.load_drift()["recent_runs"][-1]
+    assert row["event_id"] == f"drift:legacy:{run_id}"
 
 
 class _DummyTool(Tool):
@@ -1593,12 +1675,13 @@ async def test_agent_tick_enters_drift_and_records_action(tmp_path: Path):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("delivered", "message_result"),
-    [(True, "sent"), (False, "silent")],
+    ("delivered", "with_outbound", "message_result"),
+    [(True, True, "sent"), (False, True, "silent"), (False, False, "silent")],
 )
 async def test_agent_tick_drift_emits_delivery_result(
     tmp_path: Path,
     delivered: bool,
+    with_outbound: bool,
     message_result: str,
 ):
     _write_skill(tmp_path)
@@ -1624,10 +1707,18 @@ async def test_agent_tick_drift_emits_delivery_result(
     )
 
     class _Outbound:
-        async def dispatch(self, outbound: OutboundDispatch) -> DeliveryReceipt:
+        async def dispatch(
+            self,
+            outbound: OutboundDispatch,
+        ) -> ChannelDeliveryReceipt:
             sent = await sender(outbound.content)
-            return DeliveryReceipt(
-                DeliveryStatus.SUCCESS if sent else DeliveryStatus.FAILED
+            return ChannelDeliveryReceipt(
+                delivery_id=str(outbound.metadata["delivery_id"]),
+                status=(
+                    ChannelDeliveryStatus.DELIVERED
+                    if sent
+                    else ChannelDeliveryStatus.REJECTED
+                ),
             )
 
     orchestrator = TurnOrchestrator(
@@ -1642,21 +1733,23 @@ async def test_agent_tick_drift_emits_delivery_result(
 
     gate = MagicMock()
     gate.should_act.return_value = (True, {})
-    llm = FakeLLM(
-        [
-            ("select_skill", _select_input("explore-curiosity")),
-            ("message_push", {"message": "hello from drift"}),
-            (
-                "finish_drift",
-                {
-                    "skill_used": "explore-curiosity",
-                    "status": "completed",
-                    "briefing": "发出一条消息",
-                    "self_update": _self_update(),
-                },
-            ),
-        ]
+    actions: list[tuple[str, dict]] = [
+        ("select_skill", _select_input("explore-curiosity"))
+    ]
+    if with_outbound:
+        actions.append(("message_push", {"message": "hello from drift"}))
+    actions.append(
+        (
+            "finish_drift",
+            {
+                "skill_used": "explore-curiosity",
+                "status": "completed",
+                "briefing": "完成一次 drift",
+                "self_update": _self_update(),
+            },
+        )
     )
+    llm = FakeLLM(actions)
     tick = ProactiveFlowRuntime(
         ProactiveFlowDeps(
             cfg=cfg_with(
@@ -1702,14 +1795,16 @@ async def test_agent_tick_drift_emits_delivery_result(
                 ),
                 max_steps=5,
             ),
-            tool_hooks=None,
         )
     )
 
     await run_proactive_pipeline(tick)
 
-    sender.assert_awaited_once_with("hello from drift")
-    gate.record_action.assert_called_once()
+    if with_outbound:
+        sender.assert_awaited_once_with("hello from drift")
+        gate.record_action.assert_called_once()
+    else:
+        sender.assert_not_awaited()
     assert tick.last_ctx.drift_entered is True
     assert tick.last_ctx.drift_message_sent is delivered
     assert events[-1].message_result == message_result

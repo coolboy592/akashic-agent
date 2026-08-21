@@ -309,3 +309,17 @@ async def test_ack_targets_exact_source_and_passes_feedback() -> None:
         feedback="interesting",
     )
     assert pool.calls == [("feed", "ack", {"event_ids": ["e1"], "feedback": "interesting"})]
+
+
+@pytest.mark.asyncio
+async def test_typed_ack_preserves_skipped_and_uncommitted_ids() -> None:
+    sources = [source("feed", "content", ("content",), "feed", "events", ack="ack")]
+    skipped = FakePool({("feed", "ack"): {"status": "skipped", "reason": "later"}})
+    partial = FakePool({("feed", "ack"): {"status": "committed", "ids": ["one"]}})
+
+    assert await mcp_sources.acknowledge_async(
+        cast(Any, skipped), sources, "feed:content", ["one", "two"]
+    ) == []
+    assert await mcp_sources.acknowledge_async(
+        cast(Any, partial), sources, "feed:content", ["one", "two"]
+    ) == ["one"]

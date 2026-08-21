@@ -12,6 +12,14 @@ def _write_artifact(plugin_base: Path, artifact_id: str) -> Path:
     artifact = plugin_base / ".artifacts" / artifact_id
     artifact.mkdir(parents=True)
     (artifact / "plugin.py").write_text("", encoding="utf-8")
+    (artifact / "akashic.plugin.toml").write_text(
+        "schema_version = 1\n"
+        'name = "feed"\n'
+        'version = "3.0.0"\n'
+        "api_version = 3\n"
+        'entrypoint = "plugin.py"\n',
+        encoding="utf-8",
+    )
     return artifact
 
 
@@ -43,43 +51,28 @@ def test_installed_resolver_ignores_transaction_directories(tmp_path: Path) -> N
     assert resolve_plugin_sources([], installed_cache_root=tmp_path / "cache") == []
 
 
-def test_installed_resolver_rejects_ambiguous_visible_versions(tmp_path: Path) -> None:
+def test_installed_resolver_rejects_legacy_visible_versions(tmp_path: Path) -> None:
     plugin_root = tmp_path / "cache" / "lab" / "feed"
     for version in ("1.0.0", "2.0.0"):
         (plugin_root / version).mkdir(parents=True)
         (plugin_root / version / "plugin.py").write_text("", encoding="utf-8")
 
-    with pytest.raises(ValueError, match="版本冲突"):
+    with pytest.raises(ValueError, match="不受支持的旧版可见目录"):
         resolve_plugin_sources([], installed_cache_root=tmp_path / "cache")
 
 
-def test_installed_resolver_rejects_missing_plugin_file(tmp_path: Path) -> None:
-    version_root = tmp_path / "cache" / "lab" / "feed" / "1.0.0"
-    version_root.mkdir(parents=True)
+def test_installed_resolver_rejects_missing_static_manifest(tmp_path: Path) -> None:
+    plugin_base = tmp_path / "cache" / "lab" / "feed"
+    artifact = plugin_base / ".artifacts" / "1.0.0-aaaa"
+    artifact.mkdir(parents=True)
+    (artifact / "plugin.py").write_text("", encoding="utf-8")
+    (plugin_base / ".pointers.json").write_text(
+        '{"stable":".artifacts/1.0.0-aaaa",'
+        '"latest":".artifacts/1.0.0-aaaa"}\n',
+        encoding="utf-8",
+    )
 
-    with pytest.raises(ValueError, match="缺少 plugin.py"):
-        resolve_plugin_sources([], installed_cache_root=tmp_path / "cache")
-
-
-def test_installed_resolver_retries_version_moved_during_scan(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    version_root = tmp_path / "cache" / "lab" / "feed" / "1.0.0"
-    version_root.mkdir(parents=True)
-    plugin_file = version_root / "plugin.py"
-    plugin_file.write_text("", encoding="utf-8")
-    moved_root = tmp_path / "moved-version"
-    original_is_file = Path.is_file
-
-    def move_before_file_check(path: Path) -> bool:
-        if path == plugin_file:
-            version_root.rename(moved_root)
-        return original_is_file(path)
-
-    monkeypatch.setattr(Path, "is_file", move_before_file_check)
-
-    with pytest.raises(FileNotFoundError, match="扫描期间已变化"):
+    with pytest.raises(ValueError, match="缺少静态 manifest"):
         resolve_plugin_sources([], installed_cache_root=tmp_path / "cache")
 
 

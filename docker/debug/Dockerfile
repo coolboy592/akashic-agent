@@ -34,6 +34,11 @@ RUN python -m venv /opt/venv \
     && python -m pip install -r /tmp/requirements-dev.txt \
     && python -m pip install mcp==1.28.1
 
+COPY docker/debug/plugins /opt/akashic-debug-plugins
+RUN python -m venv /opt/akashic-debug-plugins/replay_debug/.venv \
+    && /opt/akashic-debug-plugins/replay_debug/.venv/bin/python -m pip install \
+        -r /opt/akashic-debug-plugins/replay_debug/requirements.txt
+
 COPY docker/debug/entrypoint.sh /usr/local/bin/akashic-debug
 RUN chmod +x /usr/local/bin/akashic-debug
 

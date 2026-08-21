@@ -20,7 +20,11 @@ from session.memory_policy import excludes_memory
 
 from .encoding import LexicalState, lexical_identity, tokenize
 from .model import CanonicalTurn, SessionState, SparseFeature, TimeStats
-from .schema import INDEX_VERSION, SCHEMA
+from .schema import (
+    INDEX_VERSION,
+    SCHEMA,
+    TOOL_CHAIN_PROJECTION_VERSION,
+)
 
 LOCAL_TIMEZONE = ZoneInfo("Asia/Shanghai")
 INTERRUPTED_ASSISTANT_MARKER = "[interrupted]"
@@ -29,6 +33,10 @@ TurnPair = tuple[tuple[sqlite3.Row, ...], sqlite3.Row]
 
 class AppendOnlyViolation(RuntimeError):
     """Report that an incremental source contains new historical turns."""
+
+
+class SparseIndexRebuildRequired(ValueError):
+    """Report that a derived sparse index must be rebuilt from its source."""
 
 
 @dataclass(frozen=True)
@@ -113,38 +121,31 @@ def build_sparse_index(
         time_stats = _load_time_stats(output)
         stream_state = _load_stream_state(output)
 
-        # 3. Encode each turn before committing it to online statistics.
+        # 3. 编码新增 Turn，只写入逻辑值发生变化的状态。
+        metadata = {
+            "index_version": INDEX_VERSION,
+            "tool_chain_projection_version": TOOL_CHAIN_PROJECTION_VERSION,
+            "embedding_model": config.embedding_model,
+            "turns_missing_embeddings": str(missing),
+            "turns_excluded_interrupted": str(excluded_interrupted),
+            "turns_excluded_memory": str(excluded_memory),
+            **lexical_identity(),
+        }
+        if config.embedding_dimension is not None:
+            metadata["embedding_dimension"] = str(config.embedding_dimension)
+        persisted_metadata = dict(
+            output.execute("SELECT key, value FROM metadata")
+        )
         with output:
             for turn in new_turns:
                 encoded = _encode_turn(turn, lexical, time_stats, stream_state, config)
                 _persist_turn(output, turn, encoded)
                 _commit_stream_state(stream_state, turn)
-            _persist_online_state(output, lexical, time_stats, stream_state)
-            _set_metadata(output, "index_version", INDEX_VERSION)
-            _set_metadata(output, "embedding_model", config.embedding_model)
-            if config.embedding_dimension is not None:
-                _set_metadata(
-                    output,
-                    "embedding_dimension",
-                    str(config.embedding_dimension),
-                )
-            _set_metadata(
-                output,
-                "turns_missing_embeddings",
-                str(missing),
-            )
-            _set_metadata(
-                output,
-                "turns_excluded_interrupted",
-                str(excluded_interrupted),
-            )
-            _set_metadata(
-                output,
-                "turns_excluded_memory",
-                str(excluded_memory),
-            )
-            for key, value in lexical_identity().items():
-                _set_metadata(output, key, value)
+            if new_turns:
+                _persist_online_state(output, lexical, time_stats, stream_state)
+            for key, value in metadata.items():
+                if persisted_metadata.get(key) != value:
+                    _set_metadata(output, key, value)
         return _build_result(
             output,
             turns,
@@ -241,7 +242,31 @@ def _validate_source(connection: sqlite3.Connection) -> None:
 def _validate_index_version(connection: sqlite3.Connection) -> None:
     row = connection.execute("SELECT value FROM metadata WHERE key='index_version'").fetchone()
     if row is not None and row["value"] != INDEX_VERSION:
-        raise ValueError(f"unsupported sparse index version: {row['value']}")
+        raise SparseIndexRebuildRequired(
+            f"unsupported sparse index version: {row['value']}"
+        )
+    if row is None and connection.execute(
+        "SELECT COUNT(*) FROM metadata"
+    ).fetchone()[0] == 0:
+        return
+    columns = {
+        str(item[1])
+        for item in connection.execute("PRAGMA table_info(sparse_turns)")
+    }
+    if "assistant_tool_chain_json" not in columns:
+        raise SparseIndexRebuildRequired(
+            "sparse index lacks assistant tool-chain projection; "
+            "explicit rebuild is required"
+        )
+    projection = connection.execute(
+        "SELECT value FROM metadata WHERE key='tool_chain_projection_version'"
+    ).fetchone()
+    actual = None if projection is None else str(projection["value"])
+    if actual != TOOL_CHAIN_PROJECTION_VERSION:
+        raise SparseIndexRebuildRequired(
+            "unsupported assistant tool-chain projection version: "
+            f"{actual}; explicit rebuild is required"
+        )
 
 
 def _load_canonical_turns(
@@ -327,7 +352,8 @@ def _source_messages(
         )
     return connection.execute(
         """
-        SELECT m.session_key, m.seq, m.id, m.role, m.content, m.extra, m.ts,
+        SELECT m.session_key, m.seq, m.id, m.role, m.content, m.tool_chain,
+               m.extra, m.ts,
                s.metadata AS session_metadata
         FROM messages AS m
         JOIN sessions AS s ON s.key = m.session_key
@@ -694,7 +720,29 @@ def _make_turn(
         remember_target_turn_ids=remember_targets,
         forget_target_turn_ids=forget_targets,
         remember_boost=remember_boost,
+        assistant_tool_chain_json=_tool_chain_json(assistant),
     )
+
+
+def _tool_chain_json(message: sqlite3.Row) -> str | None:
+    """Validate and preserve one assistant tool-chain JSON projection."""
+
+    raw = message["tool_chain"]
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raise ValueError(f"assistant tool_chain must be text: {message['id']}")
+    try:
+        decoded = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise ValueError(
+            f"assistant tool_chain must be valid JSON: {message['id']}"
+        ) from error
+    if not isinstance(decoded, list):
+        raise ValueError(
+            f"assistant tool_chain must encode a JSON array: {message['id']}"
+        )
+    return raw
 
 
 def _feedback_marker(
@@ -1140,9 +1188,10 @@ def _persist_sparse_payload(
             turn_id, session_key, user_seq,
             user_message_id, assistant_message_id,
             started_at, committed_at, user_text, assistant_text,
+            assistant_tool_chain_json,
             remember_targets_json, forget_targets_json,
             remember_boost, source_digest
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             turn.turn_id,
@@ -1154,6 +1203,7 @@ def _persist_sparse_payload(
             turn.committed_at,
             turn.user_text,
             turn.assistant_text,
+            turn.assistant_tool_chain_json,
             json.dumps(
                 turn.remember_target_turn_ids,
                 ensure_ascii=False,
@@ -1197,6 +1247,7 @@ def _turn_digest(turn: CanonicalTurn) -> str:
         turn.committed_at,
         turn.user_text,
         turn.assistant_text,
+        turn.assistant_tool_chain_json,
         json.dumps(
             turn.remember_target_turn_ids,
             ensure_ascii=False,
@@ -1209,6 +1260,9 @@ def _turn_digest(turn: CanonicalTurn) -> str:
         ),
         turn.remember_boost.hex(),
     ):
+        if value is None:
+            digest.update(b"\0")
+            continue
         encoded = value.encode("utf-8")
         digest.update(len(encoded).to_bytes(8, "big"))
         digest.update(encoded)

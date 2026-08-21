@@ -13,14 +13,16 @@ from agent.core.runtime_support import SessionLike, TurnRunResult
 from agent.core.passive_support import predict_current_user_source_ref
 from agent.core.passive_turn import PassiveTurnDeps, PassiveTurnPipeline
 from agent.core.types import ContextBundle
+from agent.plugin_composition.channels import (
+    ChannelDeliveryReceipt,
+    DeliveryStatus as ChannelDeliveryStatus,
+)
 from agent.model_runtime.context_compaction import CommittedContextUnit
 from agent.looping.ports import SessionServices
 from agent.tools.registry import ToolRegistry
 from agent.turns.outbound import OutboundDispatch, OutboundPort
 from bus.event_bus import EventBus
 from bus.events import (
-    DeliveryReceipt,
-    DeliveryStatus,
     InboundMessage,
     OutboundMessage,
     TurnDisposition,
@@ -83,16 +85,20 @@ class _DummySession:
         return tuple(units)
 
 
-@pytest.mark.asyncio
-async def test_noop_outbound_port_returns_failed_receipt() -> None:
-    receipt = await _NoopOutboundPort().dispatch(
-        OutboundDispatch(channel="mobile", chat_id="device", content="hello")
-    )
+class _DeliveringOutboundPort:
+    async def dispatch(self, _outbound: OutboundDispatch) -> ChannelDeliveryReceipt:
+        return ChannelDeliveryReceipt(
+            delivery_id="test-delivery",
+            status=ChannelDeliveryStatus.DELIVERED,
+        )
 
-    assert receipt == DeliveryReceipt(
-        DeliveryStatus.FAILED,
-        detail="未配置出站投递端口",
-    )
+
+@pytest.mark.asyncio
+async def test_noop_outbound_port_fails_loud_without_committed_dispatcher() -> None:
+    with pytest.raises(RuntimeError, match="committed Channel outbound port 未绑定"):
+        await _NoopOutboundPort().dispatch(
+            OutboundDispatch(channel="mobile", chat_id="device", content="hello")
+        )
 
 
 @pytest.mark.asyncio
@@ -150,6 +156,7 @@ async def test_passive_turn_runs_prepare_prompt_run_commit_in_order():
             context=cast(ContextBuilder, context),
             tools=cast(ToolRegistry, tools),
             reasoner=cast(Reasoner, reasoner),
+            outbound_port=cast(OutboundPort, _DeliveringOutboundPort()),
         )
     )
     msg = InboundMessage(
@@ -225,6 +232,7 @@ async def test_passive_turn_coerces_empty_reply_before_commit():
                     run_turn=AsyncMock(return_value=TurnRunResult(reply=None)),
                 ),
             ),
+            outbound_port=cast(OutboundPort, _DeliveringOutboundPort()),
         )
     )
     msg = InboundMessage(
@@ -291,6 +299,7 @@ async def test_passive_turn_before_reasoning_can_patch_context():
             tools=cast(ToolRegistry, tools),
             reasoner=cast(Reasoner, reasoner),
             event_bus=event_bus,
+            outbound_port=cast(OutboundPort, _DeliveringOutboundPort()),
         )
     )
     msg = InboundMessage(channel="telegram", sender="hua", chat_id="123", content="hi")

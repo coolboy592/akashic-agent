@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 
 from agent.config_models import Config
 from agent.looping.interrupt import InterruptController
@@ -22,10 +23,14 @@ async def start_channels(
     push_tool: MessagePushTool,
     http_resources: SharedHttpResources,
     event_bus: EventBus,
-    telegram_bot_commands: list[tuple[str, str]] | None = None,
-    mobile_bot_commands: list[tuple[str, str]] | None = None,
+    telegram_command_catalog_provider: Callable[
+        [], tuple[tuple[str, str], ...]
+    ] | None = None,
+    mobile_command_catalog_provider: Callable[
+        [], tuple[tuple[str, str], ...]
+    ] | None = None,
     interrupt_controller: InterruptController | None = None,
-    plugin_channels: list[Channel] | None = None,
+    extra_channels: list[Channel] | None = None,
 ) -> ChannelHost:
     attachment_store = AttachmentStore(session_manager.workspace / "uploads")
 
@@ -38,8 +43,8 @@ async def start_channels(
             attachment_store=attachment_store,
             http_resources=http_resources,
             interrupt_controller=interrupt_controller,
-            mobile_bot_commands=mobile_bot_commands or [],
             log=logging.getLogger(f"channels.{channel.name}"),
+            command_catalog_provider=mobile_command_catalog_provider,
         )
 
     host = ChannelHost(_ctx_factory)
@@ -53,7 +58,7 @@ async def start_channels(
             bus=bus,
             session_manager=session_manager,
             allow_from=tg.allow_from,
-            bot_commands=telegram_bot_commands,
+            command_catalog_provider=telegram_command_catalog_provider,
             event_bus=event_bus,
             interrupt_controller=interrupt_controller,
             channel_name=tg.channel_name,
@@ -75,7 +80,7 @@ async def start_channels(
             interrupt_controller=interrupt_controller,
         ))
 
-    for channel in plugin_channels or []:
+    for channel in extra_channels or []:
         host.add(channel)
 
     return host

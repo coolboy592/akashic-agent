@@ -1,12 +1,10 @@
 import json
-from pathlib import Path
 
 import httpx
 import pytest
 
 from agent.tools.web_fetch import WebFetchTool
-from infra.channels.base import AttachmentStore
-from infra.channels.qq_channel import _download_to_temp
+from infra.channels.qq_channel import _read_qq_image
 from core.net.http import (
     HttpRequester,
     RequestBudget,
@@ -69,7 +67,7 @@ async def test_web_fetch_tool_uses_injected_requester():
 
 
 @pytest.mark.asyncio
-async def test_download_to_temp_uses_injected_requester(tmp_path: Path):
+async def test_qq_image_reader_uses_injected_requester():
     def _handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200,
@@ -80,18 +78,14 @@ async def test_download_to_temp_uses_injected_requester(tmp_path: Path):
 
     requester = _build_requester(_handler)
     try:
-        paths = await _download_to_temp(
-            ["https://example.com/image.png"],
+        content, media_type = await _read_qq_image(
+            "https://example.com/image.png",
             requester,
-            AttachmentStore(tmp_path / "uploads"),
+            max_bytes=1024,
         )
-        assert len(paths) == 1
-        path = Path(paths[0])
-        assert path.suffix == ".png"
-        assert path.read_bytes() == b"fake-image-bytes"
+        assert content == b"fake-image-bytes"
+        assert media_type == "image/png"
     finally:
-        for raw_path in paths if "paths" in locals() else []:
-            Path(raw_path).unlink(missing_ok=True)
         await requester.client.aclose()
 
 

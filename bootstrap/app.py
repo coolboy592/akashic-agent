@@ -17,6 +17,7 @@ from agent.host_bridge.monitor import claim_host_bridge_boot
 from agent.restart import RestartCoordinator
 from agent.config_models import Config
 from bootstrap.channel_host import ChannelHost
+from bootstrap.channel_presentation import ChannelTurnPresentationBridge
 from bootstrap.channels import start_channels
 from bootstrap.chat_api import build_chat_server
 from bootstrap.cleanup import run_cleanup_steps
@@ -35,8 +36,6 @@ from bootstrap.workspace_lock import WorkspaceInstanceLock
 from bootstrap.workspace_token import ensure_workspace_token
 from bus.event_bus import EventBus
 from bus.queue import MessageBus
-from agent.plugins.jobs import PluginJobRuntime
-from agent.plugins.service_host import PluginServiceHost
 from agent.plugins.turn_rollout import TurnPluginRollout
 from agent.plugins.watcher import PluginWatcher
 from core.net.http import (
@@ -135,17 +134,6 @@ async def _run_primary_tasks(tasks: list[asyncio.Future[Any]]) -> None:
         raise
 
 
-def _stop_plugin_jobs(
-    runtime: PluginJobRuntime | None,
-) -> Callable[[], Awaitable[None]]:
-    async def stop() -> None:
-        if runtime is not None:
-            runtime.stop()
-            await runtime.wait_stopped()
-
-    return stop
-
-
 def _stop_proactive(runtime: ProactiveLoop | None) -> Callable[[], Awaitable[None]]:
     async def stop() -> None:
         if runtime is not None:
@@ -217,6 +205,7 @@ class AppRuntime:
         self.plugin_turn_rollout: TurnPluginRollout | None = None
         self.passive_worker: PassiveMessageWorker | None = None
         self.channel_host: ChannelHost | None = None
+        self.channel_presentation: ChannelTurnPresentationBridge | None = None
         self.core: CoreRuntime | None = None
         self.agent_loop = None
         self.bus = None
@@ -238,11 +227,8 @@ class AppRuntime:
         self.mobile_gateway_runtime = None
         self.mobile_gateway_server = None
         self.mobile_gateway_task: asyncio.Task[None] | None = None
-        self.plugin_job_runtime: PluginJobRuntime | None = None
-        self.plugin_service_host: PluginServiceHost | None = None
         self.plugin_watcher: PluginWatcher | None = None
         self.plugin_watcher_task: asyncio.Task[None] | None = None
-        self.workspace_mcp_watcher_task: asyncio.Task[None] | None = None
         self.tasks: list[Awaitable[None]] = []
         self._memory_optimizer = None
         self._shutdown = False
@@ -280,6 +266,7 @@ class AppRuntime:
             self.bus = self.core.bus
             event_bus = self.core.event_bus
             self.event_bus = event_bus
+            self.channel_presentation = ChannelTurnPresentationBridge(event_bus)
             self.tools = self.core.tools
             self.push_tool = self.core.push_tool
             self.session_manager = self.core.session_manager
@@ -288,10 +275,6 @@ class AppRuntime:
             self.light_provider = self.core.light_provider
             self.memory_runtime = self.core.memory_runtime
             self.presence = self.core.presence
-            await self.core.start()
-            if self.readiness is not None:
-                self.readiness.mark_stage("core.ready")
-            self.workspace_mcp_watcher_task = self.core.workspace_mcp_watcher_task
 
             async def _execute_control_request(request: TurnRequest):
                 assert self.agent_loop is not None
@@ -303,6 +286,7 @@ class AppRuntime:
 
             manager = getattr(self.core, "plugin_manager", None)
             if manager is None:
+                await self.core.start()
                 raise RuntimeError("插件 Runtime 不可用")
             self.plugin_turn_rollout = TurnPluginRollout(
                 manager,
@@ -324,6 +308,10 @@ class AppRuntime:
                     quiesce=self.conversation_runtime.quiesce_for_restart,
                     resume=self.conversation_runtime.resume_after_restart_cancel,
                 )
+            self.core.bind_conversation_runtime(self.conversation_runtime)
+            await self.core.start()
+            if self.readiness is not None:
+                self.readiness.mark_stage("core.ready")
             app_server_endpoint: str | None = None
             workspace_token: str | None = None
             if self.config.app_server.enabled:
@@ -359,30 +347,48 @@ class AppRuntime:
                 boot_id=self.readiness.boot_id if self.readiness else None,
                 ready=(lambda: self.readiness.ready) if self.readiness else None,
             )
+            channel_attachment_store = self.core.channel_attachment_store
+            if channel_attachment_store is None:
+                raise RuntimeError("Core channel attachment store 未初始化")
             self.passive_worker = PassiveMessageWorker(
                 self.bus,
                 self.conversation_runtime,
                 self.agent_loop,
+                attachment_store=channel_attachment_store,
+                channel_dispatcher=(
+                    lambda message, passive: self.push_tool.dispatch(
+                        message,
+                        commit_role="passive" if passive else "",
+                    )
+                ),
             )
-            if self.restart_coordinator is not None:
-                coordinator = self.restart_coordinator
 
-                async def observe_delivery(
-                    message: Any,
-                    delivered: bool,
-                ) -> None:
-                    turn_id = str(message.control_turn_id or "")
-                    if not turn_id:
-                        return
-                    if delivered:
-                        coordinator.mark_delivered(turn_id)
-                    else:
-                        coordinator.mark_delivery_failed(
-                            turn_id,
-                            "channel callback did not deliver original response",
-                        )
+            # 1. v3 control 始终通过 exact Channel binding 中断并回送收据。
+            async def interrupt_v3_channel(raw: Any) -> str:
+                assert self.conversation_runtime is not None
+                result = self.conversation_runtime.request_interrupt(
+                    raw.session_key,
+                    sender=raw.message.sender,
+                    command=raw.message.content,
+                )
+                return result.status
 
-                self.bus.bind_outbound_delivery_observer(observe_delivery)
+            async def dispatch_v3_control_response(
+                envelope: Any,
+                binding: Any,
+            ) -> Any:
+                return await self.bus.publish_channel_outbound_awaited(
+                    envelope,
+                    binding,
+                    passive=True,
+                )
+
+            manager.channel_generation_host.bind_control_interrupter(
+                interrupt_v3_channel
+            )
+            manager.channel_generation_host.bind_control_response_dispatcher(
+                dispatch_v3_control_response
+            )
             if self.config.app_server.enabled:
                 assert app_server_endpoint is not None
                 self.app_server = SocketAppServer(
@@ -396,29 +402,6 @@ class AppRuntime:
                 await self.app_server.start()
 
             plugin_manager = getattr(self.core, "plugin_manager", None)
-            if plugin_manager is not None:
-                self.plugin_service_host = PluginServiceHost()
-                snapshot = plugin_manager.current_snapshot
-                service_bindings = {
-                    plugin_id: {
-                        service_id: dict(spec) for service_id, spec in services.items()
-                    }
-                    for plugin_id, services in (
-                        snapshot.managed_services.items()
-                        if snapshot is not None
-                        else ()
-                    )
-                }
-                self.plugin_service_host.bind_plugin_services(service_bindings)
-                await self.plugin_service_host.start_all()
-                plugin_manager.bind_service_switcher(
-                    self.plugin_service_host.swap_plugin_services
-                )
-                plugin_manager.bind_candidate_service_host(
-                    start=self.plugin_service_host.start_candidate,
-                    stop=self.plugin_service_host.stop_candidate,
-                    assert_healthy=self.plugin_service_host.assert_candidate_healthy,
-                )
             if self.readiness is not None:
                 self.readiness.mark_stage("services.ready")
             from infra.mobile_realtime.runtime_inspection import (
@@ -452,6 +435,9 @@ class AppRuntime:
                 self.mobile_gateway_runtime.channel.bind_runtime_inspection(
                     runtime_inspection
                 )
+                self.mobile_gateway_runtime.channel.bind_channel_attachment_store(
+                    channel_attachment_store
+                )
                 if self.core.model_registry is None:
                     raise RuntimeError("Mobile Gateway 启动需要模型注册表")
                 self.mobile_gateway_runtime.channel.bind_model_registry(
@@ -461,16 +447,19 @@ class AppRuntime:
                     self.mobile_gateway_runtime.channel.bind_mobile_ui_provider(
                         plugin_ui_provider
                     )
-            plugin_channels = list(plugin_manager.channels) if plugin_manager else []
+            extra_channels = []
             if self.mobile_gateway_runtime is not None:
-                plugin_channels.append(self.mobile_gateway_runtime.channel)
+                extra_channels.append(self.mobile_gateway_runtime.channel)
             if self.config.channels.chat.enabled:
                 from infra.channels.web_chat_channel import WebChatChannel
 
                 self.web_chat_channel = WebChatChannel(
                     channel_name=self.config.channels.chat.channel_name,
                 )
-                plugin_channels.append(self.web_chat_channel)
+                self.web_chat_channel.bind_artifact_store(
+                    channel_attachment_store
+                )
+                extra_channels.append(self.web_chat_channel)
             self.channel_host = await start_channels(
                 self.config,
                 bus=self.bus,
@@ -478,31 +467,32 @@ class AppRuntime:
                 push_tool=self.push_tool,
                 http_resources=self.http_resources,
                 event_bus=event_bus,
-                telegram_bot_commands=(
-                    plugin_manager.telegram_bot_commands if plugin_manager else None
+                telegram_command_catalog_provider=(
+                    plugin_manager.stable_telegram_command_catalog
+                    if plugin_manager is not None
+                    else None
                 ),
-                mobile_bot_commands=(
-                    plugin_manager.mobile_bot_commands if plugin_manager else None
+                mobile_command_catalog_provider=(
+                    plugin_manager.stable_mobile_command_catalog
+                    if plugin_manager is not None
+                    else None
                 ),
                 interrupt_controller=self.conversation_runtime,
-                plugin_channels=plugin_channels,
+                extra_channels=extra_channels,
             )
+            if plugin_manager is not None:
+                from bootstrap.core_channel_adapter import build_core_channel_definition
+
+                await plugin_manager.bind_core_channel_definitions(
+                    tuple(
+                        build_core_channel_definition(channel)
+                        for channel in self.channel_host.channels
+                    )
+                )
             await self.channel_host.start_all()
             if self.readiness is not None:
                 self.readiness.mark_stage("channels.ready")
             if plugin_manager is not None:
-                channel_bindings = (
-                    {
-                        plugin_id: generation.contributions.channels
-                        for plugin_id, generation in plugin_manager.current_snapshot.generations.items()
-                    }
-                    if plugin_manager.current_snapshot is not None
-                    else {}
-                )
-                self.channel_host.bind_plugin_channels(channel_bindings)
-                plugin_manager.bind_channel_switcher(
-                    self.channel_host.swap_plugin_channels
-                )
                 plugin_manager.bind_endpoint_switcher(self._swap_plugin_endpoints)
 
             self.tasks = [
@@ -513,19 +503,6 @@ class AppRuntime:
             host_bridge_monitor = build_host_bridge_monitor()
             if host_bridge_monitor is not None:
                 self.tasks.append(host_bridge_monitor)
-            if plugin_manager is not None:
-                assert self.plugin_service_host is not None
-                self.tasks.append(self.plugin_service_host.wait_fatal_failure())
-                assert self.core.plugin_manager is not None
-                llm = self.core.plugin_manager.llm
-                if llm is not None:
-                    self.plugin_job_runtime = PluginJobRuntime(
-                        event_bus=event_bus,
-                        llm=llm,
-                        model_provider=self.provider,
-                        snapshot_store=plugin_manager.snapshot_store,
-                    )
-                    self.tasks.append(self.plugin_job_runtime.run())
             optimizer_tasks, self._memory_optimizer = build_memory_optimizer_task(
                 self.config,
                 provider=self.provider,
@@ -587,30 +564,11 @@ class AppRuntime:
                 presence=self.presence,
                 agent_loop=self.agent_loop,
                 event_bus=event_bus,
-                tool_hooks=list(plugin_manager.tool_hooks) if plugin_manager else None,
-                proactive_modules=(
-                    list(plugin_manager.proactive_modules) if plugin_manager else None
-                ),
-                proactive_lifecycles=(
-                    list(plugin_manager.proactive_lifecycles)
-                    if plugin_manager
-                    else None
-                ),
-                proactive_module_factories=(
-                    list(plugin_manager.proactive_module_factories)
-                    if plugin_manager
-                    else None
-                ),
-                proactive_runtime_factories=(
-                    list(plugin_manager.proactive_runtime_factories)
-                    if plugin_manager
-                    else None
-                ),
-                proactive_sources=(
-                    list(plugin_manager.proactive_sources) if plugin_manager else None
-                ),
                 runtime_snapshot_store=(
                     plugin_manager.snapshot_store if plugin_manager else None
+                ),
+                activity_host=(
+                    plugin_manager.activity_host if plugin_manager else None
                 ),
             )
             self.tasks.extend(proactive_tasks)
@@ -682,7 +640,6 @@ class AppRuntime:
                     self.chat_task,
                     self.mobile_gateway_task,
                     self.plugin_watcher_task,
-                    self.workspace_mcp_watcher_task,
                 )
                 if task is not None
             }
@@ -719,9 +676,7 @@ class AppRuntime:
                     watched_task = self.plugin_watcher_task
                     self.plugin_watcher_task = None
                 else:
-                    assert self.workspace_mcp_watcher_task is not None
-                    watched_task = self.workspace_mcp_watcher_task
-                    self.workspace_mcp_watcher_task = None
+                    raise RuntimeError("未知 runtime watcher task")
                 await watched_task
         except (asyncio.CancelledError, Exception) as error:
             run_error = error
@@ -841,10 +796,6 @@ class AppRuntime:
                     _stop_proactive(self.proactive_loop),
                 ),
                 (
-                    "plugin_jobs.stop",
-                    _stop_plugin_jobs(self.plugin_job_runtime),
-                ),
-                (
                     "app_server.stop",
                     self.app_server.stop if self.app_server else _noop_async,
                 ),
@@ -865,6 +816,14 @@ class AppRuntime:
                     ),
                 ),
                 (
+                    "channel_presentation.aclose",
+                    (
+                        self.channel_presentation.aclose
+                        if self.channel_presentation
+                        else _noop_async
+                    ),
+                ),
+                (
                     "plugin_turn_rollout.shutdown",
                     (
                         self.plugin_turn_rollout.shutdown
@@ -879,14 +838,6 @@ class AppRuntime:
                 (
                     "mobile_gateway.close",
                     _close_mobile_gateway(self.mobile_gateway_runtime),
-                ),
-                (
-                    "plugin_services.stop",
-                    (
-                        self.plugin_service_host.stop_all
-                        if self.plugin_service_host
-                        else _noop_async
-                    ),
                 ),
                 ("core.stop", self.core.stop if self.core else _noop_async),
                 (
@@ -1108,65 +1059,15 @@ class AppRuntime:
 
     async def _swap_plugin_endpoints(
         self,
-        plugin_id: str,
-        old_services: dict[str, dict[str, Any]],
-        new_services: dict[str, dict[str, Any]],
-        old_channels: tuple[Any, ...],
-        new_channels: tuple[Any, ...],
+        old_commands: tuple[tuple[str, str], ...],
+        new_commands: tuple[tuple[str, str], ...],
     ) -> None:
         assert self.channel_host is not None
-        assert self.plugin_service_host is not None
-        swap = (
-            self.channel_host.prepare_plugin_swap(
-                plugin_id,
-                old_channels,
-                new_channels,
+        if old_commands != new_commands:
+            await self.channel_host.swap_command_catalog(
+                old_commands,
+                new_commands,
             )
-            if old_channels != new_channels
-            else None
-        )
-        if swap is not None:
-            await self.channel_host.stop_plugin_swap(swap)
-        services_switched = False
-        try:
-            if old_services != new_services:
-                await self.plugin_service_host.swap_plugin_services(
-                    plugin_id,
-                    old_services,
-                    new_services,
-                )
-                services_switched = True
-            if swap is not None:
-                await self.channel_host.start_plugin_swap(swap)
-        except BaseException as error:
-            service_restore_error: BaseException | None = None
-            if services_switched:
-                try:
-                    await self.plugin_service_host.swap_plugin_services(
-                        plugin_id,
-                        new_services,
-                        old_services,
-                    )
-                except BaseException as restore_error:
-                    service_restore_error = restore_error
-            channel_restore_error: BaseException | None = None
-            if swap is not None:
-                try:
-                    await self.channel_host.restore_plugin_swap(swap)
-                except BaseException as restore_error:
-                    channel_restore_error = restore_error
-            if service_restore_error is not None or channel_restore_error is not None:
-                details: list[str] = []
-                if service_restore_error is not None:
-                    details.append(f"managed service: {service_restore_error}")
-                if channel_restore_error is not None:
-                    details.append(f"Channel: {channel_restore_error}")
-                raise RuntimeError(
-                    "插件旧端点恢复失败: " + "; ".join(details)
-                ) from error
-            raise
-        if swap is not None:
-            self.channel_host.commit_plugin_swap(swap)
 
 
 def build_app_runtime(

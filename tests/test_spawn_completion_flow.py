@@ -10,7 +10,12 @@ from agent.looping.ports import AgentLoopConfig, AgentLoopDeps, LLMConfig, Memor
 from agent.config_models import ContextCompactionConfig
 from agent.persona import reset_veda
 from agent.provider import LLMResponse
+from agent.plugin_composition.channels import (
+    ChannelDeliveryReceipt,
+    DeliveryStatus as ChannelDeliveryStatus,
+)
 from agent.tools.registry import ToolRegistry
+from agent.turns.outbound import OutboundDispatch, OutboundPort
 from bus.events import SpawnCompletionItem
 from bus.internal_events import SpawnCompletionEvent
 from bus.queue import MessageBus
@@ -73,6 +78,14 @@ class _CompactingProvider(_Provider):
         return 100 if messages else 0
 
 
+class _TestOutboundPort:
+    async def dispatch(self, _outbound: OutboundDispatch) -> ChannelDeliveryReceipt:
+        return ChannelDeliveryReceipt(
+            delivery_id="test-delivery",
+            status=ChannelDeliveryStatus.DELIVERED,
+        )
+
+
 @pytest.mark.asyncio
 async def test_spawn_completion_updates_original_session_without_raw_result(tmp_path):
     _ = reset_veda(tmp_path)
@@ -90,6 +103,7 @@ async def test_spawn_completion_updates_original_session_without_raw_result(tmp_
             workspace=tmp_path,
             memory_services=MemoryServices(engine=engine),
             memory_runtime=_memory_runtime(tmp_path, engine, markdown),
+            outbound_port=cast(OutboundPort, _TestOutboundPort()),
         ),
         AgentLoopConfig(llm=LLMConfig(max_iterations=3)),
     )
@@ -148,6 +162,7 @@ async def test_spawn_completion_retry_count_one_disables_retry_guidance(tmp_path
             workspace=tmp_path,
             memory_services=MemoryServices(engine=engine),
             memory_runtime=_memory_runtime(tmp_path, engine, markdown),
+            outbound_port=cast(OutboundPort, _TestOutboundPort()),
         ),
         AgentLoopConfig(llm=LLMConfig(max_iterations=3)),
     )
@@ -198,6 +213,7 @@ async def test_spawn_completion_uses_session_compaction_gate(tmp_path):
             workspace=tmp_path,
             memory_services=MemoryServices(engine=engine),
             memory_runtime=_memory_runtime(tmp_path, engine, markdown),
+            outbound_port=cast(OutboundPort, _TestOutboundPort()),
         ),
         AgentLoopConfig(
             llm=LLMConfig(max_iterations=3),

@@ -603,6 +603,10 @@ def _mix_sources(
     context = _sparsemax(
         evidence["context_dense"] + evidence["context_bm25"]
     )
+    if not direct:
+        return context
+    if not context:
+        return direct
     mixed: dict[int, float] = defaultdict(float)
     for node, value in direct:
         mixed[node] += (1.0 - context_mass) * value

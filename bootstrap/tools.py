@@ -4,19 +4,30 @@ import asyncio
 import logging
 import inspect
 import os
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, cast
+from uuid import uuid4
 
 if TYPE_CHECKING:
     from agent.plugins.manager import PluginManager
     from agent.restart import RestartCoordinator
+    from infra.channels.artifacts import ChannelAttachmentArtifactStore
 
 logger = logging.getLogger(__name__)
 
 from agent.config_models import Config
+from agent.plugin_composition.channels import (
+    ChannelCommitRole,
+    ChannelDeliveryReceipt,
+    ChannelTerminalStatus,
+    DeliveryStatus as ChannelDeliveryStatus,
+    JsonValue,
+    OutboundEnvelope,
+)
 from agent.plugins.manifest import plugins_root
+from agent.plugins.snapshot import lease_current_runtime_snapshot
 from agent.context import ContextBuilder
 from agent.looping.core import AgentLoop
 from agent.looping.ports import (
@@ -27,7 +38,6 @@ from agent.looping.ports import (
     MemoryServices,
     SessionServices,
 )
-from agent.mcp.watcher import WorkspaceMcpWatcher
 from agent.provider import LLMProvider
 from agent.model_runtime.registry import ModelRegistry
 from agent.retrieval.default_pipeline import DefaultMemoryRetrievalPipeline
@@ -35,7 +45,7 @@ from agent.scheduler import SchedulerService
 from agent.tools.base import ToolExecutionContext, get_current_tool_context
 from agent.tools.message_push import MessagePushTool
 from agent.tools.registry import ToolRegistry
-from agent.tools.spawn import SpawnTool
+from agent.turns.outbound import OutboundPort, PushToolOutboundPort
 from bootstrap.toolsets.meta import build_readonly_tools
 from bootstrap.toolsets.protocol import ToolsetDeps
 from bootstrap.toolsets.schedule import build_scheduler
@@ -46,10 +56,16 @@ from bootstrap.wiring import (
     resolve_toolset_provider,
 )
 from agent.lifecycle.facade import TurnLifecycle
-from agent.plugins.jobs import ProviderPluginLlmService
 from bootstrap.providers import build_model_registry, build_providers, build_vl_provider
 from bootstrap.cleanup import run_cleanup_steps
 from bus.event_bus import EventBus
+from bus.events import (
+    ChannelMessage,
+)
+from bootstrap.channel_attachment_import import (
+    ChannelOutboundAttachmentImporter,
+    import_channel_attachments,
+)
 from bus.processing import ProcessingState
 from bus.queue import MessageBus
 from core.memory.runtime import MemoryRuntime
@@ -60,6 +76,100 @@ from session.manager import SessionManager
 
 async def _noop_async() -> None:
     return None
+
+
+async def _dispatch_v3_channel_push(
+    plugin_manager: PluginManager,
+    bus: MessageBus,
+    message: ChannelMessage,
+    passive: bool,
+    attachment_store: ChannelAttachmentArtifactStore | None = None,
+) -> ChannelDeliveryReceipt:
+    """Dispatch one direct push through the exact public stable Channel binding."""
+
+    # 1. 当前 turn 优先复用 exact snapshot；独立调用才租用公开 stable。
+    source = lease_current_runtime_snapshot()
+    if source is None:
+        source = await plugin_manager.snapshot_store.acquire()
+    binding = None
+    try:
+        catalog = source.snapshot.channel_catalog
+        registry = catalog.registry if catalog is not None else source.snapshot.channel_registry
+        descriptor = None if registry is None else next(
+            (
+                item
+                for item in registry.descriptors
+                if item.name == message.channel
+            ),
+            None,
+        )
+        if descriptor is None:
+            raise RuntimeError(
+                f"committed Channel catalog 缺少目标渠道: {message.channel!r}"
+            )
+        binding = plugin_manager.channel_generation_host.acquire_binding(
+            source,
+            message.channel,
+        )
+    finally:
+        try:
+            await source.release()
+        except BaseException:
+            if binding is not None:
+                await binding.aclose()
+            raise
+
+    # 2. 在 provider 调用前把授权来源冻结为 Core-owned opaque refs。
+    if binding is None:
+        raise RuntimeError("v3 Channel catalog 存在但 exact binding 未建立")
+    delivery_id = uuid4().hex
+    try:
+        if message.attachments and message.attachment_refs:
+            raise RuntimeError("ChannelMessage 不得同时携带 path 与 opaque refs")
+        if message.attachments and attachment_store is None:
+            raise RuntimeError("Channel attachment store 尚未绑定")
+        attachment_refs = message.attachment_refs
+        if message.attachments:
+            attachment_refs = await import_channel_attachments(
+                cast("ChannelAttachmentArtifactStore", attachment_store),
+                message.attachments,
+            )
+
+        # 3. exact binding 保留到唯一一次 typed receipt 收束。
+        return await bus.publish_channel_outbound_awaited(
+            OutboundEnvelope(
+                logical_delivery_id=delivery_id,
+                delivery_id=delivery_id,
+                attempt_sequence=1,
+                snapshot_id=binding.snapshot_id,
+                generation_id=binding.generation_id,
+                binding_token=binding.binding_token,
+                channel=message.channel,
+                recipient=message.chat_id,
+                body=message.content,
+                metadata=cast(Mapping[str, JsonValue], message.metadata),
+                attachments=attachment_refs,
+                commit_role=(
+                    ChannelCommitRole.PASSIVE
+                    if passive
+                    else ChannelCommitRole.DIRECT
+                ),
+                thinking=message.thinking,
+                reply_to=message.reply_to,
+                session_message_id=message.session_message_id,
+                control_turn_id=message.control_turn_id,
+                execution_attempt_id=message.execution_attempt_id,
+                terminal_status=(
+                    ChannelTerminalStatus(message.terminal_status.value)
+                    if message.terminal_status is not None
+                    else None
+                ),
+            ),
+            binding,
+            passive=passive,
+        )
+    finally:
+        await binding.aclose()
 
 
 @dataclass
@@ -75,25 +185,50 @@ class CoreRuntime:
     scheduler: SchedulerService
     provider: LLMProvider
     light_provider: LLMProvider | None
-    workspace_mcp_watcher: WorkspaceMcpWatcher
-    workspace_mcp_watcher_task: asyncio.Task[None] | None
     memory_runtime: MemoryRuntime
     presence: PresenceStore
+    channel_attachment_store: "ChannelAttachmentArtifactStore | None" = None
     model_registry: ModelRegistry | None = None
     agent_provider: LLMProvider | None = None
     plugin_manager: "PluginManager | None" = None
     workspace: Path | None = None
+    background_job_host: object | None = None
+
+    def bind_conversation_runtime(self, runtime: object) -> None:
+        """Bind the unique ConversationRuntime before plugin job admission."""
+
+        host = self.background_job_host
+        if host is None:
+            return
+        bind = getattr(host, "bind_conversation_runtime", None)
+        if not callable(bind):
+            raise RuntimeError("BackgroundJob Host 缺少 ConversationRuntime binding")
+        session_creator = getattr(
+            self.session_manager.control_store,
+            "create_session",
+            None,
+        )
+        if not callable(session_creator):
+            raise RuntimeError("Core SessionManager 缺少 programmatic session creator")
+        session_reader = getattr(
+            self.session_manager.control_store,
+            "get_session_meta",
+            None,
+        )
+        if not callable(session_reader):
+            raise RuntimeError("Core SessionManager 缺少 programmatic session reader")
+        bind(
+            runtime,
+            programmatic_session_creator=session_creator,
+            programmatic_session_reader=session_reader,
+        )
 
     async def start(self) -> None:
         """启动外部连接和插件扩展。"""
 
-        # 1. workspace MCP 必须先原子发布，插件同名声明随后 fail-loud
-        await self.workspace_mcp_watcher.reconcile()
-
-        # 2. 加载插件后同步 skill，再绑定工具 hook。
+        # 1. 加载插件后同步 skill，再绑定工具 hook。
         if self.plugin_manager is not None:
             await self.plugin_manager.load_all()
-            self.plugin_manager.assert_no_workspace_mcp_plugin_conflicts()
             if self.workspace is not None:
                 from agent.plugins.skill_links import PluginSkillLinker
 
@@ -115,18 +250,6 @@ class CoreRuntime:
                 manifest_path = sync_manifest()
                 logger.info("插件清单已同步: %s", manifest_path)
             logger.info("插件加载完成: %d 个", self.plugin_manager.loaded_count)
-            if self.plugin_manager.tool_hooks:
-                self.loop.add_tool_hooks(self.plugin_manager.tool_hooks)
-                spawn_tool = self.tools.get_tool("spawn")
-                if spawn_tool is not None:
-                    if not isinstance(spawn_tool, SpawnTool):
-                        raise TypeError("spawn 工具未建立 SpawnTool 内部不变量")
-                    spawn_tool.add_tool_hooks(self.plugin_manager.tool_hooks)
-
-        # 3. 首次启动全部成功后才启动容错热重载 watcher
-        self.workspace_mcp_watcher_task = asyncio.create_task(
-            self.workspace_mcp_watcher.run(), name="workspace_mcp_watcher"
-        )
 
     async def inspect_modules(self) -> str:
         """按实际运行时依赖生成各阶段模块图。"""
@@ -148,21 +271,7 @@ class CoreRuntime:
         from agent.lifecycle.phases.before_turn import default_before_turn_modules
         from agent.lifecycle.phases.prompt_render import default_prompt_render_modules
 
-        # 2. 收集各阶段插件贡献。
-        manager = self.plugin_manager
-        before_turn_modules = manager.before_turn_modules if manager is not None else []
-        before_reasoning_modules = (
-            manager.before_reasoning_modules if manager is not None else []
-        )
-        prompt_render_modules = manager.prompt_render_modules if manager is not None else []
-        before_step_modules = manager.before_step_modules if manager is not None else []
-        after_step_modules = manager.after_step_modules if manager is not None else []
-        after_reasoning_modules = (
-            manager.after_reasoning_modules if manager is not None else []
-        )
-        after_turn_modules = manager.after_turn_modules if manager is not None else []
-
-        # 3. 从 AgentLoop 的构造不变量取得阶段依赖。
+        # 2. 从 AgentLoop 的构造不变量取得固定 Core 阶段依赖。
         pipeline = self.loop._passive_pipeline
         context = self.loop.context
 
@@ -173,7 +282,6 @@ class CoreRuntime:
                     self.event_bus,
                     self.session_manager,
                     pipeline._context_store,
-                    plugin_modules=cast(Any, before_turn_modules),
                 ),
             ),
             (
@@ -183,7 +291,6 @@ class CoreRuntime:
                     self.tools,
                     self.session_manager,
                     context,
-                    plugin_modules=cast(Any, before_reasoning_modules),
                 ),
             ),
             (
@@ -191,29 +298,21 @@ class CoreRuntime:
                 default_prompt_render_modules(
                     self.event_bus,
                     context,
-                    plugin_modules=cast(Any, prompt_render_modules),
                 ),
             ),
             (
                 "before_step",
-                default_before_step_modules(
-                    self.event_bus,
-                    plugin_modules=cast(Any, before_step_modules),
-                ),
+                default_before_step_modules(self.event_bus),
             ),
             (
                 "after_step",
-                default_after_step_modules(
-                    self.event_bus,
-                    plugin_modules=cast(Any, after_step_modules),
-                ),
+                default_after_step_modules(self.event_bus),
             ),
             (
                 "after_reasoning",
                 default_after_reasoning_modules(
                     self.event_bus,
                     pipeline._session,
-                    plugin_modules=cast(Any, after_reasoning_modules),
                 ),
             ),
             (
@@ -222,18 +321,32 @@ class CoreRuntime:
                     self.event_bus,
                     pipeline._outbound_port,
                     context,
-                    plugin_modules=cast(Any, after_turn_modules),
                 ),
             ),
         ]
 
-        # 4. 统一渲染执行顺序和依赖树。
+        # 3. 分开渲染 Core phase DAG 与 committed v3 Root 拓扑。
         parts: list[str] = []
         for phase_name, modules in phases:
             parts.append("=" * 60)
             parts.append(phase_name)
             parts.append("=" * 60)
             parts.append(inspect_phase(modules))
+        snapshot = (
+            self.plugin_manager.current_snapshot
+            if self.plugin_manager is not None
+            else None
+        )
+        topology = None if snapshot is None else snapshot.composition_topology
+        if topology is not None:
+            parts.extend(("=" * 60, "composition", "=" * 60))
+            parts.append(f"identity: {topology.identity}")
+            parts.append(f"revision: {topology.composition_revision}")
+            for fiber in topology.fibers:
+                parent = fiber.parent or "<root>"
+                parts.append(f"fiber: {parent} -> {fiber.name}")
+            for listener in topology.listeners:
+                parts.append(f"listener: {listener}")
         return "\n".join(parts)
 
     async def stop(self) -> None:
@@ -259,21 +372,8 @@ class CoreRuntime:
         async def _close_session_manager() -> None:
             self.session_manager.close()
 
-        async def _stop_workspace_mcp_watcher() -> None:
-            self.workspace_mcp_watcher.stop()
-            task = self.workspace_mcp_watcher_task
-            if task is not None:
-                _ = task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-            if self.plugin_manager is not None:
-                await self.plugin_manager.discard_workspace_mcp_candidate()
-
         # 2. 由统一 cleanup runner 完成全部步骤并保留失败。
         await run_cleanup_steps(
-            ("workspace_mcp_watcher.stop", _stop_workspace_mcp_watcher),
             ("spawn.shutdown", _stop_spawn),
             ("shell.shutdown", _stop_shell),
             ("compaction.shutdown", self.loop.shutdown_compaction),
@@ -413,6 +513,7 @@ def _build_loop_deps(
     processing_state: ProcessingState,
     event_bus: EventBus,
     memory_runtime: MemoryRuntime,
+    outbound_port: OutboundPort | None = None,
 ) -> AgentLoopDeps:
     """将已构造的 runtime 资源装配成 AgentLoop 依赖。"""
 
@@ -443,6 +544,7 @@ def _build_loop_deps(
     )
     retrieval_pipeline = DefaultMemoryRetrievalPipeline(
         memory=memory_services,
+        event_publisher=event_bus,
     )
 
     return AgentLoopDeps(
@@ -461,6 +563,7 @@ def _build_loop_deps(
         llm_services=llm_services,
         memory_services=memory_services,
         session_services=session_services,
+        outbound_port=outbound_port,
     )
 
 def build_core_runtime(
@@ -491,6 +594,7 @@ def build_core_runtime(
     session_manager = SessionManager(workspace)
     if clear_stale_session_admissions:
         session_manager.clear_stale_admissions()
+    bus.bind_mobile_session_admission_owner(session_manager)
     loop_ref: dict[str, AgentLoop] = {}
     tools, push_tool, scheduler, memory_runtime = (
         build_registered_tools(
@@ -523,6 +627,7 @@ def build_core_runtime(
         processing_state=processing_state,
         event_bus=event_bus,
         memory_runtime=memory_runtime,
+        outbound_port=PushToolOutboundPort(push_tool, commit_role="passive"),
     )
     loop = AgentLoop(
         loop_deps,
@@ -546,8 +651,19 @@ def build_core_runtime(
     )
 
     from agent.plugins.manager import PluginManager as _PluginManager
+    from infra.channels.artifacts import ChannelAttachmentArtifactStore
 
     # 3. 创建插件 manager，并把 snapshot store 绑定到 loop。
+    channel_attachment_store = ChannelAttachmentArtifactStore(
+        workspace=workspace,
+        session_store=session_manager.control_store,
+    )
+    session_services = loop_deps.session_services
+    if session_services is None:
+        raise RuntimeError("AgentLoop 缺少 SessionServices")
+    session_services.outbound_attachment_importer = (
+        ChannelOutboundAttachmentImporter(channel_attachment_store)
+    )
     plugin_manager = _PluginManager(
         plugin_dirs=_resolve_plugin_dirs(workspace),
         event_bus=event_bus,
@@ -555,51 +671,46 @@ def build_core_runtime(
         workspace=workspace,
         session_manager=session_manager,
         memory_engine=memory_runtime.engine,
-        llm=ProviderPluginLlmService(
-            provider=provider,
-            model=config.model,
-            max_tokens=0,
-        ),
         installed_cache_root=plugins_root() / "cache",
+        channel_attachment_store=channel_attachment_store,
+    )
+    from agent.plugins.generation_activity_host import ActivityHost
+    from agent.plugins.generation_job_host import BackgroundJobActivityAdapter
+    from agent.plugins.generation_proactive_host import ProactiveActivityAdapter
+    from agent.plugins.generation_private_proactive_host import (
+        PrivateProactiveHost,
+    )
+
+    proactive_activity = ProactiveActivityAdapter(
+        plugin_manager.composition_generation_host,
+    )
+    background_jobs = BackgroundJobActivityAdapter(
+        event_bus,
+        plugin_manager.snapshot_store,
+        model_provider=provider,
+        model_registry=model_registry,
+        workspace=str(workspace),
+    )
+    private_proactive = PrivateProactiveHost(config.proactive.lifecycle)
+    plugin_manager.bind_activity_host(
+        ActivityHost((proactive_activity, private_proactive, background_jobs))
+    )
+    bus.bind_channel_outbound_dispatcher(
+        plugin_manager.channel_generation_host.dispatch_outbound
+    )
+    push_tool.bind_v3_channel_dispatcher(
+        lambda message, passive: _dispatch_v3_channel_push(
+            plugin_manager,
+            bus,
+            message,
+            passive,
+            channel_attachment_store,
+        )
+    )
+    plugin_manager.channel_generation_host.bind_inbound_publisher(
+        bus.publish_channel_inbound
     )
     loop.bind_runtime_snapshot_store(plugin_manager.snapshot_store)
-    workspace_mcp_watcher = WorkspaceMcpWatcher(
-        plugin_manager,
-        workspace / "mcp" / "servers",
-        mcp_root=workspace / "mcp",
-    )
-    if config.tool_search_enabled:
-        from agent.mcp.admin import WorkspaceMcpAdmin
-        from agent.tools.workspace_mcp import (
-            WorkspaceMcpApplyTool,
-            WorkspaceMcpRemoveTool,
-            WorkspaceMcpStatusTool,
-        )
-
-        workspace_mcp_admin = WorkspaceMcpAdmin(workspace, workspace_mcp_watcher)
-        tools.register(
-            WorkspaceMcpApplyTool(workspace_mcp_admin),
-            risk="external-side-effect",
-            always_on=False,
-            preloadable=False,
-            requires_turn_search=True,
-            search_hint="安装 注册 更新 添加 MCP server 常驻服务 热重载",
-        )
-        tools.register(
-            WorkspaceMcpRemoveTool(workspace_mcp_admin),
-            risk="external-side-effect",
-            always_on=False,
-            preloadable=False,
-            requires_turn_search=True,
-            search_hint="删除 卸载 移除 MCP server 停止常驻服务",
-        )
-        tools.register(
-            WorkspaceMcpStatusTool(workspace_mcp_admin),
-            risk="read-only",
-            always_on=False,
-            search_hint="查看 列出 诊断 MCP server generation 热加载错误",
-        )
-
     return CoreRuntime(
         config=config,
         workspace=workspace,
@@ -614,12 +725,12 @@ def build_core_runtime(
         provider=provider,
         light_provider=light_provider,
         agent_provider=agent_provider,
-        workspace_mcp_watcher=workspace_mcp_watcher,
-        workspace_mcp_watcher_task=None,
         memory_runtime=memory_runtime,
         presence=presence,
+        channel_attachment_store=channel_attachment_store,
         model_registry=model_registry,
         plugin_manager=plugin_manager,
+        background_job_host=background_jobs,
     )
 
 

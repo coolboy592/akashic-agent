@@ -4,17 +4,22 @@ import asyncio
 from collections.abc import Coroutine
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 from unittest.mock import AsyncMock
 
 import pytest
 
 from agent.control.context import running_turn_id
+from agent.plugin_composition.channels import (
+    ChannelDeliveryReceipt,
+    DeliveryStatus as ChannelDeliveryStatus,
+)
 from agent.looping.core import AgentLoop
 from agent.looping.ports import LLMConfig
 from agent.looping.session_lane import SessionLaneRegistry
+from agent.plugins.snapshot import bind_runtime_snapshot, reset_runtime_snapshot
 from bus.event_bus import EventBus
-from bus.events import InboundMessage, OutboundMessage, SpawnCompletionItem
+from bus.events import InboundItem, InboundMessage, OutboundMessage, SpawnCompletionItem
 from bus.events_lifecycle import TurnStarted
 from bus.internal_events import SpawnCompletionEvent
 from bus.queue import MessageBus
@@ -23,6 +28,41 @@ from core.error_context import (
     current_session_key,
 )
 from session.store import SessionStore
+
+
+@pytest.mark.asyncio
+async def test_runtime_admission_reuses_exact_task_bound_snapshot() -> None:
+    old_snapshot = SimpleNamespace(snapshot_id="old", tool_registry=None)
+    lease = SimpleNamespace(
+        active=True,
+        snapshot=old_snapshot,
+        validation_candidate_plugin_ids=frozenset(),
+    )
+    store = SimpleNamespace(
+        current=SimpleNamespace(snapshot_id="new"),
+        acquire=AsyncMock(side_effect=AssertionError("must not reacquire current")),
+    )
+    loop = AgentLoop.__new__(AgentLoop)
+    loop._session_lanes = SessionLaneRegistry()
+    loop._runtime_snapshot_store = store
+
+    async def process(_item: object, **_kwargs: object) -> str:
+        from agent.plugins.snapshot import get_current_runtime_snapshot
+
+        snapshot = get_current_runtime_snapshot()
+        assert snapshot is old_snapshot
+        return snapshot.snapshot_id
+
+    loop._process = process
+    item = SimpleNamespace(session_key="feishu:chat")
+    token = bind_runtime_snapshot(cast(Any, lease))
+    try:
+        result = await loop._process_with_runtime_admission(cast(Any, item))
+    finally:
+        reset_runtime_snapshot(token)
+
+    assert result == "old"
+    store.acquire.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -35,7 +75,6 @@ async def test_run_cleans_active_state_before_inbound_completion_failure() -> No
     )
     bus = SimpleNamespace(
         consume_inbound=AsyncMock(return_value=item),
-        publish_outbound=AsyncMock(),
         complete_inbound=AsyncMock(side_effect=RuntimeError("ack failed")),
     )
     loop = AgentLoop.__new__(AgentLoop)
@@ -86,7 +125,6 @@ async def test_run_propagates_runtime_cancellation_after_ack() -> None:
     loop._llm_config = LLMConfig()
     loop.bus = SimpleNamespace(
         consume_inbound=consume_inbound,
-        publish_outbound=AsyncMock(),
         complete_inbound=complete_inbound,
     )
     loop._active_tasks = {}
@@ -143,7 +181,6 @@ async def test_run_waits_for_ack_before_propagating_runtime_cancellation() -> No
     loop._llm_config = LLMConfig()
     loop.bus = SimpleNamespace(
         consume_inbound=consume_inbound,
-        publish_outbound=AsyncMock(),
         complete_inbound=complete_inbound,
     )
     loop._active_tasks = {}
@@ -189,7 +226,6 @@ async def test_stop_cancels_active_turn_and_acknowledges_inbound() -> None:
 
     bus = SimpleNamespace(
         consume_inbound=AsyncMock(return_value=item),
-        publish_outbound=AsyncMock(),
         complete_inbound=AsyncMock(),
     )
     loop = AgentLoop.__new__(AgentLoop)
@@ -224,7 +260,33 @@ def _real_path_loop(
     loop.tools = SimpleNamespace(get_tool=lambda _name: None)
     loop._session_lanes = SessionLaneRegistry()
     loop._runtime_snapshot_store = None
-    loop._react = core_process
+    loop._passive_pipeline = SimpleNamespace(
+        run_command=AsyncMock(return_value=None),
+    )
+
+    async def react(
+        message: InboundMessage,
+        key: str,
+        *,
+        dispatch_outbound: bool,
+        command_admitted: bool,
+    ) -> OutboundMessage:
+        _ = command_admitted
+        return await core_process(  # type: ignore[operator]
+            message,
+            key,
+            dispatch_outbound=dispatch_outbound,
+        )
+
+    loop._react = react
+    loop._outbound_port = SimpleNamespace(
+        dispatch=AsyncMock(
+            return_value=ChannelDeliveryReceipt(
+                delivery_id="test-delivery",
+                status=ChannelDeliveryStatus.DELIVERED,
+            )
+        )
+    )
     loop._processing_state = None
     loop._active_tasks = {}
     loop._active_turn_states = {}
@@ -242,7 +304,6 @@ async def test_error_final_carries_authoritative_execution_turn_id() -> None:
         content="hello",
     )
     bus = SimpleNamespace(
-        publish_outbound=AsyncMock(),
         complete_inbound=AsyncMock(),
     )
     observed_child_turn_ids: list[str] = []
@@ -263,7 +324,7 @@ async def test_error_final_carries_authoritative_execution_turn_id() -> None:
 
     await loop._run_inbound_turn(item)
 
-    (outbound,) = bus.publish_outbound.call_args.args
+    (outbound,) = loop._outbound_port.dispatch.call_args.args
     assert outbound.content == "出错：boom"
     assert outbound.control_turn_id == observed_child_turn_ids[0]
     assert outbound.control_turn_id.startswith("turn:")
@@ -287,7 +348,6 @@ async def test_error_final_preserves_preprovided_execution_turn_id() -> None:
         },
     )
     bus = SimpleNamespace(
-        publish_outbound=AsyncMock(),
         complete_inbound=AsyncMock(),
     )
     started_events: list[TurnStarted] = []
@@ -306,7 +366,7 @@ async def test_error_final_preserves_preprovided_execution_turn_id() -> None:
 
     await loop._run_inbound_turn(item)
 
-    (outbound,) = bus.publish_outbound.call_args.args
+    (outbound,) = loop._outbound_port.dispatch.call_args.args
     assert outbound.control_turn_id == "turn:pre"
     assert started_events[0].turn_id == "turn:pre"
     bus.complete_inbound.assert_awaited_once_with(item)
@@ -325,7 +385,6 @@ async def test_error_final_preserves_control_turn_id_only_metadata() -> None:
         metadata={"control_turn_id": "turn:ctrl"},
     )
     bus = SimpleNamespace(
-        publish_outbound=AsyncMock(),
         complete_inbound=AsyncMock(),
     )
     started_events: list[TurnStarted] = []
@@ -344,7 +403,7 @@ async def test_error_final_preserves_control_turn_id_only_metadata() -> None:
 
     await loop._run_inbound_turn(item)
 
-    (outbound,) = bus.publish_outbound.call_args.args
+    (outbound,) = loop._outbound_port.dispatch.call_args.args
     assert outbound.control_turn_id == "turn:ctrl"
     assert started_events[0].turn_id == "turn:ctrl"
     bus.complete_inbound.assert_awaited_once_with(item)
@@ -369,7 +428,6 @@ async def test_spawn_completion_turn_id_chain_identical() -> None:
         ),
     )
     bus = SimpleNamespace(
-        publish_outbound=AsyncMock(),
         complete_inbound=AsyncMock(),
     )
     observed_child_turn_ids: list[str] = []
@@ -390,7 +448,7 @@ async def test_spawn_completion_turn_id_chain_identical() -> None:
 
     await loop._run_inbound_turn(item)
 
-    (outbound,) = bus.publish_outbound.call_args.args
+    (outbound,) = loop._outbound_port.dispatch.call_args.args
     assert outbound.content == "出错：boom"
     assert observed_child_turn_ids[0].startswith("turn:")
     assert started_events[0].turn_id == observed_child_turn_ids[0]
@@ -415,7 +473,6 @@ async def test_non_str_control_turn_id_fails_loud_without_polluting_owner_maps()
         metadata={"control_turn_id": 7},
     )
     bus = SimpleNamespace(
-        publish_outbound=AsyncMock(),
         complete_inbound=AsyncMock(),
     )
     started_events: list[TurnStarted] = []
@@ -437,7 +494,7 @@ async def test_non_str_control_turn_id_fails_loud_without_polluting_owner_maps()
     assert started_events == []
     assert loop._active_tasks == {}
     assert loop._active_turn_states == {}
-    bus.publish_outbound.assert_not_awaited()
+    loop._outbound_port.dispatch.assert_not_awaited()
     bus.complete_inbound.assert_not_awaited()
 
 
@@ -478,7 +535,7 @@ async def test_durable_poison_inbound_not_acked_and_offered_to_next_recovery(
     loop._event_bus.on(TurnStarted, started_events.append)
 
     with pytest.raises(TypeError):
-        await loop._run_inbound_turn(consumed)
+        await loop._run_inbound_turn(cast(InboundItem, consumed))
 
     assert started_events == []
     assert loop._active_tasks == {}
@@ -521,7 +578,7 @@ async def test_durable_poison_inbound_not_acked_and_offered_to_next_recovery(
     restarted_loop = _real_path_loop(restarted, core_process)
     restarted_loop._event_bus.on(TurnStarted, started_events.append)
     with pytest.raises(TypeError):
-        await restarted_loop._run_inbound_turn(recovered)
+        await restarted_loop._run_inbound_turn(cast(InboundItem, recovered))
     assert started_events == []
     assert restarted_loop._active_tasks == {}
     assert restarted_loop._active_turn_states == {}
@@ -545,7 +602,6 @@ async def test_owner_task_creation_failure_never_acks_and_leaves_no_maps(
         content="hello",
     )
     bus = SimpleNamespace(
-        publish_outbound=AsyncMock(),
         complete_inbound=AsyncMock(),
     )
     real_create_task = asyncio.create_task
@@ -568,7 +624,7 @@ async def test_owner_task_creation_failure_never_acks_and_leaves_no_maps(
 
     assert loop._active_tasks == {}
     assert loop._active_turn_states == {}
-    bus.publish_outbound.assert_not_awaited()
+    loop._outbound_port.dispatch.assert_not_awaited()
     bus.complete_inbound.assert_not_awaited()
 
 
@@ -576,7 +632,7 @@ async def test_owner_task_creation_failure_never_acks_and_leaves_no_maps(
 async def test_process_direct_message_real_entry_execution_owner() -> None:
     """公开入口 process_direct_message：execution turn id 恒为 owner，与
     interaction 分组 id 分叉时 execution 胜出，child 与 TurnStarted 同源。"""
-    bus = SimpleNamespace(publish_outbound=AsyncMock())
+    bus = SimpleNamespace()
     observed_child_turn_ids: list[str] = []
     started_events: list[TurnStarted] = []
 
@@ -607,7 +663,7 @@ async def test_process_direct_message_real_entry_execution_owner() -> None:
 async def test_process_direct_message_non_str_metadata_fails_loud_clean() -> None:
     """公开入口非字符串 metadata：TypeError 原样抛出，不发布 outbound，
     不泄漏任何 contextvar（零副作用）。"""
-    bus = SimpleNamespace(publish_outbound=AsyncMock())
+    bus = SimpleNamespace()
     loop = _real_path_loop(bus, object())
 
     with pytest.raises(TypeError):
@@ -616,7 +672,7 @@ async def test_process_direct_message_non_str_metadata_fails_loud_clean() -> Non
             metadata={"control_turn_id": 7},
         )
 
-    bus.publish_outbound.assert_not_awaited()
+    loop._outbound_port.dispatch.assert_not_awaited()
     assert current_session_key.get() is None
     assert running_turn_id.get() == ""
     assert current_client_message_id.get() == ""

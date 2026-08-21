@@ -1,19 +1,20 @@
 """
 Telegram Channel
 
-将 Telegram Bot 接入 MessageBus，支持 allowFrom 白名单。
+将 Telegram Bot 接入 Core v3 Channel ingress，支持 allowFrom 白名单。
 """
 
 import logging
 import asyncio
-import hashlib
 import html
+from io import BytesIO
 import json
 import time
-from collections.abc import Coroutine
+from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from telegram import BotCommand, Update
 from telegram.constants import ChatAction
@@ -30,9 +31,6 @@ from bus.event_bus import EventBus
 from bus.events import (
     ChannelMessage,
     DeliveryReceipt,
-    InboundMessage,
-    OutboundMessage,
-    channel_message_from_outbound,
 )
 from bus.events_lifecycle import (
     StreamDeltaReady,
@@ -42,9 +40,24 @@ from bus.events_lifecycle import (
 )
 from bus.queue import MessageBus
 from agent.looping.interrupt import InterruptController
-from infra.channels.base import AttachmentStore, MessageDeduper, SessionIdentityIndex
+from agent.plugin_composition.channels import (
+    AttachmentKind,
+    AttachmentRef,
+    ChannelAdapter,
+    ChannelCommitRole,
+    ChannelFactoryContext,
+    ChannelInboundMessage,
+    ChannelRuntimePorts,
+    InboundIdentity,
+    ProviderDeliveryRequest,
+    RawInbound,
+    StopReceipt,
+    JsonValue,
+)
+from infra.channels.base import MessageDeduper, SessionIdentityIndex
 from infra.channels.contract import ChannelContext
 from infra.channels.delivery import deliver_message_parts
+from infra.channels.native_delivery import NativeChannelDeliveryAdapter
 from infra.channels.reply_context import build_reply_inbound_text
 from infra.channels.telegram_utils import (
     TelegramOutboundLimiter,
@@ -73,6 +86,15 @@ _LIVE_STREAM_MIN_CHARS = 200
 _CONFLICT_LOG_INTERVAL_SECONDS = 60
 
 
+def _normalize_v3_content(value: str) -> str:
+    """Keep provider text while replacing Core-forbidden control characters."""
+
+    return "".join(
+        "\u2028" if ord(char) in {10, 13} else " " if ord(char) < 32 else char
+        for char in value
+    )
+
+
 @dataclass
 class _ToolLiveLine:
     call_id: str
@@ -82,7 +104,100 @@ class _ToolLiveLine:
     status: str = "running"
 
 
+class _TelegramInboundRuntime:
+    """Gate Telegram callbacks on one exact formal Core binding."""
+
+    def __init__(self) -> None:
+        self._ports: ChannelRuntimePorts | None = None
+        self._open = False
+        self._wake = asyncio.Event()
+        self._tasks: set[asyncio.Task[Any]] = set()
+
+    def attach(self, ports: ChannelRuntimePorts) -> None:
+        if self._open:
+            raise RuntimeError("Telegram v3 ingress 已打开")
+        if ports.ingress is None:
+            raise RuntimeError("Telegram v3 ingress 缺少 Core ingress")
+        self._ports = ports
+        self._open = False
+        self._wake.clear()
+
+    def open(self) -> None:
+        if self._ports is None:
+            raise RuntimeError("Telegram v3 ingress 尚未 attach")
+        self._open = True
+        self._wake.set()
+
+    def close(self) -> None:
+        self._open = False
+        self._ports = None
+        self._wake.set()
+
+    async def run(self, operation: Coroutine[Any, Any, None]) -> None:
+        task = asyncio.current_task()
+        if task is not None:
+            self._tasks.add(task)
+        try:
+            await operation
+        finally:
+            if task is not None:
+                self._tasks.discard(task)
+
+    async def wait_quiescent(self) -> None:
+        current = asyncio.current_task()
+        tasks = tuple(task for task in self._tasks if task is not current)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def wait_open(self) -> ChannelRuntimePorts:
+        ports = self._ports
+        if ports is None:
+            raise RuntimeError("Telegram v3 ingress 尚未 attach")
+        await self._wake.wait()
+        if not self._open or self._ports is not ports:
+            raise RuntimeError("Telegram v3 ingress admission 已关闭")
+        return ports
+
+    def require_open(self, ports: ChannelRuntimePorts) -> None:
+        if not self._open or self._ports is not ports:
+            raise RuntimeError("Telegram v3 ingress admission 已关闭")
+
+    async def admit(
+        self,
+        raw: RawInbound,
+        *,
+        ports: ChannelRuntimePorts | None = None,
+    ) -> bool:
+        if ports is None:
+            ports = await self.wait_open()
+        if not self._open or self._ports is not ports or ports.ingress is None:
+            return False
+        return await ports.ingress.admit(raw)
+
+    async def import_bytes(
+        self,
+        data: bytes,
+        *,
+        kind: AttachmentKind,
+        filename: str | None,
+        media_type: str | None,
+        ports: ChannelRuntimePorts | None = None,
+    ) -> AttachmentRef:
+        if ports is None:
+            ports = await self.wait_open()
+        if not self._open or self._ports is not ports or ports.attachment_import is None:
+            raise RuntimeError("Telegram v3 attachment import admission 已关闭")
+        return await ports.attachment_import.import_bytes(
+            data,
+            kind=kind,
+            filename=filename,
+            media_type=media_type,
+        )
+
+
 class TelegramChannel:
+
+    v3_inbound_identity = InboundIdentity.PROVIDER_MESSAGE_ID
 
     def __init__(
         self,
@@ -90,7 +205,9 @@ class TelegramChannel:
         bus: MessageBus,
         session_manager: SessionManager,
         allow_from: list[str] | None = None,
-        bot_commands: list[tuple[str, str]] | None = None,
+        command_catalog_provider: Callable[
+            [], tuple[tuple[str, str], ...]
+        ] | None = None,
         event_bus: EventBus | None = None,
         interrupt_controller: InterruptController | None = None,
         channel_name: str = _CHANNEL,
@@ -102,7 +219,6 @@ class TelegramChannel:
         self.name = channel_name
         self._allow_from: set[str] = set(allow_from) if allow_from else set()
         self._message_deduper = MessageDeduper(_SEEN_MSG_MAXSIZE)
-        self._attachments = AttachmentStore(session_manager.workspace / "uploads")
         self._identity_index = SessionIdentityIndex(
             session_manager,
             channel=channel_name,
@@ -110,7 +226,7 @@ class TelegramChannel:
             normalizer=lambda value: value.lower(),
         )
         self._app = Application.builder().token(token).build()
-        self._bot_commands = bot_commands or []
+        self._command_catalog_provider = command_catalog_provider
         self._app.add_handler(CommandHandler("stop", self._on_stop_command))
         self._app.add_handler(
             MessageHandler(filters.COMMAND, self._on_command)
@@ -125,7 +241,6 @@ class TelegramChannel:
             MessageHandler(filters.Document.ALL & ~filters.COMMAND, self._on_document)
         )
         self._event_bus = event_bus
-        self._outbound_bound = False
         self._events_bound = False
         self.user_map = self._identity_index.mapping
         self._conflict_count = 0
@@ -141,6 +256,7 @@ class TelegramChannel:
         self._tool_lines: dict[str, list[_ToolLiveLine]] = {}
         self._live_tasks: set[asyncio.Task[None]] = set()
         self._live_tasks_by_session: dict[str, set[asyncio.Task[None]]] = {}
+        self._v3_inbound_runtime = _TelegramInboundRuntime()
 
     @property
     def bot(self):
@@ -184,10 +300,6 @@ class TelegramChannel:
             self._bus = ctx.bus
             self._event_bus = ctx.event_bus
             self._interrupt_controller = ctx.interrupt_controller
-            ctx.push_tool.register_channel(
-                self.name,
-                deliver=self._deliver_message,
-            )
         self._bind_runtime()
         self._rebuild_user_map()
         await self._app.initialize()
@@ -203,9 +315,6 @@ class TelegramChannel:
         logger.info(f"TelegramChannel 已启动  已知用户: {len(self.user_map)}")
 
     def _bind_runtime(self) -> None:
-        if not self._outbound_bound:
-            self._bus.subscribe_outbound(self._channel, self._on_response)
-            self._outbound_bound = True
         if self._event_bus is not None and not self._events_bound:
             self._event_bus.on(TurnStarted, self._on_turn_started)
             self._event_bus.on(StreamDeltaReady, self._on_stream_delta)
@@ -242,14 +351,31 @@ class TelegramChannel:
         )
 
     async def _register_bot_commands(self) -> None:
+        catalog = (
+            self._command_catalog_provider()
+            if self._command_catalog_provider is not None
+            else ()
+        )
         commands = [
             BotCommand(command, description)
             for command, description in [
-                *self._bot_commands,
+                *catalog,
                 ("stop", "中断当前回复"),
             ]
         ]
         await self._app.bot.set_my_commands(commands)
+
+    async def replace_command_catalog(
+        self,
+        commands: tuple[tuple[str, str], ...],
+    ) -> None:
+        """Publish one committed command catalog to Telegram discovery."""
+
+        published = [
+            BotCommand(command, description)
+            for command, description in (*commands, ("stop", "中断当前回复"))
+        ]
+        await self._app.bot.set_my_commands(published)
 
     async def _remember_username(self, chat_id: str, username: str | None) -> None:
         if username:
@@ -271,75 +397,247 @@ class TelegramChannel:
             )
             return
 
-        # 去重：同一 (chat_id, message_id) 只处理一次，防止 Telegram 重投
-        msg_key = f"{chat.id}:{msg.message_id}"
-        if self._message_deduper.seen(msg_key):
-            logger.warning(
-                f"[telegram] 重复消息已忽略  chat_id={chat.id}  message_id={msg.message_id}"
-            )
-            return
+        await self._v3_inbound_runtime.run(self._on_message_v3(update, context))
 
-        preview = msg.text[:60] + "..." if len(msg.text) > 60 else msg.text
-        logger.info(
-            f"[telegram] 收到消息  chat_id={chat.id}  "
-            f"user=@{user.username or user.id}  内容: {preview!r}"
+    def _v3_timestamp(self, message: object) -> datetime:
+        value = getattr(message, "date", None)
+        if not isinstance(value, datetime):
+            return datetime.now(timezone.utc)
+        if value.tzinfo is None or value.utcoffset() is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value
+
+    async def _download_v3_attachment(
+        self,
+        context: ContextTypes.DEFAULT_TYPE,
+        file_id: str,
+        *,
+        kind: AttachmentKind,
+        filename: str | None,
+        media_type: str | None,
+        ports: ChannelRuntimePorts,
+    ) -> AttachmentRef:
+        runtime = self._v3_inbound_runtime
+        if runtime is None:
+            raise RuntimeError("Telegram v3 ingress 尚未 attach")
+        runtime.require_open(ports)
+        telegram_file = await context.bot.get_file(file_id)
+        download = getattr(telegram_file, "download_as_bytearray", None)
+        if not callable(download):
+            raise RuntimeError("Telegram provider 缺少 download_as_bytearray")
+        payload = bytes(
+            await cast(Awaitable[bytes | bytearray], download())
+        )
+        return await runtime.import_bytes(
+            payload,
+            kind=kind,
+            filename=filename,
+            media_type=media_type,
+            ports=ports,
         )
 
-        # 更新内存索引 + 持久化到 session.metadata
-        chat_id_str = str(chat.id)
-        await self._remember_username(chat_id_str, user.username)
+    async def _admit_v3_message(
+        self,
+        message: object,
+        *,
+        sender: str,
+        chat_id: str,
+        content: str,
+        metadata: dict[str, JsonValue],
+        attachments: tuple[AttachmentRef, ...] = (),
+        ports: ChannelRuntimePorts,
+    ) -> None:
+        runtime = self._v3_inbound_runtime
+        if runtime is None:
+            raise RuntimeError("Telegram v3 ingress 尚未 attach")
+        raw = RawInbound(
+            message_id=str(getattr(message, "message_id")),
+            provider_identity=sender,
+            recipient=chat_id,
+            message=ChannelInboundMessage(
+                channel=self._channel,
+                sender=sender,
+                chat_id=chat_id,
+                content=_normalize_v3_content(content),
+                timestamp=self._v3_timestamp(message),
+                metadata=metadata,
+                attachments=attachments,
+            ),
+        )
+        accepted = await runtime.admit(raw, ports=ports)
+        if not accepted:
+            logger.debug(
+                "[telegram] v3 ingress closed or duplicate message_id=%s",
+                raw.message_id,
+            )
 
+    async def _on_message_v3(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        msg = update.effective_message
+        chat = update.effective_chat
+        user = update.effective_user
+        if not msg or not msg.text or not chat or not user:
+            return
+        ports = await self._v3_inbound_runtime.wait_open()
+        msg_key = f"{chat.id}:{msg.message_id}"
+        if self._message_deduper.seen(msg_key):
+            return
         await self._safe_send_typing(context, chat.id)
-
         inbound_text, reply_meta = _build_inbound_text_with_reply(
             msg.text, msg.reply_to_message
         )
-        reply_media: list[str] = []
-        if msg.reply_to_message and getattr(msg.reply_to_message, "photo", None):
-            try:
-                tg_file = await context.bot.get_file(
-                    msg.reply_to_message.photo[-1].file_id
-                )
-                tmp = self._attachments.create_path("reply_photo_", ".jpg")
-                await tg_file.download_to_drive(tmp)
-                reply_media.append(str(tmp))
-                logger.info(f"[telegram] 下载被回复图片  chat_id={chat.id}  tmp={tmp}")
-            except Exception as e:
-                logger.warning(
-                    f"[telegram] 被回复图片下载失败  chat_id={chat.id}  err={e}"
-                )
-        if msg.reply_to_message and getattr(msg.reply_to_message, "document", None):
-            try:
-                rdoc = msg.reply_to_message.document
-                if rdoc is None:
-                    raise ValueError("reply document 缺失")
-                suffix = ""
-                if rdoc.file_name and "." in rdoc.file_name:
-                    suffix = "." + rdoc.file_name.rsplit(".", 1)[-1]
-                tg_file = await context.bot.get_file(rdoc.file_id)
-                tmp = self._attachments.create_path("reply_doc_", suffix)
-                await tg_file.download_to_drive(tmp)
-                reply_media.append(str(tmp))
-                logger.info(
-                    f"[telegram] 下载被回复文件  chat_id={chat.id}  filename={rdoc.file_name!r}  tmp={tmp}"
-                )
-            except Exception as e:
-                logger.warning(
-                    f"[telegram] 被回复文件下载失败  chat_id={chat.id}  err={e}"
-                )
-        await self._bus.publish_inbound(
-            InboundMessage(
-                channel=self._channel,
-                sender=str(user.id),
-                chat_id=str(chat.id),
-                content=inbound_text,
-                media=reply_media,
-                metadata={
-                    "username": user.username or "",
-                    **reply_meta,
-                },
-            )
+        attachments = await self._download_v3_reply_attachments(
+            msg.reply_to_message,
+            context,
+            ports=ports,
         )
+        await self._admit_v3_message(
+            msg,
+            sender=str(user.id),
+            chat_id=str(chat.id),
+            content=inbound_text,
+            metadata={"username": user.username or "", **reply_meta},
+            attachments=attachments,
+            ports=ports,
+        )
+
+    async def _on_command_v3(
+        self, update: Update, _context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        msg = update.effective_message
+        chat = update.effective_chat
+        user = update.effective_user
+        if not msg or not chat or not user:
+            return
+        ports = await self._v3_inbound_runtime.wait_open()
+        await self._admit_v3_message(
+            msg,
+            sender=str(user.id),
+            chat_id=str(chat.id),
+            content=str(getattr(msg, "text", "") or ""),
+            metadata={"username": user.username or ""},
+            ports=ports,
+        )
+
+    async def _on_photo_v3(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        msg = update.effective_message
+        chat = update.effective_chat
+        user = update.effective_user
+        if not msg or not msg.photo or not chat or not user:
+            return
+        ports = await self._v3_inbound_runtime.wait_open()
+        msg_key = f"{chat.id}:{msg.message_id}"
+        if self._message_deduper.seen(msg_key):
+            return
+        await self._safe_send_typing(context, chat.id)
+        photo = msg.photo[-1]
+        main = await self._download_v3_attachment(
+            context,
+            str(photo.file_id),
+            kind=AttachmentKind.IMAGE,
+            filename=getattr(photo, "file_name", None),
+            media_type="image/jpeg",
+            ports=ports,
+        )
+        inbound_text, reply_meta = _build_inbound_text_with_reply(
+            msg.caption or "", msg.reply_to_message
+        )
+        replies = await self._download_v3_reply_attachments(
+            msg.reply_to_message,
+            context,
+            ports=ports,
+        )
+        await self._admit_v3_message(
+            msg,
+            sender=str(user.id),
+            chat_id=str(chat.id),
+            content=inbound_text,
+            metadata={"username": user.username or "", **reply_meta},
+            attachments=(main, *replies),
+            ports=ports,
+        )
+
+    async def _on_document_v3(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        msg = update.effective_message
+        chat = update.effective_chat
+        user = update.effective_user
+        if not msg or not msg.document or not chat or not user:
+            return
+        ports = await self._v3_inbound_runtime.wait_open()
+        msg_key = f"{chat.id}:{msg.message_id}"
+        if self._message_deduper.seen(msg_key):
+            return
+        await self._safe_send_typing(context, chat.id)
+        document = msg.document
+        main = await self._download_v3_attachment(
+            context,
+            str(document.file_id),
+            kind=AttachmentKind.FILE,
+            filename=document.file_name or None,
+            media_type=document.mime_type or None,
+            ports=ports,
+        )
+        content, reply_meta = _build_inbound_text_with_reply(
+            msg.caption or "", msg.reply_to_message
+        )
+        if document.file_name:
+            content = f"[文件: {document.file_name}]\n{content}".strip()
+        await self._admit_v3_message(
+            msg,
+            sender=str(user.id),
+            chat_id=str(chat.id),
+            content=content,
+            metadata={
+                "username": user.username or "",
+                "document_filename": document.file_name or "",
+                "document_mime_type": document.mime_type or "",
+                **reply_meta,
+            },
+            attachments=(main,),
+            ports=ports,
+        )
+
+    async def _download_v3_reply_attachments(
+        self,
+        reply: object,
+        context: ContextTypes.DEFAULT_TYPE,
+        *,
+        ports: ChannelRuntimePorts,
+    ) -> tuple[AttachmentRef, ...]:
+        if reply is None:
+            return ()
+        result: list[AttachmentRef] = []
+        photos = getattr(reply, "photo", None)
+        if photos:
+            photo = photos[-1]
+            result.append(
+                await self._download_v3_attachment(
+                    context,
+                    str(photo.file_id),
+                    kind=AttachmentKind.IMAGE,
+                    filename=getattr(photo, "file_name", None),
+                    media_type="image/jpeg",
+                    ports=ports,
+                )
+            )
+        document = getattr(reply, "document", None)
+        if document is not None:
+            result.append(
+                await self._download_v3_attachment(
+                    context,
+                    str(document.file_id),
+                    kind=AttachmentKind.FILE,
+                    filename=document.file_name or None,
+                    media_type=document.mime_type or None,
+                    ports=ports,
+                )
+            )
+        return tuple(result)
 
     async def _on_stop_command(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -392,15 +690,7 @@ class TelegramChannel:
             )
             return
 
-        await self._bus.publish_inbound(
-            InboundMessage(
-                channel=self._channel,
-                sender=str(user.id),
-                chat_id=str(chat.id),
-                content=str(getattr(msg, "text", "") or ""),
-                metadata={"username": user.username or ""},
-            )
-        )
+        await self._v3_inbound_runtime.run(self._on_command_v3(update, context))
 
     async def _on_photo(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -418,59 +708,7 @@ class TelegramChannel:
             )
             return
 
-        msg_key = f"{chat.id}:{msg.message_id}"
-        if self._message_deduper.seen(msg_key):
-            logger.warning(
-                f"[telegram] 重复图片消息已忽略  chat_id={chat.id}  message_id={msg.message_id}"
-            )
-            return
-
-        chat_id_str = str(chat.id)
-        await self._remember_username(chat_id_str, user.username)
-
-        await self._safe_send_typing(context, chat.id)
-
-        # 下载最高分辨率的图片到持久化目录
-        tg_file = await context.bot.get_file(msg.photo[-1].file_id)
-        tmp = self._attachments.create_path("photo_", ".jpg")
-        await tg_file.download_to_drive(tmp)
-        logger.info(
-            f"[telegram] 收到图片  chat_id={chat.id}  user=@{user.username or user.id}  path={tmp}"
-        )
-
-        caption_text = msg.caption or ""
-        inbound_text, reply_meta = _build_inbound_text_with_reply(
-            caption_text, msg.reply_to_message
-        )
-        media = [str(tmp)]
-        if msg.reply_to_message and getattr(msg.reply_to_message, "photo", None):
-            try:
-                reply_file = await context.bot.get_file(
-                    msg.reply_to_message.photo[-1].file_id
-                )
-                reply_tmp = self._attachments.create_path("reply_photo_", ".jpg")
-                await reply_file.download_to_drive(reply_tmp)
-                media.append(str(reply_tmp))
-                logger.info(
-                    f"[telegram] 下载被回复图片  chat_id={chat.id}  tmp={reply_tmp}"
-                )
-            except Exception as e:
-                logger.warning(
-                    f"[telegram] 被回复图片下载失败  chat_id={chat.id}  err={e}"
-                )
-        await self._bus.publish_inbound(
-            InboundMessage(
-                channel=self._channel,
-                sender=str(user.id),
-                chat_id=str(chat.id),
-                content=inbound_text,
-                media=media,
-                metadata={
-                    "username": user.username or "",
-                    **reply_meta,
-                },
-            )
-        )
+        await self._v3_inbound_runtime.run(self._on_photo_v3(update, context))
 
     async def _on_document(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -488,44 +726,7 @@ class TelegramChannel:
             )
             return
 
-        chat_id_str = str(chat.id)
-        await self._remember_username(chat_id_str, user.username)
-
-        await self._safe_send_typing(context, chat.id)
-
-        doc = msg.document
-        suffix = ""
-        if doc.file_name and "." in doc.file_name:
-            suffix = "." + doc.file_name.rsplit(".", 1)[-1]
-        tg_file = await context.bot.get_file(doc.file_id)
-        tmp = self._attachments.create_path("doc_", suffix)
-        await tg_file.download_to_drive(tmp)
-        logger.info(
-            f"[telegram] 收到文件  chat_id={chat.id}  user=@{user.username or user.id}"
-            f"  filename={doc.file_name!r}  tmp={tmp}"
-        )
-
-        caption_text = msg.caption or ""
-        inbound_text, reply_meta = _build_inbound_text_with_reply(
-            caption_text, msg.reply_to_message
-        )
-        if doc.file_name:
-            inbound_text = f"[文件: {doc.file_name}]\n{inbound_text}".strip()
-        await self._bus.publish_inbound(
-            InboundMessage(
-                channel=self._channel,
-                sender=str(user.id),
-                chat_id=str(chat.id),
-                content=inbound_text,
-                media=[str(tmp)],
-                metadata={
-                    "username": user.username or "",
-                    "document_filename": doc.file_name or "",
-                    "document_mime_type": doc.mime_type or "",
-                    **reply_meta,
-                },
-            )
-        )
+        await self._v3_inbound_runtime.run(self._on_document_v3(update, context))
 
     def _resolve_chat_id(self, chat_id: str) -> str:
         resolved = chat_id.lstrip("@").lower()
@@ -772,6 +973,36 @@ class TelegramChannel:
             send_image=self.send_image,
         )
 
+    def build_v3_adapter(self, context: ChannelFactoryContext) -> ChannelAdapter:
+        """Build a Core adapter over this already-started Telegram provider owner."""
+
+        return TelegramV3ChannelAdapter(self, context)
+
+    def _attach_v3_inbound(self, ports: ChannelRuntimePorts) -> None:
+        """Attach one formal Core ingress without retaining a candidate context."""
+
+        runtime = self._v3_inbound_runtime
+        if runtime is None:
+            runtime = _TelegramInboundRuntime()
+            self._v3_inbound_runtime = runtime
+        runtime.attach(ports)
+
+    def _open_v3_inbound(self) -> None:
+        runtime = self._v3_inbound_runtime
+        if runtime is None:
+            raise RuntimeError("Telegram v3 ingress 尚未 attach")
+        runtime.open()
+
+    def _close_v3_inbound(self) -> None:
+        runtime = self._v3_inbound_runtime
+        if runtime is not None:
+            runtime.close()
+
+    async def _drain_v3_inbound(self) -> None:
+        runtime = self._v3_inbound_runtime
+        if runtime is not None:
+            await runtime.wait_quiescent()
+
     async def _send_document_file(
         self,
         chat_id: int,
@@ -787,56 +1018,6 @@ class TelegramChannel:
     async def _send_photo_file(self, chat_id: int, image: str) -> object:
         with open(image, "rb") as f:
             return await self._app.bot.send_photo(chat_id=chat_id, photo=f)
-
-    async def _on_response(self, msg: OutboundMessage) -> None:
-        logger.info(
-            "telegram outbound accepted",
-            extra={
-                "akashic_fields": {
-                    "event": "telegram.outbound_accepted",
-                    "output_bytes": len(msg.content.encode("utf-8")),
-                    "content_fp": hashlib.sha256(
-                        msg.content.encode("utf-8")
-                    ).hexdigest()[:16],
-                }
-            },
-        )
-        _ = int(self._resolve_chat_id(msg.chat_id))
-        session_key = f"{self._channel}:{msg.chat_id}"
-        had_live = self._has_live_messages(session_key)
-        has_live_tasks = bool(self._live_tasks_by_session.get(session_key))
-        if has_live_tasks:
-            await self._cancel_live_tasks(session_key)
-        if had_live or self._has_live_messages(session_key):
-            await self._delete_live_message(session_key)
-        final_thinking = self._final_thinking_text(session_key, msg.thinking)
-        if had_live:
-            if final_thinking:
-                await send_thinking_block(
-                    self._app.bot,
-                    msg.chat_id,
-                    final_thinking,
-                    self._telegram_outbound_limiter,
-                )
-            await self._send_final_tool_snapshot(session_key, msg.chat_id)
-        outbound = channel_message_from_outbound(msg)
-        outbound.metadata["_channel_commit_role"] = "passive"
-        receipt = await self._deliver_message(outbound)
-        if final_thinking and not had_live:
-            await send_thinking_block(
-                self._app.bot,
-                msg.chat_id,
-                final_thinking,
-                self._telegram_outbound_limiter,
-            )
-        self._reply_buffers.pop(session_key, None)
-        self._thinking_buffers.pop(session_key, None)
-        _ = self._thinking_live_next_at.pop(session_key, None)
-        _ = self._live_last_lengths.pop(session_key, None)
-        _ = self._tool_lines.pop(session_key, None)
-        _ = self._active_streams.pop(str(msg.chat_id), None)
-        if not receipt.succeeded:
-            raise RuntimeError(receipt.detail or "Telegram 消息提交失败")
 
     async def _safe_send_typing(
         self, context: ContextTypes.DEFAULT_TYPE, chat_id: int
@@ -878,6 +1059,98 @@ class TelegramChannel:
                 )
             return
         logger.warning("[telegram] polling 异常，框架将自动重试: %s", exc)
+
+
+class TelegramV3ChannelAdapter(NativeChannelDeliveryAdapter):
+    """Deliver Core requests through an already-started TelegramChannel."""
+
+    def __init__(self, channel: TelegramChannel, context: ChannelFactoryContext) -> None:
+        self._channel = channel
+        super().__init__(
+            context,
+            channel_name=channel.name,
+            validate_recipient=channel._resolve_chat_id,
+            send_text=self._send_text,
+            send_attachment=self._send_attachment,
+        )
+
+    def attach_runtime(self, ports: ChannelRuntimePorts) -> None:
+        """Bind provider callbacks to one formal Core runtime."""
+
+        self._channel._attach_v3_inbound(ports)
+
+    def open_admission(self) -> None:
+        """Release provider callbacks only after stable publication finalized."""
+
+        self._channel._open_v3_inbound()
+
+    def close_admission(self) -> None:
+        """Stop new provider callbacks before Host drain begins."""
+
+        self._channel._close_v3_inbound()
+
+    async def stop(self) -> StopReceipt:
+        self._channel._close_v3_inbound()
+        await self._channel._drain_v3_inbound()
+        return await super().stop()
+
+    async def _send_text(self, request: ProviderDeliveryRequest) -> None:
+        if bool(request.metadata.get("streamed_reply")):
+            chat_id = self._channel._resolve_chat_id(request.recipient)
+            stream = self._channel._active_streams.pop(str(chat_id), None)
+            if stream is not None:
+                await stream.finalize(request.body)
+                return
+        if request.commit_role is ChannelCommitRole.PASSIVE:
+            await self._channel.send(request.recipient, request.body)
+        else:
+            await self._channel.send_stream(request.recipient, request.body)
+
+    async def _send_attachment(
+        self,
+        request: ProviderDeliveryRequest,
+        ref: AttachmentRef,
+        payload: bytes,
+    ) -> None:
+        chat_id = int(self._channel._resolve_chat_id(request.recipient))
+        if ref.kind.value == "image":
+            await self._channel._telegram_outbound_limiter.run(
+                chat_id,
+                kind="send",
+                label="send_photo(v3)",
+                action=lambda: self._send_photo_bytes(chat_id, ref, payload),
+            )
+            return
+        await self._channel._telegram_outbound_limiter.run(
+            chat_id,
+            kind="send",
+            label="send_document(v3)",
+            action=lambda: self._send_document_bytes(chat_id, ref, payload),
+        )
+
+    async def _send_document_bytes(
+        self,
+        chat_id: int,
+        ref: AttachmentRef,
+        payload: bytes,
+    ) -> object:
+        document = BytesIO(payload)
+        document.name = ref.filename or ref.artifact_id
+        return await self._channel._app.bot.send_document(
+            chat_id=chat_id,
+            document=document,
+            filename=ref.filename,
+        )
+
+    async def _send_photo_bytes(
+        self,
+        chat_id: int,
+        ref: AttachmentRef,
+        payload: bytes,
+    ) -> object:
+        photo = BytesIO(payload)
+        photo.name = ref.filename or ref.artifact_id
+        return await self._channel._app.bot.send_photo(chat_id=chat_id, photo=photo)
 
 
 def _format_turn_live(

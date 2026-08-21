@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from datetime import UTC, datetime
 import logging
 from time import perf_counter
 from typing import TYPE_CHECKING, Any, TypeAlias, cast
 
 from agent.control.context import running_turn_id
-from agent.core.passive_support import update_session_runtime_metadata
+from agent.core.passive_support import build_session_runtime_metadata
 from agent.control.ports import InputLock, TurnUserInput
 from agent.core.response_parser import parse_response
 from agent.lifecycle.phase import (
@@ -17,11 +18,17 @@ from agent.lifecycle.phase import (
     collect_prefixed_slots,
     topo_sort_modules,
 )
+from agent.lifecycle.composition import (
+    AFTER_REASONING_CLEANUP_EVENT,
+    AFTER_REASONING_PREPROCESS_EVENT,
+    run_composition_lifecycle,
+)
 from agent.lifecycle.types import (
     AfterReasoningCtx,
     AfterReasoningInput,
     TurnSnapshot,
 )
+from agent.plugin_composition.channels import AttachmentRef
 from bus.event_bus import EventBus
 from bus.events import OutboundMessage
 from core.common.diagnostic_log import turn_milestone
@@ -70,8 +77,9 @@ _CTX_SLOT = "reasoning:ctx"
 _OUTBOUND_SLOT = "reasoning:outbound"
 _PERSISTED_USER_SLOT = "reasoning:persisted_user"
 _PERSISTED_ASSISTANT_SLOT = "reasoning:persisted_assistant"
-_PERSIST_USER_PREFIX = "persist:user:"
-_PERSIST_ASSISTANT_PREFIX = "persist:assistant:"
+_SEALED_ASSISTANT_METADATA_SLOT = "reasoning:assistant_metadata"
+_PENDING_SESSION_METADATA_SLOT = "reasoning:session_metadata"
+_ASSISTANT_ATTACHMENT_REFS_SLOT = "reasoning:assistant_attachment_refs"
 _OUTBOUND_METADATA_PREFIX = "outbound:metadata:"
 _OUTBOUND_MEDIA_PREFIX = "outbound:media:"
 _ASSISTANT_FIXED_FIELDS = {
@@ -80,7 +88,29 @@ _ASSISTANT_FIXED_FIELDS = {
     "reasoning_content",
     "model_state",
 }
+_ASSISTANT_MESSAGE_FIELDS = {
+    "role",
+    "content",
+    "timestamp",
+    "media",
+    "id",
+    "seq",
+}
+_ASSISTANT_CORE_METADATA_FIELDS = {
+    "turn_duration_ms",
+    "control_turn_id",
+    "turn_terminal",
+    "turn_input_count",
+    "skip_post_memory",
+    "attachment_ids",
+}
 _RETIRED_ASSISTANT_FIELDS = frozenset({"react_compaction"})
+_ASSISTANT_FORBIDDEN_PLUGIN_FIELDS = frozenset(
+    _ASSISTANT_FIXED_FIELDS
+    | _ASSISTANT_MESSAGE_FIELDS
+    | _ASSISTANT_CORE_METADATA_FIELDS
+    | _RETIRED_ASSISTANT_FIELDS
+)
 _USER_FIXED_FIELDS = {
     "media",
     "timestamp",
@@ -89,6 +119,23 @@ _USER_FIXED_FIELDS = {
     "reply_role",
     "reply_preview",
 }
+_USER_CORE_METADATA_FIELDS = frozenset(
+    _USER_FIXED_FIELDS
+    | {
+        "role",
+        "content",
+        "id",
+        "seq",
+        "turn_input_ordinal",
+        "control_turn_id",
+        "skip_post_memory",
+        "attachment_ids",
+        "display_content",
+        "client_created_at",
+        "llm_user_content",
+        "llm_context_frame",
+    }
+)
 
 
 class _BuildAfterReasoningCtxModule:
@@ -151,13 +198,58 @@ class _EmitAfterReasoningCtxModule:
 
     async def run(self, frame: AfterReasoningFrame) -> AfterReasoningFrame:
         ctx = cast(AfterReasoningCtx, frame.slots[_CTX_SLOT])
+        await run_composition_lifecycle(AFTER_REASONING_PREPROCESS_EVENT, ctx)
         frame.slots[_CTX_SLOT] = await self._bus.emit(ctx)
+        return frame
+
+
+class _RunCompositionAfterReasoningCleanupModule:
+    slot = "after_reasoning.composition_cleanup"
+    requires = ("after_reasoning.emit", _CTX_SLOT)
+    produces = (_CTX_SLOT,)
+
+    async def run(self, frame: AfterReasoningFrame) -> AfterReasoningFrame:
+        ctx = cast(AfterReasoningCtx, frame.slots[_CTX_SLOT])
+        await run_composition_lifecycle(AFTER_REASONING_CLEANUP_EVENT, ctx)
+        return frame
+
+
+class _ImportAssistantAttachmentsModule:
+    slot = "after_reasoning.import_attachments"
+    requires = ("after_reasoning.composition_cleanup", _CTX_SLOT)
+    produces = (_ASSISTANT_ATTACHMENT_REFS_SLOT,)
+
+    def __init__(self, session_services: SessionServices) -> None:
+        self._session_services = session_services
+
+    async def run(self, frame: AfterReasoningFrame) -> AfterReasoningFrame:
+        """Import outbound media before any Session message mutation."""
+
+        # 1. 冻结 Core 与 v3 lifecycle 共同产生的媒体列表。
+        ctx = cast(AfterReasoningCtx, frame.slots[_CTX_SLOT])
+        media = list(ctx.media)
+        _append_media(
+            media,
+            collect_prefixed_slots(frame.slots, _OUTBOUND_MEDIA_PREFIX),
+        )
+        if not media:
+            frame.slots[_ASSISTANT_ATTACHMENT_REFS_SLOT] = ()
+            return frame
+
+        # 2. 先完成 artifact transaction，随后 message binding 才能同批提交。
+        importer = self._session_services.outbound_attachment_importer
+        if importer is None:
+            raise RuntimeError("outbound attachment importer 尚未绑定")
+        refs = await importer.import_media(tuple(media))
+        if any(not isinstance(ref, AttachmentRef) for ref in refs):
+            raise TypeError("outbound attachment importer 返回值无效")
+        frame.slots[_ASSISTANT_ATTACHMENT_REFS_SLOT] = refs
         return frame
 
 
 class _PersistUserMessageModule:
     slot = "after_reasoning.persist_user"
-    requires = ("after_reasoning.emit", _CTX_SLOT)
+    requires = ("after_reasoning.import_attachments", _CTX_SLOT)
     produces = (_PERSISTED_USER_SLOT,)
 
     def __init__(self, session_services: SessionServices) -> None:
@@ -182,7 +274,7 @@ class _PersistUserMessageModule:
         llm_context_frame = ctx.context_retry.get("llm_context_frame")
         if isinstance(llm_context_frame, str) and llm_context_frame.strip():
             user_kwargs["llm_context_frame"] = llm_context_frame
-        shared_user_kwargs = _collect_persist_user_slots(frame.slots)
+        shared_user_kwargs = _collect_persist_user_metadata(ctx)
         control_turn_id = str(msg.metadata.get("control_turn_id") or "")
         persisted_users: list[dict[str, Any]] = []
         for index, turn_input in enumerate(_turn_user_inputs(msg)):
@@ -205,16 +297,27 @@ class _PersistUserMessageModule:
                 value = turn_input.metadata.get(field)
                 if isinstance(value, str) and value:
                     input_kwargs[field] = value
+            attachment_ids = turn_input.metadata.get("attachment_ids")
+            if attachment_ids is not None:
+                if not isinstance(attachment_ids, list) or not all(
+                    isinstance(item, str) and item for item in attachment_ids
+                ):
+                    raise ValueError("turn input attachment_ids 必须是非空字符串数组")
+                input_kwargs["attachment_ids"] = list(attachment_ids)
             display_content = turn_input.metadata.get("display_content")
             persisted_users.append(
-                session.add_message(
+                _pending_message(
                     "user",
                     (
                         display_content
                         if isinstance(display_content, str)
                         else turn_input.content
                     ),
-                    media=list(turn_input.media) if turn_input.media else None,
+                    media=(
+                        None
+                        if attachment_ids is not None
+                        else (list(turn_input.media) if turn_input.media else None)
+                    ),
                     **input_kwargs,
                 )
             )
@@ -224,7 +327,12 @@ class _PersistUserMessageModule:
 
 class _PersistAssistantMessageModule:
     slot = "after_reasoning.persist_asst"
-    requires = ("after_reasoning.persist_user", _CTX_SLOT)
+    requires = (
+        "after_reasoning.persist_user",
+        _CTX_SLOT,
+        _SEALED_ASSISTANT_METADATA_SLOT,
+        _ASSISTANT_ATTACHMENT_REFS_SLOT,
+    )
     produces = (_PERSISTED_ASSISTANT_SLOT,)
 
     async def run(self, frame: AfterReasoningFrame) -> AfterReasoningFrame:
@@ -244,7 +352,9 @@ class _PersistAssistantMessageModule:
             assistant_kwargs["reasoning_content"] = ctx.thinking
         if frame.input.turn_result.model_state is not None:
             assistant_kwargs["model_state"] = frame.input.turn_result.model_state
-        assistant_kwargs.update(_collect_persist_assistant_slots(frame.slots))
+        assistant_kwargs.update(
+            cast(dict[str, object], frame.slots[_SEALED_ASSISTANT_METADATA_SLOT])
+        )
         turn_inputs = _turn_user_inputs(frame.input.state.msg)
         control_turn_id = str(
             frame.input.state.msg.metadata.get("control_turn_id") or ""
@@ -259,15 +369,17 @@ class _PersistAssistantMessageModule:
         ):
             assistant_kwargs["skip_post_memory"] = True
         if frame.input.state.persistence.persist_assistant:
-            media = list(ctx.media)
-            _append_media(
-                media,
-                collect_prefixed_slots(frame.slots, _OUTBOUND_MEDIA_PREFIX),
+            refs = cast(
+                tuple[AttachmentRef, ...],
+                frame.slots[_ASSISTANT_ATTACHMENT_REFS_SLOT],
             )
-            frame.slots[_PERSISTED_ASSISTANT_SLOT] = session.add_message(
+            if refs:
+                assistant_kwargs["attachment_ids"] = [
+                    ref.artifact_id for ref in refs
+                ]
+            frame.slots[_PERSISTED_ASSISTANT_SLOT] = _pending_message(
                 "assistant",
                 ctx.reply,
-                media=media if media else None,
                 **assistant_kwargs,
             )
         return frame
@@ -276,6 +388,7 @@ class _PersistAssistantMessageModule:
 class _UpdateSessionMetadataModule:
     slot = "after_reasoning.update_meta"
     requires = ("after_reasoning.persist_asst", _CTX_SLOT)
+    produces = (_PENDING_SESSION_METADATA_SLOT,)
 
     async def run(self, frame: AfterReasoningFrame) -> AfterReasoningFrame:
         ctx = cast(AfterReasoningCtx, frame.slots[_CTX_SLOT])
@@ -283,8 +396,8 @@ class _UpdateSessionMetadataModule:
         if raw_session is None:
             raise RuntimeError("AfterReasoning requires TurnState.session")
         session = cast("Session", raw_session)
-        update_session_runtime_metadata(
-            session,
+        frame.slots[_PENDING_SESSION_METADATA_SLOT] = build_session_runtime_metadata(
+            session.metadata,
             tools_used=list(ctx.tools_used),
             tool_chain=list(ctx.tool_chain),
         )
@@ -293,7 +406,7 @@ class _UpdateSessionMetadataModule:
 
 class _AppendMessagesModule:
     slot = "after_reasoning.append_messages"
-    requires = ("after_reasoning.update_meta",)
+    requires = ("after_reasoning.update_meta", _PENDING_SESSION_METADATA_SLOT)
 
     def __init__(self, session_services: SessionServices) -> None:
         self._session_services = session_services
@@ -321,6 +434,10 @@ class _AppendMessagesModule:
             await self._session_services.session_manager.append_messages(
                 session,
                 messages,
+                metadata=cast(
+                    dict[str, Any],
+                    frame.slots[_PENDING_SESSION_METADATA_SLOT],
+                ),
             )
         except asyncio.CancelledError:
             _milestone(
@@ -340,6 +457,13 @@ class _AppendMessagesModule:
                 level=logging.ERROR,
             )
             raise
+        attached = {id(message) for message in session.messages}
+        session.messages.extend(
+            message for message in messages if id(message) not in attached
+        )
+        session.metadata = dict(
+            cast(dict[str, Any], frame.slots[_PENDING_SESSION_METADATA_SLOT])
+        )
         _milestone(
             logger,
             "after_reasoning.append.done",
@@ -351,7 +475,11 @@ class _AppendMessagesModule:
 
 class _BuildOutboundMessageModule:
     slot = "after_reasoning.build_outbound"
-    requires = ("after_reasoning.append_messages", _CTX_SLOT)
+    requires = (
+        "after_reasoning.append_messages",
+        _CTX_SLOT,
+        _ASSISTANT_ATTACHMENT_REFS_SLOT,
+    )
     produces = (_OUTBOUND_SLOT,)
 
     async def run(self, frame: AfterReasoningFrame) -> AfterReasoningFrame:
@@ -385,9 +513,9 @@ class _BuildOutboundMessageModule:
                 metadata["client_message_id"] = raw_client_message_id
             elif ctx.channel == "mobile":
                 raise RuntimeError("本轮 mobile user 消息缺少客户端 ID")
-        media = list(ctx.media)
-        _append_media(
-            media, collect_prefixed_slots(frame.slots, _OUTBOUND_MEDIA_PREFIX)
+        attachment_refs = cast(
+            tuple[AttachmentRef, ...],
+            frame.slots[_ASSISTANT_ATTACHMENT_REFS_SLOT],
         )
         session_message_id: str | None = None
         if frame.input.state.persistence.persist_assistant:
@@ -405,7 +533,7 @@ class _BuildOutboundMessageModule:
             chat_id=ctx.chat_id,
             content=ctx.reply,
             thinking=ctx.thinking,
-            media=media,
+            attachment_refs=attachment_refs,
             metadata=metadata,
             session_message_id=session_message_id,
             control_turn_id=running_turn_id.get(),
@@ -454,10 +582,14 @@ def default_after_reasoning_modules(
     session_services: SessionServices,
     plugin_modules: AfterReasoningModules | None = None,
 ) -> AfterReasoningModules:
+    legacy_modules = list(plugin_modules or [])
     builtins: AfterReasoningModules = [
         _BuildAfterReasoningCtxModule(),
         _EmitAfterReasoningCtxModule(bus),
+        _RunCompositionAfterReasoningCleanupModule(),
+        _ImportAssistantAttachmentsModule(session_services),
         _PersistUserMessageModule(session_services),
+        _SealAssistantMetadataModule(),
         _PersistAssistantMessageModule(),
         _UpdateSessionMetadataModule(),
         _AppendMessagesModule(session_services),
@@ -466,33 +598,66 @@ def default_after_reasoning_modules(
     ]
     return cast(
         AfterReasoningModules,
-        topo_sort_modules(builtins + list(plugin_modules or [])),
+        topo_sort_modules(builtins + legacy_modules),
     )
 
 
-def _collect_persist_assistant_slots(slots: dict[str, object]) -> dict[str, object]:
-    retired = {
-        key.removeprefix(_PERSIST_ASSISTANT_PREFIX)
-        for key in slots
-        if key.startswith(_PERSIST_ASSISTANT_PREFIX)
-        and key.removeprefix(_PERSIST_ASSISTANT_PREFIX) in _RETIRED_ASSISTANT_FIELDS
+class _SealAssistantMetadataModule:
+    slot = "after_reasoning.seal_metadata"
+    requires = ("after_reasoning.persist_user", _CTX_SLOT)
+    produces = (_SEALED_ASSISTANT_METADATA_SLOT,)
+
+    async def run(self, frame: AfterReasoningFrame) -> AfterReasoningFrame:
+        ctx = cast(AfterReasoningCtx, frame.slots[_CTX_SLOT])
+        frame.slots[_SEALED_ASSISTANT_METADATA_SLOT] = (
+            _collect_persist_assistant_metadata(ctx)
+        )
+        return frame
+
+
+def _pending_message(
+    role: str,
+    content: str,
+    media: list[str] | None = None,
+    **kwargs: object,
+) -> dict[str, object]:
+    """构造尚未挂入 Session 的 append-only message。"""
+
+    message: dict[str, object] = {
+        "role": role,
+        "content": content,
+        "timestamp": datetime.now(UTC).isoformat(),
+        **kwargs,
     }
-    if retired:
-        fields = ", ".join(sorted(retired))
-        raise ValueError(f"assistant extra 字段已退役: {fields}")
-    return collect_prefixed_slots(
-        slots,
-        _PERSIST_ASSISTANT_PREFIX,
-        reserved=_ASSISTANT_FIXED_FIELDS,
-    )
+    if media:
+        message["media"] = list(media)
+    return message
 
 
-def _collect_persist_user_slots(slots: dict[str, object]) -> dict[str, object]:
-    return collect_prefixed_slots(
-        slots,
-        _PERSIST_USER_PREFIX,
-        reserved=_USER_FIXED_FIELDS,
-    )
+def _collect_persist_assistant_metadata(
+    ctx: AfterReasoningCtx,
+) -> dict[str, object]:
+    """校验并冻结 v3 assistant metadata。"""
+
+    metadata = dict(ctx.persist_assistant_metadata)
+    forbidden = set(metadata) & _ASSISTANT_FORBIDDEN_PLUGIN_FIELDS
+    if forbidden:
+        fields = ", ".join(sorted(forbidden))
+        raise ValueError(f"assistant plugin metadata 字段不可写: {fields}")
+    return metadata
+
+
+def _collect_persist_user_metadata(
+    ctx: AfterReasoningCtx,
+) -> dict[str, object]:
+    """校验并冻结 v3 user metadata。"""
+
+    metadata = dict(ctx.persist_user_metadata)
+    forbidden = set(metadata) & _USER_CORE_METADATA_FIELDS
+    if forbidden:
+        fields = ", ".join(sorted(forbidden))
+        raise ValueError(f"user plugin metadata 字段不可写: {fields}")
+    return metadata
 
 
 def _append_media(target: list[str], exports: dict[str, object]) -> None:

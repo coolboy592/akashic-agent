@@ -5,6 +5,8 @@ from datetime import datetime, timezone
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
+from agent.plugin_composition.channels import AttachmentRef
+
 if TYPE_CHECKING:
     from agent.policies.delegation import SpawnDecision
     from bus.internal_events import SpawnCompletionEvent
@@ -55,7 +57,9 @@ class ChannelMessage:
     chat_id: str
     content: str
     attachments: tuple[ChannelAttachment, ...] = ()
+    attachment_refs: tuple[AttachmentRef, ...] = ()
     thinking: str | None = None
+    reply_to: str | None = None
     metadata: dict[str, object] = field(default_factory=dict[str, object])
     session_message_id: str | None = None
     control_turn_id: str | None = None
@@ -121,6 +125,7 @@ class OutboundMessage:
     thinking: str | None = None
     reply_to: str | None = None
     media: list[str] = field(default_factory=list[str])
+    attachment_refs: tuple[AttachmentRef, ...] = ()
     metadata: dict[str, Any] = field(default_factory=dict[str, Any])
     control_turn_id: str | None = field(default=None, repr=False, compare=False)
     execution_attempt_id: str | None = field(
@@ -155,7 +160,9 @@ def channel_message_from_outbound(
         attachments=tuple(
             ChannelAttachment(media_kind, source) for source in message.media
         ),
+        attachment_refs=message.attachment_refs,
         thinking=message.thinking,
+        reply_to=message.reply_to,
         metadata=dict(message.metadata),
         session_message_id=message.session_message_id,
         control_turn_id=message.control_turn_id,

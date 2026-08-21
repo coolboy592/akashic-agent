@@ -22,6 +22,7 @@ from agent.plugins.mobile_ui import (
 from agent.model_runtime.registry import ModelRegistry
 from agent.model_runtime.session_selection import read_session_model_selection
 from infra.channels.base import AttachmentStore
+from infra.channels.artifacts import ChannelAttachmentArtifactStore
 from infra.channels.web_chat_channel import (
     MAX_UPLOAD_BYTES,
     UploadTooLargeError,
@@ -33,6 +34,7 @@ from infra.mobile_realtime.runtime_inspection import (
     RuntimeInspectionService,
 )
 from infra.mobile_realtime.storage import PairingStateError
+from session.store import SessionStore
 
 if TYPE_CHECKING:
     from infra.mobile_realtime.gateway import MobilePairingAdmin
@@ -71,6 +73,17 @@ def create_chat_app(
     model_registry: ModelRegistry | None = None,
 ) -> FastAPI:
     channel.bind_attachment_store(AttachmentStore(workspace / "uploads"))
+    channel_context = channel._ctx
+    if channel.artifact_store is None and channel_context is not None:
+        session_store = channel_context.session_manager.control_store
+        if isinstance(session_store, SessionStore):
+            channel.bind_artifact_store(
+                ChannelAttachmentArtifactStore(
+                    workspace=workspace,
+                    session_store=session_store,
+                    max_import_bytes=MAX_UPLOAD_BYTES,
+                )
+            )
     app = FastAPI(title="Akashic Chat API")
     app.state.workspace = workspace
     app.state.channel = channel
@@ -254,6 +267,7 @@ def create_chat_app(
             page_size=page_size,
             before_seq=before_seq,
         )
+        _project_message_attachments(channel, items)
         next_before_seq = items[0]["seq"] if items and has_more else None
         return {
             "items": items,
@@ -270,7 +284,7 @@ def create_chat_app(
     async def upload_file(
         request: Request,
         filename: str = Query(default="upload.bin"),
-    ) -> dict[str, str]:
+    ) -> dict[str, object]:
         declared_length = request.headers.get("content-length")
         if declared_length is not None:
             try:
@@ -292,6 +306,23 @@ def create_chat_app(
             raise HTTPException(status_code=413, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/api/chat/artifacts/{artifact_id}")
+    async def read_artifact(artifact_id: str) -> Response:
+        try:
+            data, media_type, filename = await channel.read_artifact(artifact_id)
+        except (RuntimeError, ValueError) as error:
+            raise HTTPException(status_code=404, detail="附件不存在") from error
+        headers: dict[str, str] = {}
+        if filename:
+            safe_filename = Path(filename).name.replace('"', "").replace("\r", "").replace("\n", "")
+            if safe_filename:
+                headers["Content-Disposition"] = f'inline; filename="{safe_filename}"'
+        return Response(
+            content=data,
+            media_type=media_type or "application/octet-stream",
+            headers=headers,
+        )
 
     @app.get("/api/chat/media")
     def read_media(path: str = Query(...)) -> FileResponse:
@@ -329,6 +360,35 @@ def create_chat_app(
                 raise HTTPException(status_code=409, detail=str(error)) from error
 
     return app
+
+
+def _project_message_attachments(
+    channel: WebChatChannel,
+    items: list[dict[str, Any]],
+) -> None:
+    """把 durable message artifact identity 投影为不含路径的 Web descriptor。"""
+
+    # 1. Only messages with durable bindings require the Core artifact owner.
+    for item in items:
+        raw_ids = item.get("attachment_ids")
+        if raw_ids is None:
+            continue
+        if not isinstance(raw_ids, list) or not all(
+            isinstance(artifact_id, str) and artifact_id for artifact_id in raw_ids
+        ):
+            raise RuntimeError("chat message attachment_ids 投影无效")
+        store = channel.artifact_store
+        if store is None:
+            raise RuntimeError("Web artifact store 尚未绑定")
+
+        # 2. Preserve durable order and expose no filesystem path.
+        artifact_ids = tuple(raw_ids)
+        refs = store.resolve_refs(artifact_ids)
+        if tuple(ref.artifact_id for ref in refs) != artifact_ids:
+            raise RuntimeError("chat message attachment_ids 无法 exact resolve")
+        item["attachments"] = [
+            channel.artifact_descriptor(ref) for ref in refs
+        ]
 
 
 def build_chat_server(

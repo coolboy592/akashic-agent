@@ -1,4 +1,6 @@
 from __future__ import annotations
+
+import inspect
 from typing import Any, cast
 
 from types import SimpleNamespace
@@ -13,16 +15,27 @@ from plugins.default_proactive.runtime import (
     ProactiveFlowDeps,
     ProactiveFlowRuntime,
 )
-from plugins.default_proactive.plugin import DefaultRuntimeFactory, DefaultModuleFactory
-from plugins.drift_flow.plugin import DriftModuleFactory
-from plugins.proactive_flow.plugin import ProactiveModuleFactory
 from plugins.proactive_flow.prompt import ProactivePromptBuilder
 from core.memory.markdown import MemoryProfileApi
 from proactive_v2.config import ProactiveConfig
 from plugins.default_proactive.context import AgentTickContext
 from plugins.default_proactive.gateway import GatewayDeps, GatewayResult
-from proactive_v2.lifecycle import ProactiveLifecycleSpec
 from plugins.proactive_flow.tools import ToolDeps
+from agent.plugins.generation_activity_host import ActivityHost
+from proactive_v2.loop import ProactiveLoop
+
+
+def test_proactive_bootstrap_hides_generic_v2_projection_abi() -> None:
+    removed = {
+        "proactive_modules",
+        "proactive_lifecycles",
+        "proactive_module_factories",
+        "proactive_runtime_factories",
+        "proactive_sources",
+    }
+
+    assert removed.isdisjoint(inspect.signature(build_proactive_runtime).parameters)
+    assert removed.isdisjoint(inspect.signature(ProactiveLoop).parameters)
 
 
 def test_build_proactive_runtime_accepts_facade_memory(tmp_path):
@@ -48,25 +61,13 @@ def test_build_proactive_runtime_accepts_facade_memory(tmp_path):
         memory_store=facade,
         presence=cast(Any, SimpleNamespace()),
         agent_loop=cast(Any, SimpleNamespace(processing_state=None)),
-        proactive_lifecycles=[
-            ProactiveLifecycleSpec(
-                id="default",
-                terminal_slots=("run:next_wakeup",),
-            )
-        ],
-        proactive_module_factories=[
-            DefaultModuleFactory(),
-            ProactiveModuleFactory(),
-            DriftModuleFactory(),
-        ],
-        proactive_runtime_factories=[DefaultRuntimeFactory()],
+        runtime_snapshot_store=cast(Any, object()),
+        activity_host=cast(Any, ActivityHost(())),
     )
 
     assert loop is not None
     assert loop._memory is facade
-    phases = loop._proactive_kernel.inspect()
-    assert "proactive.source.collect" in phases
-    assert "default.source.poll" not in phases
+    assert not hasattr(loop, "_proactive_kernel")
     for task in tasks:
         close = getattr(task, "close", None)
         if callable(close):

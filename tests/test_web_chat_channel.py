@@ -7,27 +7,39 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
+from fastapi import WebSocket
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketState
 
 from bootstrap.chat_api import create_chat_app
-from bus.events import OutboundMessage
+from agent.plugin_composition.channels import (
+    AttachmentKind as V3AttachmentKind,
+    AttachmentRef,
+    ChannelRuntimePorts,
+    ChannelFactoryContext,
+    DeliveryStatus as V3DeliveryStatus,
+    InboundEnvelope,
+    InboundOwner,
+    ProviderDeliveryRequest,
+    RawInbound,
+)
+from agent.plugins.manager import PluginManager
+from bus.events import AttachmentKind, ChannelAttachment, ChannelMessage
+from bus.event_bus import EventBus
 from bus.events_lifecycle import StreamDeltaReady, TurnOutputCompleted, TurnStarted
+from bus.queue import MessageBus
 from infra.channels.base import AttachmentStore
 from infra.channels.web_chat_channel import UploadTooLargeError, WebChatChannel
-from session.manager import Session
+from bootstrap.core_channel_adapter import build_core_channel_definition
+from session.manager import Session, SessionManager
 
 
 class _Bus:
     def __init__(self) -> None:
         self.inbound: list[Any] = []
-        self.subscribers: dict[str, Any] = {}
 
     async def publish_inbound(self, msg: Any) -> None:
         self.inbound.append(msg)
-
-    def subscribe_outbound(self, channel: str, callback: Any) -> None:
-        self.subscribers[channel] = callback
 
 
 class _EventBus:
@@ -39,11 +51,7 @@ class _EventBus:
 
 
 class _PushTool:
-    def __init__(self) -> None:
-        self.registered: dict[str, Any] = {}
-
-    def register_channel(self, channel: str, **senders: Any) -> None:
-        self.registered[channel] = senders
+    pass
 
 
 class _WebSocket:
@@ -53,6 +61,109 @@ class _WebSocket:
 
     async def send_json(self, frame: dict[str, Any]) -> None:
         self.frames.append(frame)
+
+
+class _FailingWebSocket(_WebSocket):
+    async def send_json(self, frame: dict[str, Any]) -> None:
+        _ = frame
+        raise OSError("socket closed")
+
+
+class _ProviderClientFactory:
+    async def create(self, credentials: Any) -> Any:
+        _ = credentials
+        raise AssertionError("Web native adapter 不应创建 provider client")
+
+    async def aclose(self) -> None:
+        return None
+
+
+class _AttachmentLease:
+    def __init__(self, ref: AttachmentRef) -> None:
+        self.ref = ref
+        self.closed = False
+
+    async def read_bytes(self, *, max_bytes: int) -> bytes:
+        _ = max_bytes
+        return b"artifact"
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+class _AttachmentRead:
+    def __init__(self) -> None:
+        self.leases: list[_AttachmentLease] = []
+
+    async def acquire(self, ref: AttachmentRef) -> _AttachmentLease:
+        lease = _AttachmentLease(ref)
+        self.leases.append(lease)
+        return lease
+
+
+class _Inbound:
+    def __init__(self, *, block: bool = False) -> None:
+        self.messages: list[RawInbound] = []
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        if not block:
+            self.release.set()
+
+    async def admit(self, raw: RawInbound) -> bool:
+        self.messages.append(raw)
+        self.started.set()
+        await self.release.wait()
+        return True
+
+
+def _v3_context(
+    read: _AttachmentRead | None = None,
+    *,
+    ingress: _Inbound | None = None,
+) -> ChannelFactoryContext:
+    return ChannelFactoryContext(
+        snapshot_id="snapshot-1",
+        generation_id="generation-1",
+        binding_token="binding-1",
+        config={},
+        credentials={},
+        provider_client_factory=cast(Any, _ProviderClientFactory()),
+        ingress=cast(Any, ingress),
+        identity=None,
+        attachment_read=cast(Any, read),
+    )
+
+
+async def _open_inbound_adapter(
+    channel: WebChatChannel,
+    ingress: _Inbound,
+    *,
+    read: _AttachmentRead | None = None,
+    binding_token: str = "binding-1",
+) -> Any:
+    context = ChannelFactoryContext(
+        snapshot_id="snapshot-1",
+        generation_id="generation-1",
+        binding_token=binding_token,
+        config={},
+        credentials={},
+        provider_client_factory=cast(Any, _ProviderClientFactory()),
+        ingress=cast(Any, ingress),
+        identity=None,
+        attachment_read=cast(Any, read),
+    )
+    adapter = channel.build_v3_adapter(context)
+    await adapter.start()
+    adapter.attach_runtime(ChannelRuntimePorts(
+        snapshot_id=context.snapshot_id,
+        generation_id=context.generation_id,
+        binding_token=context.binding_token,
+        ingress=cast(Any, ingress),
+        identity=None,
+        attachment_import=None,
+    ))
+    adapter.open_admission()
+    return adapter
 
 
 class _SessionManager:
@@ -88,7 +199,10 @@ class _SessionStore:
     def list_sessions_for_dashboard(self, **_: Any) -> tuple[list[dict[str, Any]], int]:
         return [], 0
 
-    def list_chat_history_page(self, **kwargs: Any) -> tuple[list[dict[str, Any]], int, bool]:
+    def list_chat_history_page(
+        self,
+        **kwargs: Any,
+    ) -> tuple[list[dict[str, Any]], int, bool]:
         self.calls.append(kwargs)
         return [
             {"id": "m0", "seq": 8, "role": "user", "content": "用户问题"},
@@ -152,8 +266,10 @@ class _PluginUiProvider:
 @pytest.mark.asyncio
 async def test_web_chat_session_and_message_flow(tmp_path: Path) -> None:
     bus = _Bus()
+    ingress = _Inbound()
     session_manager = _SessionManager()
     channel = WebChatChannel()
+    adapter = await _open_inbound_adapter(channel, ingress)
     await channel.start(cast(Any, SimpleNamespace(
         bus=bus,
         session_manager=session_manager,
@@ -182,10 +298,14 @@ async def test_web_chat_session_and_message_flow(tmp_path: Path) -> None:
     assert created["type"] == "session.created"
     assert str(session_id).startswith("web:")
     assert session_manager.saved == []
-    assert len(bus.inbound) == 1
-    assert bus.inbound[0].content == "你好"
-    assert bus.inbound[0].session_key == session_id
-    assert bus.inbound[0].metadata["model_runtime_id"] == "runtime-b"
+    assert bus.inbound == []
+    assert len(ingress.messages) == 1
+    inbound = ingress.messages[0]
+    assert inbound.message.content == "你好"
+    assert inbound.message.chat_id == session_id.removeprefix("web:")
+    assert inbound.message.metadata["model_runtime_id"] == "runtime-b"
+    assert inbound.message.attachments == ()
+    await adapter.stop()
 
 
 def test_chat_model_catalog_reports_session_override(tmp_path: Path) -> None:
@@ -309,8 +429,10 @@ def test_web_plugin_ui_exposes_shared_slots_but_rejects_dashboard_query(
 @pytest.mark.asyncio
 async def test_web_chat_message_send_can_create_session_without_persisting_empty_one(tmp_path: Path) -> None:
     bus = _Bus()
+    ingress = _Inbound()
     session_manager = _SessionManager()
     channel = WebChatChannel()
+    adapter = await _open_inbound_adapter(channel, ingress)
     await channel.start(cast(Any, SimpleNamespace(
         bus=bus,
         session_manager=session_manager,
@@ -331,14 +453,17 @@ async def test_web_chat_message_send_can_create_session_without_persisting_empty
             })
 
     assert session_manager.saved == []
-    assert len(bus.inbound) == 1
-    assert bus.inbound[0].content == "你好"
-    assert str(bus.inbound[0].session_key).startswith("web:")
+    assert bus.inbound == []
+    assert len(ingress.messages) == 1
+    assert ingress.messages[0].message.content == "你好"
+    assert ingress.messages[0].message.chat_id
+    await adapter.stop()
 
 
 @pytest.mark.asyncio
 async def test_web_chat_message_send_resolves_canonical_reply(tmp_path: Path) -> None:
     bus = _Bus()
+    ingress = _Inbound()
     session_manager = _SessionManager()
     session_manager._store.messages["m1"] = {
         "id": "m1",
@@ -347,6 +472,7 @@ async def test_web_chat_message_send_resolves_canonical_reply(tmp_path: Path) ->
         "content": "先前回答",
     }
     channel = WebChatChannel()
+    adapter = await _open_inbound_adapter(channel, ingress)
     await channel.start(cast(Any, SimpleNamespace(
         bus=bus,
         session_manager=session_manager,
@@ -368,8 +494,9 @@ async def test_web_chat_message_send_resolves_canonical_reply(tmp_path: Path) ->
                 "reply_to_message_id": "m1",
             })
 
-    assert len(bus.inbound) == 1
-    inbound = bus.inbound[0]
+    assert bus.inbound == []
+    assert len(ingress.messages) == 1
+    inbound = ingress.messages[0].message
     assert "先前回答" in inbound.content
     assert "继续说明" in inbound.content
     assert inbound.metadata == {
@@ -379,6 +506,7 @@ async def test_web_chat_message_send_resolves_canonical_reply(tmp_path: Path) ->
         "reply_role": "assistant",
         "reply_preview": "先前回答",
     }
+    await adapter.stop()
 
 
 @pytest.mark.asyncio
@@ -497,8 +625,10 @@ def test_chat_runtime_routes_share_read_only_inspection_projection(
 @pytest.mark.asyncio
 async def test_web_chat_rejects_malformed_fields_without_closing_connection(tmp_path: Path) -> None:
     bus = _Bus()
+    ingress = _Inbound()
     session_manager = _SessionManager()
     channel = WebChatChannel()
+    adapter = await _open_inbound_adapter(channel, ingress)
     await channel.start(cast(Any, SimpleNamespace(
         bus=bus,
         session_manager=session_manager,
@@ -558,8 +688,10 @@ async def test_web_chat_rejects_malformed_fields_without_closing_connection(tmp_
                 "media": [],
             })
 
-    assert len(bus.inbound) == 1
-    assert bus.inbound[0].content == "继续"
+    assert bus.inbound == []
+    assert len(ingress.messages) == 1
+    assert ingress.messages[0].message.content == "继续"
+    await adapter.stop()
 
 
 def test_chat_upload_returns_local_path(tmp_path: Path) -> None:
@@ -680,6 +812,61 @@ def test_chat_messages_default_to_latest_turn_order(tmp_path: Path) -> None:
     }
 
 
+def test_chat_messages_project_durable_artifacts_without_paths(tmp_path: Path) -> None:
+    ref = AttachmentRef(
+        artifact_id="artifact-history",
+        kind=V3AttachmentKind.IMAGE,
+        filename="001.png",
+        media_type="image/png",
+        size_bytes=3,
+        sha256="a" * 64,
+    )
+
+    class _ArtifactStore:
+        def resolve_refs(
+            self,
+            artifact_ids: tuple[str, ...],
+        ) -> tuple[AttachmentRef, ...]:
+            assert artifact_ids == (ref.artifact_id,)
+            return (ref,)
+
+    channel = WebChatChannel()
+    session_manager = _SessionManager()
+    session_manager._store.list_chat_history_page = lambda **_kwargs: (
+        [
+            {"id": "m0", "seq": 0, "role": "user", "content": "问题"},
+            {
+                "id": "m1",
+                "seq": 1,
+                "role": "assistant",
+                "content": "答复",
+                "attachment_ids": [ref.artifact_id],
+            },
+        ],
+        2,
+        False,
+    )
+    channel._ctx = cast(Any, SimpleNamespace(session_manager=session_manager))
+    channel._artifact_store = cast(Any, _ArtifactStore())
+    app = create_chat_app(workspace=tmp_path, channel=channel)
+
+    with TestClient(app) as client:
+        payload = client.get("/api/chat/sessions/web:abc/messages").json()
+
+    assistant = payload["items"][1]
+    assert assistant["attachment_ids"] == [ref.artifact_id]
+    assert assistant["attachments"] == [{
+        "artifact_id": ref.artifact_id,
+        "kind": "image",
+        "filename": "001.png",
+        "media_type": "image/png",
+        "size_bytes": 3,
+        "sha256": "a" * 64,
+        "url": f"/api/chat/artifacts/{ref.artifact_id}",
+    }]
+    assert "/sandbox/" not in str(assistant)
+
+
 @pytest.mark.asyncio
 async def test_web_message_push_image_only_broadcasts_realtime_frame(tmp_path: Path) -> None:
     session_manager = _SessionManager()
@@ -710,16 +897,21 @@ async def test_web_final_preserves_full_outbound_projection(tmp_path: Path) -> N
     image = tmp_path / "result.png"
     image.write_bytes(b"image")
 
-    await channel._on_response(
-        OutboundMessage(
+    receipt = await channel._deliver_message(
+        ChannelMessage(
             channel="web",
             chat_id="abc",
             content="answer",
             thinking="reasoning",
-            media=[str(image)],
-            metadata={"render": "card", "turn_duration_ms": 17},
+            attachments=(ChannelAttachment(AttachmentKind.IMAGE, str(image)),),
+            metadata={
+                "render": "card",
+                "turn_duration_ms": 17,
+                "_channel_commit_role": "passive",
+            },
         )
     )
+    assert receipt.succeeded
 
     assert socket.frames == [
         {
@@ -734,6 +926,134 @@ async def test_web_final_preserves_full_outbound_projection(tmp_path: Path) -> N
         }
     ]
     assert channel.has_media(image)
+
+
+@pytest.mark.asyncio
+async def test_web_v3_native_delivery_projects_opaque_artifacts_and_semantics() -> None:
+    channel = WebChatChannel()
+    socket = _WebSocket()
+    channel._connections["web:abc"] = {cast(Any, socket)}
+    read = _AttachmentRead()
+    ref = AttachmentRef(
+        artifact_id="artifact-1",
+        kind=V3AttachmentKind.IMAGE,
+        filename="meme.png",
+        media_type="image/png",
+        size_bytes=7,
+        sha256="a" * 64,
+    )
+    adapter = channel.build_v3_adapter(_v3_context(read))
+    ready = await adapter.start()
+    receipt = await adapter.deliver(
+        ProviderDeliveryRequest(
+            binding_token=ready.binding_token,
+            delivery_id="delivery-1",
+            recipient="abc",
+            body="answer",
+            attachments=(ref,),
+            metadata=cast(Any, {
+                "turn_duration_ms": 17,
+                "render": {"kind": "card", "citations": ["mem_1"]},
+            }),
+            thinking="reasoning",
+            reply_to="user-1",
+            session_message_id="assistant-1",
+            control_turn_id="turn-1",
+            execution_attempt_id="attempt-1",
+        )
+    )
+
+    assert receipt.status is V3DeliveryStatus.DELIVERED
+    assert read.leases[0].closed is True
+    assert socket.frames == [{
+        "type": "message.final",
+        "session_id": "web:abc",
+        "turn_id": "turn-1",
+        "content": "answer",
+        "thinking": "reasoning",
+        "media": [{
+            "artifact_id": "artifact-1",
+            "kind": "image",
+            "filename": "meme.png",
+            "media_type": "image/png",
+            "size_bytes": 7,
+            "sha256": "a" * 64,
+            "url": "/api/chat/artifacts/artifact-1",
+        }],
+        "metadata": {
+            "turn_duration_ms": 17,
+            "render": {"kind": "card", "citations": ["mem_1"]},
+            "source": "message_push",
+        },
+        "reply_to": "user-1",
+        "session_message_id": "assistant-1",
+        "control_turn_id": "turn-1",
+        "execution_attempt_id": "attempt-1",
+        "duration_ms": 17,
+    }]
+
+
+@pytest.mark.asyncio
+async def test_web_v3_native_delivery_rejects_without_socket() -> None:
+    channel = WebChatChannel()
+    adapter = channel.build_v3_adapter(_v3_context())
+    await adapter.start()
+    receipt = await adapter.deliver(
+        ProviderDeliveryRequest(
+            binding_token="binding-1",
+            delivery_id="delivery-1",
+            recipient="missing",
+            body="answer",
+        )
+    )
+
+    assert receipt.status is V3DeliveryStatus.REJECTED
+    assert receipt.error == "Web 会话没有可用连接"
+
+
+@pytest.mark.asyncio
+async def test_web_v3_terminal_without_socket_refills_after_session_attach() -> None:
+    channel = WebChatChannel()
+    adapter = channel.build_v3_adapter(_v3_context())
+    await adapter.start()
+
+    receipt = await adapter.deliver(
+        ProviderDeliveryRequest(
+            binding_token="binding-1",
+            delivery_id="delivery-1",
+            recipient="abc",
+            body="answer",
+            metadata=cast(Any, {
+                "turn_duration_ms": None,
+                "nested": {"ids": ["mem_1"]},
+            }),
+            control_turn_id="turn-1",
+        )
+    )
+    socket = _WebSocket()
+    await channel._attach_session(
+        cast(Any, socket),
+        "attach-1",
+        {"session_id": "web:abc"},
+    )
+
+    assert receipt.status is V3DeliveryStatus.DELIVERED
+    assert socket.frames == [{
+        "type": "message.final",
+        "session_id": "web:abc",
+        "turn_id": "turn-1",
+        "content": "answer",
+        "thinking": "",
+        "media": [],
+        "metadata": {
+            "turn_duration_ms": None,
+            "nested": {"ids": ["mem_1"]},
+            "source": "message_push",
+        },
+        "control_turn_id": "turn-1",
+    }]
+    assert "duration_ms" not in socket.frames[0]
+    assert "web:abc" not in channel._pending_terminal
 
 
 @pytest.mark.asyncio
@@ -766,23 +1086,15 @@ async def test_web_turn_lifecycle_projects_server_owned_turn_id() -> None:
         turn_id="attempt-1",
         client_message_id="client-1",
     ))
-    await channel._on_response(OutboundMessage(
-        channel="web",
-        chat_id="abc",
-        content="answer",
-        control_turn_id="turn:server-owner",
-    ))
 
     assert [frame["type"] for frame in socket.frames] == [
         "turn.started",
         "answer.delta",
         "turn.output.completed",
-        "message.final",
     ]
     assert {frame["turn_id"] for frame in socket.frames} == {
         "turn:server-owner"
     }
-    assert "web:abc" not in channel._active_turn_ids
 
 
 @pytest.mark.asyncio
@@ -800,71 +1112,472 @@ async def test_web_turn_started_rejects_missing_server_turn_id() -> None:
 
 
 @pytest.mark.asyncio
-async def test_web_final_without_socket_caches_terminal_for_refill() -> None:
+async def test_web_v3_native_delivery_marks_socket_failure_unknown() -> None:
     channel = WebChatChannel()
-    channel._active_turn_ids["web:abc"] = "turn-1"
-    await channel._on_response(
-        OutboundMessage(
-            channel="web",
-            chat_id="abc",
-            content="answer",
-            thinking="reasoning",
-            media=[],
-            metadata={},
-            control_turn_id="turn-1",
+    channel._connections["web:abc"] = {cast(Any, _FailingWebSocket())}
+    adapter = channel.build_v3_adapter(_v3_context())
+    await adapter.start()
+    receipt = await adapter.deliver(
+        ProviderDeliveryRequest(
+            binding_token="binding-1",
+            delivery_id="delivery-1",
+            recipient="abc",
+            body="answer",
         )
     )
 
-    cached = channel._pending_terminal["web:abc"]
-    assert cached["turn_id"] == "turn-1"
-    assert cached["content"] == "answer"
+    assert receipt.status is V3DeliveryStatus.UNKNOWN
 
 
 @pytest.mark.asyncio
-async def test_web_attach_refills_cached_terminal() -> None:
+async def test_web_v3_native_delivery_marks_partial_broadcast_unknown() -> None:
     channel = WebChatChannel()
-    channel._active_turn_ids["web:abc"] = "turn-1"
-    await channel._on_response(
-        OutboundMessage(
-            channel="web",
-            chat_id="abc",
-            content="answer",
-            thinking="reasoning",
-            media=[],
-            metadata={},
-            control_turn_id="turn-1",
+    delivered_socket = _WebSocket()
+    channel._connections["web:abc"] = {
+        cast(Any, delivered_socket),
+        cast(Any, _FailingWebSocket()),
+    }
+    adapter = channel.build_v3_adapter(_v3_context())
+    await adapter.start()
+    receipt = await adapter.deliver(
+        ProviderDeliveryRequest(
+            binding_token="binding-1",
+            delivery_id="delivery-1",
+            recipient="abc",
+            body="answer",
         )
     )
-    assert "web:abc" in channel._pending_terminal
 
-    socket = _WebSocket()
-    await channel._attach_session(cast(Any, socket), "req-1", {"session_id": "web:abc"})
-
-    assert socket.frames == [{
-        "type": "message.final",
-        "session_id": "web:abc",
-        "turn_id": "turn-1",
-        "content": "answer",
-        "thinking": "reasoning",
-        "media": [],
-        "metadata": {},
-    }]
-    assert "web:abc" not in channel._pending_terminal
+    assert receipt.status is V3DeliveryStatus.UNKNOWN
+    assert len(delivered_socket.frames) == 1
 
 
 @pytest.mark.asyncio
-async def test_web_final_without_turn_is_not_cached() -> None:
+async def test_web_artifact_api_returns_opaque_upload_and_bounded_readback(
+    tmp_path: Path,
+) -> None:
+    session_manager = SessionManager(tmp_path)
+    bus = _Bus()
+    ingress = _Inbound()
     channel = WebChatChannel()
-    with pytest.raises(RuntimeError, match="缺少 Server 权威 active turn"):
-        await channel._on_response(
-            OutboundMessage(
-                channel="web",
-                chat_id="abc",
-                content="（消息发送失败，请稍后重试）",
-                thinking="",
-                media=[],
-                metadata={},
+    adapter = await _open_inbound_adapter(channel, ingress)
+    await channel.start(cast(Any, SimpleNamespace(
+        bus=bus,
+        session_manager=session_manager,
+        event_bus=_EventBus(),
+        push_tool=_PushTool(),
+        attachment_store=AttachmentStore(tmp_path / "uploads"),
+        interrupt_controller=None,
+    )))
+    app = create_chat_app(workspace=tmp_path, channel=channel)
+
+    with TestClient(app) as client:
+        upload = client.post(
+            "/api/chat/uploads",
+            params={"filename": "meme.png"},
+            content=b"image",
+        )
+        payload = upload.json()
+        assert upload.status_code == 200
+        assert payload["filename"] == "meme.png"
+        assert payload["kind"] == "image"
+        assert payload["artifact_id"]
+        assert "upload_path" not in payload
+        assert all(str(tmp_path) not in str(value) for value in payload.values())
+
+        readback = client.get(payload["upload_url"])
+        traversal = client.get("/api/chat/artifacts/../sessions.db")
+        with client.websocket_connect("/ws") as ws:
+            ws.send_json({"type": "session.create", "request_id": "create"})
+            session_id = ws.receive_json()["session_id"]
+            ws.send_json({
+                "type": "message.send",
+                "request_id": "send",
+                "session_id": session_id,
+                "text": "请查看附件",
+                "media": [payload["artifact_id"]],
+            })
+
+    assert readback.status_code == 200
+    assert readback.content == b"image"
+    assert traversal.status_code in {404, 405}
+    assert bus.inbound == []
+    assert len(ingress.messages) == 1
+    inbound = ingress.messages[0].message
+    assert inbound.attachments[0].artifact_id == payload["artifact_id"]
+    assert inbound.metadata == {"client_request_id": "send"}
+    await adapter.stop()
+
+
+@pytest.mark.asyncio
+async def test_web_v3_adapter_stop_closes_binding_without_stopping_provider() -> None:
+    channel = WebChatChannel()
+    adapter = channel.build_v3_adapter(_v3_context())
+    ready = await adapter.start()
+    receipt = await adapter.stop()
+
+    assert receipt.binding_token == ready.binding_token
+    assert receipt.resources_closed is True
+    with pytest.raises(RuntimeError, match="尚未 start"):
+        await adapter.deliver(
+            ProviderDeliveryRequest(
+                binding_token=ready.binding_token,
+                delivery_id="delivery-after-stop",
+                recipient="abc",
+                body="answer",
             )
         )
 
-    assert "web:abc" not in channel._pending_terminal
+
+@pytest.mark.asyncio
+async def test_web_v3_closed_admission_rejects_message_without_legacy_bus_call(
+    tmp_path: Path,
+) -> None:
+    bus = _Bus()
+    ingress = _Inbound()
+    channel = WebChatChannel()
+    await channel.start(cast(Any, SimpleNamespace(
+        bus=bus,
+        session_manager=_SessionManager(),
+        event_bus=_EventBus(),
+        push_tool=_PushTool(),
+        attachment_store=AttachmentStore(tmp_path / "uploads"),
+        interrupt_controller=None,
+    )))
+    socket = _WebSocket()
+    channel._connections["web:abc"] = {cast(Any, socket)}
+    adapter = await _open_inbound_adapter(channel, ingress)
+    adapter.close_admission()
+
+    await channel._send_user_message(
+        cast(Any, socket),
+        "closed-1",
+        {"session_id": "web:abc", "text": "拒绝", "media": []},
+    )
+
+    assert bus.inbound == []
+    assert ingress.messages == []
+    assert socket.frames[-1] == {
+        "type": "error",
+        "request_id": "closed-1",
+        "message": "Web v3 ingress admission 已关闭",
+    }
+    await adapter.stop()
+
+
+@pytest.mark.asyncio
+async def test_web_v3_adapter_stop_drains_old_callback_before_unregistering(
+    tmp_path: Path,
+) -> None:
+    ingress = _Inbound(block=True)
+    channel = WebChatChannel()
+    await channel.start(cast(Any, SimpleNamespace(
+        bus=_Bus(),
+        session_manager=_SessionManager(),
+        event_bus=_EventBus(),
+        push_tool=_PushTool(),
+        attachment_store=AttachmentStore(tmp_path / "uploads"),
+        interrupt_controller=None,
+    )))
+    old = await _open_inbound_adapter(channel, ingress, binding_token="old-binding")
+    socket = _WebSocket()
+    channel._connections["web:abc"] = {cast(Any, socket)}
+
+    send_task = asyncio.create_task(channel._send_user_message(
+        cast(Any, socket),
+        "old-message",
+        {"session_id": "web:abc", "text": "旧 binding", "media": []},
+    ))
+    await ingress.started.wait()
+    stop_task = asyncio.create_task(old.stop())
+    await asyncio.sleep(0)
+    assert not stop_task.done()
+    ingress.release.set()
+    await asyncio.gather(send_task, stop_task)
+    assert old.binding_token not in channel._v3_adapters
+
+
+@pytest.mark.asyncio
+async def test_web_v3_old_inflight_callback_cannot_enter_new_binding(
+    tmp_path: Path,
+) -> None:
+    old_ingress = _Inbound(block=True)
+    new_ingress = _Inbound()
+    channel = WebChatChannel()
+    await channel.start(cast(Any, SimpleNamespace(
+        bus=_Bus(),
+        session_manager=_SessionManager(),
+        event_bus=_EventBus(),
+        push_tool=_PushTool(),
+        attachment_store=AttachmentStore(tmp_path / "uploads"),
+        interrupt_controller=None,
+    )))
+    old = await _open_inbound_adapter(
+        channel,
+        old_ingress,
+        binding_token="old-binding",
+    )
+    socket = _WebSocket()
+    channel._connections["web:abc"] = {cast(Any, socket)}
+    add_started = asyncio.Event()
+    add_release = asyncio.Event()
+    original_add_connection = channel._add_connection
+
+    async def block_add_connection(session_key: str, connection: WebSocket) -> None:
+        add_started.set()
+        await add_release.wait()
+        await original_add_connection(session_key, connection)
+
+    channel._add_connection = block_add_connection  # type: ignore[method-assign]
+    send_task = asyncio.create_task(channel._send_user_message(
+        cast(Any, socket),
+        "old-message",
+        {"session_id": "web:abc", "text": "旧消息", "media": []},
+    ))
+    await add_started.wait()
+
+    old.close_admission()
+    stop_task = asyncio.create_task(old.stop())
+    await asyncio.sleep(0)
+    new = await _open_inbound_adapter(
+        channel,
+        new_ingress,
+        binding_token="new-binding",
+    )
+    add_release.set()
+    await old_ingress.started.wait()
+    assert new_ingress.messages == []
+    old_ingress.release.set()
+    await asyncio.gather(send_task, stop_task)
+    assert [item.message.content for item in old_ingress.messages] == ["旧消息"]
+    assert new_ingress.messages == []
+    await new.stop()
+
+
+@pytest.mark.asyncio
+async def test_web_bus_closed_rolls_back_identity_session_and_connection(
+    tmp_path: Path,
+) -> None:
+    session_manager = SessionManager(tmp_path / "workspace")
+    manager = PluginManager(
+        plugin_dirs=[tmp_path / "plugins"],
+        event_bus=EventBus(),
+        workspace=tmp_path / "workspace",
+        session_manager=session_manager,
+        installed_cache_root=tmp_path / "cache",
+    )
+    bus = MessageBus()
+    channel = WebChatChannel()
+    await channel.start(cast(Any, SimpleNamespace(
+        bus=bus,
+        session_manager=session_manager,
+        event_bus=EventBus(),
+        push_tool=_PushTool(),
+        attachment_store=AttachmentStore(tmp_path / "uploads"),
+        interrupt_controller=None,
+    )))
+    manager.channel_generation_host.bind_inbound_publisher(bus.publish_channel_inbound)
+    await manager.bind_core_channel_definitions(
+        (build_core_channel_definition(channel),)
+    )
+    adapter = tuple(channel._v3_adapters.values())[0]
+    existing = session_manager.get_or_create("web:existing")
+    existing.metadata["marker"] = "before"
+    session_manager.save(existing)
+    existing_before = session_manager.control_store.get_session_meta("web:existing")
+    existing_socket = _WebSocket()
+    assert await channel._add_connection(
+        "web:existing",
+        cast(Any, existing_socket),
+    ) is True
+    await bus.aclose()
+    try:
+        socket = _WebSocket()
+        with pytest.raises(RuntimeError, match="message bus 已关闭"):
+            await channel._send_user_message(
+                cast(Any, socket),
+                "closed-bus",
+                {"session_id": "web:abc", "text": "hello", "media": []},
+            )
+
+        assert session_manager.get_channel_identities("web") == {}
+        assert session_manager.control_store.get_session_meta("web:abc") is None
+        assert session_manager.channel_identity_migration_completed("web") is True
+        assert "web:abc" not in session_manager._cache
+        assert channel._connections.get("web:abc") is None
+        assert adapter._in_flight == 0
+
+        with pytest.raises(RuntimeError, match="message bus 已关闭"):
+            await channel._send_user_message(
+                cast(Any, existing_socket),
+                "closed-bus-existing",
+                {"session_id": "web:existing", "text": "hello", "media": []},
+            )
+        assert (
+            session_manager.control_store.get_session_meta("web:existing")
+            == existing_before
+        )
+        assert channel._connections["web:existing"] == {existing_socket}
+        assert adapter._in_flight == 0
+    finally:
+        await manager.terminate_all()
+        session_manager.close()
+
+
+@pytest.mark.asyncio
+async def test_web_cancelled_ingress_rolls_back_session_and_connection(
+    tmp_path: Path,
+) -> None:
+    session_manager = SessionManager(tmp_path / "workspace")
+    manager = PluginManager(
+        plugin_dirs=[tmp_path / "plugins"],
+        event_bus=EventBus(),
+        workspace=tmp_path / "workspace",
+        session_manager=session_manager,
+        installed_cache_root=tmp_path / "cache",
+    )
+    publish_started = asyncio.Event()
+    publish_release = asyncio.Event()
+
+    async def publish(_envelope: Any) -> None:
+        publish_started.set()
+        await publish_release.wait()
+
+    channel = WebChatChannel()
+    await channel.start(cast(Any, SimpleNamespace(
+        bus=_Bus(),
+        session_manager=session_manager,
+        event_bus=EventBus(),
+        push_tool=_PushTool(),
+        attachment_store=AttachmentStore(tmp_path / "uploads"),
+        interrupt_controller=None,
+    )))
+    manager.channel_generation_host.bind_inbound_publisher(publish)
+    await manager.bind_core_channel_definitions(
+        (build_core_channel_definition(channel),)
+    )
+    adapter = tuple(channel._v3_adapters.values())[0]
+    try:
+        socket = _WebSocket()
+        send_task = asyncio.create_task(channel._send_user_message(
+            cast(Any, socket),
+            "cancelled-ingress",
+            {"session_id": "web:cancel", "text": "hello", "media": []},
+        ))
+        await publish_started.wait()
+        send_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await send_task
+
+        assert session_manager.get_channel_identities("web") == {}
+        assert session_manager.control_store.get_session_meta("web:cancel") is None
+        assert "web:cancel" not in session_manager._cache
+        assert channel._connections.get("web:cancel") is None
+        assert adapter._in_flight == 0
+    finally:
+        publish_release.set()
+        await manager.terminate_all()
+        session_manager.close()
+
+
+@pytest.mark.asyncio
+async def test_web_v3_ingress_persists_unprefixed_identity_for_exact_session(
+    tmp_path: Path,
+) -> None:
+    """A Web identity and its envelope must name the same durable session."""
+
+    session_manager = SessionManager(tmp_path / "workspace")
+    manager = PluginManager(
+        plugin_dirs=[tmp_path / "plugins"],
+        event_bus=EventBus(),
+        workspace=tmp_path / "workspace",
+        session_manager=session_manager,
+        installed_cache_root=tmp_path / "cache",
+    )
+    bus = MessageBus()
+    channel = WebChatChannel()
+    await channel.start(cast(Any, SimpleNamespace(
+        bus=bus,
+        session_manager=session_manager,
+        event_bus=EventBus(),
+        push_tool=_PushTool(),
+        attachment_store=AttachmentStore(tmp_path / "uploads"),
+        interrupt_controller=None,
+    )))
+    manager.channel_generation_host.bind_inbound_publisher(bus.publish_channel_inbound)
+    await manager.bind_core_channel_definitions(
+        (build_core_channel_definition(channel),)
+    )
+    try:
+        socket = _WebSocket()
+        session_key = await channel._create_session(cast(Any, socket), "create-1")
+        await channel._send_user_message(
+            cast(Any, socket),
+            "request-1",
+            {"session_id": session_key, "text": "hello", "media": []},
+        )
+        envelope = await bus.consume_inbound()
+        assert isinstance(envelope, InboundEnvelope)
+        chat_id = session_key.removeprefix("web:")
+        assert envelope.session_key == session_key
+        assert envelope.message.chat_id == chat_id
+        assert session_manager.get_channel_identities("web") == {chat_id: chat_id}
+        _, admission_id = session_manager.admit_existing(session_key)
+        session_manager.release_admission(admission_id)
+        await bus.release_channel_inbound(envelope, InboundOwner.LANE)
+    finally:
+        await manager.terminate_all()
+        await bus.aclose()
+        session_manager.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("request_id", "session_id", "expected_request_id", "expected_error"),
+    [
+        ("x" * 257, "web:abc", "", "request_id 格式无效"),
+        ("bad\x01id", "web:abc", "", "request_id 格式无效"),
+        ("safe", f"web:{'x' * 253}", "safe", "session_id 格式无效"),
+        ("safe", "web:bad\x01id", "safe", "session_id 格式无效"),
+    ],
+)
+async def test_web_rejects_invalid_external_ids_before_ingress_or_session_write(
+    tmp_path: Path,
+    request_id: str,
+    session_id: str,
+    expected_request_id: str,
+    expected_error: str,
+) -> None:
+    session_manager = SessionManager(tmp_path / "workspace")
+    ingress = _Inbound()
+    channel = WebChatChannel()
+    await channel.start(cast(Any, SimpleNamespace(
+        bus=_Bus(),
+        session_manager=session_manager,
+        event_bus=_EventBus(),
+        push_tool=_PushTool(),
+        attachment_store=AttachmentStore(tmp_path / "uploads"),
+        interrupt_controller=None,
+    )))
+    adapter = await _open_inbound_adapter(channel, ingress)
+    socket = _WebSocket()
+    try:
+        await channel._handle_client_frame(cast(Any, socket), {
+            "type": "message.send",
+            "request_id": request_id,
+            "session_id": session_id,
+            "text": "hello",
+            "media": [],
+        })
+        assert socket.frames == [{
+            "type": "error",
+            "request_id": expected_request_id,
+            "message": expected_error,
+        }]
+        assert ingress.messages == []
+        assert session_manager.get_channel_identities("web") == {}
+        with pytest.raises(KeyError, match="session 不存在"):
+            session_manager.admit_existing("web:abc")
+    finally:
+        await adapter.stop()
+        session_manager.close()

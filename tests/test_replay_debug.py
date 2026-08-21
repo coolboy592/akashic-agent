@@ -1,14 +1,31 @@
 import json
 from datetime import UTC, datetime
-from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 
 import pytest
 
-from agent.tools.message_push import MessagePushTool
+from agent.plugin_composition import (
+    CHANNELS,
+    MCP_SERVERS,
+    PROACTIVE_COMPONENTS,
+    ChannelFactoryContext,
+    Context,
+    CredentialRef,
+    DeliveryStatus,
+    McpServerDefinition,
+    ProactiveSourceDefinition,
+    ProviderDeliveryRequest,
+    ServiceView,
+    StopReceipt,
+)
 from agent.tools.base import Tool
 from agent.tools.registry import ToolRegistry
-from docker.debug.plugins.replay_debug.plugin import CaptureChannel, ReplayDebugPlugin
+from docker.debug.plugins.replay_debug.plugin import (
+    Config,
+    apply,
+    build_channel,
+    is_active,
+)
 from docker.debug.plugins.replay_debug.replay_mcp import (
     acknowledge_replay_events,
     fetch_replay_events,
@@ -21,7 +38,6 @@ from docker.debug.replay_controller import (
     status,
 )
 from bootstrap.tools import _resolve_plugin_dirs
-from infra.channels.contract import ChannelContext
 from proactive_v2.mcp_sources import SharedMcpGateway
 
 
@@ -32,6 +48,30 @@ class _ReplayFetchTool(Tool):
 
     async def execute(self, **kwargs):
         return fetch_replay_events()
+
+
+class _ProviderFactory:
+    async def create(self, credentials):
+        raise AssertionError(credentials)
+
+    async def aclose(self) -> None:
+        return None
+
+
+class _DeclarationRecorder:
+    def __init__(self) -> None:
+        self.definitions = []
+
+    async def register(self, _ctx, definition) -> None:
+        self.definitions.append(definition)
+
+
+class _DeclarationContext:
+    def __init__(self, services) -> None:
+        self._services = services
+
+    def require(self, key):
+        return self._services[key]
 
 
 @pytest.mark.asyncio
@@ -47,18 +87,34 @@ async def test_capture_channel_records_replay_time(tmp_path, monkeypatch) -> Non
     )
     initialize(layout, datetime(2026, 3, 4, 5, 6, tzinfo=UTC))
     monkeypatch.setenv("AKASHIC_REPLAY_CLOCK_FILE", str(clock_path))
-    push = MessagePushTool()
-    channel = CaptureChannel(outbox_path)
-
-    await channel.start(cast(ChannelContext, SimpleNamespace(push_tool=push)))
-    result = await push.execute(
-        target_channel="replay",
-        target_chat_id="user",
-        message="hello",
+    monkeypatch.setenv("AKASHIC_REPLAY_OUTBOX_FILE", str(outbox_path))
+    credential = CredentialRef(("replay_token",))
+    channel = build_channel(
+        ChannelFactoryContext(
+            snapshot_id="snapshot",
+            generation_id="generation",
+            binding_token="binding",
+            config={"replay_token": credential},
+            credentials={"replay_token": credential},
+            provider_client_factory=_ProviderFactory(),
+            ingress=None,
+            identity=None,
+        )
     )
-    await channel.stop()
+    ready = await channel.start()
+    result = await channel.deliver(
+        ProviderDeliveryRequest(
+            binding_token=ready.binding_token,
+            delivery_id="delivery-1",
+            recipient="user",
+            body="hello",
+        )
+    )
+    stop = await channel.stop()
 
-    assert result == "消息已发送"
+    assert result.status is DeliveryStatus.DELIVERED
+    assert isinstance(stop, StopReceipt)
+    assert stop.resources_closed
     report = status(layout)
     assert report["outbox_messages"] == 1
     assert report["latest_outbound"]["message"] == "hello"
@@ -117,7 +173,9 @@ def test_debug_plugin_dir_can_be_added_from_env(tmp_path, monkeypatch) -> None:
     assert _resolve_plugin_dirs(tmp_path)[-1] == extra
 
 
-def test_replay_mcp_only_returns_available_unacked_events(tmp_path, monkeypatch) -> None:
+def test_replay_mcp_only_returns_available_unacked_events(
+    tmp_path, monkeypatch
+) -> None:
     layout = ReplayLayout(
         tmp_path,
         tmp_path,
@@ -155,37 +213,65 @@ def test_replay_mcp_only_returns_available_unacked_events(tmp_path, monkeypatch)
     )
 
     assert result == {"acked": 1}
-    assert [event["event_id"] for event in json.loads(fetch_replay_events())] == ["alert-now"]
-    ack_payload = json.loads((layout.replay_root / "acks.json").read_text(encoding="utf-8"))
+    assert [event["event_id"] for event in json.loads(fetch_replay_events())] == [
+        "alert-now"
+    ]
+    ack_payload = json.loads(
+        (layout.replay_root / "acks.json").read_text(encoding="utf-8")
+    )
     assert set(ack_payload["acked"]["content-now"]) == {"acked_at"}
 
 
-def test_replay_debug_plugin_declares_three_channel_mcp_source(
+@pytest.mark.asyncio
+async def test_replay_debug_v3_namespace_declares_typed_source_and_channel(
     tmp_path, monkeypatch
 ) -> None:
     monkeypatch.setenv("AKASHIC_REPLAY_CLOCK_FILE", str(tmp_path / "clock.json"))
     monkeypatch.setenv("AKASHIC_REPLAY_EVENTS_FILE", str(tmp_path / "events.jsonl"))
-    plugin = ReplayDebugPlugin()
-    server = plugin.mcp_servers()[0]
-    source = plugin.proactive_sources()[0]
+    monkeypatch.setenv("AKASHIC_REPLAY_OUTBOX_FILE", str(tmp_path / "outbox.jsonl"))
+    services = {
+        CHANNELS: _DeclarationRecorder(),
+        MCP_SERVERS: _DeclarationRecorder(),
+        PROACTIVE_COMPONENTS: _DeclarationRecorder(),
+    }
+    await apply(
+        cast(Context, _DeclarationContext(services)),
+        Config(replay_token=CredentialRef(("replay_token",))),
+    )
 
+    server = services[MCP_SERVERS].definitions[0]
+    source = services[PROACTIVE_COMPONENTS].definitions[0]
+    channel = services[CHANNELS].definitions[0]
+
+    assert isinstance(server, McpServerDefinition)
     assert server.name == "replay-debug"
     assert server.command == ("python", "replay_mcp.py")
+    assert server.candidate_read_only_tools == ("fetch_replay_events",)
+    assert isinstance(source, ProactiveSourceDefinition)
     assert source.channels == ("alert", "content", "context")
     assert source.fetch_tool == "fetch_replay_events"
     assert source.ack_tool == "acknowledge_replay_events"
     assert source.fetch_page_size == 50
+    assert channel.name == "replay"
+    assert channel.factory_export == "build_channel"
 
 
-def test_replay_debug_plugin_is_inert_without_replay_profile(monkeypatch) -> None:
+@pytest.mark.asyncio
+async def test_replay_debug_v3_namespace_is_inert_without_replay_profile(
+    monkeypatch,
+) -> None:
     monkeypatch.delenv("AKASHIC_REPLAY_CLOCK_FILE", raising=False)
     monkeypatch.delenv("AKASHIC_REPLAY_EVENTS_FILE", raising=False)
     monkeypatch.delenv("AKASHIC_REPLAY_OUTBOX_FILE", raising=False)
-    plugin = ReplayDebugPlugin()
+    services = {
+        CHANNELS: _DeclarationRecorder(),
+        MCP_SERVERS: _DeclarationRecorder(),
+        PROACTIVE_COMPONENTS: _DeclarationRecorder(),
+    }
 
-    assert plugin.mcp_servers() == []
-    assert plugin.proactive_sources() == []
-    assert plugin.channels() == []
+    assert not is_active(ServiceView.freeze({}))
+    await apply(cast(Context, _DeclarationContext(services)), Config())
+    assert all(not recorder.definitions for recorder in services.values())
 
 
 @pytest.mark.asyncio

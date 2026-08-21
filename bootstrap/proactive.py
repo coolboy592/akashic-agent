@@ -1,14 +1,12 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from agent.config_models import Config
 from agent.looping.core import AgentLoop
 from agent.provider import LLMProvider
 from agent.model_runtime.registry import RoleBoundProvider
-from agent.tool_hooks import ToolHook
-from agent.plugins.specs import RegisteredProactiveSource
 from agent.tools.message_push import MessagePushTool
 from bus.event_bus import EventBus
 from proactive_v2.loop import ProactiveLoop
@@ -18,6 +16,7 @@ from proactive_v2.state import ProactiveStateStore
 from session.manager import SessionManager
 
 if TYPE_CHECKING:
+    from agent.plugins.generation_activity_host import ActivityHost
     from agent.plugins.snapshot import RuntimeSnapshotStore
     from core.memory.markdown import MarkdownMemoryStore
     from core.memory.runtime import MemoryRuntime
@@ -58,13 +57,8 @@ def build_proactive_runtime(
     presence: PresenceStore,
     agent_loop: AgentLoop,
     event_bus: EventBus | None = None,
-    tool_hooks: list[ToolHook] | None = None,
-    proactive_modules: list[object] | None = None,
-    proactive_lifecycles: list[object] | None = None,
-    proactive_module_factories: list[object] | None = None,
-    proactive_runtime_factories: list[object] | None = None,
-    proactive_sources: list[RegisteredProactiveSource] | None = None,
     runtime_snapshot_store: RuntimeSnapshotStore | None = None,
+    activity_host: ActivityHost | None = None,
 ) -> tuple[list, ProactiveLoop | None]:
     tasks: list = []
     # 1. 总开关关闭时，主动链路完全不启动。
@@ -95,13 +89,8 @@ def build_proactive_runtime(
         ),
         shared_tools=getattr(agent_loop, "tools", None),
         event_bus=event_bus,
-        tool_hooks=tool_hooks,
-        proactive_modules=proactive_modules,
-        proactive_lifecycles=proactive_lifecycles,
-        proactive_module_factories=proactive_module_factories,
-        proactive_runtime_factories=proactive_runtime_factories,
-        proactive_sources=proactive_sources,
         runtime_snapshot_store=runtime_snapshot_store,
+        activity_host=activity_host,
     )
 
     # 4. 主动链路本体以后台任务方式常驻运行。

@@ -8,8 +8,6 @@ from typing import cast, Any
 
 import pytest
 
-from bus.events import ChannelMessage, DeliveryReceipt, DeliveryStatus
-
 import main
 from bootstrap import app as bootstrap_app
 from bootstrap import init_workspace as workspace_init
@@ -472,9 +470,6 @@ async def test_serve_smoke_loads_config_and_runs_shutdown(monkeypatch, tmp_path)
     original_build_core_runtime = bootstrap_app.build_core_runtime
     observed: dict[str, object] = {}
 
-    async def _no_fatal_failure() -> None:
-        return None
-
     def _patched_build_core_runtime(config, workspace, http_resources, **kwargs):
         runtime = original_build_core_runtime(config, workspace, http_resources, **kwargs)
         agent_loop = runtime.loop
@@ -482,9 +477,6 @@ async def test_serve_smoke_loads_config_and_runs_shutdown(monkeypatch, tmp_path)
         scheduler = runtime.scheduler
 
         async def _agent_loop_run():
-            return None
-
-        async def _bus_dispatch_outbound():
             return None
 
         async def _scheduler_run():
@@ -496,7 +488,7 @@ async def test_serve_smoke_loads_config_and_runs_shutdown(monkeypatch, tmp_path)
             "PassiveMessageWorker",
             lambda *args, **kwargs: types.SimpleNamespace(run=_agent_loop_run),
         )
-        bus.dispatch_outbound = _bus_dispatch_outbound  # type: ignore[assignment]
+        monkeypatch.setattr(bus, "dispatch_outbound", _agent_loop_run)
         scheduler.run = _scheduler_run  # type: ignore[assignment]
         observed["scheduler"] = scheduler
         observed["bus"] = bus
@@ -507,31 +499,12 @@ async def test_serve_smoke_loads_config_and_runs_shutdown(monkeypatch, tmp_path)
         bootstrap_app, "build_core_runtime", _patched_build_core_runtime
     )
     monkeypatch.setattr(
-        bootstrap_app.PluginServiceHost,
-        "wait_fatal_failure",
-        lambda _self: _no_fatal_failure(),
-    )
-    monkeypatch.setattr(
         bootstrap_app, "build_dashboard_server", lambda **_: _FakeDashboardServer()
     )
     monkeypatch.setattr(
         bootstrap_app, "build_chat_server", lambda **_: _FakeChatServer()
     )
 
-    class _FakePluginJobRuntime:
-        def __init__(self, **_: object) -> None:
-            pass
-
-        async def run(self) -> None:
-            return None
-
-        def stop(self) -> None:
-            return None
-
-        async def wait_stopped(self) -> None:
-            return None
-
-    monkeypatch.setattr(bootstrap_app, "PluginJobRuntime", _FakePluginJobRuntime)
     monkeypatch.setattr(main.Path, "home", lambda: tmp_path)
 
     await main.serve(str(config_path), tmp_path)
@@ -642,41 +615,6 @@ async def test_app_runtime_run_stops_primary_tasks_after_server_failure(tmp_path
     assert stopped.is_set()
     assert runtime.http_resources.closed is True
     assert runtime.dashboard_task is None
-
-
-@pytest.mark.asyncio
-async def test_app_runtime_supervises_workspace_mcp_watcher_failure(tmp_path):
-    runtime = bootstrap_app.AppRuntime(cast(Any, object()), tmp_path)
-    primary_stopped = asyncio.Event()
-    core_stopped = asyncio.Event()
-
-    async def _failed_watcher() -> None:
-        raise KeyError("unexpected watcher failure")
-
-    async def _primary() -> None:
-        try:
-            await asyncio.Event().wait()
-        finally:
-            primary_stopped.set()
-
-    class _Core:
-        async def stop(self) -> None:
-            core_stopped.set()
-
-    async def _start() -> None:
-        runtime.core = cast(Any, _Core())
-        runtime.workspace_mcp_watcher_task = asyncio.create_task(
-            _failed_watcher()
-        )
-        runtime.tasks = [_primary()]
-
-    runtime.start = _start  # type: ignore[method-assign]
-    with pytest.raises(KeyError, match="unexpected watcher failure"):
-        await runtime.run()
-
-    assert primary_stopped.is_set()
-    assert core_stopped.is_set()
-    assert runtime.workspace_mcp_watcher_task is None
 
 
 @pytest.mark.asyncio
@@ -1025,12 +963,11 @@ def test_init_workspace_respects_force_for_text_assets(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_start_channels_wires_telegram_qq_and_plugin(
+async def test_start_channels_wires_telegram_qq_and_extra_channel(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     starts: list[str] = []
-    registrations: list[tuple[str, list[str]]] = []
     attachment_roots: list[Path] = []
     mobile_catalogs: list[list[tuple[str, str]]] = []
     fake_telegram = types.ModuleType("infra.channels.telegram_channel")
@@ -1043,13 +980,6 @@ async def test_start_channels_wires_telegram_qq_and_plugin(
 
         async def start(self, ctx: Any) -> None:
             starts.append("telegram")
-            ctx.push_tool.register_channel(
-                self.name,
-                deliver=self.deliver,
-            )
-
-        async def deliver(self, _message: ChannelMessage) -> DeliveryReceipt:
-            return DeliveryReceipt(DeliveryStatus.SUCCESS)
 
         async def stop(self) -> None:
             starts.append("telegram.stop")
@@ -1074,13 +1004,6 @@ async def test_start_channels_wires_telegram_qq_and_plugin(
 
         async def start(self, ctx: Any) -> None:
             starts.append("qq")
-            ctx.push_tool.register_channel(
-                self.name,
-                deliver=self.deliver,
-            )
-
-        async def deliver(self, _message: ChannelMessage) -> DeliveryReceipt:
-            return DeliveryReceipt(DeliveryStatus.SUCCESS)
 
         async def stop(self) -> None:
             starts.append("qq.stop")
@@ -1100,11 +1023,8 @@ async def test_start_channels_wires_telegram_qq_and_plugin(
         async def start(self, ctx: Any) -> None:
             starts.append("plugin")
             attachment_roots.append(ctx.attachment_store.root)
-            mobile_catalogs.append(ctx.mobile_bot_commands)
-            ctx.push_tool.register_channel(self.name, deliver=self.deliver)
-
-        async def deliver(self, _message: ChannelMessage) -> DeliveryReceipt:
-            return DeliveryReceipt(DeliveryStatus.SUCCESS)
+            provider = ctx.command_catalog_provider
+            mobile_catalogs.append([] if provider is None else list(provider()))
 
         async def stop(self) -> None:
             starts.append("plugin.stop")
@@ -1118,8 +1038,7 @@ async def test_start_channels_wires_telegram_qq_and_plugin(
     monkeypatch.setitem(sys.modules, "infra.channels.qq_channel", fake_qq)
 
     class _PushTool:
-        def register_channel(self, name: str, **kwargs: object) -> None:
-            registrations.append((name, sorted(kwargs)))
+        pass
 
     config = Config(
         provider="openai",
@@ -1145,24 +1064,23 @@ async def test_start_channels_wires_telegram_qq_and_plugin(
         push_tool=cast(Any, _PushTool()),
         http_resources=resources,
         event_bus=event_bus,
-        telegram_bot_commands=[("telegram_only", "仅 Telegram")],
-        mobile_bot_commands=[("mobile_only", "仅 mobile")],
+        telegram_command_catalog_provider=lambda: (
+            ("telegram_only", "仅 Telegram"),
+        ),
+        mobile_command_catalog_provider=lambda: (("mobile_only", "仅 mobile"),),
         interrupt_controller=cast(Any, controller),
-        plugin_channels=[cast(Any, _PluginChannel())],
+        extra_channels=[cast(Any, _PluginChannel())],
     )
     try:
         await host.start_all()
 
         telegram, qq, plugin = host.channels
         assert starts == ["telegram", "qq", "plugin"]
-        assert registrations == [
-            ("telegram", ["deliver"]),
-            ("qq", ["deliver"]),
-            ("plugin", ["deliver"]),
-        ]
         assert telegram.kwargs["event_bus"] is event_bus
         assert telegram.kwargs["interrupt_controller"] is controller
-        assert telegram.kwargs["bot_commands"] == [("telegram_only", "仅 Telegram")]
+        assert telegram.kwargs["command_catalog_provider"]() == (
+            ("telegram_only", "仅 Telegram"),
+        )
         assert qq.kwargs["interrupt_controller"] is controller
         assert plugin.name == "plugin"
         assert attachment_roots == [tmp_path / "uploads"]

@@ -23,19 +23,47 @@ def _write_artifact_plugin(
     plugin_root = plugin_base / ".artifacts" / artifact_id
     plugin_root.mkdir(parents=True)
     (plugin_root / "plugin.py").write_text(
-        "from agent.plugins import Plugin\n"
-        "class DemoPlugin(Plugin):\n"
-        "    name = 'demo'\n"
-        "    version = '1.0.0'\n"
-        "    @classmethod\n"
-        "    def skill_roots(cls): return ('skills',)\n",
+        "api_version = 3\n"
+        "name = 'demo'\n"
+        "version = '1.0.0'\n"
+        "skill_roots = ('skills',)\n"
+        "def apply(ctx, config): pass\n",
         encoding="utf-8",
     )
+    _write_static_manifest(plugin_root, name="demo")
     for name, body in skills.items():
         skill_dir = plugin_root / "skills" / name
         skill_dir.mkdir(parents=True)
         (skill_dir / "SKILL.md").write_text(body, encoding="utf-8")
     return plugin_root
+
+
+def _write_static_manifest(
+    plugin_root: Path,
+    *,
+    name: str,
+    entrypoint: str = "plugin.py",
+    mcp_names: tuple[str, ...] = (),
+) -> None:
+    mcp_manifest = ""
+    for mcp_name in mcp_names:
+        runner = plugin_root / "mcp" / f"{mcp_name}.py"
+        runner.parent.mkdir(parents=True, exist_ok=True)
+        runner.write_text("", encoding="utf-8")
+        mcp_manifest += (
+            "\n[[mcp]]\n"
+            f"name = {mcp_name!r}\n"
+            f"command = ['mcp/{mcp_name}.py']\n"
+        )
+    (plugin_root / "akashic.plugin.toml").write_text(
+        "schema_version = 1\n"
+        f"name = {name!r}\n"
+        "version = '1.0.0'\n"
+        "api_version = 3\n"
+        f"entrypoint = {entrypoint!r}\n"
+        f"{mcp_manifest}",
+        encoding="utf-8",
+    )
 
 
 def _check(report: dict[str, object], name: str) -> dict[str, str]:
@@ -49,18 +77,24 @@ def _check(report: dict[str, object], name: str) -> dict[str, str]:
 def test_plugin_doctor_reads_programmatic_capabilities(tmp_path: Path) -> None:
     plugins_home = tmp_path / ".akashic-plugin"
     workspace = tmp_path / "workspace"
-    plugin_root = plugins_home / "cache" / "github" / "demo" / "1.0.0"
+    plugin_base = plugins_home / "cache" / "github" / "demo"
+    plugin_root = plugin_base / ".artifacts" / "1.0.0-aaaa"
     skill_dir = plugin_root / "skills" / "demo-skill"
     skill_dir.mkdir(parents=True)
     (skill_dir / "SKILL.md").write_text("skill", encoding="utf-8")
     (plugin_root / "plugin.py").write_text(
-        "from agent.plugins import Plugin\n"
-        "class DemoPlugin(Plugin):\n"
-        "    name = 'demo'\n"
-        "    version = '1.0.0'\n"
-        "    @classmethod\n"
-        "    def skill_roots(cls): return ('skills',)\n",
+        "api_version = 3\n"
+        "name = 'demo'\n"
+        "version = '1.0.0'\n"
+        "skill_roots = ('skills',)\n"
+        "def apply(ctx, config): pass\n",
         encoding="utf-8",
+    )
+    _write_static_manifest(plugin_root, name="demo")
+    _ = write_pointers(
+        plugin_base,
+        stable=ArtifactPointer(".artifacts/1.0.0-aaaa"),
+        latest=ArtifactPointer(".artifacts/1.0.0-aaaa"),
     )
     (workspace / "skills").mkdir(parents=True)
     (workspace / "skills" / "demo-skill").symlink_to(skill_dir, target_is_directory=True)
@@ -77,6 +111,138 @@ def test_plugin_doctor_reads_programmatic_capabilities(tmp_path: Path) -> None:
     assert "plugin doctor demo@github" in format_plugin_doctor_report(report)
 
 
+def test_plugin_doctor_reads_v3_namespace_declaration(tmp_path: Path) -> None:
+    plugins_home = tmp_path / ".akashic-plugin"
+    workspace = tmp_path / "workspace"
+    plugin_base = plugins_home / "cache" / "github" / "v3_demo"
+    plugin_root = plugin_base / ".artifacts" / "1.0.0-aaaa"
+    plugin_root.mkdir(parents=True)
+    (plugin_root / "plugin.py").write_text(
+        "api_version = 3\n"
+        "name = 'v3_demo'\n"
+        "version = '1.0.0'\n"
+        "def apply(ctx, config): pass\n",
+        encoding="utf-8",
+    )
+    _write_static_manifest(
+        plugin_root,
+        name="v3_demo",
+        mcp_names=("fitbit", "steam"),
+    )
+    _ = write_pointers(
+        plugin_base,
+        stable=ArtifactPointer(".artifacts/1.0.0-aaaa"),
+        latest=ArtifactPointer(".artifacts/1.0.0-aaaa"),
+    )
+    upsert_plugin_manifest("v3_demo@github", enabled=True, plugins_home=plugins_home)
+
+    report = run_plugin_doctor(
+        plugin_id="v3_demo@github",
+        config_path=str(_init_config(tmp_path)),
+        plugins_home=plugins_home,
+        workspace=workspace,
+    )
+
+    assert report["status"] == "healthy"
+    assert _check(report, "skills")["detail"].startswith("roots=0")
+    assert _check(report, "mcp")["detail"] == (
+        "declared_servers=2 names=['fitbit', 'steam']"
+    )
+
+
+def test_plugin_doctor_uses_static_custom_entrypoint(tmp_path: Path) -> None:
+    plugins_home = tmp_path / ".akashic-plugin"
+    workspace = tmp_path / "workspace"
+    plugin_base = plugins_home / "cache" / "github" / "static_demo"
+    plugin_root = plugin_base / ".artifacts" / "1.0.0-aaaa"
+    plugin_root.mkdir(parents=True)
+    (plugin_root / "entry.py").write_text(
+        "api_version = 3\n"
+        "name = 'static_demo'\n"
+        "version = '1.0.0'\n"
+        "def apply(ctx, config): pass\n",
+        encoding="utf-8",
+    )
+    (plugin_root / "akashic.plugin.toml").write_text(
+        "schema_version = 1\n"
+        "name = 'static_demo'\n"
+        "version = '1.0.0'\n"
+        "api_version = 3\n"
+        "entrypoint = 'entry.py'\n",
+        encoding="utf-8",
+    )
+    _ = write_pointers(
+        plugin_base,
+        stable=ArtifactPointer(".artifacts/1.0.0-aaaa"),
+        latest=ArtifactPointer(".artifacts/1.0.0-aaaa"),
+    )
+    upsert_plugin_manifest(
+        "static_demo@github",
+        enabled=True,
+        plugins_home=plugins_home,
+    )
+
+    report = run_plugin_doctor(
+        plugin_id="static_demo@github",
+        config_path=str(_init_config(tmp_path)),
+        plugins_home=plugins_home,
+        workspace=workspace,
+    )
+
+    assert report["status"] == "healthy"
+    assert "entry.py" in format_plugin_doctor_report(report)
+
+
+def test_plugin_doctor_custom_entrypoint_uses_its_relative_import_root(
+    tmp_path: Path,
+) -> None:
+    plugins_home = tmp_path / ".akashic-plugin"
+    workspace = tmp_path / "workspace"
+    plugin_base = plugins_home / "cache" / "github" / "nested_demo"
+    plugin_root = plugin_base / ".artifacts" / "1.0.0-aaaa"
+    (plugin_root / "src").mkdir(parents=True)
+    (plugin_root / "src" / "constants.py").write_text(
+        "VERSION = '1.0.0'\n",
+        encoding="utf-8",
+    )
+    (plugin_root / "src" / "entry.py").write_text(
+        "from .constants import VERSION\n"
+        "api_version = 3\n"
+        "name = 'nested_demo'\n"
+        "version = VERSION\n"
+        "def apply(ctx, config): pass\n",
+        encoding="utf-8",
+    )
+    (plugin_root / "akashic.plugin.toml").write_text(
+        "schema_version = 1\n"
+        "name = 'nested_demo'\n"
+        "version = '1.0.0'\n"
+        "api_version = 3\n"
+        "entrypoint = 'src/entry.py'\n",
+        encoding="utf-8",
+    )
+    _ = write_pointers(
+        plugin_base,
+        stable=ArtifactPointer(".artifacts/1.0.0-aaaa"),
+        latest=ArtifactPointer(".artifacts/1.0.0-aaaa"),
+    )
+    upsert_plugin_manifest(
+        "nested_demo@github",
+        enabled=True,
+        plugins_home=plugins_home,
+    )
+
+    report = run_plugin_doctor(
+        plugin_id="nested_demo@github",
+        config_path=str(_init_config(tmp_path)),
+        plugins_home=plugins_home,
+        workspace=workspace,
+    )
+
+    assert report["status"] == "healthy"
+    assert "src/entry.py" in format_plugin_doctor_report(report)
+
+
 def test_plugin_doctor_reads_latest_artifact_candidate(tmp_path: Path) -> None:
     plugins_home = tmp_path / ".akashic-plugin"
     workspace = tmp_path / "workspace"
@@ -84,12 +250,13 @@ def test_plugin_doctor_reads_latest_artifact_candidate(tmp_path: Path) -> None:
     plugin_root = plugin_base / ".artifacts" / "1.0.0-aaaa"
     plugin_root.mkdir(parents=True)
     (plugin_root / "plugin.py").write_text(
-        "from agent.plugins import Plugin\n"
-        "class DemoPlugin(Plugin):\n"
-        "    name = 'demo'\n"
-        "    version = '1.0.0'\n",
+        "api_version = 3\n"
+        "name = 'demo'\n"
+        "version = '1.0.0'\n"
+        "def apply(ctx, config): pass\n",
         encoding="utf-8",
     )
+    _write_static_manifest(plugin_root, name="demo")
     _ = write_pointers(
         plugin_base,
         stable=ArtifactPointer(None),
@@ -107,6 +274,31 @@ def test_plugin_doctor_reads_latest_artifact_candidate(tmp_path: Path) -> None:
     assert report["status"] == "degraded"
     assert str(plugin_root) in format_plugin_doctor_report(report)
     assert _check(report, "candidate")["status"] == "deferred"
+
+
+def test_plugin_doctor_rejects_legacy_visible_version_without_pointer(
+    tmp_path: Path,
+) -> None:
+    plugins_home = tmp_path / ".akashic-plugin"
+    plugin_root = plugins_home / "cache/github/demo/1.0.0"
+    plugin_root.mkdir(parents=True)
+    (plugin_root / "plugin.py").write_text(
+        "api_version = 3\nname = 'demo'\nversion = '1.0.0'\n"
+        "def apply(ctx, config): pass\n",
+        encoding="utf-8",
+    )
+    _write_static_manifest(plugin_root, name="demo")
+    upsert_plugin_manifest("demo@github", enabled=True, plugins_home=plugins_home)
+
+    report = run_plugin_doctor(
+        plugin_id="demo@github",
+        config_path=str(_init_config(tmp_path)),
+        plugins_home=plugins_home,
+        workspace=tmp_path / "workspace",
+    )
+
+    assert report["status"] == "broken"
+    assert _check(report, "install")["detail"] == "未找到插件目录"
 
 
 def test_plugin_doctor_defers_candidate_projection_until_promotion(
@@ -198,9 +390,16 @@ def test_plugin_doctor_reports_misdirected_and_stale_stable_projection(
 
 def test_plugin_doctor_reports_broken_declaration(tmp_path: Path) -> None:
     plugins_home = tmp_path / ".akashic-plugin"
-    plugin_root = plugins_home / "cache" / "github" / "demo" / "1.0.0"
+    plugin_base = plugins_home / "cache" / "github" / "demo"
+    plugin_root = plugin_base / ".artifacts" / "1.0.0-aaaa"
     plugin_root.mkdir(parents=True)
     (plugin_root / "plugin.py").write_text("class X: pass\n", encoding="utf-8")
+    _write_static_manifest(plugin_root, name="demo")
+    _ = write_pointers(
+        plugin_base,
+        stable=ArtifactPointer(".artifacts/1.0.0-aaaa"),
+        latest=ArtifactPointer(".artifacts/1.0.0-aaaa"),
+    )
     upsert_plugin_manifest("demo@github", enabled=True, plugins_home=plugins_home)
 
     report = run_plugin_doctor(

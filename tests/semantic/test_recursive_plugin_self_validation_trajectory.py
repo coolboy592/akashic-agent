@@ -18,6 +18,9 @@ from agent.looping.ports import (
     LLMConfig,
     SessionServices,
 )
+from agent.plugin_composition import TOOL_CATALOG, PluginToolDefinition
+from agent.plugin_composition.channels import ChannelDeliveryReceipt
+from agent.plugin_composition.channels import DeliveryStatus as ChannelDeliveryStatus
 from agent.persona import reset_veda
 from agent.provider import LLMProvider
 from agent.plugins.manager import PluginManager
@@ -29,7 +32,6 @@ from agent.tools.registry import ToolRegistry
 from bootstrap.app import AppRuntime
 from bootstrap.control_execution import execute_control_turn
 from bus.event_bus import EventBus
-from bus.events import DeliveryReceipt, DeliveryStatus
 from bus.queue import MessageBus
 from core.memory.engine import MemoryQueryResult
 from core.memory.markdown import build_markdown_memory_runtime
@@ -138,28 +140,56 @@ class _TrajectoryProvider(ProviderContextBudgetStub, LLMProvider):
 
 
 def _write_plugin_source(source: Path, *, forged_domain: bool) -> None:
-    """创建一个真实 Git 插件，候选工具读取 workspace 领域状态。"""
+    """创建一个真实 Git v3 插件，候选工具读取 generation 数据状态。"""
 
     source.mkdir()
     domain_expression = (
         "'forged-domain'"
         if forged_domain
-        else "(self.context.workspace / 'domain.txt').read_text(encoding='utf-8').strip()"
+        else "(Path(generation.data_dir) / 'domain.txt').read_text(encoding='utf-8').strip()"
     )
     (source / "plugin.py").write_text(
         "import json\n"
-        "from agent.plugins import Plugin\n"
-        "from agent.plugins.decorators import tool\n"
+        "from pathlib import Path\n"
+        "from agent.plugin_composition import TOOL_CATALOG, PluginToolDefinition\n"
         "from agent.plugins.snapshot import get_current_runtime_snapshot\n\n"
-        "class CandidateOnlyPlugin(Plugin):\n"
-        "    name = 'candidate_only'\n"
-        "    version = '1.0.0'\n\n"
-        "    @tool(name='candidate_only_tool', risk='read-only', always_on=True)\n"
-        "    async def candidate_only_tool(self, event) -> str:\n"
-        "        \"\"\"Read the candidate domain marker and runtime identity.\"\"\"\n"
-        f"        domain = {domain_expression}\n"
-        "        snapshot = get_current_runtime_snapshot()\n"
-        "        return json.dumps({'domain': domain, 'snapshot': snapshot.snapshot_id})\n",
+        "api_version = 3\n"
+        "name = 'candidate_only'\n"
+        "version = '1.0.0'\n"
+        "inject = (TOOL_CATALOG,)\n\n"
+        "async def candidate_only_tool(context, arguments):\n"
+        "    del context, arguments\n"
+        "    snapshot = get_current_runtime_snapshot()\n"
+        "    if snapshot is None:\n"
+        "        raise RuntimeError('candidate tool 缺少 RuntimeSnapshot')\n"
+        "    generation = snapshot.generations.get('candidate_only@lab')\n"
+        "    if generation is None:\n"
+        "        raise RuntimeError('candidate tool 缺少 candidate generation')\n"
+        f"    domain = {domain_expression}\n"
+        "    return json.dumps({'domain': domain, 'snapshot': snapshot.snapshot_id})\n\n"
+        "async def apply(ctx, config):\n"
+        "    del config\n"
+        "    await ctx.require(TOOL_CATALOG).register(ctx, PluginToolDefinition(\n"
+        "        name='candidate_only_tool',\n"
+        "        description='Read the candidate domain marker.',\n"
+        "        parameters={\n"
+        "            'type': 'object',\n"
+        "            'properties': {},\n"
+        "            'required': [],\n"
+        "            'additionalProperties': False,\n"
+        "        },\n"
+        "        handler_export='candidate_only_tool',\n"
+        "        risk='read-only',\n"
+        "        always_on=True,\n"
+        "    ))\n",
+        encoding="utf-8",
+    )
+    (source / "akashic.plugin.toml").write_text(
+        "schema_version = 1\n"
+        "name = \"candidate_only\"\n"
+        "version = \"1.0.0\"\n"
+        "api_version = 3\n"
+        "entrypoint = \"plugin.py\"\n",
         encoding="utf-8",
     )
     subprocess.run(["git", "init", "-q"], cwd=source, check=True)
@@ -173,7 +203,7 @@ def _write_plugin_source(source: Path, *, forged_domain: bool) -> None:
         cwd=source,
         check=True,
     )
-    subprocess.run(["git", "add", "plugin.py"], cwd=source, check=True)
+    subprocess.run(["git", "add", "."], cwd=source, check=True)
     subprocess.run(["git", "commit", "-q", "-m", "candidate"], cwd=source, check=True)
 
 
@@ -191,12 +221,17 @@ async def _run_trajectory(
     workspace.mkdir(parents=True)
     reset_veda(workspace)
     (workspace / "domain.txt").write_text("domain-ready", encoding="utf-8")
+    candidate_data = workspace / "plugin-data" / "candidate_only-lab"
+    candidate_data.mkdir(parents=True)
+    (candidate_data / "domain.txt").write_text("domain-ready", encoding="utf-8")
     builtin = tmp_path / "builtin" / "baseline"
     builtin.mkdir(parents=True)
     (builtin / "plugin.py").write_text(
-        "from agent.plugins import Plugin\n"
-        "class BaselinePlugin(Plugin):\n"
-        "    name = 'baseline'\n",
+        "api_version = 3\n"
+        "name = 'baseline'\n"
+        "version = '1.0.0'\n\n"
+        "async def apply(ctx, config):\n"
+        "    return None\n",
         encoding="utf-8",
     )
     source = tmp_path / "candidate"
@@ -208,13 +243,16 @@ async def _run_trajectory(
     sequence = 0
     push_sequence = 0
 
-    async def deliver(_message: object) -> DeliveryReceipt:
+    async def deliver(_message: object, _passive: bool) -> ChannelDeliveryReceipt:
         nonlocal sequence, push_sequence
         sequence += 1
         push_sequence = sequence
-        return DeliveryReceipt(DeliveryStatus.SUCCESS)
+        return ChannelDeliveryReceipt(
+            delivery_id=f"proof-{sequence}",
+            status=ChannelDeliveryStatus.DELIVERED,
+        )
 
-    _ = push.register_channel("proof", deliver)
+    push.bind_v3_channel_dispatcher(deliver)
     tools.register(
         push,
         risk="external-side-effect",
@@ -384,6 +422,7 @@ async def _run_trajectory(
         promoted = await app._promote_plugin("candidate_only@lab")
         parent_release.set()
         parent_result = await parent_handle.result()
+        await manager.snapshot_store.retry_drains()
         await bus.chat_lane.mark_passive_done("proof", "parent")
         parent_lane_pending = False
         sequence += 1

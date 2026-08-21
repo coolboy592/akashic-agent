@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 from agent.config_models import ContextCompactionConfig
 
@@ -12,6 +12,8 @@ if TYPE_CHECKING:
     from agent.core.runtime_support import ToolDiscoveryState
     from agent.provider import LLMProvider
     from agent.retrieval.protocol import MemoryRetrievalPipeline
+    from agent.turns.outbound import OutboundPort
+    from agent.plugin_composition.channels import AttachmentRef
     from agent.tools.registry import ToolRegistry
     from bus.event_bus import EventBus
     from bus.processing import ProcessingState
@@ -55,11 +57,19 @@ class MemoryServices:
     engine: MemoryEngine | None = None
 
 
+class OutboundAttachmentImporter(Protocol):
+    async def import_media(
+        self,
+        media: tuple[str, ...],
+    ) -> tuple["AttachmentRef", ...]: ...
+
+
 @dataclass
 class SessionServices:
     session_manager: SessionManager
     presence: PresenceStore | None = None
     compaction_runtime: "SessionCompactionPort | None" = None
+    outbound_attachment_importer: OutboundAttachmentImporter | None = None
 
 
 @dataclass
@@ -81,6 +91,7 @@ class AgentLoopDeps:
     session_services: SessionServices | None = None
     tool_discovery: "ToolDiscoveryState | None" = None
     reasoner: "Reasoner | None" = None
+    outbound_port: "OutboundPort | None" = None
 
 @dataclass
 class AgentLoopConfig:

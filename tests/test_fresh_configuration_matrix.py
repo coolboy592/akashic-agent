@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from agent.config import Config
+from agent.plugins.generation_private_proactive_host import PrivateProactiveBinding
 from agent.plugins.manifest import write_package_manifest
 from bootstrap import app as bootstrap_app
 from bootstrap.init_workspace import init_workspace
@@ -143,16 +144,33 @@ async def test_fresh_init_core_configuration_matrix(
 
     try:
         await runtime.start()
-        assert {
+        assert not {
             "workspace_mcp_apply",
             "workspace_mcp_remove",
             "workspace_mcp_status",
-        } <= runtime.tools.get_registered_names()
+        }.intersection(runtime.tools.get_registered_names())
         assert runtime.memory_runtime.engine.describe().name == memory_name
-        expected_lifecycles = [] if proactive_name == "off" else [proactive_name]
-        assert [
-            lifecycle.id for lifecycle in runtime.plugin_manager.proactive_lifecycles
-        ] == expected_lifecycles
+        manager = runtime.plugin_manager
+        activity_host = manager.activity_host
+        assert activity_host is not None
+        assert not hasattr(manager, "proactive_lifecycles")
+        snapshot = manager.current_snapshot
+        assert snapshot is not None
+        if proactive_name == "off":
+            assert snapshot.private_proactive_catalog is None
+            assert activity_host.active is None
+        else:
+            assert snapshot.private_proactive_catalog is not None
+            activity = activity_host.active
+            assert activity is not None
+            assert activity.snapshot_id == snapshot.snapshot_id
+            private = activity.child_bindings["private_proactive"]
+            assert isinstance(private, PrivateProactiveBinding)
+            assert private.catalog is snapshot.private_proactive_catalog
+            assert private.family == proactive_name
+            assert private.lifecycle is not None
+            assert private.lifecycle.id == proactive_name
+            assert private.active
     finally:
         await runtime.stop()
         await runtime.memory_runtime.aclose()

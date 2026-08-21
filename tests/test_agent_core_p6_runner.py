@@ -31,6 +31,7 @@ async def test_react_routes_passive_message_to_pipeline():
         msg,
         "cli:1",
         dispatch_outbound=True,
+        command_admitted=False,
     )
 
 

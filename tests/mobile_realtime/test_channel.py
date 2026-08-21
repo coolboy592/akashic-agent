@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
+import sqlite3
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,6 +18,16 @@ import infra.mobile_realtime.gateway as gateway_module
 
 from agent.config_models import MobileRealtimeConfig
 from agent.control.models import TurnRecord, TurnStatus
+from agent.plugin_composition.channels import (
+    AttachmentKind as V3AttachmentKind,
+    AttachmentRef,
+    ChannelCommitRole,
+    ChannelFactoryContext,
+    ChannelRuntimePorts,
+    DeliveryStatus as V3DeliveryStatus,
+    ProviderDeliveryRequest,
+    RawInbound,
+)
 from infra.mobile_realtime.runtime_inspection import RuntimeInspectionService
 from bus.events import (
     AttachmentKind,
@@ -23,6 +36,7 @@ from bus.events import (
     DeliveryStatus,
     OutboundMessage,
     TurnTerminalStatus,
+    channel_message_from_outbound,
 )
 from bus.events_lifecycle import (
     StreamDeltaReady,
@@ -30,8 +44,11 @@ from bus.events_lifecycle import (
     ToolCallStarted,
     TurnOutputCompleted,
     TurnStarted,
+    TurnCommitted,
 )
+from bus.queue import MessageBus
 from infra.channels.base import AttachmentStore
+from infra.channels.artifacts import ChannelAttachmentArtifactStore
 from infra.mobile_realtime.channel import MobileRealtimeChannel
 from infra.mobile_realtime.gateway import MobileGatewayRuntime
 from infra.mobile_realtime.protocol import (
@@ -44,6 +61,7 @@ from infra.mobile_realtime.remote_media import RemoteMediaError, RemoteMediaSnap
 from infra.mobile_realtime.storage import (
     AttachmentRecord,
     DeviceRecord,
+    MobileStorageError,
     MobileRealtimeStorage,
 )
 from session.manager import SessionManager
@@ -55,8 +73,18 @@ class _Runtime:
         self.config = MobileRealtimeConfig(max_attachment_mb=50)
         self.events: list[dict[str, object]] = []
 
-    async def publish_event(self, **event: object) -> None:
+    def _recipient_count(self) -> int:
+        list_active_devices = getattr(self.storage, "list_active_devices", None)
+        if not callable(list_active_devices):
+            return 1
+        active_devices = list_active_devices()
+        if not isinstance(active_devices, tuple):
+            raise TypeError("list_active_devices 必须返回 tuple")
+        return len(active_devices)
+
+    async def publish_event(self, **event: object) -> int:
         self.events.append(dict(event))
+        return self._recipient_count()
 
     async def publish_connection_control(self, **control: object) -> None:
         self.events.append(dict(control))
@@ -68,6 +96,22 @@ class _Runtime:
         payload_builder: Any,
         session_id: str,
     ) -> tuple[AttachmentRecord, ...]:
+        resolved, _recipient_count = (
+            await self.publish_event_with_outbound_attachments_result(
+                candidates=candidates,
+                payload_builder=payload_builder,
+                session_id=session_id,
+            )
+        )
+        return resolved
+
+    async def publish_event_with_outbound_attachments_result(
+        self,
+        *,
+        candidates: tuple[AttachmentRecord, ...],
+        payload_builder: Any,
+        session_id: str,
+    ) -> tuple[tuple[AttachmentRecord, ...], int]:
         event_id = gateway_module._new_ulid()
         resolved, events = self.storage.commit_outbound_event(
             candidates,
@@ -85,7 +129,7 @@ class _Runtime:
             created_at=datetime.now(timezone.utc),
         )
         self.events.append({"durable": events})
-        return resolved
+        return resolved, len(events)
 
     async def refresh_device_capabilities(
         self,
@@ -104,11 +148,12 @@ class _GatedPublishRuntime(_Runtime):
         self.delta_publish_started = asyncio.Event()
         self.delta_publish_release = asyncio.Event()
 
-    async def publish_event(self, **event: object) -> None:
+    async def publish_event(self, **event: object) -> int:
         self.events.append(dict(event))
         if event.get("event_type") == "react.thinking.delta":
             self.delta_publish_started.set()
             await self.delta_publish_release.wait()
+        return self._recipient_count()
 
 
 class _FinalGatedRuntime(_Runtime):
@@ -119,11 +164,12 @@ class _FinalGatedRuntime(_Runtime):
         self.final_started = asyncio.Event()
         self.final_release = asyncio.Event()
 
-    async def publish_event(self, **event: object) -> None:
+    async def publish_event(self, **event: object) -> int:
         self.events.append(dict(event))
         if event.get("event_type") == "message.final":
             self.final_started.set()
             await self.final_release.wait()
+        return self._recipient_count()
 
 
 class _FailOnceTerminalRuntime(_Runtime):
@@ -139,12 +185,13 @@ class _FailOnceTerminalRuntime(_Runtime):
         self.fail_type = fail_type
         self.terminal_attempts = 0
 
-    async def publish_event(self, **event: object) -> None:
+    async def publish_event(self, **event: object) -> int:
         if event.get("event_type") == self.fail_type:
             self.terminal_attempts += 1
             if self.terminal_attempts == 1:
                 raise OSError("inbox write failed")
         self.events.append(dict(event))
+        return self._recipient_count()
 
 
 class _GatedFailOnceTerminalRuntime(_FailOnceTerminalRuntime):
@@ -160,7 +207,7 @@ class _GatedFailOnceTerminalRuntime(_FailOnceTerminalRuntime):
         self.terminal_started = asyncio.Event()
         self.terminal_release = asyncio.Event()
 
-    async def publish_event(self, **event: object) -> None:
+    async def publish_event(self, **event: object) -> int:
         if event.get("event_type") == self.fail_type:
             self.terminal_attempts += 1
             if self.terminal_attempts == 1:
@@ -168,6 +215,7 @@ class _GatedFailOnceTerminalRuntime(_FailOnceTerminalRuntime):
                 await self.terminal_release.wait()
                 raise OSError("inbox write failed")
         self.events.append(dict(event))
+        return self._recipient_count()
 
 
 class _FailDeltaRuntime(_Runtime):
@@ -178,25 +226,58 @@ class _FailDeltaRuntime(_Runtime):
         self.fail_at = fail_at
         self.delta_attempts = 0
 
-    async def publish_event(self, **event: object) -> None:
+    async def publish_event(self, **event: object) -> int:
         if event.get("event_type") in {"answer.delta", "react.thinking.delta"}:
             self.delta_attempts += 1
             if self.delta_attempts == self.fail_at:
                 raise OSError("delta publish failed")
         self.events.append(dict(event))
+        return self._recipient_count()
 
 
 class _Bus:
     def __init__(self) -> None:
         self.inbound: list[object] = []
-        self.outbound: dict[str, object] = {}
         self.pending_handoff = False
+        self.order: list[str] = []
 
     async def publish_inbound(self, message: object) -> None:
         self.inbound.append(message)
 
-    def subscribe_outbound(self, channel: str, callback: object) -> None:
-        self.outbound[channel] = callback
+    def bind_mobile_channel_inbound_recoverer(self, recoverer: object) -> None:
+        channel = getattr(recoverer, "__self__", None)
+        assert isinstance(channel, MobileRealtimeChannel)
+        channel._attach_v3_inbound(
+            ChannelRuntimePorts(
+                snapshot_id="test-snapshot",
+                generation_id="test-generation",
+                binding_token="test-binding",
+                ingress=self,
+                identity=None,
+                attachment_import=None,
+                recovery_ingress=self,
+            )
+        )
+        channel._open_v3_inbound()
+
+    async def admit(self, raw: RawInbound) -> bool:
+        self.order.append("admit")
+        self.inbound.append(raw)
+        return True
+
+    async def recover(self, raw: RawInbound) -> bool:
+        self.order.append("recover")
+        self.inbound.append(raw)
+        return True
+
+    async def reserve_mobile_channel_handoff(self, raw: RawInbound) -> bool:
+        assert raw.message.metadata.get("mobile_v3_handoff") is True
+        self.order.append("reserve")
+        return True
+
+    async def defer_mobile_channel_handoff(self, handoff_id: str) -> None:
+        assert handoff_id
+        self.pending_handoff = True
 
     def has_pending_mobile_handoff(
         self,
@@ -211,6 +292,28 @@ class _FailingBus(_Bus):
     async def publish_inbound(self, message: object) -> None:
         raise RuntimeError("bus unavailable")
 
+    async def admit(self, raw: RawInbound) -> bool:
+        raise RuntimeError("bus unavailable")
+
+
+class _GatedReserveBus(_Bus):
+    def __init__(self) -> None:
+        super().__init__()
+        self.reserve_started = asyncio.Event()
+        self.reserve_release = asyncio.Event()
+
+    async def reserve_mobile_channel_handoff(self, raw: RawInbound) -> bool:
+        self.order.append("reserve")
+        self.reserve_started.set()
+        await self.reserve_release.wait()
+        return True
+
+
+class _RejectingIngressBus(_Bus):
+    async def admit(self, raw: RawInbound) -> bool:
+        self.order.append("admit-rejected")
+        return False
+
 
 class _EventBus:
     def __init__(self) -> None:
@@ -221,11 +324,810 @@ class _EventBus:
 
 
 class _PushTool:
-    def __init__(self) -> None:
-        self.registered: dict[str, dict[str, object]] = {}
+    pass
 
-    def register_channel(self, channel: str, **senders: object) -> None:
-        self.registered[channel] = senders
+
+class _ProviderFactory:
+    async def create(self, _credentials: object) -> object:
+        raise AssertionError("Mobile native adapter 不应创建 provider client")
+
+    async def aclose(self) -> None:
+        return None
+
+
+class _ReadLease:
+    def __init__(self, ref: AttachmentRef, data: bytes) -> None:
+        self.ref = ref
+        self._data = data
+        self.closed = False
+
+    async def read_bytes(self, *, max_bytes: int) -> bytes:
+        if len(self._data) > max_bytes:
+            raise ValueError("read limit")
+        return self._data
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+class _ReadPort:
+    def __init__(self, data: dict[str, bytes]) -> None:
+        self._data = data
+        self.leases: list[_ReadLease] = []
+
+    async def acquire(self, ref: AttachmentRef) -> _ReadLease:
+        lease = _ReadLease(ref, self._data[ref.artifact_id])
+        self.leases.append(lease)
+        return lease
+
+
+async def _started_native_mobile_channel(
+    tmp_path: Path,
+    *,
+    active_device: bool = True,
+    runtime: Any | None = None,
+) -> tuple[MobileRealtimeChannel, MobileRealtimeStorage, SessionManager]:
+    if runtime is None:
+        storage = MobileRealtimeStorage(tmp_path / "mobile.db")
+    else:
+        storage = cast(MobileRealtimeStorage, runtime.storage)
+    if active_device:
+        _register_device(storage, "device-1")
+    manager = SessionManager(tmp_path / "workspace")
+    channel = MobileRealtimeChannel(
+        cast(MobileGatewayRuntime, runtime or _Runtime(storage))
+    )
+    await channel.start(
+        cast(
+            Any,
+            SimpleNamespace(
+                bus=_Bus(),
+                session_manager=manager,
+                event_bus=_EventBus(),
+                push_tool=_PushTool(),
+                interrupt_controller=None,
+                attachment_store=AttachmentStore(tmp_path / "uploads"),
+            ),
+        )
+    )
+    return channel, storage, manager
+
+
+def _native_context(
+    read_port: _ReadPort | None = None,
+) -> ChannelFactoryContext:
+    return ChannelFactoryContext(
+        snapshot_id="snapshot-1",
+        generation_id="generation-1",
+        binding_token="binding-1",
+        config={},
+        credentials={},
+        provider_client_factory=cast(Any, _ProviderFactory()),
+        ingress=None,
+        identity=None,
+        attachment_read=read_port,
+    )
+
+
+def _native_ref(data: bytes, *, artifact_id: str = "core-artifact-1") -> AttachmentRef:
+    return AttachmentRef(
+        artifact_id=artifact_id,
+        kind=V3AttachmentKind.FILE,
+        filename="report.txt",
+        media_type="text/plain",
+        size_bytes=len(data),
+        sha256=hashlib.sha256(data).hexdigest(),
+    )
+
+
+def _provider_delivery(channel: MobileRealtimeChannel):
+    """把测试 outbound 映射为正式 Channel provider callback。"""
+
+    async def deliver(message: OutboundMessage | ChannelMessage):
+        if isinstance(message, ChannelMessage):
+            return await channel._deliver_message(message)
+        channel_message = channel_message_from_outbound(message)
+        metadata = dict(channel_message.metadata)
+        metadata["_channel_commit_role"] = "passive"
+        return await channel._deliver_message(
+            replace(channel_message, metadata=metadata)
+        )
+
+    return deliver
+
+
+@pytest.mark.asyncio
+async def test_mobile_message_send_uses_exact_v3_ingress_without_legacy_bus(
+    tmp_path: Path,
+) -> None:
+    storage = MobileRealtimeStorage(tmp_path / "mobile.db")
+    device_id = uuid4().hex
+    _register_device(storage, device_id)
+    runtime = _Runtime(storage)
+    channel = MobileRealtimeChannel(cast(MobileGatewayRuntime, runtime))
+    bus = _Bus()
+    manager = SessionManager(tmp_path / "workspace")
+    await channel.start(
+        cast(
+            Any,
+            SimpleNamespace(
+                bus=bus,
+                session_manager=manager,
+                event_bus=_EventBus(),
+                push_tool=_PushTool(),
+                interrupt_controller=None,
+                attachment_store=AttachmentStore(tmp_path / "uploads"),
+            ),
+        )
+    )
+    session_id = f"mobile:{uuid4()}"
+    reply = await channel.handle_command(
+        device_id=device_id,
+        frame=_message_frame(
+            frame_id="01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            session_id=session_id,
+        ),
+    )
+
+    assert reply.type == "message.send.ok"
+    assert len(bus.inbound) == 1
+    raw = cast(RawInbound, bus.inbound[0])
+    assert raw.message.channel == "mobile"
+    assert raw.message.metadata["session_key_override"] == session_id
+    assert raw.message.metadata["mobile_v3_handoff"] is True
+    manager.close()
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_mobile_captured_callback_blocks_drain_through_preprocessing(
+    tmp_path: Path,
+) -> None:
+    storage = MobileRealtimeStorage(tmp_path / "mobile.db")
+    device_id = uuid4().hex
+    _register_device(storage, device_id)
+    channel = MobileRealtimeChannel(cast(MobileGatewayRuntime, _Runtime(storage)))
+    bus = _GatedReserveBus()
+    manager = SessionManager(tmp_path / "workspace")
+    await channel.start(
+        cast(
+            Any,
+            SimpleNamespace(
+                bus=bus,
+                session_manager=manager,
+                event_bus=_EventBus(),
+                push_tool=_PushTool(),
+                interrupt_controller=None,
+                attachment_store=AttachmentStore(tmp_path / "uploads"),
+            ),
+        )
+    )
+    session_id = f"mobile:{uuid4()}"
+    sending = asyncio.create_task(
+        channel.handle_command(
+            device_id=device_id,
+            frame=_message_frame(
+                frame_id="01ARZ3NDEKTSV4RRFFQ69G5FAA",
+                session_id=session_id,
+            ),
+        )
+    )
+    await bus.reserve_started.wait()
+    channel._close_v3_inbound()
+    draining = asyncio.create_task(channel._drain_v3_inbound())
+    await asyncio.sleep(0)
+    assert not draining.done()
+
+    with pytest.raises(RuntimeError, match="admission 已关闭"):
+        await channel.handle_command(
+            device_id=device_id,
+            frame=_message_frame(
+                frame_id="01ARZ3NDEKTSV4RRFFQ69G5FAB",
+                session_id=f"mobile:{uuid4()}",
+            ),
+        )
+    bus.reserve_release.set()
+    reply = await sending
+    await draining
+
+    assert reply.type == "message.send.ok"
+    assert bus.order == ["reserve", "admit"]
+    await channel.stop()
+    manager.close()
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_mobile_exact_ingress_false_never_commits_success_receipt(
+    tmp_path: Path,
+) -> None:
+    storage = MobileRealtimeStorage(tmp_path / "mobile.db")
+    device_id = uuid4().hex
+    _register_device(storage, device_id)
+    channel = MobileRealtimeChannel(cast(MobileGatewayRuntime, _Runtime(storage)))
+    bus = _RejectingIngressBus()
+    manager = SessionManager(tmp_path / "workspace")
+    await channel.start(
+        cast(
+            Any,
+            SimpleNamespace(
+                bus=bus,
+                session_manager=manager,
+                event_bus=_EventBus(),
+                push_tool=_PushTool(),
+                interrupt_controller=None,
+                attachment_store=AttachmentStore(tmp_path / "uploads"),
+            ),
+        )
+    )
+    frame = _message_frame(
+        frame_id="01ARZ3NDEKTSV4RRFFQ69G5FAC",
+        session_id=f"mobile:{uuid4()}",
+    )
+
+    with pytest.raises(RuntimeError, match="captured binding fence"):
+        await channel.handle_command(device_id=device_id, frame=frame)
+
+    receipt = storage._db.execute(
+        "SELECT status, reply_type FROM mobile_command_receipts "
+        "WHERE device_id = ? AND command_id = ?",
+        (device_id, frame.id),
+    ).fetchone()
+    assert receipt is not None
+    assert tuple(receipt) == ("processing", None)
+    assert bus.order == ["reserve", "admit-rejected"]
+    await channel.stop()
+    manager.close()
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_native_v3_mobile_adapter_rejects_without_active_device(
+    tmp_path: Path,
+) -> None:
+    channel, storage, manager = await _started_native_mobile_channel(
+        tmp_path,
+        active_device=False,
+    )
+    adapter = channel.build_v3_adapter(_native_context())
+    ready = await adapter.start()
+    receipt = await adapter.deliver(
+        ProviderDeliveryRequest(
+            binding_token=ready.binding_token,
+            delivery_id="delivery-no-device",
+            recipient=f"mobile:{uuid4()}",
+            body="hello",
+        )
+    )
+    assert receipt.status is V3DeliveryStatus.REJECTED
+    assert receipt.error is not None
+    assert await adapter.stop() == await adapter.stop()
+    await channel.stop()
+    manager.close()
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_native_v3_mobile_adapter_reads_opaque_ref_and_commits_one_event(
+    tmp_path: Path,
+) -> None:
+    channel, storage, manager = await _started_native_mobile_channel(tmp_path)
+    data = b"native-mobile-attachment"
+    ref = AttachmentRef(
+        artifact_id="core-artifact-1",
+        kind=V3AttachmentKind.FILE,
+        filename="report.txt",
+        media_type="text/plain",
+        size_bytes=len(data),
+        sha256=hashlib.sha256(data).hexdigest(),
+    )
+    read_port = _ReadPort({ref.artifact_id: data})
+    adapter = channel.build_v3_adapter(_native_context(read_port))
+    await adapter.start()
+    session_id = f"mobile:{uuid4()}"
+    receipt = await adapter.deliver(
+        ProviderDeliveryRequest(
+            binding_token="binding-1",
+            delivery_id="delivery-with-attachment",
+            recipient=session_id,
+            body="attached",
+            attachments=(ref,),
+            metadata={
+                "delivery_id": "delivery-with-attachment",
+                "nested": {"ordinal": 1},
+            },
+        )
+    )
+    assert receipt.status is V3DeliveryStatus.DELIVERED
+    assert read_port.leases and all(lease.closed for lease in read_port.leases)
+    durable = storage.read_durable_events(
+        "device-1",
+        after_event_seq=0,
+        limit=10,
+    )
+    assert len(durable) == 1
+    envelope = json.loads(durable[0].envelope_json)
+    descriptor = envelope["payload"]["attachments"][0]
+    assert descriptor["filename"] == "report.txt"
+    assert descriptor["sha256"] == ref.sha256
+    assert envelope["payload"]["metadata"]["nested"] == {"ordinal": 1}
+    assert ref.artifact_id not in durable[0].envelope_json
+    record = storage.read_attachment(descriptor["attachment_id"])
+    assert record is not None
+    assert Path(record.local_path).read_bytes() == data
+    await adapter.stop()
+    await channel.stop()
+    manager.close()
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_native_v3_mobile_adapter_reports_unknown_if_durable_call_raises(
+    tmp_path: Path,
+) -> None:
+    class _FailingRuntime(_Runtime):
+        async def publish_event(self, **_event: object) -> int:
+            raise OSError("durable write outcome unknown")
+
+    storage = MobileRealtimeStorage(tmp_path / "mobile.db")
+    _register_device(storage, "device-1")
+    manager = SessionManager(tmp_path / "workspace")
+    channel = MobileRealtimeChannel(
+        cast(MobileGatewayRuntime, _FailingRuntime(storage))
+    )
+    await channel.start(
+        cast(
+            Any,
+            SimpleNamespace(
+                bus=_Bus(),
+                session_manager=manager,
+                event_bus=_EventBus(),
+                push_tool=_PushTool(),
+                interrupt_controller=None,
+                attachment_store=AttachmentStore(tmp_path / "uploads"),
+            ),
+        )
+    )
+    adapter = channel.build_v3_adapter(_native_context())
+    await adapter.start()
+    receipt = await adapter.deliver(
+        ProviderDeliveryRequest(
+            binding_token="binding-1",
+            delivery_id="delivery-unknown",
+            recipient=f"mobile:{uuid4()}",
+            body="unknown",
+        )
+    )
+    assert receipt.status is V3DeliveryStatus.UNKNOWN
+    await adapter.stop()
+    await channel.stop()
+    manager.close()
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_native_v3_mobile_adapter_rejects_mismatched_lease_ref(
+    tmp_path: Path,
+) -> None:
+    channel, storage, manager = await _started_native_mobile_channel(tmp_path)
+    data = b"lease-identity"
+    requested = _native_ref(data)
+    mismatched = _native_ref(data, artifact_id="different-artifact")
+
+    class _MismatchedReadPort(_ReadPort):
+        async def acquire(self, _ref: AttachmentRef) -> _ReadLease:
+            lease = _ReadLease(mismatched, data)
+            self.leases.append(lease)
+            return lease
+
+    read_port = _MismatchedReadPort({requested.artifact_id: data})
+    adapter = channel.build_v3_adapter(_native_context(read_port))
+    await adapter.start()
+    receipt = await adapter.deliver(
+        ProviderDeliveryRequest(
+            binding_token="binding-1",
+            delivery_id="delivery-mismatched-lease",
+            recipient=f"mobile:{uuid4()}",
+            body="should reject",
+            attachments=(requested,),
+        )
+    )
+    assert receipt.status is V3DeliveryStatus.REJECTED
+    assert receipt.error is not None and "lease.ref" in receipt.error
+    assert read_port.leases and all(lease.closed for lease in read_port.leases)
+    assert storage.count_durable_events("device-1") == 0
+    await adapter.stop()
+    await channel.stop()
+    manager.close()
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_native_v3_mobile_adapter_rejects_provider_read_failure(
+    tmp_path: Path,
+) -> None:
+    channel, storage, manager = await _started_native_mobile_channel(tmp_path)
+    requested = _native_ref(b"read-failure")
+
+    class _FailingReadPort:
+        async def acquire(self, _ref: AttachmentRef) -> _ReadLease:
+            raise RuntimeError("artifact provider unavailable")
+
+    adapter = channel.build_v3_adapter(_native_context(cast(Any, _FailingReadPort())))
+    await adapter.start()
+    receipt = await adapter.deliver(
+        ProviderDeliveryRequest(
+            binding_token="binding-1",
+            delivery_id="delivery-read-failure",
+            recipient=f"mobile:{uuid4()}",
+            body="should reject",
+            attachments=(requested,),
+        )
+    )
+    assert receipt.status is V3DeliveryStatus.REJECTED
+    assert receipt.error is not None and "provider unavailable" in receipt.error
+    assert storage.count_durable_events("device-1") == 0
+    await adapter.stop()
+    await channel.stop()
+    manager.close()
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_native_v3_mobile_adapter_propagates_provider_read_cancel(
+    tmp_path: Path,
+) -> None:
+    channel, storage, manager = await _started_native_mobile_channel(tmp_path)
+    data = b"read-cancel"
+    requested = _native_ref(data)
+
+    class _CancelledReadLease(_ReadLease):
+        async def read_bytes(self, *, max_bytes: int) -> bytes:
+            raise asyncio.CancelledError
+
+    class _CancelledReadPort:
+        def __init__(self) -> None:
+            self.lease: _CancelledReadLease | None = None
+
+        async def acquire(self, ref: AttachmentRef) -> _CancelledReadLease:
+            self.lease = _CancelledReadLease(ref, data)
+            return self.lease
+
+    read_port = _CancelledReadPort()
+    adapter = channel.build_v3_adapter(_native_context(cast(Any, read_port)))
+    await adapter.start()
+    with pytest.raises(asyncio.CancelledError):
+        await adapter.deliver(
+            ProviderDeliveryRequest(
+                binding_token="binding-1",
+                delivery_id="delivery-read-cancel",
+                recipient=f"mobile:{uuid4()}",
+                body="cancel",
+                attachments=(requested,),
+            )
+        )
+    assert read_port.lease is not None and read_port.lease.closed
+    assert storage.count_durable_events("device-1") == 0
+    await adapter.stop()
+    await channel.stop()
+    manager.close()
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_native_v3_mobile_adapter_rejects_when_device_revoked_before_commit(
+    tmp_path: Path,
+) -> None:
+    channel, storage, manager = await _started_native_mobile_channel(tmp_path)
+    original_list_active_devices = storage.list_active_devices
+    calls = 0
+
+    def list_active_devices_with_race() -> tuple[DeviceRecord, ...]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return original_list_active_devices()
+        return ()
+
+    storage.list_active_devices = (  # type: ignore[method-assign]
+        list_active_devices_with_race
+    )
+    adapter = channel.build_v3_adapter(_native_context())
+    await adapter.start()
+    receipt = await adapter.deliver(
+        ProviderDeliveryRequest(
+            binding_token="binding-1",
+            delivery_id="delivery-device-race",
+            recipient=f"mobile:{uuid4()}",
+            body="no zero-recipient success",
+        )
+    )
+    assert receipt.status is V3DeliveryStatus.REJECTED
+    assert calls == 2
+    assert storage.count_durable_events("device-1") == 0
+    await adapter.stop()
+    await channel.stop()
+    manager.close()
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_native_v3_mobile_passive_rejects_terminal_after_device_race(
+    tmp_path: Path,
+) -> None:
+    channel, storage, manager = await _started_native_mobile_channel(tmp_path)
+    original_list_active_devices = storage.list_active_devices
+    calls = 0
+
+    def list_active_devices_with_race() -> tuple[DeviceRecord, ...]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return original_list_active_devices()
+        return ()
+
+    storage.list_active_devices = (  # type: ignore[method-assign]
+        list_active_devices_with_race
+    )
+    adapter = channel.build_v3_adapter(_native_context())
+    await adapter.start()
+    receipt = await adapter.deliver(
+        ProviderDeliveryRequest(
+            binding_token="binding-1",
+            delivery_id="delivery-passive-device-race",
+            recipient=f"mobile:{uuid4()}",
+            body="passive no recipient",
+            commit_role=ChannelCommitRole.PASSIVE,
+            control_turn_id="turn:passive-race",
+        )
+    )
+    assert receipt.status is V3DeliveryStatus.REJECTED
+    assert calls == 2
+    assert storage.count_durable_events("device-1") == 0
+    await adapter.stop()
+    await channel.stop()
+    manager.close()
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_native_v3_mobile_passive_preserves_pending_delta_for_retry(
+    tmp_path: Path,
+) -> None:
+    class _NoZeroEventRuntime(_Runtime):
+        async def publish_event(self, **event: object) -> int:
+            recipient_count = self._recipient_count()
+            if recipient_count > 0:
+                self.events.append(dict(event))
+            return recipient_count
+
+    runtime = _NoZeroEventRuntime(MobileRealtimeStorage(tmp_path / "mobile.db"))
+    channel, storage, manager = await _started_native_mobile_channel(
+        tmp_path,
+        runtime=runtime,
+    )
+    session_id = f"mobile:{uuid4()}"
+    turn_id = "turn:passive-delta-race"
+    key = (session_id, turn_id)
+    channel._process_turns[key] = channel_module._ProcessTurnState(
+        next_ordinal=0,
+        thinking_block=None,
+        tool_blocks={},
+        answer_segments=[],
+        control_turn_id=turn_id,
+    )
+    async with channel._delta_locked(session_id, turn_id):
+        assert not channel._accept_segment_locked(
+            session_id=session_id,
+            turn_id=turn_id,
+            event_type="answer.delta",
+            delta="pending delta",
+            block_id=None,
+            ordinal=None,
+        )
+    batch = channel._delta_batches[key]
+    batch.timer.cancel()
+    _ = await asyncio.gather(batch.timer, return_exceptions=True)
+
+    original_list_active_devices = storage.list_active_devices
+    calls = 0
+
+    def list_active_devices_with_race() -> tuple[DeviceRecord, ...]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return original_list_active_devices()
+        return ()
+
+    storage.list_active_devices = (  # type: ignore[method-assign]
+        list_active_devices_with_race
+    )
+    adapter = channel.build_v3_adapter(_native_context())
+    await adapter.start()
+    request = ProviderDeliveryRequest(
+        binding_token="binding-1",
+        delivery_id="delivery-passive-delta-race",
+        recipient=session_id,
+        body="done",
+        commit_role=ChannelCommitRole.PASSIVE,
+        control_turn_id=turn_id,
+    )
+    rejected = await adapter.deliver(request)
+    assert rejected.status is V3DeliveryStatus.REJECTED
+    assert calls >= 2
+    assert key in channel._delta_batches
+    assert channel._delta_batches[key].segments == [
+        ("answer.delta", "pending delta", None, None)
+    ]
+    assert runtime.events == []
+
+    storage.list_active_devices = (  # type: ignore[method-assign]
+        original_list_active_devices
+    )
+    delivered = await adapter.deliver(request)
+    assert delivered.status is V3DeliveryStatus.DELIVERED
+    assert channel._delta_batches == {}
+    assert [event["event_type"] for event in runtime.events] == [
+        "answer.delta",
+        "message.final",
+    ]
+    await adapter.stop()
+    await channel.stop()
+    manager.close()
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_native_v3_mobile_adapter_cleans_candidates_on_cancelled_precommit(
+    tmp_path: Path,
+) -> None:
+    data = b"cancelled-before-commit"
+    requested = _native_ref(data)
+
+    class _PrecommitFailRuntime(_Runtime):
+        def __init__(self, storage: MobileRealtimeStorage) -> None:
+            super().__init__(storage)
+            self.publish_started = asyncio.Event()
+            self.publish_release = asyncio.Event()
+
+        async def publish_event_with_outbound_attachments_result(
+            self,
+            **_kwargs: object,
+        ) -> tuple[tuple[AttachmentRecord, ...], int]:
+            self.publish_started.set()
+            await self.publish_release.wait()
+            raise MobileStorageError("durable event 没有可提交的目标设备")
+
+    runtime = _PrecommitFailRuntime(
+        MobileRealtimeStorage(tmp_path / "mobile.db")
+    )
+    channel, storage, manager = await _started_native_mobile_channel(
+        tmp_path,
+        runtime=runtime,
+    )
+    read_port = _ReadPort({requested.artifact_id: data})
+    adapter = channel.build_v3_adapter(_native_context(read_port))
+    await adapter.start()
+    delivery = asyncio.create_task(
+        adapter.deliver(
+            ProviderDeliveryRequest(
+                binding_token="binding-1",
+                delivery_id="delivery-cancelled-precommit",
+                recipient=f"mobile:{uuid4()}",
+                body="cancel",
+                attachments=(requested,),
+            )
+        )
+    )
+    await runtime.publish_started.wait()
+    delivery.cancel()
+    runtime.publish_release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await delivery
+    assert not [path for path in (tmp_path / "uploads").rglob("*") if path.is_file()]
+    assert storage.count_durable_events("device-1") == 0
+    await adapter.stop()
+    await channel.stop()
+    manager.close()
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_native_v3_mobile_adapter_retains_candidates_after_unknown_effect(
+    tmp_path: Path,
+) -> None:
+    data = b"unknown-after-commit"
+    requested = _native_ref(data)
+
+    class _CommitThenRaiseRuntime(_Runtime):
+        async def publish_event_with_outbound_attachments_result(
+            self,
+            **kwargs: object,
+        ) -> tuple[tuple[AttachmentRecord, ...], int]:
+            _resolved, _count = (
+                await super().publish_event_with_outbound_attachments_result(
+                    candidates=cast(
+                        tuple[AttachmentRecord, ...],
+                        kwargs["candidates"],
+                    ),
+                    payload_builder=cast(Any, kwargs["payload_builder"]),
+                    session_id=cast(str, kwargs["session_id"]),
+                )
+            )
+            raise RuntimeError("commit acknowledgement lost")
+
+    runtime = _CommitThenRaiseRuntime(
+        MobileRealtimeStorage(tmp_path / "mobile.db")
+    )
+    channel, storage, manager = await _started_native_mobile_channel(
+        tmp_path,
+        runtime=runtime,
+    )
+    read_port = _ReadPort({requested.artifact_id: data})
+    adapter = channel.build_v3_adapter(_native_context(read_port))
+    await adapter.start()
+    receipt = await adapter.deliver(
+        ProviderDeliveryRequest(
+            binding_token="binding-1",
+            delivery_id="delivery-unknown-after-commit",
+            recipient=f"mobile:{uuid4()}",
+            body="unknown",
+            attachments=(requested,),
+        )
+    )
+    assert receipt.status is V3DeliveryStatus.UNKNOWN
+    assert storage.count_durable_events("device-1") == 1
+    assert [path for path in (tmp_path / "uploads").rglob("*") if path.is_file()]
+    await adapter.stop()
+    await channel.stop()
+    manager.close()
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_native_v3_mobile_passive_keeps_file_after_post_commit_db_error(
+    tmp_path: Path,
+) -> None:
+    data = b"passive-post-commit-error"
+    requested = _native_ref(data)
+    channel, storage, manager = await _started_native_mobile_channel(tmp_path)
+    original_create = storage.create_or_read_outbound_attachments
+
+    def commit_then_raise(
+        records: tuple[AttachmentRecord, ...],
+        *,
+        message_id: str | None = None,
+    ) -> tuple[AttachmentRecord, ...]:
+        _ = original_create(records, message_id=message_id)
+        raise sqlite3.OperationalError("post-commit acknowledgement lost")
+
+    storage.create_or_read_outbound_attachments = (  # type: ignore[method-assign]
+        commit_then_raise
+    )
+    read_port = _ReadPort({requested.artifact_id: data})
+    adapter = channel.build_v3_adapter(_native_context(read_port))
+    await adapter.start()
+    receipt = await adapter.deliver(
+        ProviderDeliveryRequest(
+            binding_token="binding-1",
+            delivery_id="delivery-passive-post-commit-error",
+            recipient=f"mobile:{uuid4()}",
+            body="unknown registration result",
+            attachments=(requested,),
+            session_message_id="assistant-message-1",
+            commit_role=ChannelCommitRole.PASSIVE,
+        )
+    )
+    assert receipt.status is V3DeliveryStatus.UNKNOWN
+    row = storage._db.execute(  # pyright: ignore[reportPrivateUsage]
+        "SELECT local_path FROM mobile_attachments WHERE direction = 'outbound'"
+    ).fetchone()
+    assert row is not None
+    assert Path(row[0]).is_file()
+    await adapter.stop()
+    await channel.stop()
+    manager.close()
+    storage.close()
 
 
 class _RuntimeInspection:
@@ -700,6 +1602,7 @@ def _message_frame(
     text: str = "你好",
     model_runtime_id: str | None = None,
     model_reasoning_effort: str | None = None,
+    media_refs: list[str] | None = None,
 ) -> MessageSendCommand:
     frame = parse_frame(
         json.dumps(
@@ -714,7 +1617,7 @@ def _message_frame(
                     "client_message_id": frame_id,
                     "session_id": session_id,
                     "text": text,
-                    "media_refs": [],
+                    "media_refs": media_refs or [],
                     "client_created_at": datetime.now(timezone.utc).isoformat(),
                     **({"reply_to": reply_to} if reply_to is not None else {}),
                     **(
@@ -822,16 +1725,140 @@ async def test_message_send_is_idempotent_and_session_is_shared_between_devices(
     assert mismatched.payload["code"] == "client_message_id_mismatch"
     assert len(bus.inbound) == 2
     assert all(
-        item.metadata["require_existing_session"] is True for item in bus.inbound
+        cast(RawInbound, item).message.metadata["require_existing_session"] is True
+        for item in bus.inbound
     )
-    with pytest.raises(ValueError, match="正在处理消息"):
-        manager.delete_session(session_id)
-    for item in bus.inbound:
-        assert item.session_admission_id is not None
-        manager.release_admission(item.session_admission_id)
     assert manager.delete_session(session_id)
     with pytest.raises(KeyError, match="session 不存在"):
         manager.get_existing(session_id)
+    await channel.stop()
+    manager.close()
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_mobile_message_adopts_finalized_upload_before_bus_admission(
+    tmp_path: Path,
+) -> None:
+    storage = MobileRealtimeStorage(tmp_path / "mobile.db")
+    device_id = uuid4().hex
+    _register_device(storage, device_id)
+    runtime = _Runtime(storage)
+    channel = MobileRealtimeChannel(cast(MobileGatewayRuntime, runtime))
+    bus = _Bus()
+    workspace = tmp_path / "workspace"
+    manager = SessionManager(workspace)
+    legacy_store = AttachmentStore(tmp_path / "uploads")
+    legacy_store.root.mkdir(parents=True)
+    content = b"mobile-c23"
+    source = legacy_store.root / "upload.png"
+    source.write_bytes(content)
+    session_id = f"mobile:{uuid4()}"
+    storage.create_attachment(
+        AttachmentRecord(
+            attachment_id="upload-c23",
+            device_id=device_id,
+            session_id=session_id,
+            direction="upload",
+            filename="upload.png",
+            content_type="image/png",
+            size_bytes=len(content),
+            sha256=hashlib.sha256(content).hexdigest(),
+            local_path=str(source),
+            transferred_bytes=len(content),
+            state="ready",
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+        )
+    )
+    artifact_store = ChannelAttachmentArtifactStore(
+        workspace=workspace,
+        session_store=manager.control_store,
+    )
+    original_adopt = artifact_store.adopt_file_with_artifact_id
+
+    async def recorded_adopt(*args: object, **kwargs: object) -> AttachmentRef:
+        bus.order.append("artifact")
+        return await original_adopt(*args, **kwargs)  # type: ignore[arg-type]
+
+    artifact_store.adopt_file_with_artifact_id = recorded_adopt  # type: ignore[method-assign]
+    channel.bind_channel_attachment_store(artifact_store)
+    await channel.start(
+        cast(
+            Any,
+            SimpleNamespace(
+                bus=bus,
+                session_manager=manager,
+                event_bus=_EventBus(),
+                push_tool=_PushTool(),
+                interrupt_controller=None,
+                attachment_store=legacy_store,
+            ),
+        )
+    )
+
+    reply = await channel.handle_command(
+        device_id=device_id,
+        frame=_message_frame(
+            frame_id="01ARZ3NDEKTSV4RRFFQ69G5FAX",
+            session_id=session_id,
+            media_refs=["upload-c23"],
+        ),
+    )
+
+    assert reply.type == "message.send.ok"
+    assert len(bus.inbound) == 1
+    inbound = cast(RawInbound, bus.inbound[0])
+    artifact_ids = cast(list[str], inbound.message.metadata["attachment_ids"])
+    assert tuple(ref.artifact_id for ref in inbound.message.attachments) == artifact_ids
+    assert len(artifact_ids) == 1
+    imported = storage.list_attachment_imports(
+        session_id=session_id,
+        client_message_id="01ARZ3NDEKTSV4RRFFQ69G5FAX",
+    )
+    assert imported[0].phase == "artifact_committed"
+    assert imported[0].artifact_id == artifact_ids[0]
+    assert bus.order == ["reserve", "artifact", "admit"]
+
+    # 1. artifact read lease 可读，且只暴露进程内 fd 路径。
+    ref = artifact_store.resolve_refs(tuple(artifact_ids))[0]
+    lease = await artifact_store.acquire(ref)
+    try:
+        assert await lease.read_bytes(max_bytes=1024) == content
+    finally:
+        await lease.aclose()
+
+    # 2. Session commit 与 Mobile import phase 最终收束到同一 artifact ID。
+    session = manager.get_existing(session_id)
+    pending: dict[str, object] = {
+        "role": "user",
+        "content": "with attachment",
+        "client_message_id": "01ARZ3NDEKTSV4RRFFQ69G5FAX",
+        "attachment_ids": list(artifact_ids),
+    }
+    await manager.append_messages(session, [pending])
+    await channel.stop()
+    restarted = MobileRealtimeChannel(cast(MobileGatewayRuntime, runtime))
+    restarted.bind_channel_attachment_store(artifact_store)
+    await restarted.start(
+        cast(
+            Any,
+            SimpleNamespace(
+                bus=bus,
+                session_manager=manager,
+                event_bus=_EventBus(),
+                push_tool=_PushTool(),
+                interrupt_controller=None,
+                attachment_store=legacy_store,
+            ),
+        )
+    )
+    assert storage.list_attachment_imports(
+        session_id=session_id,
+        client_message_id="01ARZ3NDEKTSV4RRFFQ69G5FAX",
+    )[0].phase == "message_bound"
+
+    await restarted.stop()
     manager.close()
     storage.close()
 
@@ -972,10 +1999,9 @@ async def test_claimed_message_admission_does_not_recreate_after_exists_check(
         ),
     )
 
-    assert reply.type == "message.send.error"
-    assert reply.payload["code"] == "session_not_found"
+    assert reply.type == "message.send.ok"
     assert not original_exists(session_id)
-    assert bus.inbound == []
+    assert len(bus.inbound) == 1
     with pytest.raises(KeyError, match="session 不存在"):
         manager.get_existing(session_id)
     manager.close()
@@ -1337,9 +2363,11 @@ async def test_message_send_resolves_reply_into_agent_context_and_metadata(
     )
 
     assert reply.type == "message.send.ok"
-    inbound = bus.inbound[0]
-    assert f"被回复消息（来自 Akashic）：\n{target_content}" in inbound.content
-    assert inbound.content.endswith("【你当前新消息】\n你好")
+    inbound = cast(RawInbound, bus.inbound[0]).message
+    assert channel_module._normalize_v3_content(
+        f"被回复消息（来自 Akashic）：\n{target_content}"
+    ) in inbound.content
+    assert inbound.content.endswith("【你当前新消息】\u2028你好")
     assert inbound.metadata["display_content"] == "你好"
     assert inbound.metadata["reply_to_message_id"] == target["id"]
     assert inbound.metadata["reply_role"] == "assistant"
@@ -1365,9 +2393,10 @@ async def test_message_send_resolves_reply_into_agent_context_and_metadata(
         ),
     )
     assert second.type == "message.send.ok"
-    assert bus.inbound[1].metadata["require_existing_session"] is True
-    assert bus.inbound[1].metadata["reply_to_message_id"] == user_target["id"]
-    assert "被回复消息（来自 你）：\n之前的问题" in bus.inbound[1].content
+    second_inbound = cast(RawInbound, bus.inbound[1]).message
+    assert second_inbound.metadata["require_existing_session"] is True
+    assert second_inbound.metadata["reply_to_message_id"] == user_target["id"]
+    assert "被回复消息（来自 你）：\u2028之前的问题" in second_inbound.content
 
     media_target = session.add_message(
         "user",
@@ -1387,8 +2416,9 @@ async def test_message_send_resolves_reply_into_agent_context_and_metadata(
         ),
     )
     assert third.type == "message.send.ok"
-    assert bus.inbound[2].metadata["reply_preview"] == "[附件]"
-    assert "被回复消息（来自 你）：\n[附件]" in bus.inbound[2].content
+    third_inbound = cast(RawInbound, bus.inbound[2]).message
+    assert third_inbound.metadata["reply_preview"] == "[附件]"
+    assert "被回复消息（来自 你）：\u2028[附件]" in third_inbound.content
 
     proactive_target = session.add_message(
         "assistant",
@@ -1406,9 +2436,11 @@ async def test_message_send_resolves_reply_into_agent_context_and_metadata(
         ),
     )
     assert fourth.type == "message.send.ok"
-    assert bus.inbound[3].metadata["reply_to_message_id"] == proactive_target["id"]
+    fourth_inbound = cast(RawInbound, bus.inbound[3]).message
+    assert fourth_inbound.metadata["reply_to_message_id"] == proactive_target["id"]
     assert (
-        "被回复消息（来自 Akashic）：\n尚未同步历史的主动消息" in bus.inbound[3].content
+        "被回复消息（来自 Akashic）：\u2028尚未同步历史的主动消息"
+        in fourth_inbound.content
     )
     manager.close()
     storage.close()
@@ -1562,6 +2594,7 @@ async def test_session_list_and_history_sync_publish_all_mobile_sessions(
     session_items_by_id = {str(item["session_id"]): item for item in session_items}
     assert session_items_by_id[session_id]["title"] == "恢复这段对话"
     assert session_items_by_id[empty_session_id]["title"] == "新对话"
+    assert "snapshot_max_seq" not in session_items_by_id[session_id]
     assert history.type == "history.get.ok"
     history_event = runtime.events[-1]
     history_payload = cast(dict[str, object], history_event["payload"])
@@ -1576,6 +2609,33 @@ async def test_session_list_and_history_sync_publish_all_mobile_sessions(
         "reasoning_content": "历史思考",
         "control_turn_id": "turn-history",
     }
+
+    versioned = await channel.handle_command(
+        device_id=device_id,
+        frame=_generic_frame(
+            frame_id="01ARZ3NDEKTSV4RRFFQ69G5FAZ",
+            command_type="session.list",
+            payload={"history_snapshot_version": 1},
+        ),
+    )
+    assert versioned.type == "session.list.ok"
+    versioned_items = cast(
+        list[dict[str, object]],
+        cast(dict[str, object], runtime.events[-1]["payload"])["items"],
+    )
+    versioned_by_id = {str(item["session_id"]): item for item in versioned_items}
+    assert versioned_by_id[session_id]["snapshot_max_seq"] == 1
+    assert versioned_by_id[empty_session_id]["snapshot_max_seq"] == -1
+    invalid_version = await channel.handle_command(
+        device_id=device_id,
+        frame=_generic_frame(
+            frame_id="01ARZ3NDEKTSV4RRFFQ69G5FB0",
+            command_type="session.list",
+            payload={"history_snapshot_version": 2},
+        ),
+    )
+    assert invalid_version.type == "session.list.error"
+    assert invalid_version.payload["code"] == "invalid_payload"
     tool_chain = cast(list[dict[str, object]], history_items[1]["tool_chain"])
     calls = cast(list[dict[str, object]], tool_chain[0]["calls"])
     assert calls[0]["description"] == "读取状态"
@@ -1602,7 +2662,7 @@ async def test_session_list_and_history_sync_publish_all_mobile_sessions(
     )
     session.add_message("assistant", "实时回答", media=[str(media_path)])
     manager.save(session)
-    await channel._on_response(
+    await _provider_delivery(channel)(
         OutboundMessage(
             channel="mobile",
             chat_id=session_id.removeprefix("mobile:"),
@@ -1734,7 +2794,7 @@ async def test_remote_media_failure_keeps_final_text(
         raise RemoteMediaError("签名链接已失效")
 
     monkeypatch.setattr("infra.mobile_realtime.channel.snapshot_remote_media", fail)
-    await channel._on_response(
+    await _provider_delivery(channel)(
         OutboundMessage(
             channel="mobile",
             chat_id=session_id.removeprefix("mobile:"),
@@ -1765,7 +2825,7 @@ async def test_final_event_maps_optimistic_user_to_persisted_identity(
     channel = MobileRealtimeChannel(cast(MobileGatewayRuntime, runtime))
     session_id = f"mobile:{uuid4()}"
 
-    await channel._on_response(
+    await _provider_delivery(channel)(
         OutboundMessage(
             channel="mobile",
             chat_id=session_id.removeprefix("mobile:"),
@@ -1799,7 +2859,7 @@ async def test_final_payload_accepts_client_message_id_without_user_message_id(
     session_id = f"mobile:{uuid4()}"
     turn_id = uuid4().hex
     with caplog.at_level(logging.INFO, logger="infra.mobile_realtime.channel"):
-        await channel._on_response(
+        await _provider_delivery(channel)(
             OutboundMessage(
                 channel="mobile",
                 chat_id=session_id.removeprefix("mobile:"),
@@ -1846,8 +2906,8 @@ async def test_typed_interrupted_outbound_publishes_one_durable_terminal(
         terminal_status=TurnTerminalStatus.INTERRUPTED,
     )
 
-    await channel._on_response(outbound)
-    await channel._on_response(outbound)
+    await _provider_delivery(channel)(outbound)
+    await _provider_delivery(channel)(outbound)
 
     terminals = [
         event
@@ -1890,7 +2950,7 @@ async def test_control_reply_never_reuses_previous_message_id(tmp_path: Path) ->
         )
     )
 
-    await channel._on_response(
+    await _provider_delivery(channel)(
         OutboundMessage(
             channel="mobile",
             chat_id=session_id.removeprefix("mobile:"),
@@ -2000,7 +3060,7 @@ async def test_turn_stop_idle_result_still_closes_stale_mobile_turn(
                     ),
                 ),
                 attachment_store=AttachmentStore(tmp_path / "uploads"),
-                mobile_bot_commands=[],
+                command_catalog_provider=None,
             ),
         )
     )
@@ -2247,6 +3307,12 @@ async def test_command_list_uses_active_channel_catalog_without_stop(
     _register_device(storage, device_id)
     runtime = _Runtime(storage)
     channel = MobileRealtimeChannel(cast(MobileGatewayRuntime, runtime))
+    active_catalog = [
+        ("undo", "撤销上一轮对话"),
+        ("/memorystatus", "查看记忆整理状态"),
+        ("emoji", "😀" * 129),
+        ("stop", "中断当前回复"),
+    ]
     await channel.start(
         cast(
             Any,
@@ -2257,12 +3323,7 @@ async def test_command_list_uses_active_channel_catalog_without_stop(
                 push_tool=_PushTool(),
                 interrupt_controller=None,
                 attachment_store=AttachmentStore(tmp_path / "uploads"),
-                mobile_bot_commands=[
-                    ("undo", "撤销上一轮对话"),
-                    ("/memorystatus", "查看记忆整理状态"),
-                    ("emoji", "😀" * 129),
-                    ("stop", "中断当前回复"),
-                ],
+                command_catalog_provider=lambda: tuple(active_catalog),
             ),
         )
     )
@@ -2282,6 +3343,17 @@ async def test_command_list_uses_active_channel_catalog_without_stop(
             {"command": "memorystatus", "description": "查看记忆整理状态"},
             {"command": "emoji", "description": "😀" * 129},
         ]
+    }
+    active_catalog[:] = [("status", "查看状态")]
+    refreshed = await channel.handle_command(
+        device_id=device_id,
+        frame=_generic_frame(
+            frame_id="01ARZ3NDEKTSV4RRFFQ69G5FB0",
+            command_type="command.list",
+        ),
+    )
+    assert refreshed.payload == {
+        "items": [{"command": "status", "description": "查看状态"}]
     }
     await channel.stop()
     storage.close()
@@ -2309,7 +3381,7 @@ async def test_message_send_preserves_mobile_slash_command_for_bus(
                 push_tool=_PushTool(),
                 interrupt_controller=None,
                 attachment_store=AttachmentStore(tmp_path / "uploads"),
-                mobile_bot_commands=[("undo", "撤销上一轮对话")],
+                command_catalog_provider=lambda: (("undo", "撤销上一轮对话"),),
             ),
         )
     )
@@ -2326,7 +3398,7 @@ async def test_message_send_preserves_mobile_slash_command_for_bus(
 
     assert reply.type == "message.send.ok"
     assert len(bus.inbound) == 1
-    assert cast(Any, bus.inbound[0]).content == "/undo"
+    assert cast(RawInbound, bus.inbound[0]).message.content == "/undo"
     await channel.stop()
     manager.close()
     storage.close()
@@ -2456,6 +3528,53 @@ async def test_plugin_ui_catalog_does_not_create_durable_receipt(
         (frame.id,),
     ).fetchone()[0]
     assert count == 0
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_snapshot_queries_do_not_create_durable_receipts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = MobileRealtimeStorage(tmp_path / "mobile.db")
+    device_id = uuid4().hex
+    _register_device(storage, device_id)
+    channel = MobileRealtimeChannel(cast(MobileGatewayRuntime, _Runtime(storage)))
+
+    async def execute_snapshot(**kwargs: object) -> channel_module.CommandReply:
+        frame = cast(GenericCommand, kwargs["frame"])
+        return channel_module.CommandReply(type=f"{frame.type}.ok", payload={})
+
+    monkeypatch.setattr(channel, "_execute_command", execute_snapshot)
+    command_types = (
+        "command.list",
+        "runtime.document.list",
+        "runtime.capability.list",
+        "scheduler.job.list",
+        "model.catalog.get",
+    )
+    for index, command_type in enumerate(command_types):
+        reply = await channel.handle_command(
+            device_id=device_id,
+            frame=_generic_frame(
+                frame_id=f"01ARZ3NDEKTSV4RRFFQ69G5FA{index}",
+                command_type=command_type,
+            ),
+        )
+        assert reply.type == f"{command_type}.ok"
+
+    durable = await channel.handle_command(
+        device_id=device_id,
+        frame=_generic_frame(
+            frame_id="01ARZ3NDEKTSV4RRFFQ69G5FA5",
+            command_type="runtime.document.get",
+        ),
+    )
+    assert durable.type == "runtime.document.get.ok"
+    receipts = storage._db.execute(
+        "SELECT command_type FROM mobile_command_receipts ORDER BY command_type"
+    ).fetchall()
+    assert [row[0] for row in receipts] == ["runtime.document.get"]
     storage.close()
 
 
@@ -2834,7 +3953,7 @@ async def test_stream_deltas_batch_within_transport_window_and_flush_before_tool
             thinking_delta="继续思考",
         )
     )
-    await channel._on_response(
+    await _provider_delivery(channel)(
         OutboundMessage(
             channel="mobile",
             chat_id=session_id.removeprefix("mobile:"),
@@ -3096,7 +4215,7 @@ async def test_dual_field_delta_accepts_thinking_and_answer_without_short_circui
         ]
 
         # 3. 终态：残留批 flush → terminal，正文严格 已接受 delta → message.final。
-        await channel._on_response(
+        await _provider_delivery(channel)(
             OutboundMessage(
                 channel="mobile",
                 chat_id=session_id.removeprefix("mobile:"),
@@ -3185,7 +4304,7 @@ async def test_terminal_and_reconcile_flush_pending_delta_before_terminal_event(
     assert (session_id, turn_id) in channel._delta_batches
 
     # 2. terminal：残留批必须先于 message.final 发布，随后批与定时器都被清理。
-    await channel._on_response(
+    await _provider_delivery(channel)(
         OutboundMessage(
             channel="mobile",
             chat_id=session_id.removeprefix("mobile:"),
@@ -3330,7 +4449,7 @@ async def test_terminal_barrier_flushes_accepted_deltas_then_terminal_and_drops_
     #    message.final；闸门卡住 terminal 发布，让 barrier 临界区真实持锁。
     with caplog.at_level(logging.INFO, logger="infra.mobile_realtime.channel"):
         final_task = asyncio.create_task(
-            channel._on_response(
+            _provider_delivery(channel)(
                 OutboundMessage(
                     channel="mobile",
                     chat_id=session_id.removeprefix("mobile:"),
@@ -3831,7 +4950,7 @@ async def test_post_terminal_flush_duplicate_and_late_events_never_rebuild(
         tmp_path
     )
     key = (session_id, turn_id)
-    await channel._on_response(
+    await _provider_delivery(channel)(
         OutboundMessage(
             channel="mobile",
             chat_id=session_id.removeprefix("mobile:"),
@@ -3946,7 +5065,7 @@ async def test_racing_delta_dropped_so_final_suffix_covers_full_body(
     lock = channel._delta_locks[key]
     await lock.acquire()
     final_task = asyncio.create_task(
-        channel._on_response(
+        _provider_delivery(channel)(
             OutboundMessage(
                 channel="mobile",
                 chat_id=session_id.removeprefix("mobile:"),
@@ -4066,7 +5185,7 @@ async def test_late_a_final_keeps_b_active_and_identity(
     # 1. 迟到的 A final 通过 execution attempt 归属 A；逻辑 Turn 独立投影。
     logical_turn_a = "turn:logical-A"
     with caplog.at_level(logging.INFO, logger="infra.mobile_realtime.channel"):
-        await channel._on_response(
+        await _provider_delivery(channel)(
             OutboundMessage(
                 channel="mobile",
                 chat_id=session_id.removeprefix("mobile:"),
@@ -4239,7 +5358,7 @@ async def test_final_projects_only_explicit_mobile_metadata(tmp_path: Path) -> N
     channel = MobileRealtimeChannel(cast(MobileGatewayRuntime, runtime))
     session_id = f"mobile:{uuid4()}"
 
-    await channel._on_response(
+    await _provider_delivery(channel)(
         OutboundMessage(
             channel="mobile",
             chat_id=session_id.removeprefix("mobile:"),
@@ -4274,7 +5393,7 @@ async def test_nonstreamed_large_unicode_answer_uses_bounded_deltas(
     session_id = f"mobile:{uuid4()}"
     content = ("长回复🙂\n" * 150_000)[:1_000_000]
 
-    await channel._on_response(
+    await _provider_delivery(channel)(
         OutboundMessage(
             channel="mobile",
             chat_id=session_id.removeprefix("mobile:"),
@@ -4327,7 +5446,7 @@ async def test_final_emits_only_missing_streamed_answer_suffix(tmp_path: Path) -
         )
     )
 
-    await channel._on_response(
+    await _provider_delivery(channel)(
         OutboundMessage(
             channel="mobile",
             chat_id=session_id.removeprefix("mobile:"),
@@ -4374,7 +5493,7 @@ async def test_divergent_stream_keeps_final_correction_inline(tmp_path: Path) ->
         )
     )
 
-    await channel._on_response(
+    await _provider_delivery(channel)(
         OutboundMessage(
             channel="mobile",
             chat_id=session_id.removeprefix("mobile:"),
@@ -4415,7 +5534,7 @@ async def test_proactive_sender_uses_mobile_event_path(tmp_path: Path) -> None:
         session_id=f"mobile:{chat_id}",
         created_at=datetime.now(timezone.utc),
     )
-    deliver = cast(Any, push.registered["mobile"]["deliver"])
+    deliver = cast(Any, _provider_delivery(channel))
 
     receipt = await deliver(
         ChannelMessage(
@@ -4460,7 +5579,7 @@ async def test_proactive_metadata_sender_forwards_delivery_id(tmp_path: Path) ->
         )
     )
     chat_id = str(uuid4())
-    deliver = cast(Any, push.registered["mobile"]["deliver"])
+    deliver = cast(Any, _provider_delivery(channel))
 
     receipt = await deliver(
         ChannelMessage(
@@ -4512,7 +5631,7 @@ async def test_proactive_attachment_commits_one_replayable_logical_message(
     source = tmp_path / "photo.png"
     source.write_bytes(b"png-payload")
     chat_id = str(uuid4())
-    deliver = cast(Any, push.registered["mobile"]["deliver"])
+    deliver = cast(Any, _provider_delivery(channel))
 
     receipt = await deliver(
         ChannelMessage(
@@ -4662,8 +5781,6 @@ async def test_send_and_turn_started_bind_each_client_message_id_per_session(
         {"content": "A", "client_message_id": first_id, "control_turn_id": "turn-A"},
         {"content": "B", "client_message_id": second_id, "control_turn_id": "turn-B"},
     ]
-    for item in bus.inbound:
-        manager.release_admission(item.session_admission_id)
     manager.close()
     storage.close()
 
@@ -4712,7 +5829,7 @@ async def test_terminal_and_stop_clear_send_and_turn_maps(tmp_path: Path) -> Non
 
     # 1. terminal（message.final）只清理 A 的 send/turn maps，
     #    同 session 排队中的 cmid-B 与其他会话条目必须保留。
-    await channel._on_response(
+    await _provider_delivery(channel)(
         OutboundMessage(
             channel="mobile",
             chat_id=session_id.removeprefix("mobile:"),
@@ -4833,7 +5950,7 @@ async def test_terminal_final_publish_fail_once_is_retryable_without_fake_succes
 
     # 1. 第一次：publish 在持久化前抛 OSError——原样上抛、无墓碑、无 cleanup。
     with pytest.raises(OSError):
-        await channel._on_response(outbound)
+        await _provider_delivery(channel)(outbound)
     assert runtime.terminal_attempts == 1
     assert key not in channel._turn_terminals
     assert channel._process_turns[key].client_message_id == "cmid-fail"
@@ -4851,7 +5968,7 @@ async def test_terminal_final_publish_fail_once_is_retryable_without_fake_succes
 
     # 2. 第二次：同 OutboundMessage 重试只补缺失 suffix（已 flush 则不再发），
     #    publish 调用数 2，wire 严格 已接受 delta → message.final，final 恰一。
-    await channel._on_response(outbound)
+    await _provider_delivery(channel)(outbound)
     assert runtime.terminal_attempts == 2
     events = runtime.events
     assert [event["event_type"] for event in events] == [
@@ -4949,7 +6066,7 @@ async def test_terminal_failure_after_batch_flush_retry_does_not_duplicate_delta
     # 1. 第一次：残留批先 flush（"二" 发布），suffix "终" 入批 flush，然后
     #    message.final 持久化前失败。
     with pytest.raises(OSError):
-        await channel._on_response(outbound)
+        await _provider_delivery(channel)(outbound)
     assert [event["event_type"] for event in runtime.events] == [
         "turn.started",
         "answer.delta",
@@ -4966,7 +6083,7 @@ async def test_terminal_failure_after_batch_flush_retry_does_not_duplicate_delta
     )
 
     # 2. 第二次：同一 OutboundMessage 不重复任何已 flush delta，只发布 terminal。
-    await channel._on_response(outbound)
+    await _provider_delivery(channel)(outbound)
     assert runtime.terminal_attempts == 2
     events = runtime.events
     assert [event["event_type"] for event in events] == [
@@ -5051,7 +6168,7 @@ async def test_late_delta_queued_during_terminal_failure_gap_accepted_then_retry
 
     # 1. 第一次 final 持久化前挂起（持锁）；late delta 排队等待同一把锁——
     #    真实 Event/锁编排：不等待锁、不因墓碑直接 drop。
-    final_task = asyncio.create_task(channel._on_response(outbound))
+    final_task = asyncio.create_task(_provider_delivery(channel)(outbound))
     await asyncio.wait_for(runtime.terminal_started.wait(), timeout=5)
     assert key not in channel._turn_terminals
     late_task = asyncio.create_task(
@@ -5079,7 +6196,7 @@ async def test_late_delta_queued_during_terminal_failure_gap_accepted_then_retry
     assert state.final_suffix_emitted == "晚🙂"
 
     # 3. retry：同一 OutboundMessage 真实再次 publish，final 正文完整、恰一次。
-    await channel._on_response(outbound)
+    await _provider_delivery(channel)(outbound)
     assert runtime.terminal_attempts == 2
     finals = [
         event for event in runtime.events if event["event_type"] == "message.final"

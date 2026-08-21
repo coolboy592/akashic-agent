@@ -5,68 +5,131 @@ import os
 from pathlib import Path
 from typing import Any
 
-from agent.plugins import McpServerSpec, Plugin, ProactiveSourceSpec
-from bus.events import ChannelMessage, DeliveryReceipt
+from pydantic import BaseModel
+
+from agent.plugin_composition import (
+    CHANNELS,
+    MCP_SERVERS,
+    PROACTIVE_COMPONENTS,
+    ChannelCapability,
+    ChannelDefinition,
+    ChannelFactoryContext,
+    ChannelReady,
+    Context,
+    CredentialRef,
+    DeliveryStatus,
+    McpServerDefinition,
+    ProactiveSourceDefinition,
+    ProviderDeliveryReceipt,
+    ProviderDeliveryRequest,
+    ServiceView,
+    StopReceipt,
+)
 from core.clock import clock_from_env
-from infra.channels.delivery import deliver_message_parts
-from infra.channels.contract import ChannelContext
+
+api_version = 3
+name = "replay_debug"
+version = "3.0.0"
+desc = "Debug-only replay MCP source and outbound capture channel"
+author = "Akashic Core"
+inject = (CHANNELS, MCP_SERVERS, PROACTIVE_COMPONENTS)
 
 
-def _replay_source_enabled() -> bool:
-    return bool(
-        os.environ.get("AKASHIC_REPLAY_CLOCK_FILE", "").strip()
-        and os.environ.get("AKASHIC_REPLAY_EVENTS_FILE", "").strip()
+class Config(BaseModel):
+    """Carry the opaque fixture credential required by the v3 channel seam."""
+
+    replay_token: CredentialRef | None = None
+
+
+def is_active(_services: ServiceView) -> bool:
+    """Enable replay declarations only when the debug replay profile is mounted."""
+
+    return _replay_source_enabled()
+
+
+async def apply(ctx: Context, config: object) -> None:
+    """Register typed replay source, MCP, and optional outbound capture effects."""
+
+    # 1. The replay profile owns all declarations; a normal debug runtime stays inert.
+    if not _replay_source_enabled():
+        return
+
+    # 2. MCP and proactive declarations preserve the old replay source contract.
+    await ctx.require(MCP_SERVERS).register(
+        ctx,
+        McpServerDefinition(
+            name="replay-debug",
+            command=("python", "replay_mcp.py"),
+            cwd=".",
+            candidate_read_only_tools=("fetch_replay_events",),
+        ),
+    )
+    await ctx.require(PROACTIVE_COMPONENTS).register(
+        ctx,
+        ProactiveSourceDefinition(
+            name="timeline",
+            channels=("alert", "content", "context"),
+            mcp_server="replay-debug",
+            fetch_tool="fetch_replay_events",
+            ack_tool="acknowledge_replay_events",
+            fetch_page_size=50,
+        ),
     )
 
-
-class CaptureChannel:
-    name = "replay"
-
-    def __init__(self, outbox_path: Path) -> None:
-        self.name = os.environ.get("AKASHIC_REPLAY_CHANNEL", "replay").strip() or "replay"
-        self._outbox_path = outbox_path
-        self._registration: Any = None
-
-    async def start(self, ctx: ChannelContext) -> None:
-        self._outbox_path.parent.mkdir(parents=True, exist_ok=True)
-        self._registration = ctx.push_tool.register_channel(
-            self.name,
-            deliver=self._deliver,
+    # 3. The capture channel is present only with an explicit isolated fixture token.
+    if _capture_channel_enabled(config):
+        await ctx.require(CHANNELS).register(
+            ctx,
+            ChannelDefinition(
+                name="replay",
+                capabilities=frozenset({ChannelCapability.OUTBOUND}),
+                factory_export="build_channel",
+                inbound_identity=None,
+                credential_paths=("replay_token",),
+            ),
         )
 
-    async def stop(self) -> None:
-        if self._registration is not None:
-            self._registration.close()
-            self._registration = None
 
-    async def _send_text(self, chat_id: str, message: str) -> None:
-        self._append({"type": "text", "chat_id": chat_id, "message": message})
+class ReplayCaptureAdapter:
+    """Capture text deliveries into the replay outbox with replay-clock timestamps."""
 
-    async def _deliver(self, message: ChannelMessage) -> DeliveryReceipt:
-        return await deliver_message_parts(
-            message,
-            send_text=self._send_text,
-            send_file=self._send_file,
-            send_image=self._send_image,
-        )
+    def __init__(self, context: ChannelFactoryContext) -> None:
+        self._binding_token = context.binding_token
+        self._outbox_path = _required_path("AKASHIC_REPLAY_OUTBOX_FILE")
 
-    async def _send_file(
+    async def start(self) -> ChannelReady:
+        """Start without opening external resources or admitting delivery yet."""
+
+        return ChannelReady(self._binding_token)
+
+    async def deliver(
         self,
-        chat_id: str,
-        file_path: str,
-        name: str | None = None,
-    ) -> None:
+        request: ProviderDeliveryRequest,
+    ) -> ProviderDeliveryReceipt:
+        """Capture one text delivery and reject unsupported attachment payloads."""
+
+        if request.attachments:
+            return ProviderDeliveryReceipt(
+                request.delivery_id,
+                DeliveryStatus.REJECTED,
+                error="replay capture 仅支持文本消息",
+            )
         self._append(
             {
-                "type": "file",
-                "chat_id": chat_id,
-                "path": file_path,
-                "name": name,
+                "type": "text",
+                "chat_id": request.recipient,
+                "message": request.body,
             }
         )
+        return ProviderDeliveryReceipt(
+            request.delivery_id,
+            DeliveryStatus.DELIVERED,
+        )
 
-    async def _send_image(self, chat_id: str, image_path: str) -> None:
-        self._append({"type": "image", "chat_id": chat_id, "path": image_path})
+    async def stop(self) -> StopReceipt:
+        """Close the capture adapter; its append-only outbox needs no extra teardown."""
+
+        return StopReceipt(self._binding_token, resources_closed=True)
 
     def _append(self, payload: dict[str, Any]) -> None:
         record: dict[str, Any] = {
@@ -77,35 +140,29 @@ class CaptureChannel:
             _ = handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
-class ReplayDebugPlugin(Plugin):
-    api_version = 2
-    name = "replay_debug"
+def build_channel(context: ChannelFactoryContext) -> ReplayCaptureAdapter:
+    """Build one exact-generation replay capture adapter for Core's channel host."""
 
-    def channels(self) -> list[CaptureChannel]:
-        path = os.environ.get("AKASHIC_REPLAY_OUTBOX_FILE", "").strip()
-        return [CaptureChannel(Path(path))] if path and _replay_source_enabled() else []
+    return ReplayCaptureAdapter(context)
 
-    @classmethod
-    def mcp_servers(cls) -> list[McpServerSpec]:
-        if not _replay_source_enabled():
-            return []
-        return [
-            McpServerSpec(
-                name="replay-debug",
-                command=("python", "replay_mcp.py"),
-            )
-        ]
 
-    def proactive_sources(self) -> list[ProactiveSourceSpec]:
-        if not _replay_source_enabled():
-            return []
-        return [
-            ProactiveSourceSpec(
-                id="timeline",
-                channels=("alert", "content", "context"),
-                server="replay-debug",
-                fetch_tool="fetch_replay_events",
-                ack_tool="acknowledge_replay_events",
-                fetch_page_size=50,
-            )
-        ]
+def _replay_source_enabled() -> bool:
+    return bool(
+        os.environ.get("AKASHIC_REPLAY_CLOCK_FILE", "").strip()
+        and os.environ.get("AKASHIC_REPLAY_EVENTS_FILE", "").strip()
+    )
+
+
+def _capture_channel_enabled(config: object) -> bool:
+    token = getattr(config, "replay_token", None)
+    return bool(
+        os.environ.get("AKASHIC_REPLAY_OUTBOX_FILE", "").strip()
+        and isinstance(token, CredentialRef)
+    )
+
+
+def _required_path(name: str) -> Path:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        raise RuntimeError(f"{name} is required")
+    return Path(value)

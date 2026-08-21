@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import math
+import os
 import sqlite3
 import struct
 import threading
@@ -28,8 +29,15 @@ from agent.config_models import (
 from agent.control.context import running_turn_id
 from agent.looping.ports import MemoryServices
 from agent.migrations.akasha_sidecar import rebuild_akasha_sidecars
-from agent.plugins import Plugin
-from agent.plugins.context import PluginContext, PluginKVStore
+from agent.plugin_composition import (
+    MEMORY_RUNTIME,
+    DashboardContext,
+    MemoryRuntimeInfo,
+    MemoryTurnRuntime,
+    ServiceView,
+)
+from agent.plugins.composable import ComposablePlugin
+from agent.plugins.mobile_ui import _normalize_rpc_result
 from agent.plugins.manifest import (
     builtin_plugin_data_dir,
     ensure_workspace_plugin_data_dir,
@@ -45,30 +53,38 @@ from core.memory.engine import MemoryQuery, MemoryQueryResult, MemoryScope
 from core.memory.plugin import MemoryPlugin as MemoryPluginProtocol
 from plugins.akasha.application.cycle import MemoryCycle
 from plugins.akasha.application.rebuild import rebuild_memory
-from plugins.akasha.config import AkashaConfig, render_akasha_config
+from plugins.akasha.application.runtime import OnlineMemoryRuntime
+from plugins.akasha.config import AkashaConfig, load_akasha_config, render_akasha_config
 from plugins.akasha.dashboard import register as register_dashboard
+from plugins.akasha.domain import features as features_module
 from plugins.akasha.domain.features import BurstAwareFeaturePool
 from plugins.akasha.domain.model import MemoryConfig
 from plugins.akasha.engine import (
     ActiveRecallSnapshot,
-    AkashaFeedbackPersistModule,
     AkashaMemoryEngine,
     PendingRetrieval,
     RetrievalRecords,
 )
-from plugins.akasha.inspector import AkashaInspectorReader
+from plugins.akasha.inspector import AkashaInspectorReader, mobile_summary
 from plugins.akasha.infrastructure.loader import load_turn_suffix, load_turns
 from plugins.akasha.infrastructure.persistence import (
     logical_state_sha256,
 )
 from plugins.akasha.infrastructure.sparse_index import (
     BuildConfig,
+    SparseIndexRebuildRequired,
     audit_source_embeddings,
     build_sparse_index,
 )
+from plugins.akasha.infrastructure.sparse_index.schema import (
+    INDEX_VERSION,
+    SCHEMA,
+    TOOL_CHAIN_PROJECTION_VERSION,
+)
 from plugins.akasha.memory_plugin import MemoryPlugin
+from plugins.akasha import plugin as akasha_plugin
 from plugins.akasha.plugin import (
-    AkashaPlugin,
+    _AkashaMobileQuery,
     _empty_mobile_recall,
     _mobile_recall_lane,
 )
@@ -92,91 +108,68 @@ class _Embedder:
         return None
 
 
-def test_akasha_v2_registers_both_host_protocols(tmp_path: Path) -> None:
-    plugin = AkashaPlugin()
-    plugin.context = PluginContext(
-        event_bus=cast(Any, None),
-        tool_registry=None,
-        plugin_id="akasha",
-        plugin_dir=Path("plugins/akasha"),
-        data_dir=builtin_plugin_data_dir("akasha", tmp_path),
-        kv_store=PluginKVStore(tmp_path / ".kv.json"),
-        workspace=tmp_path,
-        memory_engine=SimpleNamespace(describe=lambda: SimpleNamespace(name="akasha")),
-    )
-    assert isinstance(plugin, Plugin)
+def test_akasha_registers_v3_namespace_and_memory_factory() -> None:
+    plugin = ComposablePlugin.from_module(akasha_plugin)
+
+    assert plugin.api_version == 3
+    assert plugin.name == "akasha"
+    assert plugin.dashboard_module == "dashboard.py"
+    assert plugin.workspace_roots == ("memory",)
     assert isinstance(MemoryPlugin(), MemoryPluginProtocol)
     assert MemoryPlugin.plugin_id == "akasha"
-    assert len(plugin.after_reasoning_modules()) == 1
-    assert plugin.dashboard_module() == "dashboard.py"
-    mobile = plugin.mobile_ui()
-    assert mobile.module == "mobile_ui.js"
-    assert mobile.stylesheet == "mobile_ui.css"
-    assert mobile.slots == ("turn.before_reasoning",)
-    assert mobile.navigation is not None
-    assert mobile.navigation.label == "Akasha Inspector"
 
 
-def test_mobile_recall_is_empty_when_akasha_is_not_the_memory_owner(
+def test_akasha_is_inactive_when_default_memory_owns_runtime() -> None:
+    assert not akasha_plugin.is_active(
+        ServiceView.freeze({MEMORY_RUNTIME: MemoryRuntimeInfo(name="default")})
+    )
+
+
+def test_engine_and_inspector_resolve_sidecars_from_same_memory_root(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    plugin = AkashaPlugin()
-    plugin.context = PluginContext(
-        event_bus=cast(Any, None),
-        tool_registry=None,
-        plugin_id="akasha",
-        plugin_dir=Path("plugins/akasha"),
-        data_dir=builtin_plugin_data_dir("akasha", tmp_path),
-        kv_store=PluginKVStore(tmp_path / ".kv.json"),
+    """Keep engine writes and inspector reads on the same declared root."""
+
+    # 1. Construct the real engine with the direct filename syntax.
+    _create_sessions(tmp_path / "sessions.db")
+    monkeypatch.setattr("plugins.akasha.engine.Embedder", _Embedder)
+    config = AkashaConfig(
+        db_path="akasha.db",
+        index_path="akasha-v2-index.db",
+    )
+    engine = AkashaMemoryEngine(
+        config=Config(
+            provider="openai",
+            model="chat-model",
+            api_key="chat-key",
+            system_prompt="system",
+            memory=HostMemoryConfig(
+                embedding=MemoryEmbeddingConfig(
+                    model="embedding-model",
+                    output_dimensionality=2,
+                )
+            ),
+        ),
+        akasha_config=config,
         workspace=tmp_path,
-        memory_engine=SimpleNamespace(describe=lambda: SimpleNamespace(name="default")),
+        http_resources=cast(Any, SimpleNamespace(external_default=object())),
+        event_publisher=None,
     )
 
-    assert plugin.mobile_ui_available() is False
-    active = plugin.mobile_ui_query(
-        "recall.current",
-        {"message_id": "assistant:turn-one"},
-        session_id="web:one",
-        turn_id="turn-one",
+    # 2. Resolve the same config through the dashboard/mobile inspector.
+    inspector = AkashaInspectorReader(
+        memory_root=tmp_path / "memory",
+        config=config,
     )
-    persisted = plugin.mobile_ui_query(
-        "recall.current",
-        {"message_id": "message:one"},
-        session_id="web:one",
-        turn_id=None,
-    )
-
-    assert active == _empty_mobile_recall()
-    assert persisted == _empty_mobile_recall()
-    assert not (tmp_path / "memory" / "akasha.db").exists()
-
-
-def test_feedback_marker_is_exported_before_user_message_persistence() -> None:
-    # Import after passive-turn modules settle their lifecycle import cycle.
-    from agent.lifecycle.phases import default_after_reasoning_modules
-
-    plugin = AkashaPlugin()
-    modules = default_after_reasoning_modules(
-        EventBus(),
-        cast(Any, SimpleNamespace()),
-        cast(Any, plugin.after_reasoning_modules()),
-    )
-    slots = [module.slot for module in modules]
-
-    assert slots.index("akasha.feedback.persist") < slots.index(
-        "after_reasoning.persist_user"
-    )
-
-
-@pytest.mark.asyncio
-async def test_feedback_persistence_is_inert_when_akasha_is_not_active() -> None:
-    frame = SimpleNamespace(slots={"existing": "value"})
-    owner = SimpleNamespace(context=SimpleNamespace(memory_engine=None))
-
-    result = await AkashaFeedbackPersistModule(owner).run(frame)
-
-    assert result is frame
-    assert frame.slots == {"existing": "value"}
+    try:
+        assert engine._runtime.memory_path == inspector.paths.memory  # noqa: SLF001
+        assert engine._runtime.index_path == inspector.paths.index  # noqa: SLF001
+        assert inspector.paths.memory == tmp_path / "memory" / "akasha.db"
+        assert inspector.paths.index == tmp_path / "memory" / "akasha-v2-index.db"
+    finally:
+        engine._runtime.close()  # noqa: SLF001
+        engine._embedding_store.close()  # noqa: SLF001
 
 
 @pytest.mark.asyncio
@@ -248,12 +241,10 @@ async def test_feedback_tools_compose_correction_from_two_markers(
             "applies_after": "current_turn_commit",
         }
 
-        # 3. Export both independent markers onto the current user Message.
-        frame = SimpleNamespace(slots={})
-        owner = SimpleNamespace(context=SimpleNamespace(memory_engine=engine))
-        await AkashaFeedbackPersistModule(owner).run(frame)
-        forgotten_marker = frame.slots["persist:user:akasha_forget"]
-        remembered_marker = frame.slots["persist:user:akasha_reinforce"]
+        # 3. Export both independent markers through the narrow Memory port.
+        metadata = engine.take_turn_user_metadata("turn:feedback")
+        forgotten_marker = cast(dict[str, object], metadata["akasha_forget"])
+        remembered_marker = cast(dict[str, object], metadata["akasha_reinforce"])
         assert forgotten_marker["action"] == "forget"
         assert forgotten_marker["target_message_ids"] == ["message:1"]
         assert forgotten_marker["target_turn_ids"] == ["message:0::message:1"]
@@ -264,6 +255,39 @@ async def test_feedback_tools_compose_correction_from_two_markers(
     finally:
         running_turn_id.reset(token)
         _close_engine(engine)
+
+
+@pytest.mark.asyncio
+async def test_uncommitted_feedback_does_not_survive_engine_restart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _create_sessions(tmp_path / "sessions.db")
+    monkeypatch.setattr("plugins.akasha.engine.Embedder", _Embedder)
+    engine = _engine(tmp_path)
+    spec = next(
+        item for item in engine.tool_profile().tools if item.name == "remember_memory"
+    )
+    assert spec.tool_class is not None
+    tool = spec.tool_class(engine, spec)
+    token = running_turn_id.set("turn:crashed")
+    try:
+        result = json.loads(
+            await tool.execute(
+                message_ids=["current_user_message"],
+                reason="staged but not committed",
+            )
+        )
+    finally:
+        running_turn_id.reset(token)
+    assert result["status"] == "staged"
+    _close_engine(engine)
+
+    restarted = _engine(tmp_path)
+    try:
+        assert restarted.take_turn_user_metadata("turn:crashed") == {}
+    finally:
+        _close_engine(restarted)
 
 
 @pytest.mark.asyncio
@@ -357,17 +381,12 @@ async def test_feedback_markers_change_future_recall_and_replay_identically(
             ]
             == "staged"
         )
-        frame = SimpleNamespace(slots={})
-        owner = SimpleNamespace(context=SimpleNamespace(memory_engine=engine))
-        await AkashaFeedbackPersistModule(owner).run(frame)
+        user_extra = engine.take_turn_user_metadata("turn:correction")
     finally:
         running_turn_id.reset(token)
 
     # 2. Persist those marker fields on the next canonical user Message.
     correction_time = started + timedelta(minutes=5)
-    user_extra = {
-        key.removeprefix("persist:user:"): value for key, value in frame.slots.items()
-    }
     _append_turn(
         sessions,
         sequence=2,
@@ -463,6 +482,63 @@ def test_mobile_recall_card_projection_preserves_bounded_lanes() -> None:
         )
         < 192 * 1024
     )
+
+
+def test_mobile_inspector_detail_projects_large_assistant_text_to_bounded_rpc() -> None:
+    large_answer = "答" * (256 * 1024)
+    lane_item = {
+        "query_id": "prior-query",
+        "session_key": "test:one",
+        "user_text": "问" * 1_000,
+        "assistant_text": large_answer,
+        "assistant_preview": large_answer,
+        "ts": "2026-07-28T00:00:00Z",
+        "score": 0.5,
+        "sources": ["dense"],
+    }
+    detail = {
+        "query_id": "query",
+        "query_text": "当前问题",
+        "query_preview": "当前问题",
+        "ts": "2026-07-28T00:00:00Z",
+        "seed_count": 1,
+        "activation_capture_available": True,
+        "recall_capture_available": True,
+        "activation_count": 1,
+        "left_count": 1,
+        "right_count": 1,
+        "pushes": 1,
+        "residual_l1": 0.25,
+        "tool_left_count": 1,
+        "tool_right_count": 1,
+        "left": [lane_item],
+        "right": [lane_item],
+        "tool_left": [lane_item],
+        "tool_right": [lane_item],
+    }
+
+    projected = mobile_summary(detail)
+    rpc = _normalize_rpc_result(
+        projected,
+        plugin_id="akasha",
+        method="inspector.detail",
+    )
+    encoded = json.dumps(rpc, ensure_ascii=False, separators=(",", ":"))
+
+    assert "assistant_text" not in encoded
+    assert "user_text" not in encoded
+    assert len(encoded.encode("utf-8")) < 192 * 1024
+    for lane_name in ("left", "right", "tool_left", "tool_right"):
+        lane = cast(list[dict[str, object]], rpc[lane_name])
+        assert set(lane[0]) == {
+            "user_preview",
+            "assistant_preview",
+            "ts",
+            "score",
+        }
+        assert len(str(lane[0]["user_preview"])) == 103
+        assert len(str(lane[0]["assistant_preview"])) == 53
+    assert lane_item["assistant_text"] == large_answer
 
 
 def test_active_mobile_recall_marks_temporary_absence_as_pending() -> None:
@@ -632,16 +708,10 @@ async def test_online_turn_recall_and_replay_share_one_state(
     # 3. Explicit recall is read-only and cannot replace context learning.
     next_time = started + timedelta(minutes=5)
     active_turn_id = "turn:alpha-follow"
-    plugin = AkashaPlugin()
-    plugin.context = PluginContext(
-        event_bus=cast(Any, None),
-        tool_registry=None,
-        plugin_id="akasha",
-        plugin_dir=Path("plugins/akasha"),
-        data_dir=builtin_plugin_data_dir("akasha", tmp_path),
-        kv_store=PluginKVStore(tmp_path / ".kv.json"),
-        workspace=tmp_path,
-        memory_engine=engine,
+    mobile_query = _AkashaMobileQuery(
+        MemoryTurnRuntime(engine),
+        memory_root=tmp_path / "memory",
+        data_root=builtin_plugin_data_dir("akasha", tmp_path),
     )
     wait_started = threading.Event()
     wait_for_active_recall = engine.wait_for_active_recall
@@ -666,7 +736,7 @@ async def test_online_turn_recall_and_replay_share_one_state(
     )
     active_query = asyncio.create_task(
         asyncio.to_thread(
-            plugin.mobile_ui_query,
+            mobile_query,
             "recall.current",
             {"message_id": f"assistant:{active_turn_id}"},
             session_id="test:one",
@@ -798,7 +868,12 @@ async def test_online_turn_recall_and_replay_share_one_state(
     # 5. Inspector reconstructs the exact prior-only lanes without writes.
     _write_inspector_config(tmp_path)
     before_memory = logical_state_sha256(tmp_path / "memory" / "akasha.db")
-    reader = AkashaInspectorReader(tmp_path)
+    reader = AkashaInspectorReader(
+        memory_root=tmp_path / "memory",
+        config=load_akasha_config(
+            builtin_plugin_data_dir("akasha", tmp_path) / "config.local.toml"
+        ),
+    )
     overview = reader.get_overview()
     rows, total = reader.list_turns(q="alpha follow")
     detail = reader.get_turn(str(rows[0]["query_id"]))
@@ -806,6 +881,7 @@ async def test_online_turn_recall_and_replay_share_one_state(
     assert total == 1
     assert detail is not None
     assert detail["query_text"] == "alpha follow"
+    assert detail["assistant_text"] == "second answer"
     assert detail["recall_capture_available"] is True
     assert detail["left_count"] == 1
     assert detail["tool_left_count"] == 1
@@ -819,8 +895,16 @@ async def test_online_turn_recall_and_replay_share_one_state(
 
     # 6. The desktop API exposes the same state through read-only routes.
     app = FastAPI()
-    app.state.memory_admin = engine
-    register_dashboard(app, Path("plugins/akasha"), tmp_path)
+    register_dashboard(
+        app,
+        DashboardContext(
+            plugin_id="akasha",
+            plugin_dir=Path("plugins/akasha"),
+            data_root=builtin_plugin_data_dir("akasha", tmp_path),
+            validation=False,
+            _workspace_roots=(("memory", tmp_path / "memory"),),
+        ),
+    )
     with TestClient(app) as client:
         response = client.get(
             "/api/dashboard/akasha-inspector/turns",
@@ -835,19 +919,19 @@ async def test_online_turn_recall_and_replay_share_one_state(
         assert api_detail.json()["left_count"] == 1
 
     # 7. Mobile projections resolve the same committed assistant message.
-    mobile = plugin.mobile_ui_query(
+    mobile = mobile_query(
         "recall.current",
         {"message_id": "message:3"},
         session_id="test:one",
         turn_id=None,
     )
-    recent = plugin.mobile_ui_query(
+    recent = mobile_query(
         "inspector.recent",
         {},
         session_id=None,
         turn_id=None,
     )
-    mobile_detail = plugin.mobile_ui_query(
+    mobile_detail = mobile_query(
         "inspector.detail",
         {"query_id": str(rows[0]["query_id"])},
         session_id=None,
@@ -3041,6 +3125,317 @@ def test_rebuild_akasha_sidecars_backs_up_and_publishes_verified_pair(
     assert hashlib.sha256(sessions_path.read_bytes()).hexdigest() == source_sha
 
 
+def test_online_runtime_rebuilds_previous_sparse_index_version(
+    tmp_path: Path,
+) -> None:
+    """Boot rebuilds an obsolete derived index without changing sessions.db."""
+
+    # 1. Freeze one canonical source turn and an obsolete v9 sidecar.
+    sessions_path = tmp_path / "sessions.db"
+    index_path = tmp_path / "memory" / "akasha-v2-index.db"
+    memory_path = tmp_path / "memory" / "akasha.db"
+    _create_sessions(sessions_path)
+    _append_turn(
+        sessions_path,
+        sequence=0,
+        user="alpha request",
+        assistant="beta reply",
+        started=datetime(2026, 8, 5, tzinfo=timezone.utc),
+        with_embeddings=True,
+    )
+    index_path.parent.mkdir(parents=True)
+    with closing(sqlite3.connect(index_path)) as connection, connection:
+        connection.execute("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT)")
+        connection.execute("INSERT INTO metadata VALUES ('index_version', '9')")
+    source_sha = hashlib.sha256(sessions_path.read_bytes()).hexdigest()
+
+    # 2. Boot through the production runtime and verify the derived pair only.
+    runtime = OnlineMemoryRuntime(
+        sessions_path=sessions_path,
+        index_path=index_path,
+        memory_path=memory_path,
+        embedding_model="embedding-model",
+        embedding_dimension=2,
+        config=MemoryConfig(),
+    )
+    runtime.close()
+
+    with closing(sqlite3.connect(index_path)) as connection:
+        assert connection.execute(
+            "SELECT value FROM metadata WHERE key = 'index_version'"
+        ).fetchone() == (INDEX_VERSION,)
+        assert connection.execute("SELECT COUNT(*) FROM sparse_turns").fetchone() == (
+            1,
+        )
+    assert memory_path.is_file()
+    assert hashlib.sha256(sessions_path.read_bytes()).hexdigest() == source_sha
+
+
+def test_online_runtime_keeps_previous_sidecar_when_version_rebuild_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed version rebuild leaves both canonical input and old sidecar intact."""
+
+    # 1. Freeze the source and obsolete sidecar before the injected rebuild failure.
+    sessions_path = tmp_path / "sessions.db"
+    index_path = tmp_path / "memory" / "akasha-v2-index.db"
+    memory_path = tmp_path / "memory" / "akasha.db"
+    _create_sessions(sessions_path)
+    index_path.parent.mkdir(parents=True)
+    with closing(sqlite3.connect(index_path)) as connection, connection:
+        connection.execute("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT)")
+        connection.execute("INSERT INTO metadata VALUES ('index_version', '9')")
+    source_sha = hashlib.sha256(sessions_path.read_bytes()).hexdigest()
+    index_sha = hashlib.sha256(index_path.read_bytes()).hexdigest()
+
+    def fail_rebuild(
+        _source_path: Path,
+        output_path: Path,
+        _config: BuildConfig,
+    ) -> object:
+        if output_path == index_path:
+            raise SparseIndexRebuildRequired("obsolete test index")
+        raise RuntimeError("injected candidate rebuild failure")
+
+    monkeypatch.setattr(
+        "plugins.akasha.application.runtime.build_sparse_index",
+        fail_rebuild,
+    )
+
+    # 2. Startup fails loudly without replacing either protected input.
+    with pytest.raises(RuntimeError, match="candidate rebuild failure"):
+        OnlineMemoryRuntime(
+            sessions_path=sessions_path,
+            index_path=index_path,
+            memory_path=memory_path,
+            embedding_model="embedding-model",
+            embedding_dimension=2,
+            config=MemoryConfig(),
+        )
+
+    assert hashlib.sha256(sessions_path.read_bytes()).hexdigest() == source_sha
+    assert hashlib.sha256(index_path.read_bytes()).hexdigest() == index_sha
+    assert not memory_path.exists()
+
+
+def test_online_runtime_rebuilds_pair_after_crash_between_sidecar_replaces(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Boot rejects a new index paired with the previous memory snapshot."""
+
+    # 1. Publish one valid pair, then change its canonical source in place.
+    sessions_path = tmp_path / "sessions.db"
+    index_path = tmp_path / "memory" / "akasha-v2-index.db"
+    memory_path = tmp_path / "memory" / "akasha.db"
+    _create_sessions(sessions_path)
+    _append_turn(
+        sessions_path,
+        sequence=0,
+        user="alpha request",
+        assistant="beta reply",
+        started=datetime(2026, 8, 5, tzinfo=timezone.utc),
+        with_embeddings=True,
+    )
+    runtime = OnlineMemoryRuntime(
+        sessions_path=sessions_path,
+        index_path=index_path,
+        memory_path=memory_path,
+        embedding_model="embedding-model",
+        embedding_dimension=2,
+        config=MemoryConfig(),
+    )
+    with closing(sqlite3.connect(sessions_path)) as connection, connection:
+        connection.execute(
+            "UPDATE messages SET content = ? WHERE id = ?",
+            ("replacement request", "message:0"),
+        )
+
+    # 2. Crash after publishing the rebuilt index but before its memory pair.
+    real_replace = os.replace
+
+    def fail_memory_publication(source: Path, destination: Path) -> None:
+        if Path(destination) == memory_path:
+            raise OSError("injected crash between sidecar replaces")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(os, "replace", fail_memory_publication)
+    with pytest.raises(OSError, match="between sidecar replaces"):
+        runtime.rebuild_from_source()
+    runtime.close()
+    monkeypatch.setattr(os, "replace", real_replace)
+    mixed_index_sha = hashlib.sha256(index_path.read_bytes()).hexdigest()
+    with closing(sqlite3.connect(memory_path)) as connection:
+        stale_memory_sha = connection.execute(
+            "SELECT value FROM metadata WHERE key = 'source_index_sha256'"
+        ).fetchone()
+    assert stale_memory_sha != (mixed_index_sha,)
+
+    # 3. The next boot detects the mixed pair and deterministically republishes it.
+    recovered = OnlineMemoryRuntime(
+        sessions_path=sessions_path,
+        index_path=index_path,
+        memory_path=memory_path,
+        embedding_model="embedding-model",
+        embedding_dimension=2,
+        config=MemoryConfig(),
+    )
+    recovered.close()
+    final_index_sha = hashlib.sha256(index_path.read_bytes()).hexdigest()
+    with closing(sqlite3.connect(memory_path)) as connection:
+        recovered_memory_sha = connection.execute(
+            "SELECT value FROM metadata WHERE key = 'source_index_sha256'"
+        ).fetchone()
+    assert recovered_memory_sha == (final_index_sha,)
+
+
+def test_online_runtime_reopens_unchanged_sidecars_without_rebuilding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """正常进程重启必须复用未变化的派生库组合。"""
+
+    # 1. 发布一组完整的稀疏索引与记忆快照。
+    sessions_path = tmp_path / "sessions.db"
+    index_path = tmp_path / "memory" / "akasha-v2-index.db"
+    memory_path = tmp_path / "memory" / "akasha.db"
+    _create_sessions(sessions_path)
+    _append_turn(
+        sessions_path,
+        sequence=0,
+        user="alpha request",
+        assistant="beta reply",
+        started=datetime(2026, 8, 5, tzinfo=timezone.utc),
+        with_embeddings=True,
+    )
+    first = OnlineMemoryRuntime(
+        sessions_path=sessions_path,
+        index_path=index_path,
+        memory_path=memory_path,
+        embedding_model="embedding-model",
+        embedding_dimension=2,
+        config=MemoryConfig(),
+    )
+    first.close()
+    index_sha = hashlib.sha256(index_path.read_bytes()).hexdigest()
+    memory_sha = hashlib.sha256(memory_path.read_bytes()).hexdigest()
+
+    # 2. 再次打开同一组合，不得进入全量重建路径。
+    def reject_rebuild(_runtime: OnlineMemoryRuntime) -> MemoryCycle:
+        raise AssertionError("unchanged sidecars must not rebuild")
+
+    monkeypatch.setattr(
+        OnlineMemoryRuntime,
+        "_fresh_rebuild_from_source",
+        reject_rebuild,
+    )
+    reopened = OnlineMemoryRuntime(
+        sessions_path=sessions_path,
+        index_path=index_path,
+        memory_path=memory_path,
+        embedding_model="embedding-model",
+        embedding_dimension=2,
+        config=MemoryConfig(),
+    )
+    reopened.close()
+
+    assert hashlib.sha256(index_path.read_bytes()).hexdigest() == index_sha
+    assert hashlib.sha256(memory_path.read_bytes()).hexdigest() == memory_sha
+
+
+def test_online_runtime_replays_an_appended_suffix_without_rebuilding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """进程离线期间新增的 Turn 必须增量追平而不是重建完整图。"""
+
+    # 1. 先持久化一个与稀疏索引完全对齐的记忆快照。
+    sessions_path = tmp_path / "sessions.db"
+    index_path = tmp_path / "memory" / "akasha-v2-index.db"
+    memory_path = tmp_path / "memory" / "akasha.db"
+    _create_sessions(sessions_path)
+    _append_turn(
+        sessions_path,
+        sequence=0,
+        user="alpha request",
+        assistant="beta reply",
+        started=datetime(2026, 8, 5, tzinfo=timezone.utc),
+        with_embeddings=True,
+    )
+    first = OnlineMemoryRuntime(
+        sessions_path=sessions_path,
+        index_path=index_path,
+        memory_path=memory_path,
+        embedding_model="embedding-model",
+        embedding_dimension=2,
+        config=MemoryConfig(),
+    )
+    first.close()
+
+    # 2. 模拟 Core 停机窗口新增一个合法 append-only Turn。
+    _append_turn(
+        sessions_path,
+        sequence=2,
+        user="gamma request",
+        assistant="delta reply",
+        started=datetime(2026, 8, 5, 0, 1, tzinfo=timezone.utc),
+        with_embeddings=True,
+    )
+
+    def reject_rebuild(_runtime: OnlineMemoryRuntime) -> MemoryCycle:
+        raise AssertionError("append-only suffix must not rebuild")
+
+    monkeypatch.setattr(
+        OnlineMemoryRuntime,
+        "_fresh_rebuild_from_source",
+        reject_rebuild,
+    )
+
+    # 3. 重启只回放新增后缀，并发布新的完整配对快照。
+    reopened = OnlineMemoryRuntime(
+        sessions_path=sessions_path,
+        index_path=index_path,
+        memory_path=memory_path,
+        embedding_model="embedding-model",
+        embedding_dimension=2,
+        config=MemoryConfig(),
+    )
+    try:
+        assert reopened.cycle.state_version == 2
+        assert len(reopened.cycle.turns) == 2
+    finally:
+        reopened.close()
+
+
+@pytest.mark.parametrize(
+    ("context_mass", "query", "context", "expected_node"),
+    (
+        (1.0, np.asarray([1.0, 0.0]), np.zeros(2), 0),
+        (0.0, np.zeros(2), np.asarray([0.0, 1.0]), 1),
+    ),
+)
+def test_burst_seed_keeps_the_only_available_evidence_source(
+    context_mass: float,
+    query: np.ndarray,
+    context: np.ndarray,
+    expected_node: int,
+) -> None:
+    """An unavailable source cannot erase the other side of the mixture."""
+
+    seed = features_module._mix_sources(  # pyright: ignore[reportPrivateUsage]
+        {
+            "query_dense": query,
+            "query_bm25": np.zeros(2),
+            "context_dense": context,
+            "context_bm25": np.zeros(2),
+        },
+        context_mass,
+    )
+
+    assert seed == ((expected_node, 1.0),)
+
+
 def _write_inspector_config(workspace: Path) -> None:
     plugin_dir = builtin_plugin_data_dir("akasha", workspace)
     ensure_workspace_plugin_data_dir(plugin_dir, workspace)
@@ -3052,13 +3447,80 @@ def _write_inspector_config(workspace: Path) -> None:
 
 def test_inspector_overview_is_empty_before_first_akasha_commit(tmp_path: Path) -> None:
     _write_inspector_config(tmp_path)
+    reader = AkashaInspectorReader(
+        memory_root=tmp_path / "memory",
+        config=load_akasha_config(
+            builtin_plugin_data_dir("akasha", tmp_path) / "config.local.toml"
+        ),
+    )
+    sidecars = (reader.paths.memory, reader.paths.index)
 
-    assert AkashaInspectorReader(tmp_path).get_overview() == {
+    assert reader.get_overview() == {
         "available": True,
         "total": 0,
         "latest_at": None,
         "earliest_at": None,
     }
+    assert reader.list_turns() == ([], 0)
+    assert reader.latest_for_session("fresh:empty") is None
+    assert reader.get_turn("missing") is None
+    assert reader.for_assistant_message("fresh:empty", "missing") is None
+    assert all(not path.exists() for path in sidecars)
+
+
+def test_inspector_accepts_valid_empty_sparse_projection_without_memory(
+    tmp_path: Path,
+) -> None:
+    _write_inspector_config(tmp_path)
+    reader = AkashaInspectorReader(
+        memory_root=tmp_path / "memory",
+        config=load_akasha_config(
+            builtin_plugin_data_dir("akasha", tmp_path) / "config.local.toml"
+        ),
+    )
+    reader.paths.index.parent.mkdir(parents=True, exist_ok=True)
+    with closing(sqlite3.connect(reader.paths.index)) as connection:
+        connection.executescript(SCHEMA)
+        connection.executemany(
+            "INSERT INTO metadata(key, value) VALUES (?, ?)",
+            (
+                ("index_version", INDEX_VERSION),
+                ("tool_chain_projection_version", TOOL_CHAIN_PROJECTION_VERSION),
+            ),
+        )
+        connection.commit()
+
+    assert reader.get_overview() == {
+        "available": True,
+        "total": 0,
+        "latest_at": None,
+        "earliest_at": None,
+    }
+    assert reader.list_turns() == ([], 0)
+    assert reader.latest_for_session("fresh:empty") is None
+    assert reader.get_turn("missing") is None
+    assert reader.for_assistant_message("fresh:empty", "missing") is None
+    assert not reader.paths.memory.exists()
+
+
+@pytest.mark.parametrize("present", ("memory", "index"))
+def test_inspector_partial_sidecar_fails_loud(
+    tmp_path: Path,
+    present: str,
+) -> None:
+    _write_inspector_config(tmp_path)
+    reader = AkashaInspectorReader(
+        memory_root=tmp_path / "memory",
+        config=load_akasha_config(
+            builtin_plugin_data_dir("akasha", tmp_path) / "config.local.toml"
+        ),
+    )
+    present_path = getattr(reader.paths, present)
+    present_path.parent.mkdir(parents=True, exist_ok=True)
+    sqlite3.connect(present_path).close()
+
+    with pytest.raises(sqlite3.OperationalError):
+        reader.list_turns()
 
 
 @pytest.mark.asyncio

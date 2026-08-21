@@ -2,10 +2,26 @@ from __future__ import annotations
 
 from typing import cast
 
-from agent.plugins import Plugin
 from plugins.wake_proactive.runtime import WakeRuntime
 from proactive_v2.lifecycle import ProactiveLifecycleSpec
 from proactive_v2.runtime_scope import ProactiveRuntimeScope
+
+
+api_version = 3
+name = "wake_proactive"
+version = "3.0.0"
+desc = "Wake proactive runtime private island"
+author = "Akashic Core"
+inject = ()
+skill_roots = ()
+drift_skill_roots = ()
+workspace_roots = ()
+
+
+def apply(ctx: object, config: object) -> None:
+    """Keep the private runtime descriptor side-effect free during composition."""
+
+    _ = ctx, config
 
 
 class WakeRuntimeFactory:
@@ -23,26 +39,16 @@ class WakeProactiveModuleFactory:
         return cast(list[object], build_wake_runtime_modules(runtime))
 
 
-class WakeProactivePlugin(Plugin):
-    api_version = 2
-    name = "wake_proactive"
+def build_wake_lifecycle() -> ProactiveLifecycleSpec:
+    """Build the mature Wake lifecycle without publishing a v2 plugin method."""
 
-    def proactive_module_factories(self) -> list[object]:
-        return [WakeProactiveModuleFactory()]
-
-    def proactive_runtime_factories(self) -> list[object]:
-        return [WakeRuntimeFactory()]
-
-    def proactive_lifecycles(self) -> list[object]:
-        return [
-            ProactiveLifecycleSpec(
-                id="wake",
-                initial_slots=(
-                    "proactive:cfg",
-                    "proactive:session_key",
-                    "proactive:started_at",
-                    "proactive:last_user_at",
-                ),
-                terminal_slots=("run:next_wakeup",),
-            )
-        ]
+    return ProactiveLifecycleSpec(
+        id="wake",
+        initial_slots=(
+            "proactive:cfg",
+            "proactive:session_key",
+            "proactive:started_at",
+            "proactive:last_user_at",
+        ),
+        terminal_slots=("run:next_wakeup",),
+    )

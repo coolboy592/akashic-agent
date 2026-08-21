@@ -21,11 +21,13 @@ from ..infrastructure.lease import WriterLease
 from ..infrastructure.persistence import (
     load_memory_state,
     memory_turn_count,
+    sha256_file,
     write_memory_database,
 )
 from ..infrastructure.sparse_index import (
     AppendOnlyViolation,
     BuildConfig,
+    SparseIndexRebuildRequired,
     build_sparse_index,
 )
 from ..infrastructure.sparse_index.encoding import tokenize
@@ -75,7 +77,11 @@ class OnlineMemoryRuntime:
         self.config = config
         self._writer_lease = WriterLease(memory_path)
         self._state_lock = threading.RLock()
-        self.cycle = self._restore_or_replay()
+        try:
+            self.cycle = self._restore_or_replay()
+        except BaseException:
+            self._writer_lease.close()
+            raise
 
     def close(self) -> None:
         self._writer_lease.close()
@@ -265,7 +271,7 @@ class OnlineMemoryRuntime:
                 self.index_path,
                 self._build_config(),
             )
-        except AppendOnlyViolation as exc:
+        except (AppendOnlyViolation, SparseIndexRebuildRequired) as exc:
             logger.warning(
                 "Akasha sparse source changed; rebuilding derived state: %s",
                 exc,
@@ -367,6 +373,9 @@ class OnlineMemoryRuntime:
                 "memory snapshot contains more turns than sessions source"
             )
         prefix = turns[:persisted]
+        exact_source_hash = (
+            sha256_file(self.index_path) if persisted == len(turns) else None
+        )
         (
             graph,
             events,
@@ -378,7 +387,7 @@ class OnlineMemoryRuntime:
             self.memory_path,
             turns=prefix,
             config=self.config,
-            source_index_sha256=None,
+            source_index_sha256=exact_source_hash,
         )
         cycle = MemoryCycle.restore(
             config=self.config,

@@ -39,7 +39,8 @@ from agent.model_runtime.session_selection import (
 )
 from agent.retrieval.default_pipeline import DefaultMemoryRetrievalPipeline
 from agent.retrieval.protocol import MemoryRetrievalPipeline
-from agent.turns.outbound import BusOutboundPort
+from agent.turns.outbound import OutboundDispatch
+from agent.plugin_composition.channels import InboundEnvelope, InboundOwner
 
 # 为保持兼容重新导出：现有调用方从 core.py 导入这些名称。
 __all__ = [
@@ -70,7 +71,6 @@ if TYPE_CHECKING:
     from core.memory.engine import MemoryEngine
     from core.memory.markdown import MemoryProfileApi
     from core.memory.runtime import MemoryRuntime
-    from agent.tool_hooks.base import ToolHook
     from agent.plugins.snapshot import RuntimeSnapshotStore
 
 logger = logging.getLogger("agent.loop")
@@ -170,7 +170,7 @@ def _disable_candidate_side_effect_tools(
     """把本次 candidate lease 的副作用工具加入 turn-local 禁用集合。"""
     if tools is None or not candidate_plugin_ids:
         return
-    generations = cast(Any, snapshot).generations
+    mcp_registry = cast(Any, snapshot).mcp_server_registry
     raw_disabled = msg.metadata.get("disabled_tools")
     if isinstance(raw_disabled, str):
         disabled = {raw_disabled} if raw_disabled else set()
@@ -179,13 +179,20 @@ def _disable_candidate_side_effect_tools(
     else:
         disabled = set()
     for plugin_id in candidate_plugin_ids:
-        generation = generations[plugin_id]
-        plugin_name = str(getattr(generation.instance, "name", plugin_id))
         disabled |= tools.get_non_read_only_source_tool_names(
             "plugin",
-            plugin_name,
+            plugin_id,
         )
-        for server_name in generation.contributions.mcp_servers:
+        server_names = (
+            ()
+            if mcp_registry is None
+            else (
+                descriptor.name
+                for descriptor in mcp_registry.descriptors
+                if descriptor.owner == plugin_id
+            )
+        )
+        for server_name in server_names:
             disabled |= tools.get_non_read_only_source_tool_names(
                 "mcp",
                 server_name,
@@ -215,6 +222,7 @@ class AgentLoop:
         self._session_lanes = SessionLaneRegistry()
         self._runtime_snapshot_store: RuntimeSnapshotStore | None = None
         self._plugin_rollout_fact_provider: Callable[[], str] | None = None
+        self._outbound_port = deps.outbound_port
 
         # ── 中断控制面（纯内存态） ──
         self._active_tasks: dict[str, asyncio.Task[OutboundMessage]] = {}
@@ -411,6 +419,7 @@ class AgentLoop:
         # 3. 最后串 passive prepare / execute / commit 主链。
         retrieval_pipeline = deps.retrieval_pipeline or DefaultMemoryRetrievalPipeline(
             memory=memory_svc,
+            event_publisher=self._event_bus,
         )
         self._retrieval_pipeline = retrieval_pipeline
         passive_context_store = DefaultContextStore(
@@ -425,7 +434,7 @@ class AgentLoop:
                 tools=deps.tools,
                 reasoner=self._reasoner,
                 event_bus=self._event_bus,
-                outbound_port=BusOutboundPort(self.bus),
+                outbound_port=deps.outbound_port,
             )
         )
 
@@ -479,6 +488,14 @@ class AgentLoop:
                     )
                 except asyncio.TimeoutError:
                     continue
+                if isinstance(item, InboundEnvelope):
+                    await self.bus.release_channel_inbound(
+                        item,
+                        InboundOwner.LANE,
+                    )
+                    raise RuntimeError(
+                        "v3 Channel inbound 必须由 PassiveMessageWorker 消费"
+                    )
                 await self._run_inbound_turn(item)
         finally:
             self._running = False
@@ -522,8 +539,13 @@ class AgentLoop:
                 #    channel 按当前 active turn fallback（迟到错误会归到别的
                 #    active turn）。
                 logger.error(f"处理消息出错: {e}", exc_info=True)
-                await self.bus.publish_outbound(
-                    OutboundMessage(
+                outbound_port = getattr(self, "_outbound_port", None)
+                if outbound_port is None:
+                    raise RuntimeError(
+                        "AgentLoop passive committed Channel outbound port 未绑定"
+                    ) from e
+                await outbound_port.dispatch(
+                    OutboundDispatch(
                         channel=item.channel,
                         chat_id=item.chat_id,
                         content=f"出错：{e}",
@@ -575,51 +597,6 @@ class AgentLoop:
 
         if self._compaction_runtime is not None:
             await self._compaction_runtime.shutdown()
-
-    def add_tool_hooks(self, hooks: list["ToolHook"]) -> None:
-        self._reasoner.add_tool_hooks(hooks)
-
-    def add_before_turn_plugin_modules(
-        self,
-        modules: list[object],
-    ) -> None:
-        self._passive_pipeline.add_before_turn_plugin_modules(modules)
-
-    def add_before_reasoning_plugin_modules(
-        self,
-        modules: list[object],
-    ) -> None:
-        self._passive_pipeline.add_before_reasoning_plugin_modules(modules)
-
-    def add_after_reasoning_plugin_modules(
-        self,
-        modules: list[object],
-    ) -> None:
-        self._passive_pipeline.add_after_reasoning_plugin_modules(modules)
-
-    def add_after_turn_plugin_modules(
-        self,
-        modules: list[object],
-    ) -> None:
-        self._passive_pipeline.add_after_turn_plugin_modules(modules)
-
-    def add_prompt_render_plugin_modules(
-        self,
-        modules: list[object],
-    ) -> None:
-        self._reasoner.add_prompt_render_plugin_modules(modules)
-
-    def add_before_step_plugin_modules(
-        self,
-        modules: list[object],
-    ) -> None:
-        self._reasoner.add_before_step_plugin_modules(modules)
-
-    def add_after_step_plugin_modules(
-        self,
-        modules: list[object],
-    ) -> None:
-        self._reasoner.add_after_step_plugin_modules(modules)
 
     # ── 中断控制面 ────────────────────────────────────────────────
 
@@ -786,6 +763,7 @@ class AgentLoop:
         key: str,
         *,
         dispatch_outbound: bool = True,
+        command_admitted: bool = False,
     ) -> OutboundMessage:
         """把一个输入交给被动链路，返回它生成的消息。"""
 
@@ -802,6 +780,7 @@ class AgentLoop:
                     msg,
                     key,
                     dispatch_outbound=dispatch_outbound,
+                    command_admitted=command_admitted,
                 )
         raise TypeError(f"unsupported inbound item: {type(msg).__name__}")
 
@@ -840,6 +819,16 @@ class AgentLoop:
                 fact = rollout_fact_provider()
                 if fact:
                     msg.metadata["_plugin_rollout_fact"] = fact
+
+            # 4. Committed commands settle before model, Session, resume, and TurnStarted.
+            if isinstance(msg, InboundMessage):
+                command_result = await self._passive_pipeline.run_command(
+                    msg,
+                    key,
+                    dispatch_outbound=dispatch_outbound,
+                )
+                if command_result is not None:
+                    return command_result
             model_selection = await self._resolve_model_selection(msg, key)
             async with model_execution_scope(
                 self._llm_services.provider,
@@ -849,7 +838,7 @@ class AgentLoop:
                 if model_binding is not None and isinstance(msg, InboundMessage):
                     msg.metadata["model_binding"] = model_binding.describe("agent")
 
-                # 4. 处理可能存在的续跑态，并发布 turn started。
+                # 5. 处理可能存在的续跑态，并发布 turn started。
                 msg, resumed_from_interrupt = await self._resume_interrupted_message(
                     msg, key
                 )
@@ -858,7 +847,7 @@ class AgentLoop:
                 preview = content[:60] + "..." if len(content) > 60 else content
                 logger.info(f"Processing message from {msg.channel}: {preview}")
 
-                # 5. 再进入 busy 状态并执行核心处理。
+                # 6. 再进入 busy 状态并执行核心处理。
                 if self._processing_state:
                     self._processing_state.enter(busy_key)
                 try:
@@ -866,6 +855,7 @@ class AgentLoop:
                         msg,
                         key,
                         dispatch_outbound=dispatch_outbound,
+                        command_admitted=isinstance(msg, InboundMessage),
                     )
                     if resumed_from_interrupt:
                         self._interrupt_states.pop(key, None)
@@ -874,7 +864,7 @@ class AgentLoop:
                     if self._processing_state:
                         self._processing_state.exit(busy_key)
         finally:
-            # 6. 当前 query 结束即回收其 shell，再恢复调用方上下文。
+            # 7. 当前 query 结束即回收其 shell，再恢复调用方上下文。
             try:
                 await self._cleanup_shell_owner(key)
             finally:
@@ -991,13 +981,37 @@ class AgentLoop:
         execution_turn_id: str | None = None,
     ) -> OutboundMessage:
         key = session_key or msg.session_key
-        async with self._session_lanes.hold(key):
+        lane_key = busy_session_key or key
+        async with self._session_lanes.hold(lane_key):
             store = self._runtime_snapshot_store
             # 只有入站边界已确定的权威 ID 才显式传给 _process；直接调用/内部
             # 工作项为 None 时保持原有 metadata 派生语义（兼容外部直连 _process）。
             process_kwargs: dict[str, str] = {}
             if execution_turn_id is not None:
                 process_kwargs["execution_turn_id"] = execution_turn_id
+            from agent.plugins.snapshot import get_current_runtime_lease
+
+            bound_lease = get_current_runtime_lease()
+            if bound_lease is not None:
+                snapshot = bound_lease.snapshot
+                if bound_lease.validation_candidate_plugin_ids:
+                    if not isinstance(msg, InboundMessage):
+                        raise RuntimeError(
+                            "latest candidate 只接受普通 inbound message"
+                        )
+                    _disable_candidate_side_effect_tools(
+                        msg,
+                        bound_lease.validation_candidate_plugin_ids,
+                        snapshot.tool_registry,
+                        snapshot,
+                    )
+                return await self._process(
+                    msg,
+                    session_key=session_key,
+                    busy_session_key=busy_session_key,
+                    dispatch_outbound=dispatch_outbound,
+                    **process_kwargs,
+                )
             if store is None or store.current is None:
                 if runtime_selector != "stable":
                     raise RuntimeError("latest RuntimeSnapshot 不可用")

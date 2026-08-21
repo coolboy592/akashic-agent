@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -46,6 +47,38 @@ class EmbeddingApi(Protocol):
     async def embed(self, text: str) -> list[float]: ...
 
     async def embed_batch(self, texts: list[str]) -> list[list[float]]: ...
+
+
+@dataclass(frozen=True, slots=True)
+class ActiveRecallRecord:
+    """保存一个适合插件展示的有界召回条目。"""
+
+    user_text: str
+    assistant_preview: str
+    started_at: str
+    score: float
+
+
+@dataclass(frozen=True, slots=True)
+class ActiveRecallView:
+    """保存一个 Turn 的有界 active recall 视图。"""
+
+    query_id: str
+    dense: tuple[ActiveRecallRecord, ...]
+    completion: tuple[ActiveRecallRecord, ...]
+
+
+@runtime_checkable
+class MemoryTurnRuntimeApi(Protocol):
+    """只向 v3 插件提供当前 Turn metadata 与有界 active recall。"""
+
+    def take_turn_user_metadata(self, turn_id: str) -> Mapping[str, object]: ...
+
+    def wait_active_recall(
+        self,
+        session_key: str,
+        turn_id: str,
+    ) -> ActiveRecallView | None: ...
 
 
 @dataclass

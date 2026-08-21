@@ -11,8 +11,19 @@ import pytest
 from agent.control.models import TurnRequest, TurnStatus
 from agent.control.ports import ControlExecutionResult
 from agent.control.runtime import ConversationRuntime
+from agent.plugin_composition.channels import (
+    AttachmentKind,
+    AttachmentRef,
+    ChannelDeliveryReceipt,
+    DeliveryStatus as ChannelDeliveryStatus,
+)
 from bootstrap.passive_worker import PassiveMessageWorker
-from bus.events import InboundMessage, OutboundMessage, TurnTerminalStatus
+from bus.events import (
+    ChannelMessage,
+    InboundMessage,
+    OutboundMessage,
+    TurnTerminalStatus,
+)
 from bus.queue import MessageBus
 from session.manager import SessionManager
 from session.store import SessionStore
@@ -34,6 +45,34 @@ class _Bus:
     async def publish_outbound(self, message: OutboundMessage) -> None:
         self.outbound.append(message)
 
+    async def dispatch_channel(
+        self,
+        message: ChannelMessage,
+        _passive: bool,
+    ) -> ChannelDeliveryReceipt:
+        """Record one committed v3 delivery for the direct worker tests."""
+
+        self.outbound.append(
+            OutboundMessage(
+                channel=message.channel,
+                chat_id=message.chat_id,
+                content=message.content,
+                thinking=message.thinking,
+                reply_to=message.reply_to,
+                media=[attachment.source for attachment in message.attachments],
+                attachment_refs=message.attachment_refs,
+                metadata=dict(message.metadata),
+                session_message_id=message.session_message_id,
+                control_turn_id=message.control_turn_id,
+                execution_attempt_id=message.execution_attempt_id,
+                terminal_status=message.terminal_status,
+            )
+        )
+        return ChannelDeliveryReceipt(
+            delivery_id=message.execution_attempt_id or "test-delivery",
+            status=ChannelDeliveryStatus.DELIVERED,
+        )
+
     async def complete_inbound(self, message: InboundMessage) -> None:
         self.completed.append(message)
         self.completions.put_nowait(message)
@@ -47,6 +86,46 @@ async def _wait_for(predicate: Callable[[], bool], *, timeout: float = 3.0) -> N
             await asyncio.sleep(0.02)
 
     await asyncio.wait_for(_poll(), timeout=timeout)
+
+
+def _bind_channel_delivery(
+    worker: PassiveMessageWorker,
+    callback: Callable[[OutboundMessage], Any] | None = None,
+) -> None:
+    """Bind test delivery behavior at the committed Channel boundary."""
+
+    async def dispatch(
+        message: ChannelMessage,
+        _passive: bool,
+    ) -> ChannelDeliveryReceipt:
+        if callback is None:
+            return ChannelDeliveryReceipt(
+                delivery_id=message.execution_attempt_id or "test-delivery",
+                status=ChannelDeliveryStatus.REJECTED,
+                error="test Channel provider 未绑定",
+            )
+        outbound = OutboundMessage(
+            channel=message.channel,
+            chat_id=message.chat_id,
+            content=message.content,
+            thinking=message.thinking,
+            reply_to=message.reply_to,
+            media=[attachment.source for attachment in message.attachments],
+            metadata=dict(message.metadata),
+            session_message_id=message.session_message_id,
+            control_turn_id=message.control_turn_id,
+            execution_attempt_id=message.execution_attempt_id,
+            terminal_status=message.terminal_status,
+        )
+        result = callback(outbound)
+        if asyncio.iscoroutine(result):
+            await result
+        return ChannelDeliveryReceipt(
+            delivery_id=message.execution_attempt_id or "test-delivery",
+            status=ChannelDeliveryStatus.DELIVERED,
+        )
+
+    worker.bind_channel_dispatcher(dispatch)
 
 
 def _real_worker(
@@ -104,7 +183,12 @@ async def test_channel_adapter_uses_same_conversation_runtime(tmp_path: Path) ->
 
     runtime = ConversationRuntime(store, execute)
     bus = _Bus()
-    worker = PassiveMessageWorker(cast(Any, bus), runtime, cast(Any, object()))
+    worker = PassiveMessageWorker(
+        cast(Any, bus),
+        runtime,
+        cast(Any, object()),
+        channel_dispatcher=bus.dispatch_channel,
+    )
     inbound = InboundMessage(
         "telegram",
         "user",
@@ -115,7 +199,6 @@ async def test_channel_adapter_uses_same_conversation_runtime(tmp_path: Path) ->
     await worker._run_message(inbound)
 
     assert [message.content for message in bus.outbound] == ["channel:hello"]
-    assert bus.completed == [inbound]
     turns = store.list_turns("telegram:42")
     assert len(turns) == 1
     assert turns[0].final_response == "channel:hello"
@@ -141,6 +224,7 @@ async def test_channel_adapter_releases_session_admission_after_completion(
         cast(Any, bus),
         runtime,
         cast(Any, SimpleNamespace(session_manager=manager)),
+        channel_dispatcher=bus.dispatch_channel,
     )
     inbound = InboundMessage(
         "mobile",
@@ -176,7 +260,12 @@ async def test_worker_executes_different_threads_without_blocking_consumer(
 
     runtime = ConversationRuntime(store, execute)
     bus = _Bus()
-    worker = PassiveMessageWorker(cast(Any, bus), runtime, cast(Any, object()))
+    worker = PassiveMessageWorker(
+        cast(Any, bus),
+        runtime,
+        cast(Any, object()),
+        channel_dispatcher=bus.dispatch_channel,
+    )
     worker_task = asyncio.create_task(worker.run())
     bus.inbound.put_nowait(InboundMessage("telegram", "user", "one", "first"))
     bus.inbound.put_nowait(InboundMessage("telegram", "user", "two", "second"))
@@ -192,8 +281,7 @@ async def test_worker_executes_different_threads_without_blocking_consumer(
     await asyncio.wait_for(second_is_completed(), 1)
     assert store.list_turns("telegram:one")[0].status is TurnStatus.IN_PROGRESS
     release.set()
-    _ = await asyncio.wait_for(bus.completions.get(), 1)
-    _ = await asyncio.wait_for(bus.completions.get(), 1)
+    await _wait_for(lambda: len(bus.outbound) == 2)
     worker.stop()
     await worker_task
     await runtime.shutdown()
@@ -216,7 +304,12 @@ async def test_worker_waits_for_terminal_before_admitting_next_message(
 
     runtime = ConversationRuntime(store, execute)
     bus = _Bus()
-    worker = PassiveMessageWorker(cast(Any, bus), runtime, cast(Any, object()))
+    worker = PassiveMessageWorker(
+        cast(Any, bus),
+        runtime,
+        cast(Any, object()),
+        channel_dispatcher=bus.dispatch_channel,
+    )
     worker_task = asyncio.create_task(worker.run())
     bus.inbound.put_nowait(InboundMessage("telegram", "user", "same", "u1"))
     bus.inbound.put_nowait(InboundMessage("telegram", "user", "same", "u2"))
@@ -225,8 +318,7 @@ async def test_worker_waits_for_terminal_before_admitting_next_message(
     assert len(store.list_turns("telegram:same")) == 1
     assert bus.completed == []
     release.set()
-    _ = await asyncio.wait_for(bus.completions.get(), 1)
-    _ = await asyncio.wait_for(bus.completions.get(), 1)
+    await _wait_for(lambda: len(bus.outbound) == 2)
 
     assert [message.content for message in bus.outbound] == ["u1", "u2"]
     turns = store.list_turns("telegram:same")
@@ -243,6 +335,22 @@ async def test_channel_adapter_preserves_full_outbound_projection(
     tmp_path: Path,
 ) -> None:
     store = SessionStore(tmp_path / "sessions.db")
+    ref = AttachmentRef(
+        artifact_id="artifact-terminal",
+        kind=AttachmentKind.IMAGE,
+        filename="result.png",
+        media_type="image/png",
+        size_bytes=3,
+        sha256="a" * 64,
+    )
+
+    class _ArtifactStore:
+        def resolve_refs(
+            self,
+            artifact_ids: tuple[str, ...],
+        ) -> tuple[AttachmentRef, ...]:
+            assert artifact_ids == (ref.artifact_id,)
+            return (ref,)
 
     async def execute(_request: TurnRequest) -> ControlExecutionResult:
         return ControlExecutionResult(
@@ -251,6 +359,7 @@ async def test_channel_adapter_preserves_full_outbound_projection(
                 "thinking": "reasoning",
                 "replyTo": "message-1",
                 "media": ["image.png"],
+                "attachmentIds": [ref.artifact_id],
                 "metadata": {"render": "card"},
                 "sessionMessageId": "telegram:42:2",
             },
@@ -258,7 +367,13 @@ async def test_channel_adapter_preserves_full_outbound_projection(
 
     runtime = ConversationRuntime(store, execute)
     bus = _Bus()
-    worker = PassiveMessageWorker(cast(Any, bus), runtime, cast(Any, object()))
+    worker = PassiveMessageWorker(
+        cast(Any, bus),
+        runtime,
+        cast(Any, object()),
+        attachment_store=cast(Any, _ArtifactStore()),
+        channel_dispatcher=bus.dispatch_channel,
+    )
     inbound = InboundMessage("telegram", "user", "42", "hello")
     await worker._run_message(inbound)
 
@@ -270,6 +385,7 @@ async def test_channel_adapter_preserves_full_outbound_projection(
             thinking="reasoning",
             reply_to="message-1",
             media=["image.png"],
+            attachment_refs=(ref,),
             metadata={"render": "card"},
             session_message_id="telegram:42:2",
         )
@@ -299,8 +415,7 @@ async def test_recovered_mobile_handoff_without_turn_creates_one_turn_and_delive
     async def on_outbound(msg: OutboundMessage) -> None:
         delivered.append(msg)
 
-    bus.subscribe_outbound("mobile", on_outbound)
-    dispatch = asyncio.create_task(bus.dispatch_outbound())
+    _bind_channel_delivery(worker, on_outbound)
     inbound = _mobile_item("existing", "hello", "client:1")
     await bus.publish_inbound(inbound)
     recovered = await _consume_message(bus)
@@ -314,7 +429,6 @@ async def test_recovered_mobile_handoff_without_turn_creates_one_turn_and_delive
     assert [msg.content for msg in delivered] == ["echo:hello"]
     assert delivered[0].control_turn_id == turns[0].id
     assert delivered[0].execution_attempt_id == turns[0].id
-    await _cancel_task(dispatch)
     await runtime.shutdown()
     manager.close()
 
@@ -354,8 +468,7 @@ async def test_recovered_mobile_handoff_with_completed_turn_redelivers_and_acks(
     async def on_outbound(msg: OutboundMessage) -> None:
         delivered.append(msg)
 
-    bus.subscribe_outbound("mobile", on_outbound)
-    dispatch = asyncio.create_task(bus.dispatch_outbound())
+    _bind_channel_delivery(worker, on_outbound)
     inbound = _mobile_item("terminal", "hello", "client:t")
     await bus.publish_inbound(inbound)
     recovered = await _consume_message(bus)
@@ -386,7 +499,6 @@ async def test_recovered_mobile_handoff_with_completed_turn_redelivers_and_acks(
         record.akashic_fields["counts"] == "mode=recovery"
         for record in recovery_records
     )
-    await _cancel_task(dispatch)
     await runtime.shutdown()
     manager.close()
 
@@ -421,8 +533,7 @@ async def test_recovered_mobile_handoff_in_interrupted_attempt_is_not_reenqueued
     async def commit_mobile_terminal(message: OutboundMessage) -> None:
         delivered.append(message)
 
-    _ = bus.subscribe_outbound("mobile", commit_mobile_terminal)
-    dispatcher = asyncio.create_task(bus.dispatch_outbound())
+    _bind_channel_delivery(worker, commit_mobile_terminal)
     inbound = _mobile_item("interrupted", "u1", "client:interrupted")
     await bus.publish_inbound(inbound)
     recovered = await _consume_message(bus)
@@ -435,8 +546,6 @@ async def test_recovered_mobile_handoff_in_interrupted_attempt_is_not_reenqueued
     assert delivered[0].metadata["client_message_id"] == "client:interrupted"
     assert manager.control_store.list_inbound_handoffs() == []
     assert bus._inbound_accepted == {}
-    bus.stop()
-    await dispatcher
     await runtime.shutdown()
     manager.close()
 
@@ -465,9 +574,8 @@ async def test_capacity_busy_waits_then_creates_single_turn_and_delivers(
     async def on_outbound(msg: OutboundMessage) -> None:
         delivered.append(msg)
 
-    bus.subscribe_outbound("mobile", on_outbound)
+    _bind_channel_delivery(worker, on_outbound)
     worker_task = asyncio.create_task(worker.run())
-    dispatch = asyncio.create_task(bus.dispatch_outbound())
     await bus.publish_inbound(_mobile_item("one", "u1", "client:a"))
     await asyncio.wait_for(first_started.wait(), timeout=2)
     await bus.publish_inbound(_mobile_item("two", "u2", "client:b"))
@@ -495,7 +603,6 @@ async def test_capacity_busy_waits_then_creates_single_turn_and_delivers(
     assert [msg.content for msg in delivered] == ["echo:u1", "echo:u2"]
     assert len({msg.control_turn_id for msg in delivered}) == 2
     await _cancel_task(worker_task)
-    await _cancel_task(dispatch)
     await runtime.shutdown()
     manager.close()
 
@@ -528,18 +635,17 @@ async def test_capacity_bytes_includes_request_waits_without_busy_polling(
     async def on_outbound(msg: OutboundMessage) -> None:
         delivered.append(msg)
 
-    bus.subscribe_outbound("mobile", on_outbound)
+    _bind_channel_delivery(worker, on_outbound)
     worker_task = asyncio.create_task(worker.run())
-    dispatch = asyncio.create_task(bus.dispatch_outbound())
     await bus.publish_inbound(_mobile_item("big", "x" * 900, "client:big"))
     await asyncio.wait_for(first_started.wait(), timeout=2)
 
     attempts = {"count": 0}
     original_start = runtime.start_turn
 
-    async def counting_start(request: TurnRequest) -> Any:
+    async def counting_start(request: TurnRequest, **kwargs: Any) -> Any:
         attempts["count"] += 1
-        return await original_start(request)
+        return await original_start(request, **kwargs)
 
     runtime.start_turn = counting_start  # type: ignore[method-assign]
     await bus.publish_inbound(_mobile_item("small", "y" * 200, "client:small"))
@@ -563,7 +669,6 @@ async def test_capacity_bytes_includes_request_waits_without_busy_polling(
         f"echo:{'y' * 200}",
     ]
     await _cancel_task(worker_task)
-    await _cancel_task(dispatch)
     await runtime.shutdown()
     manager.close()
 
@@ -628,8 +733,7 @@ async def test_runtime_closed_while_waiting_capacity_keeps_handoff(
     async def commit_mobile_terminal(message: OutboundMessage) -> None:
         delivered.append(message)
 
-    _ = bus.subscribe_outbound("mobile", commit_mobile_terminal)
-    dispatcher = asyncio.create_task(bus.dispatch_outbound())
+    _bind_channel_delivery(worker, commit_mobile_terminal)
     worker_task = asyncio.create_task(worker.run())
     await bus.publish_inbound(_mobile_item("one", "u1", "client:a"))
     await asyncio.wait_for(first_started.wait(), timeout=2)
@@ -655,8 +759,6 @@ async def test_runtime_closed_while_waiting_capacity_keeps_handoff(
 
     # 3. B 未建 turn，不发送“请重发”假 final；durable row 留给新 runtime。
     assert bus.outbound_size == 0
-    bus.stop()
-    await dispatcher
     manager.close()
 
 
@@ -691,8 +793,7 @@ async def test_restart_cancel_resumes_waiting_mobile_handoff_in_same_process(
     async def commit_mobile_terminal(message: OutboundMessage) -> None:
         delivered.append(message)
 
-    bus.subscribe_outbound("mobile", commit_mobile_terminal)
-    dispatcher = asyncio.create_task(bus.dispatch_outbound())
+    _bind_channel_delivery(worker, commit_mobile_terminal)
     worker_task = asyncio.create_task(worker.run())
     await bus.publish_inbound(
         _mobile_item("restart-waiting", "hello", "client:restart-waiting")
@@ -716,8 +817,6 @@ async def test_restart_cancel_resumes_waiting_mobile_handoff_in_same_process(
     assert (await caller.result()).status is TurnStatus.COMPLETED
     worker.stop()
     await worker_task
-    bus.stop()
-    await dispatcher
     await runtime.shutdown()
     manager.close()
 
@@ -771,6 +870,12 @@ async def test_terminal_handoff_retained_until_dispatcher_delivers(
 
     runtime = ConversationRuntime(manager.control_store, execute)
     bus, worker = _real_worker(manager, runtime)
+    delivered: list[OutboundMessage] = []
+
+    async def on_outbound(msg: OutboundMessage) -> None:
+        delivered.append(msg)
+
+    _bind_channel_delivery(worker, on_outbound)
     inbound = _mobile_item("p1", "hello", "client:p1")
     await bus.publish_inbound(inbound)
     consumed = await _consume_message(bus)
@@ -782,22 +887,13 @@ async def test_terminal_handoff_retained_until_dispatcher_delivers(
         is TurnStatus.COMPLETED
     )
 
-    # 1. dispatcher 未启动：SessionDB terminal 已落，但 handoff row 仍在。
-    assert len(manager.control_store.list_inbound_handoffs()) == 1
-    assert bus.outbound_size == 1
-    delivered: list[OutboundMessage] = []
-
-    async def on_outbound(msg: OutboundMessage) -> None:
-        delivered.append(msg)
-
-    bus.subscribe_outbound("mobile", on_outbound)
-    dispatch = asyncio.create_task(bus.dispatch_outbound())
+    # 1. typed dispatcher 收到 exact terminal 并返回 settled receipt。
+    assert len(manager.control_store.list_inbound_handoffs()) == 0
     await asyncio.wait_for(result_task, timeout=2)
 
     # 2. 实际送达后 worker 才完成 handoff。
     assert manager.control_store.list_inbound_handoffs() == []
     assert [msg.content for msg in delivered] == ["echo:hello"]
-    await _cancel_task(dispatch)
     await runtime.shutdown()
     manager.close()
 
@@ -825,8 +921,7 @@ async def test_handoff_deleted_only_after_callback_durable_commit(
         await release_callback.wait()
         events.append("callback_committed")
 
-    bus.subscribe_outbound("mobile", on_outbound)
-    dispatch = asyncio.create_task(bus.dispatch_outbound())
+    _bind_channel_delivery(worker, on_outbound)
     inbound = _mobile_item("order", "hello", "client:o")
     await bus.publish_inbound(inbound)
     consumed = await _consume_message(bus)
@@ -849,7 +944,6 @@ async def test_handoff_deleted_only_after_callback_durable_commit(
     # 2. 顺序：callback 提交成功后才删除 handoff。
     assert events == ["callback_entered", "callback_committed"]
     assert manager.control_store.list_inbound_handoffs() == []
-    await _cancel_task(dispatch)
     await runtime.shutdown()
     manager.close()
 
@@ -870,23 +964,21 @@ async def test_handoff_retained_when_callback_fails_twice(tmp_path: Path) -> Non
 
     runtime = ConversationRuntime(manager.control_store, execute)
     bus, worker = _real_worker(manager, runtime)
-    bus.subscribe_outbound("mobile", on_outbound)
-    dispatch = asyncio.create_task(bus.dispatch_outbound())
+    _bind_channel_delivery(worker, on_outbound)
     inbound = _mobile_item("fail2", "hello", "client:f")
     await bus.publish_inbound(inbound)
     consumed = await _consume_message(bus)
-    with pytest.raises(RuntimeError, match="handoff retained"):
+    with pytest.raises(RuntimeError, match="channel down"):
         await worker._run_message(consumed)
 
-    # 1. callback 两次失败：fail-loud，row 与 owner 保留，不伪成功删除。
-    assert attempts["count"] >= 2
+    # 1. typed dispatcher 单次失败：fail-loud，row 与 owner 保留。
+    assert attempts["count"] == 1
     assert len(manager.control_store.list_inbound_handoffs()) == 1
     assert id(consumed) in bus._inbound_accepted
 
     # 2. 失败路径 finally 恰一次释放 session admission，同一会话可再次 admit。
     _, readmission = manager.admit_existing(session_key)
     manager.release_admission(readmission)
-    await _cancel_task(dispatch)
     await runtime.shutdown()
     manager.close()
 
@@ -938,12 +1030,11 @@ async def test_handoff_retained_when_dispatcher_cancelled(tmp_path: Path) -> Non
 
     async def on_outbound(_msg: OutboundMessage) -> None:
         entered.set()
-        await asyncio.Event().wait()
+        raise RuntimeError("provider stopped")
 
     runtime = ConversationRuntime(manager.control_store, execute)
     bus, worker = _real_worker(manager, runtime)
-    bus.subscribe_outbound("mobile", on_outbound)
-    dispatch = asyncio.create_task(bus.dispatch_outbound())
+    _bind_channel_delivery(worker, on_outbound)
     inbound = _mobile_item("dc", "hello", "client:d")
     await bus.publish_inbound(inbound)
     consumed = await _consume_message(bus)
@@ -951,13 +1042,11 @@ async def test_handoff_retained_when_dispatcher_cancelled(tmp_path: Path) -> Non
     assert result_task is not None
     await asyncio.wait_for(entered.wait(), timeout=2)
 
-    # 1. dispatch 取消把 receipt 收束为未送达：worker fail-loud，row 保留。
-    await _cancel_task(dispatch)
-    with pytest.raises(RuntimeError, match="handoff retained"):
-        await result_task
+    # 1. typed dispatcher provider 失败：worker fail-loud，row 保留。
+    with pytest.raises(RuntimeError, match="provider stopped"):
+        await asyncio.wait_for(result_task, timeout=2)
     assert len(manager.control_store.list_inbound_handoffs()) == 1
     assert id(consumed) in bus._inbound_accepted
-    assert bus._pending_outbound_receipts == set()
     await runtime.shutdown()
     manager.close()
 
@@ -983,9 +1072,8 @@ async def test_failed_outbound_carries_authoritative_turn_id_across_threads(
     async def on_outbound(msg: OutboundMessage) -> None:
         delivered.append(msg)
 
-    bus.subscribe_outbound("mobile", on_outbound)
+    _bind_channel_delivery(worker, on_outbound)
     worker_task = asyncio.create_task(worker.run())
-    dispatch = asyncio.create_task(bus.dispatch_outbound())
     await bus.publish_inbound(_mobile_item("afail", "a", "client:a"))
     await bus.publish_inbound(_mobile_item("bsuccess", "b", "client:b"))
     await _wait_for(lambda: manager.control_store.list_inbound_handoffs() == [])
@@ -1002,7 +1090,6 @@ async def test_failed_outbound_carries_authoritative_turn_id_across_threads(
     assert echoed.control_turn_id == turns_b[0].id
     assert turns_a[0].id != turns_b[0].id
     await _cancel_task(worker_task)
-    await _cancel_task(dispatch)
     await runtime.shutdown()
     manager.close()
 
@@ -1018,17 +1105,15 @@ async def test_handoff_retained_without_subscriber(tmp_path: Path) -> None:
 
     runtime = ConversationRuntime(manager.control_store, execute)
     bus, worker = _real_worker(manager, runtime)
-    dispatch = asyncio.create_task(bus.dispatch_outbound())
     inbound = _mobile_item("nosub", "hello", "client:n")
     await bus.publish_inbound(inbound)
     consumed = await _consume_message(bus)
-    with pytest.raises(RuntimeError, match="handoff retained"):
+    with pytest.raises(RuntimeError, match="Passive terminal exact Channel dispatcher 未绑定"):
         await worker._run_message(consumed)
 
     # 1. 无 subscriber 不算 delivered：row 与 owner 保留。
     assert len(manager.control_store.list_inbound_handoffs()) == 1
     assert id(consumed) in bus._inbound_accepted
-    await _cancel_task(dispatch)
     await runtime.shutdown()
     manager.close()
 
@@ -1128,13 +1213,12 @@ async def test_restart_recovery_redelivers_terminals_and_creates_missing_turn_on
     async def on_outbound(msg: OutboundMessage) -> None:
         delivered2.append(msg)
 
-    bus2.subscribe_outbound("mobile", on_outbound)
+    _bind_channel_delivery(worker2, on_outbound)
     await bus2.recover_durable_inbounds()
     await bus2.recover_durable_inbounds()
     assert bus2.inbound_size == 4
     assert len(bus2._inbound_accepted) == 4
     worker2_task = asyncio.create_task(worker2.run())
-    dispatch2 = asyncio.create_task(bus2.dispatch_outbound())
     await _wait_for(lambda: manager2.control_store.list_inbound_handoffs() == [])
 
     done = manager2.control_store.find_turn_by_client_message_id(
@@ -1182,7 +1266,6 @@ async def test_restart_recovery_redelivers_terminals_and_creates_missing_turn_on
     assert interrupted_outbound.metadata["client_message_id"] == "client:interrupt"
     assert bus2._inbound_accepted == {}
     await _cancel_task(worker2_task)
-    await _cancel_task(dispatch2)
     await runtime2.shutdown()
     manager2.close()
 
@@ -1205,8 +1288,7 @@ async def test_failed_outbound_carries_verified_client_message_id(
     async def on_outbound(msg: OutboundMessage) -> None:
         delivered.append(msg)
 
-    bus.subscribe_outbound("mobile", on_outbound)
-    dispatch = asyncio.create_task(bus.dispatch_outbound())
+    _bind_channel_delivery(worker, on_outbound)
     inbound = _mobile_item("fcmid", "hello", "client:fcmid")
     await bus.publish_inbound(inbound)
     consumed = await _consume_message(bus)
@@ -1221,7 +1303,6 @@ async def test_failed_outbound_carries_verified_client_message_id(
     assert failed.metadata["client_message_id"] == "client:fcmid"
     assert failed.control_turn_id == turn.id
     assert manager.control_store.list_inbound_handoffs() == []
-    await _cancel_task(dispatch)
     await runtime.shutdown()
     manager.close()
 
@@ -1241,14 +1322,12 @@ async def test_restart_redelivery_failed_carries_verified_client_message_id(
     # 进程1：FAILED turn 已落库，但无 subscriber 送达，handoff 保留（崩溃窗口）。
     runtime1 = ConversationRuntime(manager1.control_store, execute)
     bus1, worker1 = _real_worker(manager1, runtime1)
-    dispatch1 = asyncio.create_task(bus1.dispatch_outbound())
     inbound1 = _mobile_item("rdfail", "hello", "client:rdfail")
     await bus1.publish_inbound(inbound1)
     consumed1 = await _consume_message(bus1)
-    with pytest.raises(RuntimeError, match="handoff retained"):
+    with pytest.raises(RuntimeError, match="Passive terminal exact Channel dispatcher 未绑定"):
         await worker1._run_message(consumed1)
     assert len(manager1.control_store.list_inbound_handoffs()) == 1
-    await _cancel_task(dispatch1)
     await bus1.aclose()
     await runtime1.shutdown()
     manager1.close()
@@ -1262,8 +1341,7 @@ async def test_restart_redelivery_failed_carries_verified_client_message_id(
     async def on_outbound(msg: OutboundMessage) -> None:
         delivered2.append(msg)
 
-    bus2.subscribe_outbound("mobile", on_outbound)
-    dispatch2 = asyncio.create_task(bus2.dispatch_outbound())
+    _bind_channel_delivery(worker2, on_outbound)
     await bus2.recover_durable_inbounds()
     recovered = await _consume_message(bus2)
     await worker2._run_message(recovered)
@@ -1276,7 +1354,6 @@ async def test_restart_redelivery_failed_carries_verified_client_message_id(
     assert failed.metadata["client_message_id"] == "client:rdfail"
     assert failed.control_turn_id == turn.id
     assert manager2.control_store.list_inbound_handoffs() == []
-    await _cancel_task(dispatch2)
     await runtime2.shutdown()
     manager2.close()
 
@@ -1299,18 +1376,12 @@ async def test_worker_terminal_error_milestone_carries_result_identity(
 
     runtime = ConversationRuntime(manager.control_store, execute)
     bus, worker = _real_worker(manager, runtime)
-    monkeypatch.setattr("bus.queue._OUTBOUND_RETRY_DELAY", 0.0)
-    monkeypatch.setattr(
-        "bootstrap.passive_worker._TERMINAL_DELIVERY_RETRY_DELAYS",
-        (0.0, 0.0),
-    )
-    bus.subscribe_outbound("mobile", on_outbound)
-    dispatch = asyncio.create_task(bus.dispatch_outbound())
+    _bind_channel_delivery(worker, on_outbound)
     inbound = _mobile_item("emid", "hello", "client:emid")
     await bus.publish_inbound(inbound)
     consumed = await _consume_message(bus)
     with caplog.at_level(logging.INFO, logger="bootstrap.passive_worker"):
-        with pytest.raises(RuntimeError, match="handoff retained"):
+        with pytest.raises(RuntimeError, match="channel down"):
             await worker._run_message(consumed)
 
     # 1. result 已取得：error 里程碑保留 result.id 与已验证 client_message_id。
@@ -1330,7 +1401,6 @@ async def test_worker_terminal_error_milestone_carries_result_identity(
     assert error_records[0].akashic_fields["outcome"] == "error"
     assert error_records[0].akashic_fields["duration_ms"] is not None
     assert len(manager.control_store.list_inbound_handoffs()) == 1
-    await _cancel_task(dispatch)
     await runtime.shutdown()
     manager.close()
 
@@ -1369,8 +1439,7 @@ async def test_worker_terminal_cleanup_failure_emits_only_error_terminal(
 
     monkeypatch.setattr(SessionStore, "complete_inbound_handoff", fail_once)
     monkeypatch.setattr("bus.queue._INBOUND_CLEANUP_RETRY_INITIAL_DELAY", 0.0)
-    bus.subscribe_outbound("mobile", commit_mobile_terminal)
-    dispatcher = asyncio.create_task(bus.dispatch_outbound())
+    _bind_channel_delivery(worker, commit_mobile_terminal)
     inbound = _mobile_item(
         "cleanup-fail-once",
         "hello",
@@ -1403,160 +1472,6 @@ async def test_worker_terminal_cleanup_failure_emits_only_error_terminal(
         "tl:worker.terminal.start",
         "tl:worker.terminal.error",
     ]
-    await _cancel_task(dispatcher)
-    await runtime.shutdown()
-    manager.close()
-
-
-@pytest.mark.asyncio
-async def test_worker_run_retries_terminal_and_excludes_executor_from_duration(
-    tmp_path: Path,
-    caplog: pytest.LogCaptureFixture,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """真实 worker/bus/runtime/store 链在临时送达失败后重投同一 terminal。"""
-
-    manager = SessionManager(tmp_path / "workspace")
-    session_key = "mobile:retry-chain"
-    manager.save(manager.get_or_create(session_key))
-    executor_delay = 0.2
-
-    async def execute(request: TurnRequest) -> str:
-        await asyncio.sleep(executor_delay)
-        return f"echo:{request.input}"
-
-    monkeypatch.setattr("bus.queue._OUTBOUND_RETRY_DELAY", 0.0)
-    monkeypatch.setattr(
-        "bootstrap.passive_worker._TERMINAL_DELIVERY_RETRY_DELAYS",
-        (0.0, 0.0),
-    )
-    runtime = ConversationRuntime(manager.control_store, execute)
-    bus, worker = _real_worker(manager, runtime)
-    attempts = 0
-    delivered: list[OutboundMessage] = []
-
-    async def commit_mobile_terminal(message: OutboundMessage) -> None:
-        nonlocal attempts
-        attempts += 1
-        if attempts <= 2:
-            raise RuntimeError("temporary mobile inbox failure")
-        delivered.append(message)
-
-    _ = bus.subscribe_outbound("mobile", commit_mobile_terminal)
-    dispatcher = asyncio.create_task(bus.dispatch_outbound())
-    worker_task = asyncio.create_task(worker.run())
-    with caplog.at_level(logging.INFO):
-        await bus.publish_inbound(
-            _mobile_item("retry-chain", "hello", "client:retry-chain")
-        )
-        await _wait_for(
-            lambda: manager.control_store.list_inbound_handoffs() == [],
-        )
-
-    # 1. 首个 worker attempt 内两次渠道发送都失败，第二个 attempt 成功。
-    assert attempts == 3
-    assert len(delivered) == 1
-    turn = manager.control_store.find_turn_by_client_message_id(
-        session_key,
-        "client:retry-chain",
-    )
-    assert turn is not None and turn.status is TurnStatus.COMPLETED
-    assert delivered[0].control_turn_id == turn.id
-    assert delivered[0].terminal_status is TurnTerminalStatus.COMPLETED
-    assert worker._result_tasks == set()
-
-    # 2. terminal duration 从 handle.result 后开始，不包含 executor 的 200ms。
-    done_records = [
-        record
-        for record in caplog.records
-        if getattr(record, "akashic_fields", {}).get("event")
-        == "tl:worker.terminal.done"
-        and record.akashic_fields.get("turn_id") == turn.id
-    ]
-    assert len(done_records) == 1
-    duration_ms = done_records[0].akashic_fields["duration_ms"]
-    assert isinstance(duration_ms, float)
-    assert duration_ms < executor_delay * 1_000
-    assert not any(
-        "Task exception was never retrieved" in record.getMessage()
-        for record in caplog.records
-    )
-
-    worker.stop()
-    await worker_task
-    bus.stop()
-    await dispatcher
-    await runtime.shutdown()
-    manager.close()
-
-
-@pytest.mark.asyncio
-async def test_worker_lane_retries_terminal_after_bounded_attempts_exhausted(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """一次有界投递耗尽后 lane 继续重投同一 terminal，不重跑 Provider。"""
-
-    manager = SessionManager(tmp_path / "workspace")
-    session_key = "mobile:retry-after-exhaustion"
-    manager.save(manager.get_or_create(session_key))
-    executor_calls = 0
-
-    async def execute(request: TurnRequest) -> str:
-        nonlocal executor_calls
-        executor_calls += 1
-        return f"echo:{request.input}"
-
-    monkeypatch.setattr("bus.queue._OUTBOUND_RETRY_DELAY", 0.0)
-    monkeypatch.setattr(
-        "bootstrap.passive_worker._TERMINAL_DELIVERY_RETRY_DELAYS",
-        (0.0, 0.0),
-    )
-    monkeypatch.setattr(
-        "bootstrap.passive_worker._TERMINAL_LANE_RETRY_DELAY",
-        0.0,
-    )
-    runtime = ConversationRuntime(manager.control_store, execute)
-    bus, worker = _real_worker(manager, runtime)
-    physical_attempts = 0
-    delivered: list[OutboundMessage] = []
-
-    async def recover_after_first_cycle(message: OutboundMessage) -> None:
-        nonlocal physical_attempts
-        physical_attempts += 1
-        if physical_attempts <= 6:
-            raise OSError("mobile inbox temporarily unavailable")
-        delivered.append(message)
-
-    bus.subscribe_outbound("mobile", recover_after_first_cycle)
-    dispatcher = asyncio.create_task(bus.dispatch_outbound())
-    worker_task = asyncio.create_task(worker.run())
-    await bus.publish_inbound(
-        _mobile_item(
-            "retry-after-exhaustion",
-            "hello",
-            "client:retry-after-exhaustion",
-        )
-    )
-    await _wait_for(lambda: manager.control_store.list_inbound_handoffs() == [])
-
-    # 1. 首轮 3×MessageBus(每次2次物理发送)耗尽；lane 第二轮第1次成功。
-    assert physical_attempts == 7
-    assert executor_calls == 1
-    assert len(delivered) == 1
-    turn = manager.control_store.find_turn_by_client_message_id(
-        session_key,
-        "client:retry-after-exhaustion",
-    )
-    assert turn is not None and turn.status is TurnStatus.COMPLETED
-    assert delivered[0].control_turn_id == turn.id
-    assert bus._inbound_accepted == {}
-    assert worker_task.done() is False
-
-    worker.stop()
-    await worker_task
-    bus.stop()
-    await dispatcher
     await runtime.shutdown()
     manager.close()
 
@@ -1587,8 +1502,7 @@ async def test_never_fit_input_persists_failed_terminal_before_handoff_ack(
     async def commit_mobile_terminal(message: OutboundMessage) -> None:
         delivered.append(message)
 
-    _ = bus.subscribe_outbound("mobile", commit_mobile_terminal)
-    dispatcher = asyncio.create_task(bus.dispatch_outbound())
+    _bind_channel_delivery(worker, commit_mobile_terminal)
     worker_task = asyncio.create_task(worker.run())
     await bus.publish_inbound(
         _mobile_item("never-fit", "x" * 2_000, "client:never-fit")
@@ -1622,7 +1536,5 @@ async def test_never_fit_input_persists_failed_terminal_before_handoff_ack(
 
     worker.stop()
     await worker_task
-    bus.stop()
-    await dispatcher
     await runtime.shutdown()
     manager.close()

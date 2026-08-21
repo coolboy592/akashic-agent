@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise Akasha V2 through the real Docker runtime and replay boundary."""
+"""Exercise the Akasha memory engine through Docker and replay boundaries."""
 
 from __future__ import annotations
 

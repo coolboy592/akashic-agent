@@ -2,7 +2,7 @@
 统一消息推送工具，agent 通过显式 target_channel + target_chat_id 向任意已注册渠道发送消息、文件或图片。
 """
 
-import logging
+import json
 from dataclasses import replace
 from pathlib import Path
 from collections.abc import Awaitable, Callable
@@ -10,30 +10,20 @@ from typing import Any, cast
 from uuid import uuid4
 
 from agent.tools.base import Tool
+from agent.plugin_composition.channels import (
+    ChannelDeliveryReceipt,
+)
 from bus.events import (
     AttachmentKind,
     ChannelAttachment,
     ChannelMessage,
-    DeliveryReceipt,
-    DeliveryStatus,
 )
 from bus.queue import ChatLane
 
-logger = logging.getLogger(__name__)
-
-
-class ChannelRegistration:
-    def __init__(self, tool: "MessagePushTool", channel: str, token: object) -> None:
-        self._tool = tool
-        self._channel = channel
-        self._token = token
-        self._active = True
-
-    def close(self) -> None:
-        if not self._active:
-            return
-        self._active = False
-        self._tool.unregister_channel(self._channel, self._token)
+V3ChannelDispatcher = Callable[
+    [ChannelMessage, bool],
+    Awaitable[ChannelDeliveryReceipt],
+]
 
 
 class MessagePushTool(Tool):
@@ -71,32 +61,20 @@ class MessagePushTool(Tool):
     }
 
     def __init__(self, chat_lane: ChatLane | None = None) -> None:
-        self._adapters: dict[
-            str, Callable[[ChannelMessage], Awaitable[DeliveryReceipt]]
-        ] = {}
-        self._registration_tokens: dict[str, object] = {}
-        self._chat_lane = chat_lane
+        # ``chat_lane`` remains an accepted constructor argument for callers that
+        # construct the shared tool before Core wiring; ordering is now owned by
+        # the committed Channel dispatcher.
+        _ = chat_lane
+        self._v3_dispatcher: V3ChannelDispatcher | None = None
 
-    def register_channel(
-        self,
-        channel: str,
-        deliver: Callable[[ChannelMessage], Awaitable[DeliveryReceipt]],
-    ) -> ChannelRegistration:
-        """注册完整逻辑消息的唯一渠道 adapter。"""
+    def bind_v3_channel_dispatcher(self, dispatcher: V3ChannelDispatcher) -> None:
+        """Bind Core's exact stable Channel dispatch boundary once."""
 
-        if channel in self._adapters:
-            raise RuntimeError(f"message_push 渠道名称重复: {channel}")
-        self._adapters[channel] = deliver
-        token = object()
-        self._registration_tokens[channel] = token
-        logger.debug("message_push: 注册渠道 %r", channel)
-        return ChannelRegistration(self, channel, token)
-
-    def unregister_channel(self, channel: str, token: object) -> None:
-        if self._registration_tokens.get(channel) is not token:
-            return
-        _ = self._registration_tokens.pop(channel, None)
-        _ = self._adapters.pop(channel, None)
+        if not callable(dispatcher):
+            raise TypeError("v3 channel dispatcher 必须可调用")
+        if self._v3_dispatcher is not None:
+            raise RuntimeError("v3 channel dispatcher 已绑定")
+        self._v3_dispatcher = dispatcher
 
     async def execute(self, **kwargs: Any) -> str:
         target_channel = kwargs["target_channel"]
@@ -122,7 +100,7 @@ class MessagePushTool(Tool):
             )
         if image:
             attachments.append(ChannelAttachment(AttachmentKind.IMAGE, image))
-        receipt = await self.dispatch(
+        receipt = await self._dispatch_result(
             ChannelMessage(
                 channel=target_channel,
                 chat_id=target_chat_id,
@@ -132,48 +110,43 @@ class MessagePushTool(Tool):
             ),
             commit_role=commit_role,
         )
-        if receipt.status is DeliveryStatus.SUCCESS:
-            return "消息已发送"
-        if receipt.status is DeliveryStatus.PARTIAL:
-            return f"消息部分送达：{receipt.detail or '渠道未提交全部内容'}"
-        return f"发送失败：{receipt.detail or '渠道未提交消息'}"
+        return json.dumps(
+            {
+                "delivery_id": receipt.delivery_id,
+                "status": receipt.status.value,
+                "retryable": False,
+                "provider_ids": list(receipt.provider_ids),
+                "error": receipt.error,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
 
     async def dispatch(
         self,
         message: ChannelMessage,
         *,
         commit_role: str = "",
-    ) -> DeliveryReceipt:
-        """通过单一 adapter 提交完整消息，并保留 chat lane 顺序。"""
+    ) -> ChannelDeliveryReceipt:
+        """通过 committed Channel catalog 提交一条完整逻辑消息。"""
+
+        return await self._dispatch_result(message, commit_role=commit_role)
+
+    async def _dispatch_result(
+        self,
+        message: ChannelMessage,
+        *,
+        commit_role: str = "",
+    ) -> ChannelDeliveryReceipt:
+        """Dispatch through the required committed Channel catalog and fail loudly otherwise."""
 
         if commit_role != "passive" and message.control_turn_id is None:
             message = replace(message, control_turn_id=f"turn:{uuid4().hex}")
-        adapter = self._adapters.get(message.channel)
-        if adapter is None:
-            return DeliveryReceipt(
-                DeliveryStatus.FAILED,
-                detail=(
-                    f"渠道 {message.channel!r} 未注册，可用渠道："
-                    f"{list(self._adapters) or ['（无）']}"
-                ),
-            )
-
-        async def _deliver() -> DeliveryReceipt:
-            receipt = await adapter(message)
-            if not isinstance(receipt, DeliveryReceipt):
-                raise TypeError("message_push channel adapter 必须返回 DeliveryReceipt")
-            return receipt
-
-        if self._chat_lane is not None:
-            if commit_role == "passive":
-                return await self._chat_lane.run_passive(
-                    message.channel,
-                    message.chat_id,
-                    _deliver,
-                )
-            return await self._chat_lane.run_non_passive(
-                message.channel,
-                message.chat_id,
-                _deliver,
-            )
-        return await _deliver()
+        dispatcher = self._v3_dispatcher
+        if dispatcher is None:
+            raise RuntimeError("message_push committed Channel dispatcher 未绑定")
+        receipt = await dispatcher(message, commit_role == "passive")
+        if not isinstance(receipt, ChannelDeliveryReceipt):
+            raise TypeError("message_push committed Channel dispatcher 必须返回 ChannelDeliveryReceipt")
+        return receipt

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import sqlite3
 from contextlib import contextmanager
@@ -13,6 +14,12 @@ from unittest.mock import AsyncMock, MagicMock, Mock
 import pytest
 
 from agent.context import ContextBuilder
+from agent.plugin_composition.channels import (
+    AttachmentKind,
+    AttachmentRef,
+    ChannelDeliveryReceipt,
+    DeliveryStatus as ChannelDeliveryStatus,
+)
 from agent.control.context import running_turn_id
 from agent.core.passive_support import build_context_hint_message
 from agent.core.passive_turn import (
@@ -29,13 +36,13 @@ from agent.lifecycle.phase import Phase
 from agent.tools.registry import ToolRegistry
 from bus.event_bus import EventBus
 from bus.events import (
-    DeliveryReceipt,
-    DeliveryStatus,
     InboundMessage,
     OutboundMessage,
 )
 from bus.events_lifecycle import TurnCommitted
 from core.error_context import current_client_message_id, current_session_key
+from infra.channels.artifacts import ChannelAttachmentArtifactStore
+from bootstrap.channel_attachment_import import ChannelOutboundAttachmentImporter
 from agent.lifecycle.types import (
     AfterReasoningCtx,
     AfterReasoningInput,
@@ -53,6 +60,8 @@ from agent.lifecycle.types import (
 )
 from agent.lifecycle.phases.after_reasoning import (
     AfterReasoningFrame,
+    _collect_persist_assistant_metadata,
+    _collect_persist_user_metadata,
     default_after_reasoning_modules,
 )
 from agent.lifecycle.phases.after_step import (
@@ -81,8 +90,7 @@ from agent.lifecycle.phases.prompt_render import (
 )
 from agent.prompting import PromptSectionRender
 from agent.persona import reset_veda
-from agent.turns.outbound import BusOutboundPort, OutboundDispatch, OutboundPort
-from bus.queue import MessageBus
+from agent.turns.outbound import OutboundDispatch, OutboundPort
 from session.manager import SessionManager, logical_history_unit_ranges
 
 _now = datetime.now()
@@ -157,8 +165,11 @@ class _MemoryStatusPluginModule:
 
 
 class _DummyOutbound:
-    async def dispatch(self, outbound: OutboundDispatch) -> DeliveryReceipt:
-        return DeliveryReceipt(DeliveryStatus.SUCCESS)
+    async def dispatch(self, outbound: OutboundDispatch) -> ChannelDeliveryReceipt:
+        return ChannelDeliveryReceipt(
+            delivery_id="test-delivery",
+            status=ChannelDeliveryStatus.DELIVERED,
+        )
 
 
 class _KVCachePluginModule:
@@ -1546,14 +1557,17 @@ async def test_after_step_collects_telemetry_slots_before_fanout():
 
 
 @pytest.mark.asyncio
-async def test_after_reasoning_collects_persist_and_outbound_slots():
+async def test_after_reasoning_collects_v3_metadata_and_outbound_slots():
     class SlotModule:
         slot = "test.after_reasoning.slot"
         requires = ("after_reasoning.emit", "reasoning:ctx")
 
         async def run(self, frame: AfterReasoningFrame) -> AfterReasoningFrame:
-            frame.slots["persist:user:user_flag"] = "u"
-            frame.slots["persist:assistant:assistant_flag"] = "a"
+            ctx = cast(AfterReasoningCtx, frame.slots["reasoning:ctx"])
+            ctx.persist_user_metadata["akasha_reinforce"] = {
+                "target_message_ids": ["message-1"]
+            }
+            ctx.persist_assistant_metadata["citation_ids"] = ["mem_1"]
             frame.slots["outbound:metadata:plugin_flag"] = "m"
             frame.slots["outbound:media:image"] = ["/tmp/a.png", None, 1]
             return frame
@@ -1568,13 +1582,33 @@ async def test_after_reasoning_collects_persist_and_outbound_slots():
     async def append_messages(
         current: _DummySession,
         messages: list[dict[str, object]],
+        *,
+        metadata: dict[str, Any] | None = None,
     ) -> None:
         for index, persisted in enumerate(messages):
             persisted["id"] = f"{current.key}:{index}"
 
+    class Importer:
+        async def import_media(
+            self,
+            media: tuple[str, ...],
+        ) -> tuple[AttachmentRef, ...]:
+            return tuple(
+                AttachmentRef(
+                    artifact_id=f"artifact-{index}",
+                    kind=AttachmentKind.IMAGE,
+                    filename=Path(source).name,
+                    media_type="image/png",
+                    size_bytes=index + 1,
+                    sha256=f"{index + 1:064x}",
+                )
+                for index, source in enumerate(media)
+            )
+
     services = SimpleNamespace(
         presence=Mock(),
         session_manager=SimpleNamespace(append_messages=append_messages),
+        outbound_attachment_importer=Importer(),
     )
     turn_result = TurnRunResult(
         reply="reply",
@@ -1596,14 +1630,250 @@ async def test_after_reasoning_collects_persist_and_outbound_slots():
 
     result = await phase.run(AfterReasoningInput(state=state, turn_result=turn_result))
 
-    assert session.messages[0]["user_flag"] == "u"
+    assert session.messages[0]["akasha_reinforce"] == {
+        "target_message_ids": ["message-1"]
+    }
     assert session.messages[0]["client_message_id"] == "01ARZ3NDEKTSV4RRFFQ69G5FAV"
-    assert session.messages[1]["assistant_flag"] == "a"
-    assert session.messages[1]["media"] == ["/tmp/from-turn.png", "/tmp/a.png"]
+    assert session.messages[1]["citation_ids"] == ["mem_1"]
+    assert session.messages[1]["attachment_ids"] == ["artifact-0", "artifact-1"]
     assert result.outbound.metadata["before_turn_flag"] == "bt"
     assert result.outbound.metadata["plugin_flag"] == "m"
-    assert result.outbound.media == ["/tmp/from-turn.png", "/tmp/a.png"]
+    assert [ref.artifact_id for ref in result.outbound.attachment_refs] == [
+        "artifact-0",
+        "artifact-1",
+    ]
+    assert result.outbound.media == []
     assert result.outbound.session_message_id == "telegram:123:1"
+
+
+@pytest.mark.asyncio
+async def test_after_reasoning_commits_outbound_attachment_binding_atomically(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    manager = SessionManager(workspace)
+    artifact_store = ChannelAttachmentArtifactStore(
+        workspace=workspace,
+        session_store=manager.control_store,
+    )
+    source = tmp_path / "generated.png"
+    source.write_bytes(b"generated image bytes")
+    session = manager.get_or_create("telegram:123")
+    state = TurnState(
+        msg=_inbound(),
+        session_key=session.key,
+        dispatch_outbound=True,
+    )
+    state.session = session
+    services = SimpleNamespace(
+        presence=None,
+        session_manager=manager,
+        outbound_attachment_importer=ChannelOutboundAttachmentImporter(
+            artifact_store
+        ),
+    )
+    phase = Phase(
+        default_after_reasoning_modules(EventBus(), cast(Any, services)),
+        frame_factory=AfterReasoningFrame,
+    )
+
+    result = await phase.run(
+        AfterReasoningInput(
+            state=state,
+            turn_result=TurnRunResult(
+                reply="reply",
+                media=[str(source)],
+            ),
+        )
+    )
+
+    assistant = session.messages[-1]
+    attachment_ids = assistant.get("attachment_ids")
+    assert isinstance(attachment_ids, list) and len(attachment_ids) == 1
+    assert manager.control_store.message_attachment_ids(cast(str, assistant["id"])) == tuple(
+        attachment_ids
+    )
+    assert result.outbound.attachment_refs[0].artifact_id == attachment_ids[0]
+    assert result.outbound.media == []
+    manager.close()
+
+
+def _assistant_metadata_ctx() -> AfterReasoningCtx:
+    return AfterReasoningCtx(
+        session_key="telegram:123",
+        channel="telegram",
+        chat_id="123",
+        tools_used=(),
+        thinking=None,
+        response_metadata=ResponseMetadata(raw_text="reply"),
+        streamed=False,
+        tool_chain=(),
+        context_retry={},
+        reply="reply",
+    )
+
+
+def test_after_reasoning_rejects_fixed_assistant_metadata_field() -> None:
+    ctx = _assistant_metadata_ctx()
+    ctx.persist_assistant_metadata["tools_used"] = ["spoof"]
+
+    with pytest.raises(ValueError, match="metadata 字段不可写: tools_used"):
+        _ = _collect_persist_assistant_metadata(ctx)
+
+
+def test_after_reasoning_rejects_core_owned_user_metadata_field() -> None:
+    ctx = _assistant_metadata_ctx()
+    ctx.persist_user_metadata["control_turn_id"] = "spoof"
+
+    with pytest.raises(ValueError, match="user plugin metadata 字段不可写"):
+        _ = _collect_persist_user_metadata(ctx)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "control_turn_id",
+        "turn_terminal",
+        "turn_input_count",
+        "skip_post_memory",
+        "turn_duration_ms",
+    ],
+)
+def test_after_reasoning_rejects_core_owned_assistant_metadata(field: str) -> None:
+    ctx = _assistant_metadata_ctx()
+    ctx.persist_assistant_metadata[field] = "spoof"
+
+    with pytest.raises(ValueError, match=f"metadata 字段不可写: {field}"):
+        _ = _collect_persist_assistant_metadata(ctx)
+
+
+@pytest.mark.asyncio
+async def test_session_manager_adopts_pending_rows_before_post_commit_cancel(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = SessionManager(tmp_path / "workspace")
+    session = manager.get_or_create("telegram:commit-cancel")
+    pending: list[dict[str, object]] = [
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": "reply"},
+    ]
+    pending_metadata = {
+        "sentinel": "committed",
+        "last_turn_tool_calls_count": 1,
+    }
+    original_persist = manager._persist_session
+
+    def persist_then_cancel(*args: Any, **kwargs: Any) -> int:
+        count = original_persist(*args, **kwargs)
+        task = asyncio.current_task()
+        assert task is not None
+        _ = task.cancel()
+        return count
+
+    monkeypatch.setattr(manager, "_persist_session", persist_then_cancel)
+
+    async def append_then_checkpoint() -> None:
+        await manager.append_messages(
+            session,
+            pending,
+            metadata=pending_metadata,
+        )
+        await asyncio.sleep(0)
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.create_task(append_then_checkpoint())
+
+    assert session.messages == pending
+    assert [message["id"] for message in session.messages] == [
+        "telegram:commit-cancel:0",
+        "telegram:commit-cancel:1",
+    ]
+    assert session.metadata == pending_metadata
+    manager.close()
+    reloaded = SessionManager(tmp_path / "workspace")
+    persisted = reloaded.get_or_create(session.key)
+    assert persisted.messages == session.messages
+    assert persisted.metadata == pending_metadata
+    reloaded.close()
+
+
+@pytest.mark.parametrize("failure_type", [RuntimeError, asyncio.CancelledError])
+@pytest.mark.asyncio
+async def test_session_metadata_stays_unchanged_when_pending_append_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_type: type[BaseException],
+) -> None:
+    manager = SessionManager(tmp_path / "workspace")
+    session = manager.get_or_create("telegram:metadata-rollback")
+    session.metadata = {
+        "sentinel": "old",
+        "last_turn_tool_calls_count": 7,
+        "last_turn_ts": "old-ts",
+    }
+    manager.save(session)
+    original_metadata = dict(session.metadata)
+
+    def fail_before_commit(*args: Any, **kwargs: Any) -> int:
+        raise failure_type("injected append failure")
+
+    monkeypatch.setattr(manager, "_persist_session", fail_before_commit)
+    phase = Phase(
+        default_after_reasoning_modules(
+            EventBus(),
+            cast(Any, SimpleNamespace(presence=None, session_manager=manager)),
+        ),
+        frame_factory=AfterReasoningFrame,
+    )
+
+    with pytest.raises(failure_type, match="injected append failure"):
+        _ = await phase.run(
+            AfterReasoningInput(
+                state=TurnState(
+                    msg=_inbound(),
+                    session_key=session.key,
+                    dispatch_outbound=True,
+                    session=session,
+                ),
+                turn_result=TurnRunResult(
+                    reply="reply",
+                    tool_chain=[{"calls": [{"name": "shell"}]}],
+                ),
+            )
+        )
+
+    assert session.messages == []
+    assert session.metadata == original_metadata
+    manager.close()
+    reloaded = SessionManager(tmp_path / "workspace")
+    persisted = reloaded.get_or_create(session.key)
+    assert persisted.messages == []
+    assert persisted.metadata == original_metadata
+    reloaded.close()
+
+
+def test_late_legacy_observer_keeps_existing_phase_dag_contract() -> None:
+    class LateObserverModule:
+        slot = "test.after_reasoning.late_observer"
+        requires = ("after_reasoning.persist_user", "reasoning:persisted_user")
+
+        async def run(self, frame: AfterReasoningFrame) -> AfterReasoningFrame:
+            return frame
+
+    modules = default_after_reasoning_modules(
+        EventBus(),
+        cast(Any, SimpleNamespace(presence=None, session_manager=object())),
+        plugin_modules=[LateObserverModule()],
+    )
+    slots = [module.slot for module in modules]
+
+    assert slots.index("after_reasoning.persist_user") < slots.index(
+        "test.after_reasoning.late_observer"
+    )
+    assert slots.index("test.after_reasoning.late_observer") < slots.index(
+        "after_reasoning.seal_metadata"
+    )
 
 
 @pytest.mark.asyncio
@@ -1619,13 +1889,27 @@ async def test_after_reasoning_persists_mobile_canonical_ids(tmp_path: Path):
             return frame
 
     manager = SessionManager(tmp_path / "workspace")
+    artifact_store = ChannelAttachmentArtifactStore(
+        workspace=tmp_path / "workspace",
+        session_store=manager.control_store,
+    )
+    attachment = await artifact_store.import_bytes(
+        b"mobile-user-attachment",
+        kind=AttachmentKind.FILE,
+        filename="note.txt",
+        media_type="text/plain",
+    )
     session = manager.get_or_create("mobile:00000000-0000-0000-0000-000000000001")
     msg = InboundMessage(
         channel="mobile",
         sender="device:test",
         chat_id="00000000-0000-0000-0000-000000000001",
         content="hello",
-        metadata={"client_message_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV"},
+        media=["/proc/self/fd/999"],
+        metadata={
+            "client_message_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "attachment_ids": [attachment.artifact_id],
+        },
     )
     state = TurnState(msg=msg, session_key=session.key, dispatch_outbound=True)
     state.session = session
@@ -1655,6 +1939,12 @@ async def test_after_reasoning_persists_mobile_canonical_ids(tmp_path: Path):
         == messages[0]["client_message_id"]
     )
     assert result.outbound.session_message_id == messages[1]["id"]
+    assert messages[0]["attachment_ids"] == [attachment.artifact_id]
+    assert messages[0].get("media") in (None, [])
+    assert "/proc/" not in json.dumps(messages[0], ensure_ascii=False)
+    assert reloaded.control_store.message_attachment_ids(cast(str, messages[0]["id"])) == (
+        attachment.artifact_id,
+    )
     reloaded.close()
 
 
@@ -1965,6 +2255,8 @@ async def test_after_reasoning_append_records_success_milestones(
     async def append_messages(
         current: _DummySession,
         messages: list[dict[str, object]],
+        *,
+        metadata: dict[str, Any] | None = None,
     ) -> None:
         appended.append((current.key, messages))
 
@@ -2043,6 +2335,8 @@ async def test_after_reasoning_append_records_error_milestones(
     async def append_messages(
         current: _DummySession,
         messages: list[dict[str, object]],
+        *,
+        metadata: dict[str, Any] | None = None,
     ) -> None:
         raise RuntimeError("append exploded")
 
@@ -2114,6 +2408,8 @@ async def test_after_reasoning_append_records_cancelled_milestone(
     async def append_messages(
         current: _DummySession,
         messages: list[dict[str, object]],
+        *,
+        metadata: dict[str, Any] | None = None,
     ) -> None:
         raise asyncio.CancelledError()
 
@@ -2217,7 +2513,14 @@ def _after_turn_phase(
     return phase, state, session
 
 
-async def _run_after_turn(phase: Phase, state: TurnState) -> None:
+async def _run_after_turn(
+    phase: Phase,
+    state: TurnState,
+    *,
+    reply_to: str | None = None,
+    media: list[str] | None = None,
+    session_message_id: str | None = None,
+) -> None:
     session = cast(_DummySession, state.session)
     msg = state.msg
     await phase.run(
@@ -2227,6 +2530,9 @@ async def _run_after_turn(phase: Phase, state: TurnState) -> None:
                 channel=msg.channel,
                 chat_id=msg.chat_id,
                 content="reply",
+                reply_to=reply_to,
+                media=list(media or []),
+                session_message_id=session_message_id,
                 control_turn_id=str(msg.metadata.get("control_turn_id") or ""),
             ),
             ctx=AfterReasoningCtx(
@@ -2434,12 +2740,21 @@ async def test_after_turn_fanout_returns_after_observer_error(
 
 
 @pytest.mark.asyncio
-async def test_after_turn_dispatch_forwards_control_turn_id_to_bus() -> None:
-    """正常 final 的 after_turn dispatch 把 outbound.control_turn_id 原样传给
-    BusOutboundPort，出站消息携带当前 running turn id，不依赖 channel fallback。"""
+async def test_after_turn_dispatch_forwards_typed_identity_to_channel_port() -> None:
+    """after_turn 将 control/reply/session/media 身份完整交给 typed Channel port。"""
 
-    bus = MessageBus()
-    outbound_port = BusOutboundPort(bus)
+    bus = EventBus()
+    dispatched: list[OutboundDispatch] = []
+
+    class _RecordingOutbound:
+        async def dispatch(self, outbound: OutboundDispatch) -> ChannelDeliveryReceipt:
+            dispatched.append(outbound)
+            return ChannelDeliveryReceipt(
+                delivery_id="delivery-final",
+                status=ChannelDeliveryStatus.DELIVERED,
+            )
+
+    outbound_port = _RecordingOutbound()
     turn_id = "turn:final"
     client_message_id = "cm:01"
     session = _DummySession("telegram:123")
@@ -2466,10 +2781,20 @@ async def test_after_turn_dispatch_forwards_control_turn_id_to_bus() -> None:
         turn_id=turn_id,
         client_message_id=client_message_id,
     ):
-        await _run_after_turn(phase, state)
+        await _run_after_turn(
+            phase,
+            state,
+            reply_to="message-1",
+            media=["/tmp/image.png"],
+            session_message_id="telegram:123:2",
+        )
 
-    outbound_message = await bus._outbound.get()
+    assert len(dispatched) == 1
+    outbound_message = dispatched[0]
     assert outbound_message.control_turn_id == turn_id
+    assert outbound_message.reply_to == "message-1"
+    assert outbound_message.session_message_id == "telegram:123:2"
+    assert outbound_message.media == ["/tmp/image.png"]
     assert outbound_message.content == "reply"
     assert outbound_message.channel == msg.channel
     assert outbound_message.chat_id == msg.chat_id

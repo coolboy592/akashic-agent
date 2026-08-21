@@ -11,3 +11,10 @@ path = "~/documents/important.md"
 name = "databases/app.db"
 kind = "sqlite"
 path = "~/data/app.db"
+
+# 目录源只复制 regular file 和目录，并拒绝目录树中的任何符号链接。
+# source 内每个条目会记录 relative_path、mode、size 和 SHA-256；SQLite 仍应单独声明。
+[[sources]]
+name = "plugin-data"
+kind = "directory"
+path = "~/akasha/plugin-data"

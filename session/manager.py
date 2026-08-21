@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 import mimetypes
+from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -15,7 +16,11 @@ from agent.prompting import (
     build_context_frame_content,
     build_context_frame_message,
 )
-from session.store import SessionDeleteAudit, SessionStore
+from session.store import (
+    ChannelIdentityWriteReceipt,
+    SessionDeleteAudit,
+    SessionStore,
+)
 
 _TOOL_RESULT_CHAR_BUDGET = 10000
 _STORED_TOOL_RESULT_CHAR_BUDGET = 20000
@@ -545,6 +550,7 @@ class SessionManager:
         messages: list[dict[str, object]],
         *,
         updated_at: datetime,
+        metadata: Mapping[str, Any] | None = None,
     ) -> int:
         """准备待写消息并原子追加 session 元数据和消息。"""
 
@@ -580,7 +586,7 @@ class SessionManager:
             session.key,
             created_at=session.created_at.isoformat(),
             updated_at=updated_at.isoformat(),
-            metadata=session.metadata,
+            metadata=dict(session.metadata if metadata is None else metadata),
             messages=pending_payloads,
         )
         for msg, row in zip(pending_messages, rows):
@@ -610,13 +616,30 @@ class SessionManager:
             self.save(session)
 
     async def append_messages(
-        self, session: Session, messages: list[dict[str, object]]
+        self,
+        session: Session,
+        messages: list[dict[str, object]],
+        *,
+        metadata: Mapping[str, Any] | None = None,
     ) -> None:
         updated_at = datetime.now(UTC)
         msgs_copy = list(messages)
         async with self._lock(session.key):
-            # 1. 原子追加消息并刷新 session 元数据。
-            _ = self._persist_session(session, msgs_copy, updated_at=updated_at)
+            # 1. 原子追加消息并回填稳定 ID。
+            _ = self._persist_session(
+                session,
+                msgs_copy,
+                updated_at=updated_at,
+                metadata=metadata,
+            )
+
+            # 2. 同一无 await 临界段把 pending rows 挂回当前 Session cache。
+            attached = {id(message) for message in session.messages}
+            session.messages.extend(
+                message for message in msgs_copy if id(message) not in attached
+            )
+            if metadata is not None:
+                session.metadata = dict(metadata)
             self._cache[session.key] = session
 
     def invalidate(self, key: str) -> None:
@@ -655,3 +678,66 @@ class SessionManager:
 
     def get_channel_metadata(self, channel: str) -> list[dict[str, Any]]:
         return self._store.get_channel_metadata(channel)
+
+    def get_channel_identities(self, channel: str) -> dict[str, str]:
+        return self._store.get_channel_identities(channel)
+
+    def channel_identity_migration_completed(self, channel: str) -> bool:
+        return self._store.channel_identity_migration_completed(channel)
+
+    def seed_channel_identities(
+        self,
+        channel: str,
+        mapping: Mapping[str, tuple[str, str]],
+    ) -> None:
+        self._store.seed_channel_identities(channel, mapping)
+
+    async def remember_channel_identity(
+        self,
+        *,
+        channel: str,
+        identity: str,
+        chat_id: str,
+        metadata_key: str,
+    ) -> ChannelIdentityWriteReceipt:
+        """Atomically move one durable identity to its target Session."""
+
+        session_key = f"{channel}:{chat_id}"
+        async with self._lock(session_key):
+            # 1. Build a transient Session without creating a durable row.
+            stored = self._store.get_session_meta(session_key)
+            session = Session(session_key) if stored is None else self.get_existing(session_key)
+            updated_at = datetime.now(UTC)
+            metadata = dict(session.metadata)
+            metadata[metadata_key] = identity
+
+            # 2. Commit the Session metadata and unique identity owner together.
+            receipt = self._store.persist_channel_identity(
+                channel=channel,
+                identity=identity,
+                chat_id=chat_id,
+                session_key=session.key,
+                created_at=session.created_at.isoformat(),
+                updated_at=updated_at.isoformat(),
+                metadata=metadata,
+            )
+
+            # 3. Adopt the committed state only after SQLite succeeds.
+            session.metadata = metadata
+            session.updated_at = datetime.fromisoformat(receipt.committed_updated_at)
+            self._cache[session.key] = session
+            return receipt
+
+    async def rollback_channel_identity(
+        self,
+        receipt: ChannelIdentityWriteReceipt,
+    ) -> bool:
+        """撤销仍由失败 acceptance attempt 拥有的 identity 写入。"""
+
+        if not isinstance(receipt, ChannelIdentityWriteReceipt):
+            raise TypeError("channel identity rollback receipt 类型无效")
+        async with self._lock(receipt.session_key):
+            rolled_back = self._store.rollback_channel_identity(receipt)
+            if rolled_back:
+                self.invalidate(receipt.session_key)
+            return rolled_back

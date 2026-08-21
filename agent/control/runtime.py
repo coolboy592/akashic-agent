@@ -7,7 +7,7 @@ import time
 from collections import OrderedDict
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
-from typing import Any, Callable, cast
+from typing import TYPE_CHECKING, Any, Callable, cast
 
 from agent.control.errors import (
     ControlAdmissionError,
@@ -15,6 +15,7 @@ from agent.control.errors import (
     RuntimeClosedError,
     SlowConsumerError,
     ThreadBusyError,
+    TurnAdmissionUncertainError,
     TurnNotFoundError,
 )
 from agent.control.events import TurnEvent
@@ -43,6 +44,10 @@ from agent.restart import RestartCoordinator
 from core.common.diagnostic_log import turn_milestone
 from session.store import SessionStore
 from agent.looping.interrupt import InterruptResult
+
+if TYPE_CHECKING:
+    from agent.plugins.channel_generation_host import ChannelBindingLease
+    from agent.plugins.snapshot import RuntimeSnapshotLease
 
 logger = logging.getLogger(__name__)
 _STREAM_END = object()
@@ -274,8 +279,15 @@ class ConversationRuntime:
                 len(recovered),
             )
 
-    async def start_turn(self, request: TurnRequest) -> TurnHandle:
-        """拒绝 active thread，否则恢复未完成 interaction 并创建新 attempt。"""
+    async def start_turn(
+        self,
+        request: TurnRequest,
+        *,
+        runtime_snapshot_lease: RuntimeSnapshotLease | None = None,
+        channel_binding_lease: ChannelBindingLease | None = None,
+        live_media: tuple[str, ...] = (),
+    ) -> TurnHandle:
+        """拒绝 active thread，并仅把本次进程可用的 media 交给 executor。"""
 
         # 1. 在唯一 owner 处检查 thread 与控制面容量；拒绝不写 SessionStore。
         _validate_turn_request_metadata(request)
@@ -339,23 +351,83 @@ class ConversationRuntime:
             self._next_event_sequence[turn_id] = 0
             self._subscribers[turn_id] = set()
             handle = TurnHandle(self, request.thread_id, turn_id)
-        self._publish(
-            TurnEvent.create(
-                "turn/queued", request.thread_id, turn_id, turn=record.to_dict()
+        try:
+            self._publish(
+                TurnEvent.create(
+                    "turn/queued", request.thread_id, turn_id, turn=record.to_dict()
+                )
             )
-        )
-        self._publish_user_item(request.thread_id, turn_id, user_item)
-        task = asyncio.create_task(
-            self._run(
-                effective_request,
+            self._publish_user_item(request.thread_id, turn_id, user_item)
+            execution_request = (
+                TurnRequest(
+                    effective_request.thread_id,
+                    effective_request.input,
+                    {**effective_request.metadata, "media": list(live_media)},
+                )
+                if live_media
+                else effective_request
+            )
+            task = asyncio.create_task(
+                self._run(
+                    execution_request,
+                    turn_id,
+                    attempt_replay=attempt_replay,
+                    prior_tool_chain=prior_tool_chain,
+                    runtime_snapshot_lease=runtime_snapshot_lease,
+                    channel_binding_lease=channel_binding_lease,
+                ),
+                name=f"conversation-turn:{turn_id}",
+            )
+        except BaseException as error:
+            try:
+                self._fail_queued_start(request.thread_id, turn_id, error)
+            except BaseException as cleanup_error:
+                raise TurnAdmissionUncertainError(
+                    turn_id,
+                    "turn 已持久化，且 start_turn cleanup 未完成",
+                ) from cleanup_error
+            raise TurnAdmissionUncertainError(
                 turn_id,
-                attempt_replay=attempt_replay,
-                prior_tool_chain=prior_tool_chain,
-            ),
-            name=f"conversation-turn:{turn_id}",
-        )
+                "turn 已持久化，但 start_turn 未返回 handle",
+            ) from error
         self._tasks[turn_id] = task
         return handle
+
+    def _fail_queued_start(
+        self,
+        thread_id: str,
+        turn_id: str,
+        error: BaseException,
+    ) -> None:
+        """Terminalize a persisted Turn whose execution task was not published."""
+
+        terminal: TurnRecord | None = None
+        try:
+            current = self._store.read_turn(turn_id)
+            if current is not None and current.status is TurnStatus.QUEUED:
+                current = self._store.transition_turn(
+                    turn_id,
+                    expected_status=TurnStatus.QUEUED,
+                    status=TurnStatus.IN_PROGRESS,
+                    thread_id=thread_id,
+                )
+                terminal = self._store.transition_turn(
+                    turn_id,
+                    expected_status=current.status,
+                    status=TurnStatus.FAILED,
+                    thread_id=thread_id,
+                    error=TurnError(
+                        type=type(error).__name__,
+                        message=str(error),
+                        retryable=False,
+                    ),
+                )
+            future = self._results.get(turn_id)
+            if terminal is not None and future is not None and not future.done():
+                future.set_result(TurnResult.from_record(terminal))
+                self._finish_streams(turn_id)
+        finally:
+            self._release_turn_ownership(thread_id, turn_id)
 
     async def reject_never_fit_turn(self, request: TurnRequest) -> TurnHandle:
         """把永久超过单请求容量的输入持久化为可观察 failed turn。"""
@@ -827,6 +899,8 @@ class ConversationRuntime:
         *,
         attempt_replay: list[dict[str, Any]],
         prior_tool_chain: list[dict[str, Any]],
+        runtime_snapshot_lease: RuntimeSnapshotLease | None,
+        channel_binding_lease: ChannelBindingLease | None,
     ) -> None:
         """执行已按 thread 和容量准入的 turn，并保证只写一个终态。"""
 
@@ -920,7 +994,33 @@ class ConversationRuntime:
                 )
 
             execution_request.metadata["_controlItemEvent"] = publish_item
-            execution = await self._executor(execution_request)
+            snapshot_token = None
+            channel_token = None
+            if runtime_snapshot_lease is not None:
+                if not runtime_snapshot_lease.active:
+                    raise RuntimeError("turn exact RuntimeSnapshot lease 已关闭")
+                from agent.plugins.snapshot import bind_runtime_snapshot
+
+                snapshot_token = bind_runtime_snapshot(runtime_snapshot_lease)
+            if channel_binding_lease is not None:
+                from agent.plugins.channel_generation_host import (
+                    bind_channel_turn_binding,
+                )
+
+                channel_token = bind_channel_turn_binding(channel_binding_lease)
+            try:
+                execution = await self._executor(execution_request)
+            finally:
+                if channel_token is not None:
+                    from agent.plugins.channel_generation_host import (
+                        reset_channel_turn_binding,
+                    )
+
+                    reset_channel_turn_binding(channel_token)
+                if snapshot_token is not None:
+                    from agent.plugins.snapshot import reset_runtime_snapshot
+
+                    reset_runtime_snapshot(snapshot_token)
             await self._turn_input_sources[turn_id].lock()
             if open_item_ids:
                 raise RuntimeError(

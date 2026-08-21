@@ -116,13 +116,10 @@ priority = "p0"
 requirements = ["PLG-004", "PLG-008", "PLG-009", "TST-001", "TST-003"]
 paths = [
   "agent/mcp/**",
-  "agent/tools/workspace_mcp.py",
   "bootstrap/toolsets/protocol.py",
   "proactive_v2/mcp_sources.py",
-  "tests/test_mcp_declarations.py",
   "tests/test_mcp_sources_async.py",
-  "tests/test_workspace_mcp_admin.py",
-  "tests/test_workspace_mcp_reload_probe.py",
+  "tests/test_workspace_mcp_removed.py",
 ]
 depends_on = ["plugin", "lifecycle"]
 scenarios = ["mcp_call_finality", "mcp_process_lifecycle"]
@@ -131,16 +128,19 @@ scenarios = ["mcp_call_finality", "mcp_process_lifecycle"]
 priority = "p0"
 requirements = ["PLG-001", "PLG-004", "PLG-009"]
 paths = [
+  "agent/plugin_composition/**",
   "agent/plugins/**",
+  "examples/plugin_composition/**",
   "plugin_packages/**",
   "plugins/**",
+  "scripts/plugin_composition_experiment.py",
   "bootstrap/tools.py",
   "bootstrap/wiring.py",
-  "tests/fixtures/plugins/**",
   "tests/test_plugin_*.py",
 ]
+deleted_paths = ["agent/tool_hooks/**"]
 depends_on = ["lifecycle"]
-scenarios = ["plugin_generation_contract", "plugin_uninstall_drain_finality", "mcp_process_lifecycle"]
+scenarios = ["plugin_generation_contract", "plugin_uninstall_drain_finality", "mcp_process_lifecycle", "plugin_domain_observe_events"]
 
 [groups.recursive_plugin_validation]
 priority = "p0"
@@ -173,16 +173,16 @@ scenarios = ["recursive_plugin_self_validation_contract"]
 [groups.lifecycle]
 priority = "p1"
 requirements = ["RUN-001", "RUN-002", "PLG-001"]
-paths = ["agent/lifecycle/**", "bootstrap/runtime_readiness.py"]
+paths = ["agent/lifecycle/**", "agent/turn_events/**", "bootstrap/runtime_readiness.py"]
 depends_on = ["events"]
-scenarios = ["contract_catalog"]
+scenarios = ["contract_catalog", "plugin_generation_contract", "plugin_domain_observe_events"]
 
 [groups.events]
 priority = "p1"
 requirements = ["RUN-001", "OUT-001"]
-paths = ["bus/**", "agent/tool_hooks/**"]
+paths = ["bus/**", "agent/tools/events.py", "agent/tools/executor.py"]
 depends_on = []
-scenarios = ["contract_catalog"]
+scenarios = ["contract_catalog", "plugin_domain_observe_events"]
 
 [groups.channel]
 priority = "p1"
@@ -218,12 +218,19 @@ paths = [
   "bootstrap/toolsets/memory.py",
 ]
 depends_on = ["session_persistence"]
-scenarios = ["memory_persistence_contract"]
+scenarios = ["memory_persistence_contract", "plugin_domain_observe_events"]
 
 [groups.jobs]
 priority = "p1"
 requirements = ["SCH-001", "SCH-002"]
-paths = ["agent/scheduler.py", "agent/plugins/jobs.py", "agent/tools/schedule.py", "bootstrap/toolsets/schedule.py"]
+paths = [
+  "agent/scheduler.py",
+  "agent/plugin_composition/background_jobs.py",
+  "agent/plugins/generation_job_host.py",
+  "agent/plugins/job_outcome_ledger.py",
+  "agent/tools/schedule.py",
+  "bootstrap/toolsets/schedule.py",
+]
 depends_on = ["plugin"]
 scenarios = ["contract_catalog"]
 

@@ -7,9 +7,7 @@ import pytest
 
 from agent.tools.message_push import MessagePushTool
 from bootstrap.channel_host import ChannelHost
-from bootstrap.app import AppRuntime
 from bus.event_bus import EventBus
-from bus.events import ChannelMessage, DeliveryReceipt, DeliveryStatus
 from bus.queue import MessageBus
 
 
@@ -42,53 +40,35 @@ class _Event:
     pass
 
 
-class _DependentChannel:
-    def __init__(
-        self,
-        name: str,
-        service: SimpleNamespace,
-        expected: str,
-        events: list[str],
-        *,
-        fail_start: bool = False,
-    ) -> None:
-        self.name = name
-        self._service = service
-        self._expected = expected
-        self._events = events
-        self._fail_start = fail_start
-
-    async def start(self, _ctx: object) -> None:
-        self._events.append(f"start:{self.name}:{self._service.version}")
-        assert self._service.version == self._expected
-        if self._fail_start:
-            raise RuntimeError("dependent start failed")
-
-    async def stop(self) -> None:
-        assert self._service.version == self._expected
-        self._events.append(f"stop:{self.name}:{self._service.version}")
-
-
 class _RegisteredChannel:
     def __init__(self, *, fail_start: bool = False) -> None:
         self.name = "registered"
         self._fail_start = fail_start
 
     async def start(self, ctx: object) -> None:
-        async def on_outbound(_message: object) -> None:
-            return None
-
-        async def deliver(_message: ChannelMessage) -> DeliveryReceipt:
-            return DeliveryReceipt(DeliveryStatus.SUCCESS)
-
         ctx.event_bus.on(_Event, lambda event: event)
-        ctx.bus.subscribe_outbound(self.name, on_outbound)
-        ctx.push_tool.register_channel(self.name, deliver=deliver)
         if self._fail_start:
             raise RuntimeError("registered start failed")
 
     async def stop(self) -> None:
         return None
+
+
+class _CommandCatalogChannel(_Channel):
+    def __init__(self, events: list[str]) -> None:
+        super().__init__("catalog", events)
+        self.catalog: tuple[tuple[str, str], ...] = (("old", "old"),)
+        self.fail_next = False
+
+    async def replace_command_catalog(
+        self,
+        commands: tuple[tuple[str, str], ...],
+    ) -> None:
+        self._events.append(f"commands:{commands[0][0] if commands else 'empty'}")
+        self.catalog = commands
+        if self.fail_next:
+            self.fail_next = False
+            raise RuntimeError("command publish failed")
 
 
 def _context(channel: _Channel) -> SimpleNamespace:
@@ -100,7 +80,7 @@ def _context(channel: _Channel) -> SimpleNamespace:
         attachment_store=None,
         http_resources=None,
         interrupt_controller=None,
-        mobile_bot_commands=[],
+        command_catalog_provider=None,
         log=f"ctx:{channel.name}",
     )
 
@@ -122,6 +102,27 @@ async def test_channel_host_start_failure_does_not_block_others():
         "stop:b",
         "start:c:ctx:c",
     ]
+
+
+@pytest.mark.asyncio
+async def test_channel_host_command_catalog_failure_restores_old_remote_state():
+    events: list[str] = []
+    channel = _CommandCatalogChannel(events)
+    host = ChannelHost(_context)  # type: ignore[arg-type]
+    host.add(channel)  # type: ignore[arg-type]
+    await host.start_all()
+    events.clear()
+    channel.fail_next = True
+
+    with pytest.raises(RuntimeError, match="command publish failed"):
+        await host.swap_command_catalog(
+            (("old", "old"),),
+            (("new", "new"),),
+        )
+
+    assert channel.catalog == (("old", "old"),)
+    assert events == ["commands:new", "commands:old"]
+    await host.stop_all()
 
 
 @pytest.mark.asyncio
@@ -160,98 +161,7 @@ async def test_channel_host_continues_after_cancelled_stop():
 
 
 @pytest.mark.asyncio
-async def test_channel_host_swaps_plugin_generation():
-    events: list[str] = []
-    host = ChannelHost(_context)  # type: ignore[arg-type]
-    old = _Channel("old", events)
-    new = _Channel("new", events)
-    host.add(old)  # type: ignore[arg-type]
-    host.bind_plugin_channels({"chat": (old,)})  # type: ignore[arg-type]
-    await host.start_all()
-    events.clear()
-
-    await host.swap_plugin_channels("chat", (old,), (new,))  # type: ignore[arg-type]
-
-    assert host.channels == [new]
-    assert events == ["stop:old", "start:new:ctx:new"]
-
-
-@pytest.mark.asyncio
-async def test_channel_host_restores_old_generation_when_start_fails():
-    events: list[str] = []
-    host = ChannelHost(_context)  # type: ignore[arg-type]
-    old = _Channel("old", events)
-    failed = _Channel("new", events, fail_start=True, fail_stop=True)
-    host.add(old)  # type: ignore[arg-type]
-    host.bind_plugin_channels({"chat": (old,)})  # type: ignore[arg-type]
-    await host.start_all()
-    events.clear()
-
-    with pytest.raises(RuntimeError, match="start failed"):
-        await host.swap_plugin_channels("chat", (old,), (failed,))  # type: ignore[arg-type]
-
-    assert host.channels == [old]
-    assert events == [
-        "stop:old",
-        "start:new:ctx:new",
-        "stop:new",
-        "start:old:ctx:old",
-    ]
-
-
-@pytest.mark.asyncio
-async def test_channel_host_keeps_failed_stop_channel_and_restores_stopped_ones():
-    events: list[str] = []
-    host = ChannelHost(_context)  # type: ignore[arg-type]
-    first = _Channel("first", events, fail_stop=True)
-    second = _Channel("second", events)
-    replacement = _Channel("replacement", events)
-    host.add(first)  # type: ignore[arg-type]
-    host.add(second)  # type: ignore[arg-type]
-    host.bind_plugin_channels({"chat": (first, second)})  # type: ignore[arg-type]
-    await host.start_all()
-    events.clear()
-
-    with pytest.raises(RuntimeError, match="stop failed"):
-        await host.swap_plugin_channels(  # type: ignore[arg-type]
-            "chat",
-            (first, second),
-            (replacement,),
-        )
-
-    assert host.channels == [first, second]
-    assert events == [
-        "stop:second",
-        "stop:first",
-        "start:second:ctx:second",
-    ]
-
-
-@pytest.mark.asyncio
-async def test_channel_host_rejects_name_conflict_before_stopping_old():
-    events: list[str] = []
-    host = ChannelHost(_context)  # type: ignore[arg-type]
-    core = _Channel("core", events)
-    old = _Channel("old", events)
-    conflict = _Channel("core", events)
-    host.add(core)  # type: ignore[arg-type]
-    host.add(old)  # type: ignore[arg-type]
-    host.bind_plugin_channels({"chat": (old,)})  # type: ignore[arg-type]
-    await host.start_all()
-    events.clear()
-
-    with pytest.raises(RuntimeError, match="名称冲突"):
-        await host.swap_plugin_channels(  # type: ignore[arg-type]
-            "chat",
-            (old,),
-            (conflict,),
-        )
-
-    assert events == []
-
-
-@pytest.mark.asyncio
-async def test_channel_host_revokes_shared_registrations_on_stop():
+async def test_channel_host_scopes_event_handlers_without_legacy_registrations():
     event_bus = EventBus()
     message_bus = MessageBus()
     push_tool = MessagePushTool()
@@ -264,7 +174,7 @@ async def test_channel_host_revokes_shared_registrations_on_stop():
         attachment_store=None,
         http_resources=None,
         interrupt_controller=None,
-        mobile_bot_commands=[],
+        command_catalog_provider=None,
         log="ctx:registered",
     )
     host = ChannelHost(lambda _channel: context)  # type: ignore[arg-type]
@@ -273,149 +183,9 @@ async def test_channel_host_revokes_shared_registrations_on_stop():
     await host.start_all()
 
     assert event_bus.handler_count() == 1
-    assert "registered" in message_bus._subscribers
-    assert await push_tool.execute(
-        target_channel="registered",
-        target_chat_id="1",
-        message="hello",
-    ) == "消息已发送"
+    assert not hasattr(message_bus, "_subscribers")
+    assert not hasattr(push_tool, "register_channel")
 
     await host.stop_all()
 
     assert event_bus.handler_count() == 0
-    assert "registered" not in message_bus._subscribers
-    assert "未注册" in await push_tool.execute(
-        target_channel="registered",
-        target_chat_id="1",
-        message="hello",
-    )
-
-
-@pytest.mark.asyncio
-async def test_channel_host_restores_shared_registrations_after_failed_swap():
-    event_bus = EventBus()
-    message_bus = MessageBus()
-    push_tool = MessagePushTool()
-    old = _RegisteredChannel()
-    failed = _RegisteredChannel(fail_start=True)
-    context = SimpleNamespace(
-        bus=message_bus,
-        session_manager=None,
-        event_bus=event_bus,
-        push_tool=push_tool,
-        attachment_store=None,
-        http_resources=None,
-        interrupt_controller=None,
-        mobile_bot_commands=[],
-        log="ctx:registered",
-    )
-    host = ChannelHost(lambda _channel: context)  # type: ignore[arg-type]
-    host.add(old)  # type: ignore[arg-type]
-    host.bind_plugin_channels({"chat": (old,)})  # type: ignore[arg-type]
-    await host.start_all()
-
-    with pytest.raises(RuntimeError, match="registered start failed"):
-        await host.swap_plugin_channels(  # type: ignore[arg-type]
-            "chat",
-            (old,),
-            (failed,),
-        )
-
-    assert event_bus.handler_count() == 1
-    assert len(message_bus._subscribers["registered"]) == 1
-    assert await push_tool.execute(
-        target_channel="registered",
-        target_chat_id="1",
-        message="hello",
-    ) == "消息已发送"
-
-
-@pytest.mark.asyncio
-async def test_endpoint_transaction_orders_channel_around_service_and_rolls_back():
-    events: list[str] = []
-    service = SimpleNamespace(version="v1")
-    old = _DependentChannel("old", service, "v1", events)
-    failed = _DependentChannel(
-        "new",
-        service,
-        "v2",
-        events,
-        fail_start=True,
-    )
-    channel_host = ChannelHost(lambda _channel: _context(_channel))  # type: ignore[arg-type]
-    channel_host.add(old)  # type: ignore[arg-type]
-    channel_host.bind_plugin_channels({"combined": (old,)})  # type: ignore[arg-type]
-    await channel_host.start_all()
-    events.clear()
-
-    class ServiceHost:
-        async def swap_plugin_services(self, _plugin_id, before, after) -> None:
-            assert service.version == before["worker"]["version"]
-            service.version = after["worker"]["version"]
-            events.append(f"service:{service.version}")
-
-    runtime = object.__new__(AppRuntime)
-    runtime.channel_host = channel_host
-    runtime.plugin_service_host = ServiceHost()
-    v1 = {"worker": {"version": "v1"}}
-    v2 = {"worker": {"version": "v2"}}
-
-    with pytest.raises(RuntimeError, match="dependent start failed"):
-        await runtime._swap_plugin_endpoints(
-            "combined",
-            v1,
-            v2,
-            (old,),
-            (failed,),
-        )
-
-    assert service.version == "v1"
-    assert channel_host.channels == [old]
-    assert events == [
-        "stop:old:v1",
-        "service:v2",
-        "start:new:v2",
-        "stop:new:v2",
-        "service:v1",
-        "start:old:v1",
-    ]
-    await channel_host.stop_all()
-
-
-@pytest.mark.asyncio
-async def test_endpoint_transaction_attempts_channel_restore_when_service_restore_fails():
-    events: list[str] = []
-    service = SimpleNamespace(version="v1")
-    old = _DependentChannel("old", service, "v1", events)
-    failed = _DependentChannel("new", service, "v2", events, fail_start=True)
-    channel_host = ChannelHost(lambda _channel: _context(_channel))  # type: ignore[arg-type]
-    channel_host.add(old)  # type: ignore[arg-type]
-    channel_host.bind_plugin_channels({"combined": (old,)})  # type: ignore[arg-type]
-    await channel_host.start_all()
-    events.clear()
-
-    class ServiceHost:
-        async def swap_plugin_services(self, _plugin_id, before, after) -> None:
-            if before["worker"]["version"] == "v2":
-                events.append("service_restore_failed")
-                raise RuntimeError("restore failed")
-            service.version = after["worker"]["version"]
-            events.append(f"service:{service.version}")
-
-    runtime = object.__new__(AppRuntime)
-    runtime.channel_host = channel_host
-    runtime.plugin_service_host = ServiceHost()
-    v1 = {"worker": {"version": "v1"}}
-    v2 = {"worker": {"version": "v2"}}
-
-    with pytest.raises(RuntimeError, match="managed service.*Channel"):
-        await runtime._swap_plugin_endpoints(
-            "combined",
-            v1,
-            v2,
-            (old,),
-            (failed,),
-        )
-
-    assert "service_restore_failed" in events
-    assert "start:old:v2" in events

@@ -103,6 +103,12 @@ def excluded_reason(relative: Path, *, is_symlink: bool) -> str | None:
         return "forensic_corrupt_artifact"
     if name.endswith(("-wal", "-shm", "-journal")):
         return "sqlite_sidecar"
-    if is_symlink and (parts[:1] == ("skills",) or parts[:2] == ("drift", "skills")):
+    if is_symlink and (
+        parts[:1] == ("skills",)
+        or any(
+            parts[index : index + 2] == ("drift", "skills")
+            for index in range(len(parts) - 1)
+        )
+    ):
         return "rebuildable_skill_projection"
     return None

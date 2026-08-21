@@ -25,7 +25,13 @@ from starlette.websockets import WebSocketDisconnect
 
 from agent.config_models import MobileKeyEncryptionConfig, MobileRealtimeConfig
 from agent.plugins.mobile_ui import MobileUiRpcExecutionError
-from bus.events import OutboundMessage
+from agent.plugin_composition.channels import (
+    ChannelFactoryContext,
+    ChannelInboundMessage,
+    ChannelRuntimePorts,
+    RawInbound,
+)
+from bus.events import OutboundMessage, channel_message_from_outbound
 from bus.events_lifecycle import (
     StreamDeltaReady,
     ToolCallCompleted,
@@ -33,6 +39,7 @@ from bus.events_lifecycle import (
     TurnStarted,
 )
 from infra.channels.base import AttachmentStore
+from infra.channels.artifacts import ChannelAttachmentArtifactStore
 from infra.mobile_realtime.attachments import (
     AttachmentChunk,
     AttachmentTransferService,
@@ -60,6 +67,40 @@ from infra.mobile_realtime.protocol import (
 )
 from infra.mobile_realtime.storage import DeviceRecord, MobileStorageError
 from session.manager import SessionManager
+
+
+async def _attach_open_mobile_v3(
+    channel: Any,
+    ingress: Any,
+    *,
+    binding_token: str,
+) -> Any:
+    """Attach one exact v3 ingress and open admission for this fixture."""
+
+    context = ChannelFactoryContext(
+        snapshot_id="gateway-test-snapshot",
+        generation_id="gateway-test-generation",
+        binding_token=binding_token,
+        config={},
+        credentials={},
+        provider_client_factory=cast(Any, object()),
+        ingress=ingress,
+        identity=None,
+    )
+    adapter = channel.build_v3_adapter(context)
+    adapter.attach_runtime(
+        ChannelRuntimePorts(
+            snapshot_id=context.snapshot_id,
+            generation_id=context.generation_id,
+            binding_token=context.binding_token,
+            ingress=context.ingress,
+            identity=context.identity,
+            attachment_import=context.attachment_import,
+        )
+    )
+    assert (await adapter.start()).binding_token == binding_token
+    adapter.open_admission()
+    return adapter
 
 
 @pytest.mark.asyncio
@@ -94,15 +135,19 @@ async def test_gateway_atomically_publishes_proactive_attachment(
         local_media_paths=(source,),
     )
     try:
-        resolved = await runtime.publish_event_with_outbound_attachments(
-            candidates=candidates,
-            session_id="mobile:session-1",
-            payload_builder=lambda records: {
-                "content": "报告",
-                "attachments": [attachment_descriptor(record) for record in records],
-                "metadata": {"source": "message_push"},
-                "delivery_id": "delivery-1",
-            },
+        resolved, recipient_count = (
+            await runtime.publish_event_with_outbound_attachments_result(
+                candidates=candidates,
+                session_id="mobile:session-1",
+                payload_builder=lambda records: {
+                    "content": "报告",
+                    "attachments": [
+                        attachment_descriptor(record) for record in records
+                    ],
+                    "metadata": {"source": "message_push"},
+                    "delivery_id": "delivery-1",
+                },
+            )
         )
 
         replay = runtime.storage.read_durable_events(
@@ -111,6 +156,7 @@ async def test_gateway_atomically_publishes_proactive_attachment(
             limit=10,
         )
         assert len(resolved) == 1
+        assert recipient_count == 1
         assert runtime.storage.read_attachment(resolved[0].attachment_id) == resolved[0]
         assert len(replay) == 1
         envelope = json.loads(replay[0].envelope_json)
@@ -153,6 +199,53 @@ async def test_gateway_rejects_attachment_commit_after_last_device_disappears(
             )
     finally:
         service.cleanup_outbound_candidates(candidates)
+        runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_gateway_publish_event_reports_zero_after_device_race(
+    tmp_path: Path,
+) -> None:
+    runtime, _keyset = build_mobile_gateway_runtime(
+        _config(),
+        tmp_path,
+        master_keys=_EphemeralMasterKeys(),
+    )
+    device_id = uuid4().hex
+    runtime.storage.register_device(
+        DeviceRecord(
+            device_id=device_id,
+            public_key="test-public-key",
+            display_name="Pixel",
+            created_at=datetime.now(timezone.utc),
+            revoked_at=None,
+            capabilities=(),
+        )
+    )
+    original_list_active_devices = runtime.storage.list_active_devices
+    calls = 0
+
+    def list_active_devices_with_race() -> tuple[DeviceRecord, ...]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return original_list_active_devices()
+        return ()
+
+    runtime.storage.list_active_devices = (  # type: ignore[method-assign]
+        list_active_devices_with_race
+    )
+    try:
+        assert runtime.storage.list_active_devices()
+        recipient_count = await runtime.publish_event(
+            event_type="message.proactive",
+            session_id="mobile:race",
+            payload={"content": "race"},
+        )
+        assert recipient_count == 0
+        assert calls == 2
+        assert runtime.storage.count_durable_events(device_id) == 0
+    finally:
         runtime.close()
 
 
@@ -1197,41 +1290,59 @@ def test_authenticated_message_send_reaches_agent_event_path_once(
 
     class LoopbackBus:
         def __init__(self) -> None:
-            self.inbound: list[object] = []
-
-        def subscribe_outbound(self, channel: str, callback: object) -> None:
-            assert channel == "mobile"
+            self.inbound: list[RawInbound] = []
+            self.legacy_publish_calls = 0
 
         async def publish_inbound(self, message: object) -> None:
-            from bus.events import InboundMessage
+            self.legacy_publish_calls += 1
+            raise AssertionError("Mobile v3 fixture 不得调用 legacy publish_inbound")
 
-            assert isinstance(message, InboundMessage)
-            self.inbound.append(message)
+        async def reserve_mobile_channel_handoff(self, raw: RawInbound) -> bool:
+            assert isinstance(raw, RawInbound)
+            assert raw.message.metadata["mobile_v3_handoff"] is True
+            return True
+
+        async def defer_mobile_channel_handoff(self, handoff_id: str) -> None:
+            raise AssertionError(f"unexpected deferred Mobile v3 handoff: {handoff_id}")
+
+        def has_pending_mobile_handoff(
+            self,
+            *,
+            session_key: str,
+            client_message_id: str,
+        ) -> bool:
+            return False
+
+        async def admit(self, raw: RawInbound) -> bool:
+            assert isinstance(raw, RawInbound)
+            inbound = raw.message
+            assert isinstance(inbound, ChannelInboundMessage)
+            self.inbound.append(raw)
             turn_id = uuid4().hex
             await runtime.channel._on_turn_started(
                 TurnStarted(
-                    session_key=message.session_key,
-                    channel=message.channel,
-                    chat_id=message.chat_id,
-                    content=message.content,
-                    timestamp=message.timestamp,
+                    session_key=cast(str, inbound.metadata["session_key_override"]),
+                    channel=inbound.channel,
+                    chat_id=inbound.chat_id,
+                    content=inbound.content,
+                    timestamp=inbound.timestamp,
                     turn_id=turn_id,
                 )
             )
             await runtime.channel._on_stream_delta(
                 StreamDeltaReady(
-                    session_key=message.session_key,
-                    channel=message.channel,
-                    chat_id=message.chat_id,
+                    session_key=cast(str, inbound.metadata["session_key_override"]),
+                    channel=inbound.channel,
+                    chat_id=inbound.chat_id,
                     turn_id=turn_id,
                     thinking_delta="先检查",
                 )
             )
             await runtime.channel._on_tool_call_started(
                 ToolCallStarted(
-                    session_key=message.session_key,
-                    channel=message.channel,
-                    chat_id=message.chat_id,
+                    session_key=cast(str, inbound.metadata["session_key_override"]),
+                    channel=inbound.channel,
+                    chat_id=inbound.chat_id,
                     iteration=1,
                     call_id="call-1",
                     tool_name="shell",
@@ -1241,9 +1352,9 @@ def test_authenticated_message_send_reaches_agent_event_path_once(
             )
             await runtime.channel._on_tool_call_completed(
                 ToolCallCompleted(
-                    session_key=message.session_key,
-                    channel=message.channel,
-                    chat_id=message.chat_id,
+                    session_key=cast(str, inbound.metadata["session_key_override"]),
+                    channel=inbound.channel,
+                    chat_id=inbound.chat_id,
                     iteration=1,
                     call_id="call-1",
                     tool_name="shell",
@@ -1256,30 +1367,34 @@ def test_authenticated_message_send_reaches_agent_event_path_once(
             )
             await runtime.channel._on_stream_delta(
                 StreamDeltaReady(
-                    session_key=message.session_key,
-                    channel=message.channel,
-                    chat_id=message.chat_id,
+                    session_key=cast(str, inbound.metadata["session_key_override"]),
+                    channel=inbound.channel,
+                    chat_id=inbound.chat_id,
                     turn_id=turn_id,
                     thinking_delta="工具后继续",
                 )
             )
-            await runtime.channel._on_response(
-                OutboundMessage(
-                    channel="mobile",
-                    chat_id=message.chat_id,
-                    content="完成",
-                    thinking="先检查",
-                    control_turn_id=turn_id,
+            receipt = await runtime.channel._deliver_message(
+                channel_message_from_outbound(
+                    OutboundMessage(
+                        channel="mobile",
+                        chat_id=inbound.chat_id,
+                        content="完成",
+                        thinking="先检查",
+                        control_turn_id=turn_id,
+                        metadata={"_channel_commit_role": "passive"},
+                    )
                 )
             )
+            assert receipt.succeeded
+            return True
 
     class FakeEventBus:
         def on(self, event_type: type[object], callback: object) -> None:
             return None
 
     class FakePushTool:
-        def register_channel(self, channel: str, **senders: object) -> None:
-            assert channel == "mobile"
+        pass
 
     import asyncio
 
@@ -1298,6 +1413,13 @@ def test_authenticated_message_send_reaches_agent_event_path_once(
                     attachment_store=AttachmentStore(tmp_path / "uploads"),
                 ),
             )
+        )
+    )
+    adapter = asyncio.run(
+        _attach_open_mobile_v3(
+            runtime.channel,
+            bus,
+            binding_token="gateway-event-fixture",
         )
     )
     device_key = ec.generate_private_key(ec.SECP256R1())
@@ -1394,6 +1516,7 @@ def test_authenticated_message_send_reaches_agent_event_path_once(
         assert websocket.receive_json()["type"] == "ping.ok"
 
     assert len(bus.inbound) == 1
+    assert bus.legacy_publish_calls == 0
     reply_records = [
         record
         for record in caplog.records
@@ -1419,6 +1542,7 @@ def test_authenticated_message_send_reaches_agent_event_path_once(
         record.akashic_fields["reply_type"] == "message.send.ok"
         for record in reply_records
     )
+    asyncio.run(adapter.stop())
     asyncio.run(runtime.channel.stop())
     runtime.close()
 
@@ -1726,34 +1850,61 @@ def test_attachment_upload_resumes_and_reaches_agent_media(
 
     class CaptureBus:
         def __init__(self) -> None:
-            self.inbound: list[object] = []
-
-        def subscribe_outbound(self, channel: str, callback: object) -> None:
-            assert channel == "mobile"
+            self.inbound: list[RawInbound] = []
+            self.legacy_publish_calls = 0
 
         async def publish_inbound(self, message: object) -> None:
-            self.inbound.append(message)
+            self.legacy_publish_calls += 1
+            raise AssertionError("Mobile v3 fixture 不得调用 legacy publish_inbound")
+
+        async def reserve_mobile_channel_handoff(self, raw: RawInbound) -> bool:
+            assert isinstance(raw, RawInbound)
+            assert raw.message.metadata["mobile_v3_handoff"] is True
+            return True
+
+        async def defer_mobile_channel_handoff(self, handoff_id: str) -> None:
+            raise AssertionError(f"unexpected deferred Mobile v3 handoff: {handoff_id}")
+
+        def has_pending_mobile_handoff(
+            self,
+            *,
+            session_key: str,
+            client_message_id: str,
+        ) -> bool:
+            return False
+
+        async def admit(self, raw: RawInbound) -> bool:
+            assert isinstance(raw, RawInbound)
+            assert isinstance(raw.message, ChannelInboundMessage)
+            self.inbound.append(raw)
+            return True
 
     class FakeEventBus:
         def on(self, event_type: type[object], callback: object) -> None:
             return None
 
     class FakePushTool:
-        def register_channel(self, channel: str, **senders: object) -> None:
-            assert channel == "mobile"
+        pass
 
     import asyncio
 
     runtime, _ = asyncio.run(build())
     request.addfinalizer(runtime.close)
     bus = CaptureBus()
+    session_manager = SessionManager(tmp_path / "sessions")
+    runtime.channel.bind_channel_attachment_store(
+        ChannelAttachmentArtifactStore(
+            workspace=session_manager.workspace,
+            session_store=session_manager.control_store,
+        )
+    )
     asyncio.run(
         runtime.channel.start(
             cast(
                 Any,
                 SimpleNamespace(
                     bus=bus,
-                    session_manager=SessionManager(tmp_path / "sessions"),
+                    session_manager=session_manager,
                     event_bus=FakeEventBus(),
                     push_tool=FakePushTool(),
                     interrupt_controller=None,
@@ -1762,7 +1913,15 @@ def test_attachment_upload_resumes_and_reaches_agent_media(
             )
         )
     )
+    adapter = asyncio.run(
+        _attach_open_mobile_v3(
+            runtime.channel,
+            bus,
+            binding_token="gateway-attachment-fixture",
+        )
+    )
     request.addfinalizer(lambda: asyncio.run(runtime.channel.stop()))
+    request.addfinalizer(lambda: asyncio.run(adapter.stop()))
     device_key = ec.generate_private_key(ec.SECP256R1())
     device_id = uuid4().hex
     runtime.storage.register_device(
@@ -1932,13 +2091,20 @@ def test_attachment_upload_resumes_and_reaches_agent_media(
         )
         assert websocket.receive_json()["type"] == "message.send.ok"
 
-    from bus.events import InboundMessage
-
     assert len(bus.inbound) == 1
-    assert isinstance(bus.inbound[0], InboundMessage)
-    assert bus.inbound[0].content == ""
-    assert len(bus.inbound[0].media) == 1
-    assert Path(bus.inbound[0].media[0]).read_bytes() == content
+    assert bus.legacy_publish_calls == 0
+    raw = bus.inbound[0]
+    assert raw.message.content == ""
+    artifact_ids = cast(tuple[str, ...], raw.message.metadata["attachment_ids"])
+    assert len(artifact_ids) == 1
+    assert tuple(ref.artifact_id for ref in raw.message.attachments) == artifact_ids
+    artifact = session_manager.control_store.get_attachment(artifact_ids[0])
+    assert artifact is not None
+    assert artifact.state == "ready"
+    assert artifact.size_bytes == len(content)
+    assert (
+        session_manager.workspace / artifact.storage_key
+    ).read_bytes() == content
 
 
 def test_outbound_attachment_download_replays_binary_before_reply(
@@ -1955,8 +2121,7 @@ def test_outbound_attachment_download_replays_binary_before_reply(
         )
 
     class CapturePushTool:
-        def register_channel(self, channel: str, **senders: object) -> None:
-            assert channel == "mobile"
+        pass
 
     import asyncio
 
@@ -1968,7 +2133,7 @@ def test_outbound_attachment_download_replays_binary_before_reply(
             cast(
                 Any,
                 SimpleNamespace(
-                    bus=SimpleNamespace(subscribe_outbound=lambda *_: None),
+                    bus=SimpleNamespace(),
                     session_manager=SessionManager(tmp_path / "sessions"),
                     event_bus=SimpleNamespace(on=lambda *_: None),
                     push_tool=push,
@@ -2023,14 +2188,17 @@ def test_outbound_attachment_download_replays_binary_before_reply(
         )
     )
     asyncio.run(
-        runtime.channel._on_response(
-            OutboundMessage(
-                channel="mobile",
-                chat_id=chat_id,
-                content="文件已生成",
-                media=[str(source)],
-                control_turn_id=turn_id,
-                session_message_id=str(persisted.messages[-1]["id"]),
+        runtime.channel._deliver_message(
+            channel_message_from_outbound(
+                OutboundMessage(
+                    channel="mobile",
+                    chat_id=chat_id,
+                    content="文件已生成",
+                    media=[str(source)],
+                    control_turn_id=turn_id,
+                    session_message_id=str(persisted.messages[-1]["id"]),
+                    metadata={"_channel_commit_role": "passive"},
+                )
             )
         )
     )

@@ -1,6 +1,7 @@
 """SQLite schema for the derived sparse turn index."""
 
 INDEX_VERSION = "10"
+TOOL_CHAIN_PROJECTION_VERSION = "1"
 
 SCHEMA = """
 PRAGMA foreign_keys = ON;
@@ -20,6 +21,7 @@ CREATE TABLE IF NOT EXISTS sparse_turns (
     committed_at         TEXT NOT NULL,
     user_text            TEXT NOT NULL,
     assistant_text       TEXT NOT NULL,
+    assistant_tool_chain_json TEXT,
     remember_targets_json TEXT NOT NULL,
     forget_targets_json   TEXT NOT NULL,
     remember_boost        REAL NOT NULL CHECK (

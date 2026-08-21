@@ -4,10 +4,12 @@ import json
 import logging
 import sqlite3
 from contextlib import contextmanager
+from contextvars import ContextVar, Token
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator, cast
+from uuid import uuid4
 
 import yaml
 
@@ -15,6 +17,22 @@ from core.common.timekit import parse_iso
 from infra.persistence.json_store import load_json
 
 logger = logging.getLogger(__name__)
+
+
+def _event_id(value: object) -> str:
+    """Validate one durable Drift event identity."""
+
+    if not isinstance(value, str):
+        raise TypeError("event_id 必须是字符串")
+    if not value:
+        raise ValueError("event_id 不能为空")
+    if value.strip() != value:
+        raise ValueError("event_id 不能有首尾空白")
+    return value
+
+
+def _new_event_id() -> str:
+    return f"drift:{uuid4().hex}"
 
 
 def _clip(text: str, limit: int) -> str:
@@ -69,10 +87,41 @@ class DriftStateStore:
         self.plugin_skill_roots = tuple(
             root.expanduser().resolve(strict=False) for root in plugin_skill_roots
         )
+        self._active_event_id: ContextVar[str | None] = ContextVar(
+            "drift_active_event_id", default=None
+        )
         self._last_saved_run_id: int | None = None
         self._last_saved_run_at: str = ""
+        self._last_saved_event_id: str | None = None
         self.skills_dir.mkdir(parents=True, exist_ok=True)
         self._ensure_db()
+
+    def bind_event_id(self, event_id: str) -> Token[str | None]:
+        """Bind a run event identity to the current Drift execution task."""
+
+        return self._active_event_id.set(_event_id(event_id))
+
+    def reset_event_id(self, token: Token[str | None]) -> None:
+        """Restore the previous task-local Drift event identity."""
+
+        self._active_event_id.reset(token)
+
+    @property
+    def last_saved_event_id(self) -> str | None:
+        """Return the last event ID saved by this store instance."""
+
+        return self._last_saved_event_id
+
+    def has_event(self, event_id: str) -> bool:
+        """Return whether one durable run already owns the event identity."""
+
+        clean_event_id = _event_id(event_id)
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM runs WHERE event_id = ? LIMIT 1",
+                (clean_event_id,),
+            ).fetchone()
+        return row is not None
 
     def scan_skills(self) -> list[SkillMeta]:
         skills: list[SkillMeta] = []
@@ -313,13 +362,18 @@ class DriftStateStore:
         cursor_update: dict[str, Any] | None = None,
         journal_append: list[dict[str, Any]] | None = None,
         self_update: dict[str, str] | None = None,
-    ) -> None:
+        event_id: str | None = None,
+    ) -> str:
         skill_name = str(skill_used or "").strip()
         status_value = str(status or "").strip()
         if status_value not in {"completed", "paused"}:
             raise ValueError("drift status must be completed or paused")
+        durable_event_id = _event_id(
+            event_id or self._active_event_id.get() or _new_event_id()
+        )
         logger.info(
-            "[drift_state] save_finish: skill=%s status=%s note=%s",
+            "[drift_state] save_finish: event=%s skill=%s status=%s note=%s",
+            durable_event_id,
             skill_name,
             status_value,
             bool(global_note_update),
@@ -328,11 +382,14 @@ class DriftStateStore:
         with self._connection() as conn:
             cursor = conn.execute(
                 """
-                INSERT INTO runs (run_at, skill_name, status, briefing, message_result)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO runs (
+                    run_at, event_id, skill_name, status, briefing, message_result
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 (
                     now_utc.isoformat(),
+                    durable_event_id,
                     skill_name,
                     status_value,
                     _clip(briefing, 500),
@@ -343,6 +400,7 @@ class DriftStateStore:
             if run_id:
                 self._last_saved_run_id = run_id
                 self._last_saved_run_at = now_utc.isoformat()
+                self._last_saved_event_id = durable_event_id
                 _ = conn.execute(
                     """
                     UPDATE run_steps
@@ -436,15 +494,65 @@ class DriftStateStore:
                     ),
                 )
 
-    def update_last_message_result(self, message_result: str) -> None:
+        return durable_event_id
+
+    def update_last_message_result(
+        self,
+        message_result: str,
+        *,
+        event_id: str | None = None,
+    ) -> None:
+        clean_event_id = _event_id(event_id) if event_id is not None else None
         run_id = self._last_saved_run_id
-        if not run_id:
+        if not run_id and clean_event_id is None:
             return
         with self._connection() as conn:
-            _ = conn.execute(
-                "UPDATE runs SET message_result = ? WHERE id = ?",
-                (message_result, run_id),
-            )
+            if clean_event_id is None:
+                _ = conn.execute(
+                    "UPDATE runs SET message_result = ? WHERE id = ?",
+                    (message_result, run_id),
+                )
+            else:
+                updated = conn.execute(
+                    "UPDATE runs SET message_result = ? WHERE event_id = ?",
+                    (message_result, clean_event_id),
+                )
+                if updated.rowcount != 1:
+                    raise KeyError(f"Drift event_id 不存在: {clean_event_id}")
+                row = conn.execute(
+                    "SELECT id, run_at FROM runs WHERE event_id = ?",
+                    (clean_event_id,),
+                ).fetchone()
+                if row is None:
+                    raise RuntimeError("Drift message_result 更新后找不到 run")
+                self._last_saved_run_id = int(row["id"])
+                self._last_saved_run_at = str(row["run_at"])
+                self._last_saved_event_id = clean_event_id
+
+    def load_run_event(self, event_id: str) -> dict[str, str] | None:
+        """Read the durable event payload for restart or delivery reconciliation."""
+
+        clean_event_id = _event_id(event_id)
+        with self._connection() as conn:
+            row = conn.execute(
+                """
+                SELECT event_id, run_at, skill_name, status, briefing, message_result
+                FROM runs
+                WHERE event_id = ?
+                """,
+                (clean_event_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "event_id": str(row["event_id"]),
+            "timestamp": str(row["run_at"]),
+            "session_key": "",
+            "skill_name": str(row["skill_name"] or ""),
+            "status": str(row["status"] or ""),
+            "briefing": str(row["briefing"] or ""),
+            "message_result": str(row["message_result"] or ""),
+        }
 
     def append_step(
         self,
@@ -543,6 +651,7 @@ class DriftStateStore:
                 CREATE TABLE IF NOT EXISTS runs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     run_at TEXT NOT NULL,
+                    event_id TEXT,
                     skill_name TEXT NOT NULL,
                     status TEXT NOT NULL,
                     briefing TEXT NOT NULL,
@@ -603,6 +712,7 @@ class DriftStateStore:
                 );
                 """
             )
+            self._ensure_runs_columns(conn)
             self._ensure_skill_continuum_columns(conn)
 
     def _connect(self) -> sqlite3.Connection:
@@ -623,7 +733,7 @@ class DriftStateStore:
         with self._connection() as conn:
             rows = conn.execute(
                 """
-                SELECT run_at, skill_name, status, briefing, message_result
+                SELECT event_id, run_at, skill_name, status, briefing, message_result
                 FROM runs
                 ORDER BY id DESC
                 LIMIT ?
@@ -634,6 +744,7 @@ class DriftStateStore:
         for row in reversed(rows):
             result.append(
                 {
+                    "event_id": _clip(row["event_id"], 160),
                     "skill": _clip(row["skill_name"], 80),
                     "run_at": _clip(row["run_at"], 80),
                     "status": _clip(self._normalize_status(row["status"]), 20),
@@ -642,6 +753,23 @@ class DriftStateStore:
                 }
             )
         return result
+
+    @staticmethod
+    def _ensure_runs_columns(conn: sqlite3.Connection) -> None:
+        columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(runs)").fetchall()
+        }
+        if "event_id" not in columns:
+            _ = conn.execute("ALTER TABLE runs ADD COLUMN event_id TEXT")
+        _ = conn.execute(
+            "UPDATE runs SET event_id = 'drift:legacy:' || id "
+            "WHERE event_id IS NULL"
+        )
+        _ = conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_event_id "
+            "ON runs(event_id) WHERE event_id IS NOT NULL"
+        )
 
     def _load_global_note(self) -> str:
         with self._connection() as conn:

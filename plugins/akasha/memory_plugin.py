@@ -1,4 +1,4 @@
-"""Akasic Agent MemoryPlugin factory for Akasha V2."""
+"""Akashic Agent memory engine factory for Akasha."""
 
 from __future__ import annotations
 
@@ -15,13 +15,13 @@ from infra.persistence.json_store import atomic_write_text
 from .config import (
     load_akasha_config,
     render_akasha_config,
-    resolve_workspace_path,
+    resolve_memory_path,
 )
 from .engine import AkashaMemoryEngine
 
 
 class MemoryPlugin:
-    """Build the Akasha V2 runtime with host-owned infrastructure."""
+    """Build the Akasha runtime with host-owned infrastructure."""
 
     plugin_id = "akasha"
 
@@ -47,9 +47,10 @@ class MemoryPlugin:
 
         # 2. Report storage paths without creating invalid empty databases.
         akasha_config = load_akasha_config(config_path)
+        memory_root = workspace / "memory"
         paths = (
-            resolve_workspace_path(workspace, akasha_config.db_path),
-            resolve_workspace_path(workspace, akasha_config.index_path),
+            resolve_memory_path(memory_root, akasha_config.db_path),
+            resolve_memory_path(memory_root, akasha_config.index_path),
         )
         return [(path, path.exists()) for path in paths]
 

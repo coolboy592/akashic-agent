@@ -14,6 +14,7 @@ import tempfile
 import threading
 import time
 import uuid
+import venv
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, cast
@@ -41,6 +42,7 @@ from docker.debug.programmatic_control_probe import (
     _wait_socket,
     _write_json,
 )
+from infra.persistence.json_store import atomic_write_text
 
 
 READINESS_DEADLINE_S = 30.0
@@ -271,21 +273,74 @@ def _wait_identity_exit(identity: dict[str, int]) -> None:
     raise GateFailure(f"旧进程 identity 未退出: {identity}")
 
 
-def _write_mcp_declaration(version: str, *, workspace: Path = WORKSPACE) -> None:
-    root = workspace / "mcp"
-    declarations = root / "servers"
-    declarations.mkdir(parents=True, exist_ok=True)
-    server = root / "restart_probe_server.py"
-    server.write_text(MCP_SERVER_SOURCE, encoding="utf-8")
-    lifecycle = root / "restart-probe-lifecycle.jsonl"
-    (declarations / "restart_probe.toml").write_text(
-        "schema_version = 1\n"
-        'name = "restart_probe"\n'
-        f'command = ["{sys.executable}", "{server}"]\n'
-        "[env]\n"
-        f'VERSION = "{version}"\n'
-        f'LIFECYCLE_LOG = "{lifecycle}"\n',
+def _write_mcp_plugin(
+    version: str,
+    *,
+    plugin_root: Path,
+    workspace: Path = WORKSPACE,
+    runtime_workspace: Path | None = None,
+    stage_runtime: bool = True,
+) -> None:
+    """Write one disposable pure-v3 MCP plugin generation."""
+
+    # 1. 写入与真实 Root 声明一致的 v3 module。
+    lifecycle_file = Path("mcp/restart-probe-lifecycle.jsonl")
+    (workspace / lifecycle_file).parent.mkdir(parents=True, exist_ok=True)
+    lifecycle = (runtime_workspace or workspace) / lifecycle_file
+    plugin_root.mkdir(parents=True, exist_ok=True)
+    module = plugin_root / "plugin.py"
+    if not module.exists():
+        module.write_text(
+            "from pathlib import Path\n"
+            "import tomllib\n"
+            "from agent.plugin_composition import MCP_SERVERS, McpServerDefinition\n"
+            "_manifest = tomllib.loads(\n"
+            "    Path(__file__).with_name('akashic.plugin.toml').read_text(encoding='utf-8')\n"
+            ")\n"
+            "api_version = 3\n"
+            "name = 'restart_probe'\n"
+            "version = str(_manifest['version'])\n"
+            "inject = (MCP_SERVERS,)\n"
+            "async def apply(ctx, config):\n"
+            "    await ctx.require(MCP_SERVERS).register(\n"
+            "        ctx, McpServerDefinition(\n"
+            "            name='restart_probe',\n"
+            "            command=('python', 'restart_probe_server.py'),\n"
+            f"            env={{'VERSION': version, "
+            f"'LIFECYCLE_LOG': {str(lifecycle)!r}}},\n"
+            "            required_tools=('version',),\n"
+            "            candidate_read_only_tools=('version',),\n"
+            "        ),\n"
+            "    )\n",
+            encoding="utf-8",
+        )
+
+    # 2. 静态 manifest 冻结同一 MCP 合同，server 只写 disposable lifecycle。
+    (plugin_root / "restart_probe_server.py").write_text(
+        MCP_SERVER_SOURCE,
         encoding="utf-8",
+    )
+    (plugin_root / "requirements.txt").write_text("", encoding="utf-8")
+    runtime = plugin_root / ".venv"
+    if stage_runtime and not runtime.exists():
+        venv.EnvBuilder(with_pip=False).create(runtime)
+    atomic_write_text(
+        plugin_root / "akashic.plugin.toml",
+        "schema_version = 1\n"
+        "name = 'restart_probe'\n"
+        f"version = {version!r}\n"
+        "api_version = 3\n"
+        "entrypoint = 'plugin.py'\n\n"
+        "[[python]]\n"
+        "requirements = 'requirements.txt'\n\n"
+        "[[mcp]]\n"
+        "name = 'restart_probe'\n"
+        "command = ['python', 'restart_probe_server.py']\n"
+        f"env = {{VERSION = {version!r}, "
+        f"LIFECYCLE_LOG = {str(lifecycle)!r}}}\n"
+        "required_tools = ['version']\n"
+        "candidate_read_only_tools = ['version']\n",
+        domain="restart_gate_fixture",
     )
 
 
@@ -765,7 +820,7 @@ def _inside(iterations: int, report_dir: Path, *, resource_gate: bool) -> int:
         checks.append(
             CheckResult(
                 "RESTART-ISOLATION",
-                isolation["extraPluginDirs"] is None
+                isolation["extraPluginDirs"] == "/sandbox/restart-plugins"
                 and isolation["pluginCacheExists"] is False,
                 isolation,
             )
@@ -777,7 +832,10 @@ def _inside(iterations: int, report_dir: Path, *, resource_gate: bool) -> int:
         resource_samples: list[dict[str, dict[str, int]]] = []
         for index in range(iterations):
             version = f"v{index + 1}"
-            _write_mcp_declaration(version)
+            _write_mcp_plugin(
+                version,
+                plugin_root=Path("/sandbox/restart-plugins/restart_probe"),
+            )
             mcp_identity = _running_mcp_identity(
                 version, previous=previous_mcp_identity
             )
@@ -899,16 +957,28 @@ def _isolated_config(name: str) -> tuple[Path, Path, Path]:
     return config, workspace, endpoint
 
 
-def _install_startup_plugin(home: Path, name: str, source: str) -> None:
-    cache = home / f".akashic-plugin/cache/gate/{name}/1.0.0"
-    cache.mkdir(parents=True, exist_ok=True)
-    (cache / "plugin.py").write_text(source, encoding="utf-8")
-    manifest = home / ".akashic-plugin/manifest.toml"
-    manifest.parent.mkdir(parents=True, exist_ok=True)
-    manifest.write_text(
-        f'[plugins."{name}@gate"]\nenabled = true\n',
+def _install_startup_plugin(home: Path, name: str, source: str) -> Path:
+    """Install a disposable v3 source plugin for one startup failure scenario."""
+
+    root = home / "plugins"
+    plugin = root / name
+    plugin.mkdir(parents=True, exist_ok=True)
+    (plugin / "plugin.py").write_text(
+        "api_version = 3\n"
+        f"name = {name!r}\n"
+        "version = '1.0.0'\n"
+        f"{source}",
         encoding="utf-8",
     )
+    (plugin / "akashic.plugin.toml").write_text(
+        "schema_version = 1\n"
+        f"name = {name!r}\n"
+        "version = '1.0.0'\n"
+        "api_version = 3\n"
+        "entrypoint = 'plugin.py'\n",
+        encoding="utf-8",
+    )
+    return root
 
 
 def _wait_scenario_ready(path: Path) -> dict[str, Any]:
@@ -932,7 +1002,7 @@ def _failure_mode_checks(report_dir: Path) -> list[CheckResult]:
     naked_config, naked_workspace, _ = _isolated_config("naked75")
     naked_home = Path("/sandbox/naked75-home")
     count_path = Path("/sandbox/naked75-count.txt")
-    _install_startup_plugin(
+    naked_plugins = _install_startup_plugin(
         naked_home,
         "naked75",
         "import os, pathlib\n"
@@ -950,7 +1020,11 @@ def _failure_mode_checks(report_dir: Path) -> list[CheckResult]:
             "--workspace",
             str(naked_workspace),
         ],
-        env={**os.environ, "HOME": str(naked_home)},
+        env={
+            **os.environ,
+            "HOME": str(naked_home),
+            "AKASHIC_EXTRA_PLUGIN_DIRS": str(naked_plugins),
+        },
         timeout=20,
     )
     naked_starts = count_path.read_text().splitlines() if count_path.exists() else []
@@ -967,7 +1041,11 @@ def _failure_mode_checks(report_dir: Path) -> list[CheckResult]:
     stale_home = Path("/sandbox/stale-ready-home")
     stale_payload = {"bootId": "stale", "pid": 1, "state": "ready"}
     (stale_workspace / ".runtime-ready.json").write_text(json.dumps(stale_payload))
-    _install_startup_plugin(stale_home, "stale_ready", "import time\ntime.sleep(30)\n")
+    stale_plugins = _install_startup_plugin(
+        stale_home,
+        "stale_ready",
+        "import time\ntime.sleep(30)\n",
+    )
     stale_started = time.monotonic()
     stale = subprocess.run(
         [
@@ -982,6 +1060,7 @@ def _failure_mode_checks(report_dir: Path) -> list[CheckResult]:
         env={
             **os.environ,
             "HOME": str(stale_home),
+            "AKASHIC_EXTRA_PLUGIN_DIRS": str(stale_plugins),
             "AKASHIC_READINESS_TIMEOUT_S": "15",
         },
         timeout=25,
@@ -1008,7 +1087,12 @@ def _failure_mode_checks(report_dir: Path) -> list[CheckResult]:
     stop_config, stop_workspace, _ = _isolated_config("supervisor-stop")
     stop_home = Path("/sandbox/supervisor-stop-home")
     stop_home.mkdir(exist_ok=True)
-    _write_mcp_declaration("sigterm", workspace=stop_workspace)
+    stop_plugins = stop_home / "plugins"
+    _write_mcp_plugin(
+        "sigterm",
+        plugin_root=stop_plugins / "restart_probe",
+        workspace=stop_workspace,
+    )
     supervisor = subprocess.Popen(
         [
             sys.executable,
@@ -1019,7 +1103,11 @@ def _failure_mode_checks(report_dir: Path) -> list[CheckResult]:
             "--workspace",
             str(stop_workspace),
         ],
-        env={**os.environ, "HOME": str(stop_home)},
+        env={
+            **os.environ,
+            "HOME": str(stop_home),
+            "AKASHIC_EXTRA_PLUGIN_DIRS": str(stop_plugins),
+        },
     )
     ready_path = stop_workspace / ".runtime-ready.json"
     ready = _wait_scenario_ready(ready_path)
@@ -1060,7 +1148,12 @@ def _failure_mode_checks(report_dir: Path) -> list[CheckResult]:
     kill_config, kill_workspace, _ = _isolated_config("supervisor-kill")
     kill_home = Path("/sandbox/supervisor-kill-home")
     kill_home.mkdir(exist_ok=True)
-    _write_mcp_declaration("supervisor-kill", workspace=kill_workspace)
+    kill_plugins = kill_home / "plugins"
+    _write_mcp_plugin(
+        "supervisor-kill",
+        plugin_root=kill_plugins / "restart_probe",
+        workspace=kill_workspace,
+    )
     killed_supervisor = subprocess.Popen(
         [
             sys.executable,
@@ -1071,7 +1164,11 @@ def _failure_mode_checks(report_dir: Path) -> list[CheckResult]:
             "--workspace",
             str(kill_workspace),
         ],
-        env={**os.environ, "HOME": str(kill_home)},
+        env={
+            **os.environ,
+            "HOME": str(kill_home),
+            "AKASHIC_EXTRA_PLUGIN_DIRS": str(kill_plugins),
+        },
     )
     kill_ready_path = kill_workspace / ".runtime-ready.json"
     _ = _wait_scenario_ready(kill_ready_path)
@@ -1104,7 +1201,12 @@ def _failure_mode_checks(report_dir: Path) -> list[CheckResult]:
     guardian_config, guardian_workspace, _ = _isolated_config("guardian-kill")
     guardian_home = Path("/sandbox/guardian-kill-home")
     guardian_home.mkdir(exist_ok=True)
-    _write_mcp_declaration("guardian-kill", workspace=guardian_workspace)
+    guardian_plugins = guardian_home / "plugins"
+    _write_mcp_plugin(
+        "guardian-kill",
+        plugin_root=guardian_plugins / "restart_probe",
+        workspace=guardian_workspace,
+    )
     guardian_supervisor = subprocess.Popen(
         [
             sys.executable,
@@ -1115,7 +1217,11 @@ def _failure_mode_checks(report_dir: Path) -> list[CheckResult]:
             "--workspace",
             str(guardian_workspace),
         ],
-        env={**os.environ, "HOME": str(guardian_home)},
+        env={
+            **os.environ,
+            "HOME": str(guardian_home),
+            "AKASHIC_EXTRA_PLUGIN_DIRS": str(guardian_plugins),
+        },
     )
     guardian_ready_path = guardian_workspace / ".runtime-ready.json"
     _ = _wait_scenario_ready(guardian_ready_path)
@@ -1175,6 +1281,13 @@ def _configure_restart_gate(sandbox: Path) -> None:
     text = text.replace("max_iterations = 2", "max_iterations = 5")
     text += "\n[agent.tools]\nsearch_enabled = true\n"
     config.write_text(text, encoding="utf-8")
+    _write_mcp_plugin(
+        "bootstrap",
+        plugin_root=sandbox / "restart-plugins/restart_probe",
+        workspace=sandbox / "workspace",
+        runtime_workspace=WORKSPACE,
+        stage_runtime=False,
+    )
     # 启动迁移会改写活动配置；隔离场景必须从不可变模板各自迁移。
     (sandbox / "restart-config-template.toml").write_text(text, encoding="utf-8")
 
@@ -1230,7 +1343,7 @@ def _host(iterations: int, *, soak: bool) -> int:
         "UID": str(os.getuid()),
         "GID": str(os.getgid()),
     }
-    env.pop("AKASHIC_EXTRA_PLUGIN_DIRS", None)
+    env["AKASHIC_EXTRA_PLUGIN_DIRS"] = "/sandbox/restart-plugins"
     project = f"akashic-restart-{run_id.lower()}"
     compose = [
         "docker",
@@ -1255,6 +1368,29 @@ def _host(iterations: int, *, soak: bool) -> int:
         build = subprocess.run([*compose, "build", "model-gate"], cwd=repo, env=env)
         if build.returncode != 0:
             raise GateFailure(f"image build failed: {build.returncode}")
+        stage_runtime = subprocess.run(
+            [
+                *compose,
+                "run",
+                "--rm",
+                "-T",
+                "--no-deps",
+                "--user",
+                f"{os.getuid()}:{os.getgid()}",
+                "--entrypoint",
+                "python",
+                "control-probe",
+                "-m",
+                "venv",
+                "/sandbox/restart-plugins/restart_probe/.venv",
+            ],
+            cwd=repo,
+            env=env,
+        )
+        if stage_runtime.returncode != 0:
+            raise GateFailure(
+                f"restart fixture runtime staging failed: {stage_runtime.returncode}"
+            )
         image_inspect = subprocess.run(
             [
                 "docker", "image", "inspect", "akashic-agent-control-gate:latest",

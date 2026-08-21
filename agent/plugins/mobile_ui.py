@@ -4,11 +4,15 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from typing import Protocol, cast
 
-from agent.plugins.base import Plugin
+from agent.plugin_composition import (
+    MobileUiBinding,
+    MobileUiRpcInvalidRequest,
+)
 from agent.plugins.generation import MobileUiAsset, PluginGeneration
 from agent.plugins.manager import PluginManager
 from agent.plugins.snapshot import RuntimeSnapshot
@@ -81,13 +85,14 @@ class PluginMobileUiProvider:
     ) -> dict[str, object]:
         """只在版本和摘要完全匹配时返回单个资源。"""
 
-        generation = self._active_generation(self._require_snapshot(), plugin_id)
+        snapshot = self._require_snapshot()
+        generation = self._active_generation(snapshot, plugin_id)
         if generation.source_revision != plugin_revision:
             raise MobileUiStaleRevision(plugin_id)
-        asset = self._available_asset(generation)
-        if asset is None:
+        binding = self._mobile_ui_binding(snapshot, generation)
+        if binding is None:
             raise MobileUiPluginUnavailable(plugin_id)
-        content, expected_sha256 = _asset_content(asset, kind)
+        content, expected_sha256 = _asset_content(binding.asset, kind)
         if expected_sha256 != sha256:
             raise MobileUiStaleRevision(plugin_id)
         return {
@@ -169,14 +174,14 @@ class PluginMobileUiProvider:
             generation = self._active_generation(snapshot, plugin_id)
             if generation.source_revision != plugin_revision:
                 raise MobileUiStaleRevision(plugin_id)
-            if self._available_asset(generation) is None:
+            binding = self._mobile_ui_binding(snapshot, generation)
+            if binding is None:
                 raise MobileUiPluginUnavailable(plugin_id)
-            plugin = cast(Plugin, generation.instance)
             try:
                 loop = asyncio.get_running_loop()
                 result = await loop.run_in_executor(
                     self._executor,
-                    lambda: plugin.mobile_ui_query(
+                    lambda: binding.query(
                         method,
                         payload,
                         session_id=session_id,
@@ -219,19 +224,29 @@ class PluginMobileUiProvider:
         return generation
 
     @staticmethod
-    def _available_asset(generation: PluginGeneration) -> MobileUiAsset | None:
-        plugin = cast(Plugin, generation.instance)
-        if not plugin.mobile_ui_available():
+    def _mobile_ui_binding(
+        snapshot: RuntimeSnapshot,
+        generation: PluginGeneration,
+    ) -> MobileUiBinding | None:
+        """Resolve a live Mobile UI handler from this snapshot's exact Root registry."""
+
+        # 1. Only the immutable registry from this exact snapshot Root owns handlers.
+        registry = snapshot.mobile_ui_registry
+        if registry is None:
             return None
-        return generation.contributions.mobile_ui_asset
+        binding = registry.binding(generation.plugin_id)
+        if binding is None or not binding.is_live():
+            return None
+        return None if not binding.available() else binding
 
     @staticmethod
     def _catalog_items(snapshot: RuntimeSnapshot) -> list[dict[str, object]]:
         items: list[dict[str, object]] = []
         for generation in snapshot.active_generations():
-            asset = PluginMobileUiProvider._available_asset(generation)
-            if asset is None:
+            binding = PluginMobileUiProvider._mobile_ui_binding(snapshot, generation)
+            if binding is None:
                 continue
+            asset = binding.asset
             navigation: dict[str, object] | None = None
             if asset.navigation_label is not None:
                 navigation = {
@@ -277,10 +292,6 @@ class MobileUiQueryOverloaded(RuntimeError):
     pass
 
 
-class MobileUiRpcInvalidRequest(ValueError):
-    pass
-
-
 class MobileUiRpcExecutionError(RuntimeError):
     pass
 
@@ -293,13 +304,24 @@ def _normalize_rpc_result(
 ) -> dict[str, object]:
     """校验并规范化插件 RPC 返回对象。"""
 
-    # 1. 校验返回结构和 JSON 可编码性
+    # 1. 校验返回结构和严格 JSON 值域
     if not isinstance(result, Mapping):
         raise TypeError(f"插件 mobile UI RPC 必须返回对象: {plugin_id}.{method}")
     mapping = cast(Mapping[object, object], result)
-    if any(not isinstance(key, str) for key in mapping):
-        raise TypeError(f"插件 mobile UI RPC 返回键必须是字符串: {plugin_id}.{method}")
-    normalized = {cast(str, key): value for key, value in mapping.items()}
+    normalized: dict[str, object] = {}
+    active_containers: set[int] = set()
+    for key, value in mapping.items():
+        if not isinstance(key, str):
+            raise TypeError(
+                f"插件 mobile UI RPC 返回键必须是字符串: {plugin_id}.{method}"
+            )
+        _validate_json_value(
+            value,
+            plugin_id=plugin_id,
+            method=method,
+            active_containers=active_containers,
+        )
+        normalized[key] = value
     encoded = json.dumps(
         normalized,
         ensure_ascii=False,
@@ -311,3 +333,54 @@ def _normalize_rpc_result(
     if len(encoded.encode("utf-8")) > 192 * 1024:
         raise ValueError(f"插件 mobile UI RPC 返回超过 192 KiB: {plugin_id}.{method}")
     return normalized
+
+
+def _validate_json_value(
+    value: object,
+    *,
+    plugin_id: str,
+    method: str,
+    active_containers: set[int],
+) -> None:
+    """Reject values outside the finite, recursively JSON-compatible result ABI."""
+
+    if value is None or isinstance(value, (bool, int, str)):
+        return
+    if isinstance(value, float):
+        if math.isfinite(value):
+            return
+        raise TypeError(
+            f"插件 mobile UI RPC 返回浮点数必须有限: {plugin_id}.{method}"
+        )
+    if not isinstance(value, (list, dict)):
+        raise TypeError(
+            f"插件 mobile UI RPC 返回值不是严格 JSON 类型: {plugin_id}.{method}"
+        )
+    container_id = id(value)
+    if container_id in active_containers:
+        raise TypeError(f"插件 mobile UI RPC 返回值存在循环: {plugin_id}.{method}")
+    active_containers.add(container_id)
+    try:
+        if isinstance(value, list):
+            for item in value:
+                _validate_json_value(
+                    item,
+                    plugin_id=plugin_id,
+                    method=method,
+                    active_containers=active_containers,
+                )
+            return
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise TypeError(
+                    "插件 mobile UI RPC 嵌套对象键必须是字符串: "
+                    f"{plugin_id}.{method}"
+                )
+            _validate_json_value(
+                item,
+                plugin_id=plugin_id,
+                method=method,
+                active_containers=active_containers,
+            )
+    finally:
+        active_containers.remove(container_id)

@@ -51,19 +51,19 @@ from agent.model_runtime.types import LLMResponse, ModelUsage
 from agent.model_runtime.usage import aggregate_usage
 from agent.provider import ContentSafetyError, ContextLengthError
 from agent.retrieval.protocol import RetrievalRequest, RetrievalResult
-from agent.tool_hooks import ToolExecutionRequest, ToolExecutionResult, ToolExecutor
 from agent.tool_runtime import (
     append_assistant_tool_calls,
     append_tool_result,
     tool_call_batch_snapshot,
 )
 from agent.tools.base import normalize_tool_result
+from agent.tools.events import ToolExecutionRequest, ToolExecutionResult
+from agent.tools.executor import ToolExecutor
 from agent.tools.registry import begin_turn_search_scope, end_turn_search_scope
 from agent.turns.outbound import OutboundDispatch, OutboundPort
+from agent.plugin_composition.channels import ChannelDeliveryReceipt
 from bus.event_bus import EventBus
 from bus.events import (
-    DeliveryReceipt,
-    DeliveryStatus,
     InboundMessage,
     OutboundMessage,
     TurnDisposition,
@@ -119,7 +119,6 @@ if TYPE_CHECKING:
     from agent.core.runtime_support import SessionLike, TurnRunResult
     from agent.looping.ports import LLMConfig, LLMServices, SessionServices
     from agent.retrieval.protocol import MemoryRetrievalPipeline
-    from agent.tool_hooks.base import ToolHook
     from agent.tools.registry import ToolRegistry
 
 # 1. 统一通过模块 logger 记录关键分支，供排障和回归测试抓取。
@@ -238,6 +237,7 @@ def _turn_log_id(key: str, msg: InboundMessage) -> str:
 
 def _phase_error_reason(phase: str) -> str:
     return {
+        "command": "command_error",
         "before_turn": "before_turn_error",
         "before_reasoning": "before_reasoning_error",
         "reasoner": "provider_error",
@@ -245,10 +245,9 @@ def _phase_error_reason(phase: str) -> str:
 
 
 def _is_tool_loop_guard_denial(exec_result: ToolExecutionResult) -> bool:
-    traces = exec_result.pre_hook_trace
-    return any(
-        item.decision == "deny" and item.reason.startswith("tool_loop_guard:")
-        for item in traces
+    return (
+        exec_result.status == "denied"
+        and str(exec_result.output).startswith("tool_loop_guard:")
     )
 
 
@@ -265,11 +264,9 @@ def _disabled_tools_from_msg(msg: object) -> set[str]:
 
 
 class _NoopOutboundPort:
-    async def dispatch(self, outbound: OutboundDispatch) -> DeliveryReceipt:
-        return DeliveryReceipt(
-            DeliveryStatus.FAILED,
-            detail="未配置出站投递端口",
-        )
+    async def dispatch(self, outbound: OutboundDispatch) -> ChannelDeliveryReceipt:
+        _ = outbound
+        raise RuntimeError("PassiveTurnPipeline committed Channel outbound port 未绑定")
 
 
 @dataclass
@@ -281,12 +278,6 @@ class PassiveTurnDeps:
     reasoner: "Reasoner"
     event_bus: "EventBus | None" = None
     outbound_port: "OutboundPort | None" = None
-    before_turn_plugin_modules: list[object] | None = None
-    before_reasoning_plugin_modules: list[object] | None = None
-    before_step_plugin_modules: list[object] | None = None
-    after_step_plugin_modules: list[object] | None = None
-    after_reasoning_plugin_modules: list[object] | None = None
-    after_turn_plugin_modules: list[object] | None = None
 
 
 @dataclass
@@ -325,55 +316,10 @@ class PassiveTurnPipeline:
         self._context = deps.context
         self._tools = deps.tools
         self._reasoner = deps.reasoner
-        if deps.before_step_plugin_modules is not None:
-            self._reasoner.add_before_step_plugin_modules(
-                list(deps.before_step_plugin_modules)
-            )
-        if deps.after_step_plugin_modules is not None:
-            self._reasoner.add_after_step_plugin_modules(
-                list(deps.after_step_plugin_modules)
-            )
         self._outbound_port = deps.outbound_port or _NoopOutboundPort()
-        self._before_turn_plugin_modules = list(deps.before_turn_plugin_modules or [])
-        self._before_reasoning_plugin_modules = list(
-            deps.before_reasoning_plugin_modules or []
-        )
-        self._after_reasoning_plugin_modules = list(
-            deps.after_reasoning_plugin_modules or []
-        )
-        self._after_turn_plugin_modules = list(deps.after_turn_plugin_modules or [])
         bus = deps.event_bus or EventBus()
         self._bus = bus
 
-        self._snapshot_phases: tuple[str, _PassivePhaseBundle] | None = None
-        self._rebuild_phases()
-
-    def add_before_turn_plugin_modules(
-        self,
-        modules: list[object],
-    ) -> None:
-        self._before_turn_plugin_modules.extend(modules)
-        self._rebuild_phases()
-
-    def add_before_reasoning_plugin_modules(
-        self,
-        modules: list[object],
-    ) -> None:
-        self._before_reasoning_plugin_modules.extend(modules)
-        self._rebuild_phases()
-
-    def add_after_reasoning_plugin_modules(
-        self,
-        modules: list[object],
-    ) -> None:
-        self._after_reasoning_plugin_modules.extend(modules)
-        self._rebuild_phases()
-
-    def add_after_turn_plugin_modules(
-        self,
-        modules: list[object],
-    ) -> None:
-        self._after_turn_plugin_modules.extend(modules)
         self._rebuild_phases()
 
     def _rebuild_phases(self) -> None:
@@ -383,32 +329,21 @@ class PassiveTurnPipeline:
             after_reasoning=self._build_after_reasoning_phase(),
             after_turn=self._build_after_turn_phase(),
         )
-        self._snapshot_phases = None
 
     def _build_before_turn_phase(
         self,
-        plugin_modules: list[object] | None = None,
     ) -> Phase[TurnState, BeforeTurnCtx, BeforeTurnFrame]:
         return Phase(
             default_before_turn_modules(
                 self._bus,
                 self._session.session_manager,
                 self._context_store,
-                plugin_modules=cast(
-                    "list[Any]",
-                    (
-                        self._before_turn_plugin_modules
-                        if plugin_modules is None
-                        else plugin_modules
-                    ),
-                ),
             ),
             frame_factory=BeforeTurnFrame,
         )
 
     def _build_before_reasoning_phase(
         self,
-        plugin_modules: list[object] | None = None,
     ) -> Phase[BeforeReasoningInput, BeforeReasoningCtx, BeforeReasoningFrame]:
         return Phase(
             default_before_reasoning_modules(
@@ -416,85 +351,118 @@ class PassiveTurnPipeline:
                 self._tools,
                 self._session.session_manager,
                 self._context,
-                plugin_modules=cast(
-                    "list[Any]",
-                    (
-                        self._before_reasoning_plugin_modules
-                        if plugin_modules is None
-                        else plugin_modules
-                    ),
-                ),
             ),
             frame_factory=BeforeReasoningFrame,
         )
 
     def _build_after_reasoning_phase(
         self,
-        plugin_modules: list[object] | None = None,
     ) -> Phase[AfterReasoningInput, TurnSnapshot, AfterReasoningFrame]:
         return Phase(
             default_after_reasoning_modules(
                 self._bus,
                 self._session,
-                plugin_modules=cast(
-                    "list[Any]",
-                    (
-                        self._after_reasoning_plugin_modules
-                        if plugin_modules is None
-                        else plugin_modules
-                    ),
-                ),
             ),
             frame_factory=AfterReasoningFrame,
         )
 
     def _build_after_turn_phase(
         self,
-        plugin_modules: list[object] | None = None,
     ) -> Phase[TurnSnapshot, OutboundMessage, AfterTurnFrame]:
         return Phase(
             default_after_turn_modules(
                 self._bus,
                 self._outbound_port,
                 self._context,
-                plugin_modules=cast(
-                    "list[Any]",
-                    (
-                        self._after_turn_plugin_modules
-                        if plugin_modules is None
-                        else plugin_modules
-                    ),
-                ),
             ),
             frame_factory=AfterTurnFrame,
         )
 
     def _runtime_phases(self) -> _PassivePhaseBundle:
+        return self._phases
+
+    async def run_command(
+        self,
+        msg: InboundMessage,
+        key: str,
+        *,
+        dispatch_outbound: bool = True,
+    ) -> OutboundMessage | None:
+        """Execute one committed command before Session and model admission."""
+
+        # 1. Only the command catalog frozen into this turn's snapshot may handle it.
         snapshot = get_current_runtime_snapshot()
-        if snapshot is None:
-            return self._phases
-        if (
-            self._snapshot_phases is None
-            or self._snapshot_phases[0] != snapshot.snapshot_id
-        ):
-            self._snapshot_phases = (
-                snapshot.snapshot_id,
-                _PassivePhaseBundle(
-                    before_turn=self._build_before_turn_phase(
-                        list(snapshot.before_turn_modules)
-                    ),
-                    before_reasoning=self._build_before_reasoning_phase(
-                        list(snapshot.before_reasoning_modules)
-                    ),
-                    after_reasoning=self._build_after_reasoning_phase(
-                        list(snapshot.after_reasoning_modules)
-                    ),
-                    after_turn=self._build_after_turn_phase(
-                        list(snapshot.after_turn_modules)
-                    ),
+        command_registry = snapshot.command_registry if snapshot is not None else None
+        if command_registry is None:
+            return None
+        started = time.perf_counter()
+        turn_id = _turn_log_id(key, msg)
+        state = TurnState(
+            msg=msg,
+            session_key=key,
+            dispatch_outbound=dispatch_outbound,
+            persistence=_persistence_from_metadata(msg.metadata),
+        )
+        try:
+            execution = await command_registry.execute(
+                msg.content,
+                session_key=key,
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                sender=msg.sender,
+            )
+        except Exception as exc:
+            logger.exception(
+                diagnostic_line(
+                    "PassiveTurnPipeline.run",
+                    event="phase_error",
+                    flow="passive",
+                    phase="command",
+                    session=key,
+                    turn=turn_id,
+                    action="fail",
+                    reason=_phase_error_reason("command"),
+                    duration_ms=int((time.perf_counter() - started) * 1000),
+                    error_type=type(exc).__name__,
+                    note=str(exc)[:160],
+                )
+            )
+            if not dispatch_outbound:
+                raise
+            return await self._control_outbound(
+                state,
+                OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content="处理消息时出错，请稍后再试。",
                 ),
             )
-        return self._snapshot_phases[1]
+        if execution is None:
+            return None
+
+        # 2. A known command settles through the normal outbound owner without a Turn.
+        logger.info(
+            diagnostic_line(
+                "PassiveTurnPipeline.run",
+                event="gate_exit",
+                flow="passive",
+                phase="command",
+                session=key,
+                turn=turn_id,
+                action="short_circuit",
+                reason=execution.name,
+                duration_ms=int((time.perf_counter() - started) * 1000),
+            )
+        )
+        return await self._control_outbound(
+            state,
+            OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=execution.result.text,
+                turn_disposition=TurnDisposition.SHORT_CIRCUITED,
+            ),
+        )
 
     # 核心方法：处理一条普通被动消息，并提交最终出站结果。
     async def run(
@@ -503,6 +471,7 @@ class PassiveTurnPipeline:
         key: str,
         *,
         dispatch_outbound: bool = True,
+        command_admitted: bool = False,
     ) -> OutboundMessage:
         started = time.perf_counter()
         phase_started = started
@@ -528,7 +497,20 @@ class PassiveTurnPipeline:
             )
             # try/except 只包前置模块链和 reasoning：在派发前兜底并返回错误提示。
             try:
+                # Phase 0: stable command catalog 在 Session 与模型调用前短路。
+                if not command_admitted:
+                    active_phase = "command"
+                    command_result = await self.run_command(
+                        msg,
+                        key,
+                        dispatch_outbound=dispatch_outbound,
+                    )
+                    if command_result is not None:
+                        return command_result
+
                 # Phase 1: BeforeTurn 模块链（会话、上下文、BeforeTurn 事件）。
+                active_phase = "before_turn"
+                phase_started = time.perf_counter()
                 with diagnostic_context(phase="before_turn"):
                     before_turn = await self._runtime_phases().before_turn.run(state)
                 # TurnState 存内部默认 metadata；BeforeTurnCtx 存插件导出，同名 key 以后者覆盖。
@@ -794,8 +776,10 @@ class PassiveTurnPipeline:
                     chat_id=outbound.chat_id,
                     content=outbound.content,
                     thinking=outbound.thinking,
+                    reply_to=outbound.reply_to,
                     metadata=outbound.metadata,
                     media=outbound.media,
+                    attachment_refs=outbound.attachment_refs,
                     session_message_id=outbound.session_message_id,
                     control_turn_id=(
                         outbound.control_turn_id or running_turn_id.get() or None
@@ -927,27 +911,6 @@ class Reasoner(ABC):
     ) -> "TurnRunResult":
         """执行完整被动 turn，包括 retry / trim / tool loop。"""
 
-    def add_tool_hooks(self, hooks: list["ToolHook"]) -> None:
-        """子类可重写以注入 tool hooks。默认 no-op。"""
-
-    def add_prompt_render_plugin_modules(
-        self,
-        modules: list[object],
-    ) -> None:
-        """子类可重写以注入 prompt render modules。默认 no-op。"""
-
-    def add_before_step_plugin_modules(
-        self,
-        modules: list[object],
-    ) -> None:
-        """子类可重写以注入 before-step modules。默认 no-op。"""
-
-    def add_after_step_plugin_modules(
-        self,
-        modules: list[object],
-    ) -> None:
-        """子类可重写以注入 after-step modules。默认 no-op。"""
-
     async def render_prompt(
         self,
         input: PromptRenderInput,
@@ -980,27 +943,7 @@ class DefaultReasoner(Reasoner):
         self._context = context
         self._event_bus = event_bus
         self._non_preloadable_names = non_preloadable_names or set
-        self._prompt_render_plugin_modules: list[object] = []
-        self._before_step_plugin_modules: list[object] = []
-        self._after_step_plugin_modules: list[object] = []
-        self._snapshot_step_phases: (
-            tuple[
-                str,
-                tuple[
-                    Phase[BeforeStepInput, BeforeStepCtx, BeforeStepFrame],
-                    Phase[AfterStepCtx, AfterStepCtx, AfterStepFrame],
-                ],
-            ]
-            | None
-        ) = None
-        self._snapshot_prompt_render_phase: (
-            tuple[
-                str,
-                Phase[PromptRenderInput, PromptRenderResult, PromptRenderFrame],
-            ]
-            | None
-        ) = None
-        self._tool_executor = ToolExecutor([])
+        self._tool_executor = ToolExecutor()
         self._stream_sink_factory: (
             Callable[[object], Callable[[dict[str, str] | str], Awaitable[None]] | None]
             | None
@@ -1052,90 +995,28 @@ class DefaultReasoner(Reasoner):
         )
         return set(projected), projected
 
-    def add_tool_hooks(self, hooks: list["ToolHook"]) -> None:
-        self._tool_executor.add_hooks(hooks)
-
-    def add_prompt_render_plugin_modules(
-        self,
-        modules: list[object],
-    ) -> None:
-        self._prompt_render_plugin_modules.extend(modules)
-        self._snapshot_prompt_render_phase = None
-        if self._context is not None:
-            self._prompt_render = self._build_prompt_render_phase(self._context)
-
-    def add_before_step_plugin_modules(
-        self,
-        modules: list[object],
-    ) -> None:
-        self._before_step_plugin_modules.extend(modules)
-        self._snapshot_step_phases = None
-        self._before_step = self._build_before_step_phase()
-
-    def add_after_step_plugin_modules(
-        self,
-        modules: list[object],
-    ) -> None:
-        self._after_step_plugin_modules.extend(modules)
-        self._snapshot_step_phases = None
-        self._after_step = self._build_after_step_phase()
-
     def _build_before_step_phase(
         self,
-        plugin_modules: list[object] | None = None,
     ) -> Phase[BeforeStepInput, BeforeStepCtx, BeforeStepFrame]:
         return Phase(
-            default_before_step_modules(
-                self._bus,
-                plugin_modules=cast(
-                    "list[Any]",
-                    (
-                        self._before_step_plugin_modules
-                        if plugin_modules is None
-                        else plugin_modules
-                    ),
-                ),
-            ),
+            default_before_step_modules(self._bus),
             frame_factory=BeforeStepFrame,
         )
 
     def _build_after_step_phase(
         self,
-        plugin_modules: list[object] | None = None,
     ) -> Phase[AfterStepCtx, AfterStepCtx, AfterStepFrame]:
         return Phase(
-            default_after_step_modules(
-                self._bus,
-                plugin_modules=cast(
-                    "list[Any]",
-                    (
-                        self._after_step_plugin_modules
-                        if plugin_modules is None
-                        else plugin_modules
-                    ),
-                ),
-            ),
+            default_after_step_modules(self._bus),
             frame_factory=AfterStepFrame,
         )
 
     def _build_prompt_render_phase(
         self,
         context: "ContextBuilder",
-        plugin_modules: list[object] | None = None,
     ) -> Phase[PromptRenderInput, PromptRenderResult, PromptRenderFrame]:
         return Phase(
-            default_prompt_render_modules(
-                self._bus,
-                context,
-                plugin_modules=cast(
-                    "list[Any]",
-                    (
-                        self._prompt_render_plugin_modules
-                        if plugin_modules is None
-                        else plugin_modules
-                    ),
-                ),
-            ),
+            default_prompt_render_modules(self._bus, context),
             frame_factory=PromptRenderFrame,
         )
 
@@ -1145,19 +1026,6 @@ class DefaultReasoner(Reasoner):
     ) -> PromptRenderResult:
         if self._context is None:
             raise RuntimeError("DefaultReasoner.render_prompt requires context")
-        snapshot = get_current_runtime_snapshot()
-        if snapshot is not None:
-            cached = self._snapshot_prompt_render_phase
-            if cached is None or cached[0] != snapshot.snapshot_id:
-                cached = (
-                    snapshot.snapshot_id,
-                    self._build_prompt_render_phase(
-                        self._context,
-                        list(snapshot.prompt_render_modules),
-                    ),
-                )
-                self._snapshot_prompt_render_phase = cached
-            return await cached[1].run(input)
         if self._prompt_render is None:
             self._prompt_render = self._build_prompt_render_phase(self._context)
         return await self._prompt_render.run(input)
@@ -1168,20 +1036,7 @@ class DefaultReasoner(Reasoner):
         Phase[BeforeStepInput, BeforeStepCtx, BeforeStepFrame],
         Phase[AfterStepCtx, AfterStepCtx, AfterStepFrame],
     ]:
-        snapshot = get_current_runtime_snapshot()
-        if snapshot is None:
-            return self._before_step, self._after_step
-        cached = self._snapshot_step_phases
-        if cached is None or cached[0] != snapshot.snapshot_id:
-            cached = (
-                snapshot.snapshot_id,
-                (
-                    self._build_before_step_phase(list(snapshot.before_step_modules)),
-                    self._build_after_step_phase(list(snapshot.after_step_modules)),
-                ),
-            )
-            self._snapshot_step_phases = cached
-        return cached[1]
+        return self._before_step, self._after_step
 
     def _build_compaction_state(
         self,
@@ -1982,17 +1837,6 @@ class DefaultReasoner(Reasoner):
                                     "status": exec_result.status,
                                     "arguments": tool_call.arguments,
                                     "final_arguments": exec_result.final_arguments,
-                                    "pre_hook_trace": [
-                                        {
-                                            "hook_name": item.hook_name,
-                                            "event": item.event,
-                                            "matched": item.matched,
-                                            "decision": item.decision,
-                                            "reason": item.reason,
-                                            "extra_message": item.extra_message,
-                                        }
-                                        for item in exec_result.pre_hook_trace
-                                    ],
                                     "result": result,
                                 }
                             )
@@ -2082,7 +1926,7 @@ class DefaultReasoner(Reasoner):
                         )
                         continue
 
-                    # 6.2 通过统一执行器跑 pre/post hooks + 真实工具。
+                    # 6.2 通过统一执行器跑 typed admission + 真实工具。
                     async def _execute_tool(
                         name: str,
                         arguments: dict[str, Any],
@@ -2098,6 +1942,7 @@ class DefaultReasoner(Reasoner):
                             name,
                             arguments,
                             internal_arguments=internal_arguments,
+                            raise_errors=True,
                         )
 
                     _args_preview = support.log_preview(tool_call.arguments, 120)
@@ -2113,8 +1958,7 @@ class DefaultReasoner(Reasoner):
                         tool_name=tool_call.name,
                         arguments=tool_call.arguments,
                     )
-                    # 工具调用统一先过 ToolExecutor：
-                    # pre_hook 可改参/拒绝，真实执行后再补 post_hook trace。
+                    # 工具调用统一先过 ToolExecutor，完成 typed prepare/authorize。
                     await self._bus.fanout(
                         BeforeToolCallCtx(
                             session_key=tool_event_session_key,
@@ -2136,7 +1980,6 @@ class DefaultReasoner(Reasoner):
                             tool_batch=tool_batch,
                             tool_batch_index=tool_batch_index,
                         ),
-                        # hook 只负责拦截与记录，不替代 registry。
                         _execute_tool,
                     )
                     if exec_result.status == "success":
@@ -2239,7 +2082,7 @@ class DefaultReasoner(Reasoner):
                         else:
                             logger.info("[工具解锁] tool_search 未解锁新工具")
                     # tool_chain 持久化的是“执行后的事实”：
-                    # 最终参数、hook trace、结果预览，供后续回放与 session 复原。
+                    # 最终参数、结果状态与预览，供后续回放与 session 复原。
                     iter_calls.append(
                         {
                             "call_id": tool_call.id,
@@ -2247,28 +2090,6 @@ class DefaultReasoner(Reasoner):
                             "status": exec_result.status,
                             "arguments": tool_call.arguments,
                             "final_arguments": exec_result.final_arguments,
-                            "pre_hook_trace": [
-                                {
-                                    "hook_name": item.hook_name,
-                                    "event": item.event,
-                                    "matched": item.matched,
-                                    "decision": item.decision,
-                                    "reason": item.reason,
-                                    "extra_message": item.extra_message,
-                                }
-                                for item in exec_result.pre_hook_trace
-                            ],
-                            "post_hook_trace": [
-                                {
-                                    "hook_name": item.hook_name,
-                                    "event": item.event,
-                                    "matched": item.matched,
-                                    "decision": item.decision,
-                                    "reason": item.reason,
-                                    "extra_message": item.extra_message,
-                                }
-                                for item in exec_result.post_hook_trace
-                            ],
                             "result": normalized.preview(),
                         }
                     )

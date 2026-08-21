@@ -6,63 +6,34 @@ import re
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Mapping, cast
 
-from agent.lifecycle.types import AfterToolResultCtx, BeforeTurnCtx
-from agent.plugins import Plugin, on_tool_result
+from agent.lifecycle.composition import CONTEXT_PREPARED_EVENT
+from agent.lifecycle.types import BeforeTurnCtx
+from agent.plugin_composition import Context, MEMORY_RUNTIME, ServiceView
+from agent.tools.events import TOOL_RESULT, ToolResult
 
-_CTX_SLOT = "session:ctx"
 _ITEM_LINE_RE = re.compile(r"^-\s+\[([^\]]+)\]\s*(.*)$")
 _META_RE = re.compile(r"（(?P<meta>[^（）]*(?:证据|src|有印象|不确定)[^（）]*)）$")
+_RECALL_FILENAME = "recall_inspector.jsonl"
 
+api_version = 3
+name = "default_memory"
+version = "3.0.0"
+desc = "记录默认记忆的上下文注入与显式召回结果"
+drift_skill_roots = ("drift/skills",)
+dashboard_module = "dashboard.py"
 
-class ContextPrepareRecordModule:
-    slot = "default_memory.inspector"
-    requires = ("before_turn.emit", _CTX_SLOT)
-
-    def __init__(self, plugin: "DefaultMemoryInspector") -> None:
-        self._plugin = plugin
-
-    async def run(self, frame: Any) -> Any:
-        ctx = frame.slots.get(_CTX_SLOT)
-        if isinstance(ctx, BeforeTurnCtx):
-            self._plugin.record_context_prepare(ctx)
-        return frame
-
-
-class DefaultMemoryInspector(Plugin):
-    api_version = 2
-
-    @classmethod
-    def dashboard_module(cls) -> str | None:
-        return "dashboard.py"
-
-    name = "default_memory"
-
-    @classmethod
-    def drift_skill_roots(cls) -> tuple[str, ...]:
-        return ("drift/skills",)
-
-    def activate(self) -> None:
-        self._active = _is_memory_engine(self.context.memory_engine, "default")
+class DefaultMemoryInspector:
+    def __init__(self, data_path: Path) -> None:
         self._lock = threading.RLock()
         self._active_turns: dict[str, str] = {}
-        self._data_path = _data_path(
-            plugin_dir=self.context.plugin_dir,
-            workspace=self.context.workspace,
-        )
-        self._data_path.parent.mkdir(parents=True, exist_ok=True)
-
-    def is_active(self) -> bool:
-        return self._active
-
-    def before_turn_modules(self) -> list[object]:
-        return [ContextPrepareRecordModule(self)]
+        self._data_path = data_path
 
     def record_context_prepare(self, event: BeforeTurnCtx) -> None:
-        if not self._active:
-            return
-        turn_id = _turn_id(event.session_key, event.timestamp.isoformat(), event.content)
+        turn_id = _turn_id(
+            event.session_key, event.timestamp.isoformat(), event.content
+        )
         self._active_turns[event.session_key] = turn_id
         block = event.retrieved_memory_block or ""
         injected_items = _items_from_block(block)
@@ -88,13 +59,16 @@ class DefaultMemoryInspector(Plugin):
             }
         )
 
-    @on_tool_result()
-    async def record_recall_memory(self, event: AfterToolResultCtx) -> None:
-        if not self._active or event.tool_name != "recall_memory":
+    async def record_recall_memory(self, event: ToolResult) -> None:
+        if event.source != "passive" or event.tool_name != "recall_memory":
             return
         turn_id = self._active_turns.get(event.session_key)
         if not turn_id:
-            turn_id = _turn_id(event.session_key, _now_iso(), json.dumps(event.arguments, ensure_ascii=False))
+            turn_id = _turn_id(
+                event.session_key,
+                _now_iso(),
+                json.dumps(event.arguments, ensure_ascii=False),
+            )
         payload = _safe_json(event.result)
         raw_items: object = payload.get("items")
         items: list[dict[str, Any]] = []
@@ -115,7 +89,7 @@ class DefaultMemoryInspector(Plugin):
                 "timestamp": _now_iso(),
                 "created_at": _now_iso(),
                 "recall_memory": {
-                    "arguments": dict(event.arguments),
+                    "arguments": dict(cast(Mapping[str, Any], event.arguments)),
                     "status": event.status,
                     "count": len(items),
                     "items": [_compact_item(item) for item in items],
@@ -127,28 +101,39 @@ class DefaultMemoryInspector(Plugin):
     def _append(self, record: dict[str, Any]) -> None:
         line = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
         with self._lock:
+            self._data_path.parent.mkdir(parents=True, exist_ok=True)
             with self._data_path.open("a", encoding="utf-8") as fh:
                 _ = fh.write(line + "\n")
+
+
+async def apply(ctx: Context, config: object) -> None:
+    """挂载 default memory inspector listener。"""
+
+    # 1. Core 已用 static service view 决定当前 generation 是否挂载。
+    _ = config
+    # 2. 当前 generation 独占自己的诊断数据根。
+    data_path = _resolve_recall_data_path(data_root=ctx.data_root)
+    inspector = DefaultMemoryInspector(data_path)
+
+    # 3. 两个 listener 都由当前 Fiber Effect 持有并逆序清理。
+    _ = await ctx.on(CONTEXT_PREPARED_EVENT, inspector.record_context_prepare)
+    _ = await ctx.on(TOOL_RESULT, inspector.record_recall_memory)
+
+
+def is_active(services: ServiceView) -> bool:
+    runtime = services.get(MEMORY_RUNTIME)
+    return runtime is not None and runtime.name == "default"
+
+
+def _resolve_recall_data_path(*, data_root: Path) -> Path:
+    """返回当前 generation 独占的 inspector JSONL 路径。"""
+
+    return data_root / _RECALL_FILENAME
 
 
 def _turn_id(session_key: str, timestamp: str, content: str) -> str:
     raw = f"{session_key}\n{timestamp}\n{content}"
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
-
-
-def _is_memory_engine(engine: object, name: str) -> bool:
-    if engine is None:
-        return False
-    describe = getattr(engine, "describe", None)
-    if not callable(describe):
-        return False
-    return str(describe().name) == name
-
-
-def _data_path(*, plugin_dir: Path, workspace: Path | None) -> Path:
-    if workspace is not None:
-        return workspace / "observe" / "recall_inspector.jsonl"
-    return plugin_dir / ".data" / "recall_turns.jsonl"
 
 
 def _now_iso() -> str:
@@ -202,7 +187,9 @@ def _hits_from_trace(trace: Any) -> list[dict[str, Any]]:
         items.append(
             {
                 "id": item_id,
-                "summary": _split_summary_meta(str(getattr(hit, "summary", "") or ""))[0],
+                "summary": _split_summary_meta(str(getattr(hit, "summary", "") or ""))[
+                    0
+                ],
                 "memory_type": str(getattr(hit, "memory_type", "") or ""),
                 "score": getattr(hit, "score", None),
                 "injected": bool(getattr(hit, "injected", False)),

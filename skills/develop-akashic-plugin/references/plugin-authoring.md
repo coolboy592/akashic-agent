@@ -1,96 +1,241 @@
-# Akashic 插件编写参考
+# Akashic v3 插件编写参考
 
-## 目录
+本文只描述当前 v3 authoring contract。字段和类型以同一 Core checkout 的 `agent/plugins/static_manifest.py`、`agent/plugins/composable.py` 与 `agent/plugin_composition/` 为准；可对照 `docker/debug/plugins/replay_debug/` 以及外部 `calendar`、`feishu`、`huayue-skills`、`citation`、`observe` 和 `proactive_feedback` source。
 
-1. 最小插件
-2. Tool
-3. Prompt 注入
-4. Skill
-5. MCP 与其他贡献
-6. 状态与生命周期
-7. Source 验证
+## 1. Source 与静态 manifest
 
-## 1. 最小插件
+外部安装包的根目录至少包含：
 
-当前 canonical API 来自仓库的 `agent/plugins/base.py`、`agent/plugins/decorators.py`、`agent/plugins/specs.py` 和 `agent/plugins/__init__.py`。先读这些文件和一个相邻插件；接口漂移时以代码为准。
+```text
+plugin-repo/
+├── akashic.plugin.toml
+├── plugin.py
+└── ...
+```
 
-最小 `plugin.py`：
+最小 manifest：
+
+```toml
+schema_version = 1
+name = "example"
+version = "1.0.0"
+api_version = 3
+entrypoint = "plugin.py"
+```
+
+字段规则：
+
+| 字段 | 规则 |
+| --- | --- |
+| `schema_version` | 整数 `1`。 |
+| `name` | 小写字母开头，只能含小写字母、数字、`_`、`-`，最长 64。 |
+| `version` | 非空版本字符串；应与 module 导出一致。 |
+| `api_version` | 整数 `3`。 |
+| `entrypoint` | artifact 内存在的相对 Python 文件；不能是 symlink、绝对路径或含 `..`。 |
+| `[[python]]` | 可选。每项只写一个存在的 `requirements` 相对路径；Core 会在该目录准备独立 Python runtime。无依赖就省略。 |
+| `[validation]` | 可选，唯一字段为 `exclude_data_paths`；只列 candidate 验证不应纳入比较的 artifact 相对数据路径。 |
+| `[[processes]]` | 可选的 managed process 声明；`[[process]]` 与 `[[managed_processes]]` 是读取层支持的别名，新增 source 统一使用 `[[processes]]`。 |
+| `[[mcp]]` | 可选的 MCP 声明；`[[mcp_servers]]` 是读取层支持的别名，新增 source 统一使用 `[[mcp]]`。 |
+| `[channel_credentials]` | 可选。按 channel 名映射 config dotted paths，用于精确脱敏与凭据边界。 |
+
+`[[processes]]` 字段：
+
+```toml
+[[processes]]
+name = "example_api"
+command = ["python", "mcp/run_server.py"]
+cwd = "."
+env = {HOST = "127.0.0.1"}
+port_env = "PORT"
+formal_port = 18000
+readiness_path = "/health"
+startup_timeout_seconds = 15.0
+```
+
+`name`、`command`、`cwd` 必须指向 artifact 内的安全相对内容；`port_env` 是大写环境变量名，不能覆盖 Core 保留变量；`formal_port` 为 `1..65535`；`readiness_path` 只能是本地绝对 URL path；超时范围是 `0 < seconds <= 300`。
+
+`[[mcp]]` 字段：
+
+```toml
+[[mcp]]
+name = "example"
+command = ["python", "mcp/run.py"]
+cwd = "."
+required_tools = ["fetch_events", "ack_events"]
+candidate_read_only_tools = ["fetch_events"]
+endpoint_env = [{env = "PORT", process = "example_api"}]
+candidate_env = {BACKEND = "recording"}
+```
+
+`env`、`candidate_env` 只能是字符串映射；`endpoint_env.process` 必须指向同一 manifest 中的 process；candidate 的非只读 MCP 不会因为声明存在就自动获准执行。
+
+channel 凭据示例：
+
+```toml
+[channel_credentials]
+feishu = ["appId", "appSecret", "app_id", "app_secret"]
+```
+
+每个 path 只能是安全的 dotted config path，不能与同 channel 或其他 channel 的前缀重叠。静态 manifest 在 import 前校验；未知字段、symlink、越界路径、依赖或端点声明错误都会 fail-loud。
+
+## 2. Module namespace
+
+`entrypoint` 指向的 module namespace 至少导出：
 
 ```python
-from agent.plugins import Plugin, tool
+from agent.plugin_composition import Context
+
+api_version = 3
+name = "example"
+version = "1.0.0"
+desc = "Example capability"
+author = "Example Team"
+inject = ()
+skill_roots = ("skills",)
+drift_skill_roots = ()
+workspace_roots = ()
+dashboard_module = None
 
 
-class ExamplePlugin(Plugin):
-    name = "example"
-    version = "0.1.0"
+async def apply(ctx: Context, config: object) -> None:
+    """Register this generation's typed capabilities."""
 
-    @tool(
-        name="example_lookup",
-        risk="read-only",
-        search_hint="look up an example value",
+    _ = ctx, config
+```
+
+`api_version/name/version/apply` 是安装身份和入口的硬合同；`desc`、`author`、`inject`、`skill_roots`、`drift_skill_roots`、`workspace_roots`、`dashboard_module` 按需提供。`apply` 必须精确接受两个无默认值的位置参数 `ctx, config`，不得增加 keyword-only、`*args`、`**kwargs` 或重排参数；返回同步值或 awaitable 均可。
+
+`inject` 只列 apply 需要的 `ServiceKey`，且不得重复。可选能力在使用点 `ctx.get()`；必须存在的服务用 `ctx.require()`，Core 会在服务不活跃时明确失败。`workspace_roots` 只能是插件自有的单层目录名，不能声明 `plugin-data` 或 `runtime`。
+
+## 3. Typed capability services
+
+先在 namespace 中声明所需 key，再在 `apply` 中取得对应 service。常用公开 key 与定义类型如下：
+
+| ServiceKey | 用途 | 典型 definition |
+| --- | --- | --- |
+| `TOOL_CATALOG` | 注册 Tool 的 schema、风险和 handler export | `PluginToolDefinition` |
+| `COMMANDS` | 注册命令及结果类型 | `CommandDefinition` |
+| `CHANNELS` | 注册 Channel descriptor，不在 apply 中开正式 ingress | `ChannelDefinition` |
+| `MCP_SERVERS` | 注册 MCP command、工具和 candidate endpoint | `McpServerDefinition` |
+| `MANAGED_PROCESSES` | 注册进程、端口和 readiness | `ManagedProcessDefinition` |
+| `PROACTIVE_COMPONENTS` | 注册 MCP-backed source 或 proactive module | `ProactiveSourceDefinition`、`ProactiveModuleDefinition` |
+| `BACKGROUND_JOBS` | 注册 interval/Core-event job | `BackgroundJobDefinition` |
+| `UI_SLOTS` | 注册移动 UI 资源和查询 handler | `MobileUiDefinition` |
+| `SESSION_READ` | 读取既有 Session 的脱离快照 | `SessionReadService` |
+| `INTERACTION_UNDO` | 使用 Core-owned undo service | `InteractionUndoService` |
+| `MEMORY_RUNTIME`、`MEMORY_TURN_RUNTIME` | 读取已声明的 memory runtime view | 对应 runtime service |
+
+`ctx` 还提供生命周期边界：`require/get/provide/effect/on/emit/serial/parallel/transform/observe/spawn`、`data_root` 和已声明的 `workspace_root(name)`。写入、监听、后台 task 与外部效果都应由当前 Fiber 持有的 Effect 或 service owner 管理；不要取得 Core repository、任意 SQL 或可变全局集合。
+
+### 3.1 Tool
+
+Tool 以不可变 `PluginToolDefinition` 注册，schema 使用严格 JSON object subset：
+
+```python
+from agent.plugin_composition import (
+    Context,
+    PluginToolDefinition,
+    TOOL_CATALOG,
+)
+
+inject = (TOOL_CATALOG,)
+
+
+async def inspect_repository(context: object, arguments: object) -> str:
+    """Return a read-only inspection result."""
+
+    _ = context
+    return str(arguments)
+
+
+async def apply(ctx: Context, config: object) -> None:
+    _ = config
+    await ctx.require(TOOL_CATALOG).register(
+        ctx,
+        PluginToolDefinition(
+            name="inspect_repository",
+            description="Inspect one repository without changing it.",
+            parameters={
+                "type": "object",
+                "properties": {"repository": {"type": "string"}},
+                "required": ["repository"],
+                "additionalProperties": False,
+            },
+            handler_export="inspect_repository",
+            risk="read-only",
+            search_hint="when a repository inspection is requested",
+        ),
     )
-    async def lookup(self, event, key: str) -> str:
-        """Look up one example value.
-
-        Args:
-            key: Value key to look up.
-        """
-        return self.context.kv.get(key) or "not found"
 ```
 
-要求：
+`name`、`description`、`handler_export`、risk 和 JSON schema 会在注册时校验；`risk` 只能是 `read-only`、`read-write` 或 `external-side-effect`。handler export 是 source-relative 的名字，不把闭包或跨 generation callable 放进 descriptor。schema、真实参数、返回值、异常和副作用都必须由 source test 与 attached child oracle 覆盖。
 
-- `plugin.py` 位于 Git 仓库根。
-- `name`、`version` 是安全的非空路径片段。
-- 不在 import 阶段启动进程、打开端口或写正式状态。
-- 需要初始化时使用 `prepare/activate/retire/terminate` 的既有生命周期。
-- 非平凡 readiness 用 `static_semantic_checks()` 或 `readiness_semantic_checks()` 返回结构化 `PluginSemanticCheck`。
+### 3.2 MCP、managed process 与 proactive source
 
-## 2. Tool
-
-`@tool` handler 的前两个参数必须是 `self, event`。其余参数由注解和 docstring 生成 schema。
-
-- `risk="read-only"`：不改变文件、数据库、远程服务或消息。
-- `risk="read-write"`：可能产生写入或外部效果；不要为了方便错标 read-only。
-- `always_on=True` 只给每轮确实需要的窄能力；普通能力依赖 ToolSearch。
-- `search_hint` 描述何时找这个工具，不复述实现。
-- 内部契约违反直接失败；只捕获当前位置能真实恢复或转换的具体异常。
-
-测试要同时断言 schema、真实调用结果和失败语义。仅断言装饰器注册不证明工具可用。
-
-## 3. Prompt 注入
-
-只需要追加 system prompt section 时，直接使用当前 `on_prompt_render` 事件，不要先搜索 phase slot、编写自定义 module factory 或复制 ContextBuilder：
+典型接线是一个 `apply` 同时注册 typed process、MCP 和 source：
 
 ```python
-from agent.lifecycle.types import PromptRenderCtx
-from agent.plugins import Plugin, on_prompt_render
-from agent.prompting import PromptSectionRender
+from agent.plugin_composition import (
+    Context,
+    EndpointEnv,
+    MANAGED_PROCESSES,
+    MCP_SERVERS,
+    PROACTIVE_COMPONENTS,
+    ManagedProcessDefinition,
+    McpServerDefinition,
+    ProactiveSourceDefinition,
+)
+
+inject = (MANAGED_PROCESSES, MCP_SERVERS, PROACTIVE_COMPONENTS)
 
 
-class PromptOnlyPlugin(Plugin):
-    name = "prompt_only"
-    version = "0.1.0"
-
-    @on_prompt_render(priority=100)
-    async def inject_rule(self, ctx: PromptRenderCtx) -> PromptRenderCtx:
-        ctx.system_sections_bottom.append(
-            PromptSectionRender(
-                name="prompt_only_rule",
-                content="这里写可独立断言的规则。",
-                is_static=True,
-            )
-        )
-        return ctx
+async def apply(ctx: Context, config: object) -> None:
+    _ = config
+    await ctx.require(MANAGED_PROCESSES).register(
+        ctx,
+        ManagedProcessDefinition(
+            name="example_api",
+            command=("python", "mcp/run_server.py"),
+            port_env="PORT",
+            formal_port=18000,
+            readiness_path="/health",
+            startup_timeout_seconds=15.0,
+        ),
+    )
+    await ctx.require(MCP_SERVERS).register(
+        ctx,
+        McpServerDefinition(
+            name="example",
+            command=("python", "mcp/run.py"),
+            required_tools=("fetch_events", "ack_events"),
+            candidate_read_only_tools=("fetch_events",),
+            endpoint_env=(EndpointEnv("PORT", "example_api"),),
+            candidate_env={"BACKEND": "recording"},
+        ),
+    )
+    await ctx.require(PROACTIVE_COMPONENTS).register(
+        ctx,
+        ProactiveSourceDefinition(
+            name="events",
+            channels=("alert",),
+            mcp_server="example",
+            fetch_tool="fetch_events",
+            ack_tool="ack_events",
+        ),
+    )
 ```
 
-source test 至少直接调用 handler，断言 section 的 name、content、位置和静态属性，并证明没有意外 Tool handler。真实有效性仍由安装后的 latest child 断言，source test 不能替代模型行为。
+`apply` 只登记声明；Core 负责 Fiber readiness、隔离端口、MCP 启停、快照和 cleanup。`managed process` 的服务进程和 MCP 必须真正读取 `port_env`；忽略注入端口或 readiness 失败不能降级为成功。
 
-测试 `channels()`、`jobs()` 等普通实例方法时先实例化插件；只有 `skill_roots()`、`mcp_servers()`、`managed_services()` 等基类声明为 `@classmethod` 的能力才直接从类调用。不要为确认这个区别遍历 manager/EventBus 实现。
+### 3.3 Channel、事件和 UI
 
-## 4. Skill
+Channel 通过 `ChannelDefinition` 声明 `capabilities`、`factory_export`、可选 inbound identity 与 `credential_paths`；factory 必须从同一 source generation 解析，candidate 不持有正式 token 或 ingress ownership。
 
-插件 Skill 放在：
+事件使用 typed event key：`ctx.on(key, listener)` 返回由当前 Fiber 持有的 Effect；同步传播使用 `emit`，有序结果使用 `serial`，并行使用 `parallel`，类型变换使用 `transform`，只读观察使用 `observe`。不要自行建立 priority、listener DAG 或第二个事件总线。
+
+移动 UI 使用 `UI_SLOTS.register_mobile(ctx, MobileUiDefinition(...), query=...)`；资源路径必须在 source 内，RPC 边界校验 method、payload、session identity 和返回体大小。查询结果是 generation 投影，不是服务端权威事实。
+
+### 3.4 Skill 与 workspace data
 
 ```text
 skills/<skill-name>/
@@ -100,70 +245,30 @@ skills/<skill-name>/
 └── assets/       可选
 ```
 
-插件类声明：
+在 namespace 中声明 `skill_roots = ("skills",)` 或 `drift_skill_roots = ("drift/skills",)`。每个 Skill 目录必须有 `SKILL.md`，frontmatter 至少有 `name` 和 `description`；同一 generation 内名称不能冲突。Core 会从 source snapshot 构建 catalog，workspace 软链接只是可重建投影，不是 canonical source。
 
-```python
-@classmethod
-def skill_roots(cls) -> tuple[str, ...]:
-    return ("skills",)
+需要持久状态时使用 `ctx.data_root` 或已声明的 `ctx.workspace_root("<name>")`；candidate validation 不得写正式 Session、memory、plugin-data 或外部服务。卸载代码默认保留 plugin-data，删除数据需要另一个明确且可恢复的用户操作。
+
+## 4. Core-private Default/Wake 边界
+
+`default_proactive`、`proactive_flow`、`drift_flow`、`wake_proactive`、`wake_proactive_flow`、`wake_drift_flow` 是 Core 维护的两个 private island。它们的 exact source root、member 顺序和 factory export 由 `agent/plugins/private_proactive.py` allowlist 固定，只服务 Core 内部兼容层。
+
+外部 source 不得：
+
+- 依赖这些 module、factory、runtime、registry 或 bridge；
+- 通过同名 package、installed copy、symlink、re-export 或自定义 manifest 取得 private admission；
+- 把 private island 当成 proactive source、job 或通用 typed service 的示例。
+
+外部 proactive 需求请使用 `MCP_SERVERS` 与 `PROACTIVE_COMPONENTS`，并按 [create-proactive-source](../../create-proactive-source/SKILL.md) 编写。
+
+## 5. Source 验证清单
+
+```text
+manifest parse → module identity → apply(ctx, config) signature
+      → typed declaration/schema/readiness
+      → Skill/MCP/Tool source behavior
+      → candidate attached child oracle
+      → write set、cleanup、generation identity
 ```
 
-`SKILL.md` frontmatter 至少包含 `name` 和 `description`。description 同时说明功能和触发场景；正文使用命令式步骤，保持精简。详细 schema、范例和领域规则放入一层 `references/`，并从 SKILL.md 明确路由。
-
-验证 Skill 不止检查文件存在：
-
-1. 用 `SkillsLoader` 或 runtime catalog 证明名称、source 和 available。
-2. 调用 `load_skill` 证明正文与相对资源可读取。
-3. 安装后由父 turn 创建 attached programmatic child，让 Core 自动绑定候选；不得手工选择 latest。Core 不支持因果绑定时，只能在一次性隔离 runtime 验证并报告候选隔离不可用。
-4. 从 tool items、产物或领域状态证明 Skill 被正确执行。
-
-## 5. MCP 与其他贡献
-
-只通过 Plugin API 声明：
-
-- `mcp_servers()` → `McpServerSpec`
-- `managed_services()` → `ManagedServiceSpec`
-- `proactive_sources()` → `ProactiveSourceSpec`
-- `channels()` → Channel
-- `jobs()` → `PluginJobSpec`
-- `drift_skill_roots()` → Drift Skill roots
-
-不要创建第二套 workspace MCP/skill owner。固定 listener 的 managed service 使用通用隔离合同：
-
-```python
-ManagedServiceSpec(
-    id="api",
-    command=("python", "server.py"),
-    readiness_url="http://127.0.0.1:18765/ready",
-    validation_port_env="PLUGIN_API_PORT",
-)
-```
-
-服务进程和同插件 MCP 必须真正读取 `PLUGIN_API_PORT`；Core 在候选验证时注入临时端口和隔离 plugin-data。bot token、long-poll 或 webhook Channel 不复制正式 ownership，只在父 turn 结束后的统一切换中 stop/start。
-
-## 6. 状态与生命周期
-
-- canonical source：插件 Git 仓库。
-- installed code：全局插件 cache；不可直接编辑。
-- workspace data：`<workspace>/plugin-data/<plugin>-<marketplace>/`；卸载代码默认保留。
-- runtime catalog：snapshot 投影；turn 绑定后整轮冻结。
-
-候选 prepare/readiness 不得写正式 session、memory、plugin-data 或外部服务。行为验证若需要写入，必须使用真实事务/dry-run、隔离目标或明确副作用授权；代码 pointer 回滚不拥有这些效果。
-
-## 7. Source 验证
-
-先确认当前 Gateway 的 Python 解释器。仓库存在 `.venv/bin/python` 时使用它，不要默认系统 `python` 已安装 runtime/test 依赖；不确定时从 Gateway 进程的 `/proc/<pid>/exe` 核对。source test 示例：
-
-```bash
-/absolute/repository/.venv/bin/python -m pytest -q /absolute/plugin-source/tests
-```
-
-按插件仓库自己的说明执行最小测试。随后从干净 Git HEAD 安装：
-
-```bash
-python main.py plugin-install \
-  --source /absolute/path/to/plugin-repo \
-  --marketplace local
-```
-
-远程 source 使用其真实 URL/marketplace；先 push 安装所需 commit。安装成功返回已经说明候选身份、当前 turn 与后续动作，不要再查询 status 或运行 doctor。只有安装失败且错误明确指向结构、声明或配置时，才把 `plugin-doctor` 作为诊断工具；它不能证明新增 Tool/Skill 已经被模型真实使用。最终行为验证使用父 turn 创建的 attached programmatic child，不显式选择 runtime。Core 不支持因果候选绑定时，只能在一次性隔离环境验证，并明确报告 `safe candidate self-validation unavailable`。
+测试应从 source commit 运行，至少确认：未知 manifest 字段、路径越界、缺失 root、重复 service/name、错误 schema、错误 apply 参数、服务未就绪和 Fiber cleanup 都真实失败；不能只断言文件存在或返回字符串。

@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from agent.plugins.static_manifest import load_static_plugin_manifest
 from docker.debug.programmatic_control_probe import _prepare_host_sandbox
 from docker.debug.restart_probe import (
     _copied_source_digests,
@@ -20,6 +21,7 @@ from docker.debug.restart_probe import (
     _process_metrics,
     _restart_scripts,
     _tool_names,
+    _write_mcp_plugin,
 )
 
 
@@ -71,6 +73,43 @@ def test_mcp_scripts_unlock_call_and_complete() -> None:
     assert scripts[0]["tool_calls"][0]["name"] == "tool_search"  # type: ignore[index]
     assert scripts[1]["tool_calls"][0]["name"] == "mcp_restart_probe__version"  # type: ignore[index]
     assert scripts[2]["content"] == "mcp-v7"
+
+
+def test_restart_mcp_fixture_is_a_pure_v3_static_plugin(tmp_path: Path) -> None:
+    plugin_root = tmp_path / "plugins/restart_probe"
+    workspace = tmp_path / "workspace"
+    runtime_workspace = Path("/sandbox/workspace")
+
+    _write_mcp_plugin(
+        "v7",
+        plugin_root=plugin_root,
+        workspace=workspace,
+        runtime_workspace=runtime_workspace,
+    )
+    manifest = load_static_plugin_manifest(plugin_root)
+
+    assert manifest.name == "restart_probe"
+    assert manifest.api_version == 3
+    assert manifest.mcp_servers[0].command == ("python", "restart_probe_server.py")
+    assert manifest.mcp_servers[0].env == (
+        ("LIFECYCLE_LOG", "/sandbox/workspace/mcp/restart-probe-lifecycle.jsonl"),
+        ("VERSION", "v7"),
+    )
+    assert manifest.mcp_servers[0].python_runtime == "."
+    assert manifest.mcp_servers[0].required_tools == ("version",)
+    assert os.access(plugin_root / ".venv/bin/python", os.X_OK)
+
+    module_source = (plugin_root / "plugin.py").read_text(encoding="utf-8")
+    _write_mcp_plugin(
+        "v8",
+        plugin_root=plugin_root,
+        workspace=workspace,
+        runtime_workspace=runtime_workspace,
+    )
+    reloaded = load_static_plugin_manifest(plugin_root)
+
+    assert reloaded.version == "v8"
+    assert (plugin_root / "plugin.py").read_text(encoding="utf-8") == module_source
 
 
 def test_sandbox_digest_uses_same_source_manifest(tmp_path: Path) -> None:

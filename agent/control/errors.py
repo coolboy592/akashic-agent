@@ -42,6 +42,14 @@ class ControlAdmissionError(ControlError):
     retryable = True
 
 
+class TurnAdmissionUncertainError(ControlError):
+    """Report a Turn persisted before start_turn could return its handle."""
+
+    def __init__(self, turn_id: str, message: str) -> None:
+        super().__init__(message)
+        self.turn_id = turn_id
+
+
 class ControlExecutionError(ControlError):
     def __init__(self, error_type: str, message: str, *, retryable: bool) -> None:
         super().__init__(message)

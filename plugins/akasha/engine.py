@@ -39,13 +39,14 @@ from core.memory.engine import (
     MemoryToolProfile,
     MemoryToolSpec,
 )
+from core.memory.plugin import ActiveRecallRecord, ActiveRecallView
 from memory2.embedder import Embedder
 from session.embedding_store import MessageEmbeddingStore
 from session.store import InteractionDeletion
 
 from .application.cycle import RetrievalTicket
 from .application.runtime import OnlineMemoryRuntime, StagedOnlineCommit
-from .config import AkashaConfig, resolve_workspace_path
+from .config import AkashaConfig, resolve_memory_path
 from .domain.model import Turn
 
 if TYPE_CHECKING:
@@ -269,28 +270,6 @@ class AkashaForgetTool(_AkashaFeedbackTool):
     action = "forget"
 
 
-class AkashaFeedbackPersistModule:
-    """Export staged feedback markers into the current user message."""
-
-    slot = "akasha.feedback.persist"
-    requires = ("after_reasoning.emit", "reasoning:ctx")
-
-    def __init__(self, plugin: Any) -> None:
-        self._plugin = plugin
-
-    async def run(self, frame: Any) -> Any:
-        engine = self._plugin.context.memory_engine
-        if engine is None or engine.describe().name != "akasha":
-            return frame
-        markers = cast(
-            AkashaMemoryEngine,
-            engine,
-        ).take_staged_feedback(running_turn_id.get())
-        for marker in markers:
-            frame.slots[f"persist:user:{marker.extra_key}"] = marker.payload()
-        return frame
-
-
 class AkashaMemoryEngine:
     """Adapt the standalone explicit memory runtime to Akasic Agent."""
 
@@ -342,14 +321,15 @@ class AkashaMemoryEngine:
         self._workspace = workspace
         self._sessions_path = workspace / "sessions.db"
         self._embedding_store = MessageEmbeddingStore(self._sessions_path)
+        memory_root = workspace / "memory"
         self._runtime = OnlineMemoryRuntime(
             sessions_path=self._sessions_path,
-            index_path=resolve_workspace_path(
-                workspace,
+            index_path=resolve_memory_path(
+                memory_root,
                 akasha_config.index_path,
             ),
-            memory_path=resolve_workspace_path(
-                workspace,
+            memory_path=resolve_memory_path(
+                memory_root,
                 akasha_config.db_path,
             ),
             embedding_model=embedding.model,
@@ -656,6 +636,24 @@ class AkashaMemoryEngine:
                     return None
                 self._pending_changed.wait(remaining)
 
+    def wait_active_recall(
+        self,
+        session_key: str,
+        turn_id: str,
+    ) -> ActiveRecallView | None:
+        """把当前 Turn 的召回投影成不暴露 engine 的冻结视图。"""
+
+        snapshot = self.wait_for_active_recall(session_key, turn_id)
+        if snapshot is None:
+            return None
+        return ActiveRecallView(
+            query_id=snapshot.query_id,
+            dense=tuple(_active_recall_record(item) for item in snapshot.records.dense),
+            completion=tuple(
+                _active_recall_record(item) for item in snapshot.records.completion
+            ),
+        )
+
     async def ingest(
         self,
         request: MemoryIngestRequest,
@@ -891,6 +889,14 @@ class AkashaMemoryEngine:
         return tuple(
             staged[action] for action in ("forget", "remember") if action in staged
         )
+
+    def take_turn_user_metadata(self, turn_id: str) -> dict[str, object]:
+        """消费当前 Turn 的反馈并返回 user message 扩展字段。"""
+
+        return {
+            marker.extra_key: marker.payload()
+            for marker in self.take_staged_feedback(turn_id)
+        }
 
     def keyword_match_procedures(
         self,
@@ -1762,6 +1768,25 @@ def _merge_feedback_markers(
         ),
         reason=current.reason or previous.reason,
     )
+
+
+def _active_recall_record(record: MemoryRecord) -> ActiveRecallRecord:
+    """把内部 MemoryRecord 收窄成 mobile recall 需要的字段。"""
+
+    return ActiveRecallRecord(
+        user_text=_bounded_active_text(record.signals["user_text"], 100),
+        assistant_preview=_bounded_active_text(
+            record.signals["assistant_preview"],
+            50,
+        ),
+        started_at=str(record.signals["started_at"]),
+        score=record.score,
+    )
+
+
+def _bounded_active_text(value: object, limit: int) -> str:
+    text = str(value)
+    return text if len(text) <= limit else f"{text[:limit]}..."
 
 
 def _parse_turn_time(value: str) -> datetime:
