@@ -43,13 +43,25 @@ def _write_static_manifest(
     *,
     name: str,
     entrypoint: str = "plugin.py",
+    mcp_names: tuple[str, ...] = (),
 ) -> None:
+    mcp_manifest = ""
+    for mcp_name in mcp_names:
+        runner = plugin_root / "mcp" / f"{mcp_name}.py"
+        runner.parent.mkdir(parents=True, exist_ok=True)
+        runner.write_text("", encoding="utf-8")
+        mcp_manifest += (
+            "\n[[mcp]]\n"
+            f"name = {mcp_name!r}\n"
+            f"command = ['mcp/{mcp_name}.py']\n"
+        )
     (plugin_root / "akashic.plugin.toml").write_text(
         "schema_version = 1\n"
         f"name = {name!r}\n"
         "version = '1.0.0'\n"
         "api_version = 3\n"
-        f"entrypoint = {entrypoint!r}\n",
+        f"entrypoint = {entrypoint!r}\n"
+        f"{mcp_manifest}",
         encoding="utf-8",
     )
 
@@ -112,7 +124,11 @@ def test_plugin_doctor_reads_v3_namespace_declaration(tmp_path: Path) -> None:
         "def apply(ctx, config): pass\n",
         encoding="utf-8",
     )
-    _write_static_manifest(plugin_root, name="v3_demo")
+    _write_static_manifest(
+        plugin_root,
+        name="v3_demo",
+        mcp_names=("fitbit", "steam"),
+    )
     _ = write_pointers(
         plugin_base,
         stable=ArtifactPointer(".artifacts/1.0.0-aaaa"),
@@ -129,7 +145,9 @@ def test_plugin_doctor_reads_v3_namespace_declaration(tmp_path: Path) -> None:
 
     assert report["status"] == "healthy"
     assert _check(report, "skills")["detail"].startswith("roots=0")
-    assert _check(report, "mcp")["detail"] == "servers=0"
+    assert _check(report, "mcp")["detail"] == (
+        "declared_servers=2 names=['fitbit', 'steam']"
+    )
 
 
 def test_plugin_doctor_uses_static_custom_entrypoint(tmp_path: Path) -> None:

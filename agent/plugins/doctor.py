@@ -284,8 +284,14 @@ def _check_capabilities(
                 f"misdirected={misdirected} stale={stale}",
             )
         )
-    servers = _declared_mcp_servers(declaration)
-    checks.append(_check("mcp", "ok", f"servers={len(servers)}"))
+    servers = _declared_mcp_servers(plugin_root)
+    checks.append(
+        _check(
+            "mcp",
+            "ok",
+            f"declared_servers={len(servers)} names={list(servers)}",
+        )
+    )
     return checks
 
 
@@ -306,12 +312,12 @@ def _check_candidate_declaration(
                 f"roots={len(roots)} missing={missing}",
             )
         )
-    servers = _declared_mcp_servers(declaration)
+    servers = _declared_mcp_servers(plugin_root)
     checks.append(
         _check(
             "candidate_mcp",
             "ok",
-            f"servers={len(servers)}",
+            f"declared_servers={len(servers)} names={list(servers)}",
         )
     )
     return checks
@@ -326,10 +332,14 @@ def _declared_skill_roots(
 
 
 def _declared_mcp_servers(
-    declaration: ComposablePlugin,
-) -> tuple[()]:
-    del declaration
-    return ()
+    plugin_root: Path,
+) -> tuple[str, ...]:
+    """Return import-free MCP names declared by the artifact."""
+
+    manifest = _load_optional_static_manifest(plugin_root)
+    if manifest is None:
+        return ()
+    return tuple(server.name for server in manifest.mcp_servers)
 
 
 def _check_empty_projection(
