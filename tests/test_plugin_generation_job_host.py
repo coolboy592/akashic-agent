@@ -17,6 +17,7 @@ from agent.plugin_composition.background_jobs import (
     CoreEvent,
     CoreEventTrigger,
     IntervalTrigger,
+    ProgrammaticTurnPreAdmissionError,
     ProgrammaticTurnUncertainError,
     RetryPolicy,
 )

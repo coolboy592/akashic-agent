@@ -1942,6 +1942,7 @@ class DefaultReasoner(Reasoner):
                             name,
                             arguments,
                             internal_arguments=internal_arguments,
+                            raise_errors=True,
                         )
 
                     _args_preview = support.log_preview(tool_call.arguments, 120)

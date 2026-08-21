@@ -297,6 +297,7 @@ def _turn_projection(turn: dict[str, Any]) -> dict[str, Any]:
             if isinstance(metadata, dict):
                 stable_metadata = dict(metadata)
                 stable_metadata.pop("client_request_id", None)
+                stable_metadata.pop("client_message_id", None)
                 data["metadata"] = stable_metadata
         if raw_item.get("type") == "assistantMessage" and isinstance(data, dict):
             session_message_id = data.get("sessionMessageId")
@@ -1580,7 +1581,7 @@ def _inside_failure_matrix(report_dir: Path) -> int:
                 and failed_error.get("type") == "RuntimeError"
                 and failed_error.get("retryable") is False
                 and pc10_completed.get("id") == pc10_started.get("id")
-                and pc10_completed.get("data", {}).get("status") == "failed"
+                and pc10_completed.get("data", {}).get("status") == "error"
                 and persisted_failed_item == pc10_completed
                 and failed_terminal_count == 1
                 and failed_read.get("result") == failed_payload,
