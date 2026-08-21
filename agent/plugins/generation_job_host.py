@@ -698,7 +698,8 @@ class _ProgrammaticTurnPort:
             or metadata.get("job_name") != self._request.job.binding.name
         ):
             raise ProgrammaticTurnPreAdmissionError(
-                "programmatic Turn session provenance 不匹配"
+                "programmatic Turn session provenance 不匹配",
+                reason="session_provenance_mismatch",
             )
         plugin_metadata = {
             str(key): value

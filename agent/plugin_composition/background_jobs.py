@@ -131,6 +131,10 @@ class ProgrammaticTurnReceipt:
 class ProgrammaticTurnPreAdmissionError(RuntimeError):
     """Report a failure proven to happen before Turn admission."""
 
+    def __init__(self, message: str, *, reason: str | None = None) -> None:
+        super().__init__(message)
+        self.reason = reason
+
 
 class ProgrammaticTurnUncertainError(RuntimeError):
     """Report a failure after Turn admission may already have happened."""

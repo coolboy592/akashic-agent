@@ -993,8 +993,12 @@ async def test_programmatic_turn_port_rejects_reserved_metadata_and_foreign_sess
         with pytest.raises(ValueError, match="不能覆盖 Core 字段"):
             await ctx.turns.create_session(metadata={"plugin_id": "forged"})
         session_id = await ctx.turns.create_session(metadata={})
-        with pytest.raises(RuntimeError, match="provenance 不匹配"):
+        with pytest.raises(
+            ProgrammaticTurnPreAdmissionError,
+            match="provenance 不匹配",
+        ) as caught:
             await ctx.turns.submit("programmatic:foreign", "no")
+        assert caught.value.reason == "session_provenance_mismatch"
         handle = conversation.requests
         assert session_id.startswith("programmatic:")
         assert handle == []
