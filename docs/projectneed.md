@@ -837,7 +837,7 @@ Schedule 在整个 workspace 维度默认最多同时存在 10 个 active job。
 
 ### SEC-006 Mobile receipt 与 plugin lease 保留
 
-completed mobile receipt 从 `completed_at` 起保留 7 天，并受每设备 10,000 条和 64 MiB 高水位保护。高水位先清理已过期 completed；仍满时只拒绝当前新 command，不能删除有效 receipt 或结束 runtime。processing 不能按 TTL 盲删，必须根据真实外部效果恢复为 completed、可安全重试或 `outcome_unknown`。超时 plugin query 在真实 worker 结束前持续占用 quota 和 generation lease。
+有副作用或持久结果的 Mobile command 必须保存 receipt；completed receipt 从 `completed_at` 起保留 7 天，并受每设备 10,000 条和 64 MiB 高水位保护。只读取当前快照的启动查询不保存 receipt，重试时重新读取当前状态。高水位先清理已过期 completed；仍满时只拒绝当前需要 receipt 的新 command，不能删除有效 receipt 或结束 runtime。processing 不能按 TTL 盲删，必须根据真实外部效果恢复为 completed、可安全重试或 `outcome_unknown`。超时 plugin query 在真实 worker 结束前持续占用 quota 和 generation lease。
 
 ### SEC-007 Shell 与 Subagent 准入有界
 

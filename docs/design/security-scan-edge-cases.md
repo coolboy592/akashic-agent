@@ -72,7 +72,7 @@ Mutants：无限 add、达到上限时删除旧任务、按 channel 分开计数
 
 ## 8. Receipt 与 Plugin query lease（G6 / D6）
 
-completed receipt 从 `completed_at` 起保留 7 天，每设备高水位为 10,000 条或 64 MiB。新命令先清理过期 completed；仍满则当前命令返回 `mobile_command_receipt_capacity_reached`，有效 receipt 不得删除，runtime 继续。相同 request 重放返回原结果；同 ID 不同 request 继续 conflict。
+有副作用或持久结果的命令保存 receipt；只读取当前快照的 `command.list`、`runtime.document.list`、`runtime.capability.list`、`scheduler.job.list` 和 `model.catalog.get` 不保存 receipt，重试时读取新快照。completed receipt 从 `completed_at` 起保留 7 天，每设备高水位为 10,000 条或 64 MiB。需要 receipt 的新命令先清理过期 completed；仍满则当前命令返回 `mobile_command_receipt_capacity_reached`，有效 receipt 不得删除，runtime 继续。相同 request 重放返回原结果；同 ID 不同 request 继续 conflict。
 
 processing receipt 不按 TTL 盲删。重启或 reconciliation 必须判断真实外部效果：已完成则补交 completed，明确未执行且无副作用才允许重试，无法判断则持久化 `outcome_unknown` 并阻止自动重放。receipt 状态提交失败不得报告 accepted/terminal success。
 

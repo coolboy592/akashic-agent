@@ -3503,6 +3503,53 @@ async def test_plugin_ui_catalog_does_not_create_durable_receipt(
     storage.close()
 
 
+@pytest.mark.asyncio
+async def test_bootstrap_snapshot_queries_do_not_create_durable_receipts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = MobileRealtimeStorage(tmp_path / "mobile.db")
+    device_id = uuid4().hex
+    _register_device(storage, device_id)
+    channel = MobileRealtimeChannel(cast(MobileGatewayRuntime, _Runtime(storage)))
+
+    async def execute_snapshot(**kwargs: object) -> channel_module.CommandReply:
+        frame = cast(GenericCommand, kwargs["frame"])
+        return channel_module.CommandReply(type=f"{frame.type}.ok", payload={})
+
+    monkeypatch.setattr(channel, "_execute_command", execute_snapshot)
+    command_types = (
+        "command.list",
+        "runtime.document.list",
+        "runtime.capability.list",
+        "scheduler.job.list",
+        "model.catalog.get",
+    )
+    for index, command_type in enumerate(command_types):
+        reply = await channel.handle_command(
+            device_id=device_id,
+            frame=_generic_frame(
+                frame_id=f"01ARZ3NDEKTSV4RRFFQ69G5FA{index}",
+                command_type=command_type,
+            ),
+        )
+        assert reply.type == f"{command_type}.ok"
+
+    durable = await channel.handle_command(
+        device_id=device_id,
+        frame=_generic_frame(
+            frame_id="01ARZ3NDEKTSV4RRFFQ69G5FA5",
+            command_type="runtime.document.get",
+        ),
+    )
+    assert durable.type == "runtime.document.get.ok"
+    receipts = storage._db.execute(
+        "SELECT command_type FROM mobile_command_receipts ORDER BY command_type"
+    ).fetchall()
+    assert [row[0] for row in receipts] == ["runtime.document.get"]
+    storage.close()
+
+
 def _plugin_ui_query_frame(frame_id: str) -> GenericCommand:
     return _generic_frame(
         frame_id=frame_id,

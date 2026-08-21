@@ -109,6 +109,16 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_EPHEMERAL_QUERY_COMMAND_TYPES = frozenset(
+    {
+        "command.list",
+        "model.catalog.get",
+        "runtime.capability.list",
+        "runtime.document.list",
+        "scheduler.job.list",
+    }
+)
+
 
 class MobileCommandError(ValueError):
     def __init__(self, code: str, message: str) -> None:
@@ -616,10 +626,17 @@ class MobileRealtimeChannel:
         device_id: str,
         frame: ClientCommand,
     ) -> CommandReply:
-        """幂等执行业务命令，并持久化可跨重连复用的回复。"""
+        """执行命令，并为有副作用或持久结果的命令保存可重放收据。"""
 
-        # 1. 先持久化命令占用，避免重连重复触发 Agent turn
+        # 1. 纯查询直接读取当前快照，不消耗持久收据容量
         self._raise_delta_failure()
+        if frame.type in _EPHEMERAL_QUERY_COMMAND_TYPES:
+            return await self._execute_command_reply(
+                device_id=device_id,
+                frame=frame,
+            )
+
+        # 2. 先持久化命令占用，避免重连重复触发副作用
         try:
             receipt, created = self._runtime.storage.reserve_command(
                 device_id=device_id,
@@ -653,22 +670,16 @@ class MobileRealtimeChannel:
                 replayed=True,
             )
 
-        # 2. 当前实例只在命令实际执行期间拥有 processing 收据
+        # 3. 当前实例只在命令实际执行期间拥有 processing 收据
         command_key = (device_id, frame.id)
         self._processing_commands.add(command_key)
         try:
-            try:
-                reply = await self._execute_command(device_id=device_id, frame=frame)
-            except (MobileCommandError, RuntimeInspectionError) as error:
-                reply = CommandReply(
-                    type=f"{frame.type}.error",
-                    payload={"code": error.code, "message": str(error)},
-                    session_id=frame.session_id,
-                    turn_id=frame.turn_id,
-                )
+            reply = await self._execute_command_reply(
+                device_id=device_id,
+                frame=frame,
+            )
 
-            # 3. 只有收据完成后才释放当前进程对未决副作用的所有权
-            _validate_reply_frame_size(frame, reply)
+            # 4. 只有收据完成后才释放当前进程对未决副作用的所有权
             try:
                 completed = self._runtime.storage.complete_command(
                     device_id=device_id,
@@ -698,6 +709,26 @@ class MobileRealtimeChannel:
             )
         finally:
             self._processing_commands.discard(command_key)
+
+    async def _execute_command_reply(
+        self,
+        *,
+        device_id: str,
+        frame: ClientCommand,
+    ) -> CommandReply:
+        """执行一次命令并统一生成经过帧大小校验的回复。"""
+
+        try:
+            reply = await self._execute_command(device_id=device_id, frame=frame)
+        except (MobileCommandError, RuntimeInspectionError) as error:
+            reply = CommandReply(
+                type=f"{frame.type}.error",
+                payload={"code": error.code, "message": str(error)},
+                session_id=frame.session_id,
+                turn_id=frame.turn_id,
+            )
+        _validate_reply_frame_size(frame, reply)
+        return reply
 
     async def handle_plugin_ui_command(
         self,
