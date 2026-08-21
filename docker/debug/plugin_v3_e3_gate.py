@@ -486,9 +486,10 @@ def main() -> int:
     try:
         if args.require_clean_core and core_status:
             raise GateFailure(f"核心工作树不干净: {core_status}")
+        tmp_root = _resolve_tmp_root(args.tmp_root)
         with tempfile.TemporaryDirectory(
             prefix="akashic-plugin-v3-e3-",
-            dir="/home/huashen/.cache/akashic-gate-tmp",
+            dir=tmp_root,
         ) as raw:
             sandbox_path = Path(raw)
             report["runtime"] = asyncio.run(_run_runtime(sandbox_path))
@@ -533,8 +534,20 @@ def _parse_args() -> argparse.Namespace:
         description="验证 pure-v3 Channel/MessagePush/Passive WebUI 集中 E3"
     )
     parser.add_argument("--report", type=Path, default=DEFAULT_REPORT)
+    parser.add_argument("--tmp-root", type=Path)
     parser.add_argument("--require-clean-core", action="store_true")
     return parser.parse_args()
+
+
+def _resolve_tmp_root(value: Path | None) -> Path | None:
+    """解析调用方可选的临时目录。"""
+
+    if value is None:
+        return None
+    root = value.expanduser().resolve()
+    if not root.is_dir():
+        raise GateFailure(f"E3 tmp root 不是已存在目录: {root}")
+    return root
 
 
 def _require_runtime_evidence(runtime: Mapping[str, object]) -> None:

@@ -7,6 +7,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 from agent.plugin_composition.channels import DeliveryStatus
 
 
@@ -308,3 +310,12 @@ def test_write_json_round_trips_gate_evidence(tmp_path: Path) -> None:
     gate._write_json(report, payload)
 
     assert json.loads(report.read_text(encoding="utf-8")) == payload
+
+
+def test_tmp_root_is_optional_and_caller_owned(tmp_path: Path) -> None:
+    assert gate._resolve_tmp_root(None) is None
+    assert gate._resolve_tmp_root(tmp_path) == tmp_path.resolve()
+
+    invalid = tmp_path / "missing"
+    with pytest.raises(gate.GateFailure, match="tmp root"):
+        gate._resolve_tmp_root(invalid)

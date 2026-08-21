@@ -265,6 +265,9 @@ python docker/debug/plugin_v3_e4_gate.py \
   --plugin-home /path/to/plugin-home
 ```
 
+所有集中 Gate 默认使用 Python/操作系统选择的临时目录；E1～E4 可通过 `--tmp-root`
+显式选择已有目录。测试源码不绑定维护者 HOME、正式 workspace 或一次性试运行路径。
+
 E1 覆盖 Default Memory/Akasha、Citation/Meme、Observe、Emotion、Proactive Feedback 与
 Plugin Undo；E2 覆盖 Shell 三件与 MCP/process 插件；E3 覆盖 Channel、Command、
 Proactive source/job 与 GitHub Watcher。E4 不重复逐插件运行，而是从同一 Core head

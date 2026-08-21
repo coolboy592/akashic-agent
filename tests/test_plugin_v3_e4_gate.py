@@ -165,6 +165,16 @@ def test_tree_summary_and_artifact_pointer_inventory(tmp_path: Path) -> None:
     assert gate._tree_summary(root)["digest"] != before
 
 
+def test_tmp_root_is_optional_and_caller_owned(tmp_path: Path) -> None:
+    assert gate._resolve_tmp_root(None) is None
+    assert gate._resolve_tmp_root(tmp_path) == tmp_path.resolve()
+
+    invalid = tmp_path / "not-a-directory"
+    invalid.write_text("fixture", encoding="utf-8")
+    with pytest.raises(gate.GateFailure, match="tmp root"):
+        gate._resolve_tmp_root(invalid)
+
+
 def test_plugin_data_inventory_ignores_only_sqlite_runtime_sidecars(
     tmp_path: Path,
 ) -> None:

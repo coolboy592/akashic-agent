@@ -80,7 +80,7 @@ def _run_host(report_path: Path, *, require_clean: bool) -> int:
     )  # pyright: ignore[reportPrivateUsage]
     lock = _load_final_sources()
     run_id = f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
-    sandbox = Path(tempfile.mkdtemp(prefix="akashic-passive-webui-v3-", dir="/tmp"))
+    sandbox = Path(tempfile.mkdtemp(prefix="akashic-passive-webui-v3-"))
     project = f"akashic-passive-webui-{run_id.lower()}"
     env = {
         **os.environ,

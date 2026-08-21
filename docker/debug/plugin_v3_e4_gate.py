@@ -37,7 +37,6 @@ DEFAULT_E3_REPORT = ROOT / "docker/debug/reports/plugin-v3-e3" / "gate.json"
 DEFAULT_PASSIVE_REPORT = (
     ROOT / "docker/debug/reports/plugin-passive-webui-v3" / "gate.json"
 )
-DEFAULT_TMP_ROOT = Path("/home/huashen/.cache/akashic-gate-tmp")
 
 GATE_VERSION = 1
 SCENARIO_PROFILE = "plugin-v3-e4-copied-workspace-rehearsal-v1"
@@ -79,6 +78,17 @@ class GateBlocked(RuntimeError):
 
 class GateFailure(RuntimeError):
     """Copied-workspace invariant violation."""
+
+
+def _resolve_tmp_root(value: Path | None) -> Path | None:
+    """解析调用方可选的临时目录。"""
+
+    if value is None:
+        return None
+    root = value.expanduser().resolve()
+    if not root.is_dir():
+        raise GateFailure(f"E4 tmp root 不是已存在目录: {root}")
+    return root
 
 
 def _sha256_file(path: Path) -> str:
@@ -667,8 +677,7 @@ async def _run_runtime(args: argparse.Namespace, report: dict[str, object]) -> N
     report["source_before"] = {
         **source_before, "sessions_db": _sanitize_sqlite(source_db_before),
     }
-    tmp_parent = args.tmp_root.resolve() if args.tmp_root else DEFAULT_TMP_ROOT
-    tmp_parent.mkdir(parents=True, exist_ok=True)
+    tmp_parent = _resolve_tmp_root(args.tmp_root)
     with tempfile.TemporaryDirectory(prefix="akashic-plugin-v3-e4-", dir=tmp_parent) as raw:
         target = Path(raw) / "rehearsal"
         manifest = prepare_rehearsal(
