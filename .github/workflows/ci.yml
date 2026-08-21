@@ -253,10 +253,6 @@ jobs:
           assert restart["status"] == "passed"
           assert restart["head"] == os.environ["GITHUB_SHA"]
           assert restart["dirtyStatus"] == []
-          assert not any(
-              restart[name]
-              for name in ("residualContainers", "residualNetworks", "residualVolumes")
-          )
           assert not any(restart["residualResources"].values())
           PY
 
