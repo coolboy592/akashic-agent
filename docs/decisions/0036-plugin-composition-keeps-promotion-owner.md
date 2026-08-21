@@ -20,6 +20,8 @@ Akashic 新插件采用 Python 实现的最小组合内核：Root Context 持有
 
 现有 publication plane 保持唯一 owner：安装 artifact、候选隔离、generation identity、行为验证回执、stable/latest、父 Turn 终点授权、snapshot lease、晋升、丢弃和恢复日志继续由 Core 管理。候选发布单位是完整 Root Context 拓扑，不是单个回调或单个 Service。
 
+跨 snapshot 暴露单例 live owner、且 old/new 不能仅靠 generation lease 安全共存的能力，才进入 closed provisional publication transaction。当前参与者只有 Activity、Channel 和 command endpoint/catalog；Manager 依次关闭 admission、排空旧 owner、切换或建立新 owner，并在 stable pointer 与全部 participant 一起成功后统一开放。MCP、managed process、background job 以及只读取 committed snapshot 的 catalog consumer 不参加这项同步切换；它们由 candidate closed 状态、snapshot/generation lease 和各自 Host 的 cleanup/recovery 收束旧代。新增第 4 个同步参与者前，必须先证明其 live owner 无法跨代共存、仅靠 lease 无法恢复，并明确正向切换、逆向恢复和失败后资源 owner；届时再评估是否提取窄 `PublicationParticipant` 协议，不为形状相似预建抽象。
+
 现有插件在迁移完成前继续由一个 legacy host 承载。新内核不得为每个旧插件增加适配器，也不得改变旧 lifecycle、phase/slot 顺序、错误传播、plugin-data 或外部效果。每个领域迁移完成后删除对应旧分支，最终删除 legacy host。
 
 第一阶段只实现组合内核、候选回执和无外部效果的实验插件，并在带 run identity 的隔离 workspace 验证。它不接管正式 manifest、正式 plugin-data、真实渠道或远程 API。
