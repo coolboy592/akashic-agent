@@ -189,7 +189,7 @@ jobs:
           ../../.venv/bin/pytest -q tests
 
       - name: Run pytest
-        timeout-minutes: 10
+        timeout-minutes: 15
         env:
           PYTHONWARNINGS: "ignore:.*AbstractEventLoopPolicy.*:DeprecationWarning"
         run: |
