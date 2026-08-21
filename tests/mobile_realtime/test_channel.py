@@ -2594,6 +2594,7 @@ async def test_session_list_and_history_sync_publish_all_mobile_sessions(
     session_items_by_id = {str(item["session_id"]): item for item in session_items}
     assert session_items_by_id[session_id]["title"] == "恢复这段对话"
     assert session_items_by_id[empty_session_id]["title"] == "新对话"
+    assert "snapshot_max_seq" not in session_items_by_id[session_id]
     assert history.type == "history.get.ok"
     history_event = runtime.events[-1]
     history_payload = cast(dict[str, object], history_event["payload"])
@@ -2608,6 +2609,33 @@ async def test_session_list_and_history_sync_publish_all_mobile_sessions(
         "reasoning_content": "历史思考",
         "control_turn_id": "turn-history",
     }
+
+    versioned = await channel.handle_command(
+        device_id=device_id,
+        frame=_generic_frame(
+            frame_id="01ARZ3NDEKTSV4RRFFQ69G5FAZ",
+            command_type="session.list",
+            payload={"history_snapshot_version": 1},
+        ),
+    )
+    assert versioned.type == "session.list.ok"
+    versioned_items = cast(
+        list[dict[str, object]],
+        cast(dict[str, object], runtime.events[-1]["payload"])["items"],
+    )
+    versioned_by_id = {str(item["session_id"]): item for item in versioned_items}
+    assert versioned_by_id[session_id]["snapshot_max_seq"] == 1
+    assert versioned_by_id[empty_session_id]["snapshot_max_seq"] == -1
+    invalid_version = await channel.handle_command(
+        device_id=device_id,
+        frame=_generic_frame(
+            frame_id="01ARZ3NDEKTSV4RRFFQ69G5FB0",
+            command_type="session.list",
+            payload={"history_snapshot_version": 2},
+        ),
+    )
+    assert invalid_version.type == "session.list.error"
+    assert invalid_version.payload["code"] == "invalid_payload"
     tool_chain = cast(list[dict[str, object]], history_items[1]["tool_chain"])
     calls = cast(list[dict[str, object]], tool_chain[0]["calls"])
     assert calls[0]["description"] == "读取状态"

@@ -2066,7 +2066,17 @@ class MobileRealtimeChannel:
         """发布全部移动会话索引，供手机按需分页拉取缺失历史。"""
 
         # 1. 所有已认证手机共享 mobile 渠道的完整会话空间
-        _expect_keys(frame.payload, set())
+        _expect_keys(frame.payload, {"history_snapshot_version"})
+        history_snapshot_version = frame.payload.get("history_snapshot_version")
+        if history_snapshot_version is not None and (
+            not isinstance(history_snapshot_version, int)
+            or isinstance(history_snapshot_version, bool)
+            or history_snapshot_version != 1
+        ):
+            raise MobileCommandError(
+                "invalid_payload",
+                "history_snapshot_version 仅支持 1",
+            )
         ctx = self._require_ctx()
         session_rows = {
             item["key"]: item for item in ctx.session_manager.list_sessions()
@@ -2085,7 +2095,7 @@ class MobileRealtimeChannel:
                 raise RuntimeError(
                     f"已绑定移动会话在 session store 中不存在: {session_id}"
                 )
-            messages, total = (
+            messages, dashboard_total = (
                 ctx.session_manager.control_store.list_messages_for_dashboard(
                     session_key=session_id,
                     page=1,
@@ -2095,18 +2105,23 @@ class MobileRealtimeChannel:
                 )
             )
             first_content = str(messages[0]["content"]).strip() if messages else ""
-            items.append(
-                {
-                    "session_id": session_id,
-                    "title": (
-                        first_content.splitlines()[0][:32]
-                        if first_content
-                        else "新对话"
-                    ),
-                    "updated_at": str(session["updated_at"]),
-                    "message_count": total,
-                }
-            )
+            item: dict[str, object] = {
+                "session_id": session_id,
+                "title": (
+                    first_content.splitlines()[0][:32]
+                    if first_content
+                    else "新对话"
+                ),
+                "updated_at": str(session["updated_at"]),
+                "message_count": dashboard_total,
+            }
+            if history_snapshot_version == 1:
+                snapshot_total, snapshot_max_seq = (
+                    ctx.session_manager.control_store.mobile_history_snapshot(session_id)
+                )
+                item["message_count"] = snapshot_total
+                item["snapshot_max_seq"] = snapshot_max_seq
+            items.append(item)
 
         # 3. 索引也走 durable event，断线后仍会重放
         _ = await self._runtime.publish_event(
