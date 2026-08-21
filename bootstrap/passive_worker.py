@@ -254,6 +254,30 @@ class PassiveMessageWorker:
                 session_admission_id = self._bus.mobile_session_admission_id(
                     envelope
                 )
+                store = self._legacy_loop.session_manager.control_store
+                matched = store.find_turn_by_client_message_id(
+                    envelope.session_key,
+                    envelope.message_id,
+                )
+                if matched is not None:
+                    if not matched.status.is_terminal:
+                        raise RuntimeError(
+                            f"mobile turn 非终态未恢复: "
+                            f"{matched.id}/{matched.status.value}"
+                        )
+                    task = asyncio.create_task(
+                        self._settle_channel_envelope(
+                            envelope,
+                            TurnResult.from_record(matched),
+                            (),
+                            session_admission_id,
+                        ),
+                        name=f"channel-passive-recovery:{matched.id}",
+                    )
+                    self._result_tasks.add(task)
+                    task.add_done_callback(self._result_tasks.discard)
+                    transferred = True
+                    return task
             else:
                 _, session_admission_id = (
                     self._legacy_loop.session_manager.admit_existing(
@@ -370,9 +394,25 @@ class PassiveMessageWorker:
     ) -> None:
         """Await the turn and settle one exact non-retryable provider delivery."""
 
+        result = await handle.result()
+        await self._settle_channel_envelope(
+            envelope,
+            result,
+            attachment_leases,
+            session_admission_id,
+        )
+
+    async def _settle_channel_envelope(
+        self,
+        envelope: InboundEnvelope,
+        result: TurnResult,
+        attachment_leases: tuple[_ModelAttachmentLease, ...],
+        session_admission_id: str,
+    ) -> None:
+        """Deliver one authoritative terminal and settle its exact inbound owner."""
+
         terminal_durable = envelope.channel != "mobile"
         try:
-            result = await handle.result()
             legacy_view = InboundMessage(
                 channel=envelope.channel,
                 sender=envelope.sender,

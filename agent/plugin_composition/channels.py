@@ -157,7 +157,7 @@ class ChannelInboundMessage:
         _text(self.channel, "channel")
         _text(self.sender, "sender")
         _text(self.chat_id, "chat_id")
-        _string(self.content, "content")
+        _content_string(self.content, "content")
         if not isinstance(self.timestamp, datetime):
             raise TypeError("timestamp 必须是 datetime")
         if self.timestamp.tzinfo is None or self.timestamp.utcoffset() is None:
@@ -430,7 +430,7 @@ class OutboundEnvelope:
             "recipient",
         ):
             _text(getattr(self, field_name), field_name)
-        _string(self.body, "body")
+        _content_string(self.body, "body")
         if isinstance(self.attempt_sequence, bool) or not isinstance(
             self.attempt_sequence, int
         ) or self.attempt_sequence < 1:
@@ -447,8 +447,9 @@ class OutboundEnvelope:
         )
         if not isinstance(self.commit_role, ChannelCommitRole):
             raise TypeError("commit_role 必须是 ChannelCommitRole")
+        if self.thinking is not None:
+            _content_string(self.thinking, "thinking")
         for field_name in (
-            "thinking",
             "reply_to",
             "session_message_id",
             "control_turn_id",
@@ -513,8 +514,8 @@ class ControlResponseBodies:
     idle: str
 
     def __post_init__(self) -> None:
-        _string(self.interrupted, "interrupted")
-        _string(self.idle, "idle")
+        _content_string(self.interrupted, "interrupted")
+        _content_string(self.idle, "idle")
 
 
 class ChannelControlPort(Protocol):
@@ -554,8 +555,8 @@ class StreamDeltaPresentation:
     def __post_init__(self) -> None:
         _text(self.turn_id, "turn_id")
         _positive_sequence(self.sequence)
-        _string(self.text_delta, "text_delta")
-        _string(self.reasoning_delta, "reasoning_delta")
+        _content_string(self.text_delta, "text_delta")
+        _content_string(self.reasoning_delta, "reasoning_delta")
 
 
 @dataclass(frozen=True, slots=True)
@@ -719,7 +720,7 @@ class PushToolRequest:
     def __post_init__(self) -> None:
         _text(self.channel, "channel")
         _text(self.recipient, "recipient")
-        _string(self.body, "body")
+        _content_string(self.body, "body")
         object.__setattr__(self, "metadata", _freeze_json_mapping(self.metadata))
         object.__setattr__(
             self,
@@ -894,8 +895,7 @@ class ProviderDeliveryRequest:
         _text(self.binding_token, "binding_token")
         _text(self.delivery_id, "delivery_id")
         _text(self.recipient, "recipient")
-        if not isinstance(self.body, str):
-            raise TypeError("body 必须是 str")
+        _content_string(self.body, "body")
         object.__setattr__(
             self,
             "attachments",
@@ -905,8 +905,9 @@ class ProviderDeliveryRequest:
         object.__setattr__(self, "metadata", metadata)
         if not isinstance(self.commit_role, ChannelCommitRole):
             raise TypeError("commit_role 必须是 ChannelCommitRole")
+        if self.thinking is not None:
+            _content_string(self.thinking, "thinking")
         for field_name in (
-            "thinking",
             "reply_to",
             "session_message_id",
             "control_turn_id",
@@ -1800,6 +1801,14 @@ def _string(value: object, field_name: str) -> str:
     if not isinstance(value, str):
         raise TypeError(f"{field_name} 必须是 str")
     if any(ord(char) < 32 for char in value):
+        raise ValueError(f"{field_name} 不能包含控制字符")
+    return value
+
+
+def _content_string(value: object, field_name: str) -> str:
+    if not isinstance(value, str):
+        raise TypeError(f"{field_name} 必须是 str")
+    if any(ord(char) < 32 and char not in "\t\n\r" for char in value):
         raise ValueError(f"{field_name} 不能包含控制字符")
     return value
 

@@ -680,6 +680,40 @@ def test_c14c_metadata_is_recursively_frozen_and_rejects_unsafe_values() -> None
         )
 
 
+def test_channel_text_accepts_layout_controls_and_rejects_nul() -> None:
+    body = "line one\nline two\tvalue\r\n"
+    message = ChannelInboundMessage(
+        channel="feishu",
+        sender="sender",
+        chat_id="chat",
+        content=body,
+        timestamp=datetime.now(timezone.utc),
+        metadata={},
+    )
+    outbound = OutboundEnvelope(
+        logical_delivery_id="delivery",
+        delivery_id="delivery",
+        attempt_sequence=1,
+        snapshot_id="snapshot",
+        generation_id="generation",
+        binding_token="binding",
+        channel="feishu",
+        recipient="chat",
+        body=body,
+        metadata={},
+    )
+
+    assert message.content == body
+    assert outbound.body == body
+    with pytest.raises(ValueError, match="控制字符"):
+        _ = PushToolRequest(
+            channel="feishu",
+            recipient="chat",
+            body="unsafe\x00body",
+            metadata={},
+        )
+
+
 def test_raw_inbound_and_outbound_receipts_enforce_identity_contract() -> None:
     envelope = _inbound_envelope()
     raw = RawInbound(message_id="provider-message", message=envelope.message)

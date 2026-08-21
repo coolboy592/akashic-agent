@@ -1386,6 +1386,125 @@ async def test_v3_channel_worker_preserves_exact_binding_through_terminal_delive
 
 
 @pytest.mark.asyncio
+async def test_v3_mobile_recovery_redelivers_existing_turn_without_duplicate(
+    tmp_path: Path,
+) -> None:
+    manager1 = SessionManager(tmp_path)
+    session_key = "mobile:chat-1"
+    client_message_id = "client-recovered-1"
+    manager1.save(manager1.get_or_create(session_key))
+    executed: list[TurnRequest] = []
+
+    async def execute(request: TurnRequest) -> str:
+        executed.append(request)
+        return f"echo:\n{request.input}"
+
+    runtime1 = ConversationRuntime(manager1.control_store, execute)
+    original = await runtime1.start_turn(
+        TurnRequest(
+            session_key,
+            "hello",
+            {"inboundMetadata": {"client_message_id": client_message_id}},
+        )
+    )
+    original_result = await original.result()
+
+    bus1 = MessageBus()
+    bus1.bind_durable_inbound_store(manager1.control_store)
+    bus1.bind_mobile_session_admission_owner(manager1)
+    envelope1, lease1 = _v3_inbound(
+        channel="mobile",
+        message_id=client_message_id,
+        metadata={
+            "session_key_override": session_key,
+            "client_message_id": client_message_id,
+            "mobile_v3_handoff": True,
+            "mobile_handoff_id": "handoff-recovered-1",
+        },
+    )
+    await bus1.publish_channel_inbound(envelope1)
+    await bus1.aclose()
+    assert lease1.closed == 1
+    assert len(manager1.control_store.list_inbound_handoffs()) == 1
+    await runtime1.shutdown()
+    manager1.close()
+
+    manager2 = SessionManager(tmp_path)
+    manager2.clear_stale_admissions()
+    runtime2 = ConversationRuntime(manager2.control_store, execute)
+    bus2 = MessageBus()
+    bus2.bind_durable_inbound_store(manager2.control_store)
+    bus2.bind_mobile_session_admission_owner(manager2)
+    delivered: list[OutboundEnvelope] = []
+    recovered_leases: list[_InboundLease] = []
+    recovered_event = asyncio.Event()
+
+    async def dispatch(
+        envelope: OutboundEnvelope,
+        _binding: object,
+    ) -> ChannelDeliveryReceipt:
+        delivered.append(envelope)
+        return ChannelDeliveryReceipt(
+            envelope.delivery_id,
+            DeliveryStatus.DELIVERED,
+        )
+
+    async def recover(raw: RawInbound) -> bool:
+        lease = _InboundLease(channel="mobile")
+        recovered_leases.append(lease)
+        envelope = InboundEnvelope(
+            message_id=raw.message_id,
+            snapshot_id=lease.snapshot_id,
+            generation_id=lease.generation_id,
+            binding_token=lease.binding_token,
+            message=raw.message,
+            lease=lease,
+        )
+        await bus2.publish_channel_inbound(envelope)
+        recovered_event.set()
+        return True
+
+    bus2.bind_mobile_channel_inbound_recoverer(recover)
+    bus2.bind_channel_outbound_dispatcher(dispatch)
+    from bootstrap.passive_worker import PassiveMessageWorker
+
+    worker = PassiveMessageWorker(
+        bus2,
+        runtime2,
+        cast(Any, SimpleNamespace(session_manager=manager2)),
+    )
+    worker_task = asyncio.create_task(worker.run())
+    dispatch_task = asyncio.create_task(bus2.dispatch_outbound())
+    await asyncio.wait_for(recovered_event.wait(), timeout=2)
+    await asyncio.wait_for(recovered_leases[0].closed_event.wait(), timeout=2)
+
+    turns = manager2.control_store.list_turns(session_key, limit=10)
+    assert len(executed) == 1
+    assert len(turns) == 1
+    assert turns[0].id == original_result.id
+    assert len(delivered) == 1
+    assert delivered[0].control_turn_id == original_result.id
+    assert delivered[0].body == "echo:\nhello"
+    assert manager2.control_store.list_inbound_handoffs() == []
+    for _ in range(100):
+        admission = manager2.control_store._conn.execute(
+            "SELECT 1 FROM session_admissions WHERE session_key = ?",
+            (session_key,),
+        ).fetchone()
+        if admission is None:
+            break
+        await asyncio.sleep(0)
+    assert admission is None
+
+    worker.stop()
+    bus2.stop()
+    await worker_task
+    await dispatch_task
+    await runtime2.shutdown()
+    manager2.close()
+
+
+@pytest.mark.asyncio
 async def test_v3_channel_worker_holds_session_admission_until_terminal(
     tmp_path: Path,
 ) -> None:
