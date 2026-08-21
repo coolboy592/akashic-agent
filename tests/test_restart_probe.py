@@ -99,6 +99,18 @@ def test_restart_mcp_fixture_is_a_pure_v3_static_plugin(tmp_path: Path) -> None:
     assert manifest.mcp_servers[0].required_tools == ("version",)
     assert os.access(plugin_root / ".venv/bin/python", os.X_OK)
 
+    module_source = (plugin_root / "plugin.py").read_text(encoding="utf-8")
+    _write_mcp_plugin(
+        "v8",
+        plugin_root=plugin_root,
+        workspace=workspace,
+        runtime_workspace=runtime_workspace,
+    )
+    reloaded = load_static_plugin_manifest(plugin_root)
+
+    assert reloaded.version == "v8"
+    assert (plugin_root / "plugin.py").read_text(encoding="utf-8") == module_source
+
 
 def test_sandbox_digest_uses_same_source_manifest(tmp_path: Path) -> None:
     app = tmp_path / "app"

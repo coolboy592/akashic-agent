@@ -42,6 +42,7 @@ from docker.debug.programmatic_control_probe import (
     _wait_socket,
     _write_json,
 )
+from infra.persistence.json_store import atomic_write_text
 
 
 READINESS_DEADLINE_S = 30.0
@@ -287,25 +288,32 @@ def _write_mcp_plugin(
     (workspace / lifecycle_file).parent.mkdir(parents=True, exist_ok=True)
     lifecycle = (runtime_workspace or workspace) / lifecycle_file
     plugin_root.mkdir(parents=True, exist_ok=True)
-    (plugin_root / "plugin.py").write_text(
-        "from agent.plugin_composition import MCP_SERVERS, McpServerDefinition\n"
-        "api_version = 3\n"
-        "name = 'restart_probe'\n"
-        f"version = {version!r}\n"
-        "inject = (MCP_SERVERS,)\n"
-        "async def apply(ctx, config):\n"
-        "    await ctx.require(MCP_SERVERS).register(\n"
-        "        ctx, McpServerDefinition(\n"
-        "            name='restart_probe',\n"
-        "            command=('python', 'restart_probe_server.py'),\n"
-        f"            env={{'VERSION': {version!r}, "
-        f"'LIFECYCLE_LOG': {str(lifecycle)!r}}},\n"
-        "            required_tools=('version',),\n"
-        "            candidate_read_only_tools=('version',),\n"
-        "        ),\n"
-        "    )\n",
-        encoding="utf-8",
-    )
+    module = plugin_root / "plugin.py"
+    if not module.exists():
+        module.write_text(
+            "from pathlib import Path\n"
+            "import tomllib\n"
+            "from agent.plugin_composition import MCP_SERVERS, McpServerDefinition\n"
+            "_manifest = tomllib.loads(\n"
+            "    Path(__file__).with_name('akashic.plugin.toml').read_text(encoding='utf-8')\n"
+            ")\n"
+            "api_version = 3\n"
+            "name = 'restart_probe'\n"
+            "version = str(_manifest['version'])\n"
+            "inject = (MCP_SERVERS,)\n"
+            "async def apply(ctx, config):\n"
+            "    await ctx.require(MCP_SERVERS).register(\n"
+            "        ctx, McpServerDefinition(\n"
+            "            name='restart_probe',\n"
+            "            command=('python', 'restart_probe_server.py'),\n"
+            f"            env={{'VERSION': version, "
+            f"'LIFECYCLE_LOG': {str(lifecycle)!r}}},\n"
+            "            required_tools=('version',),\n"
+            "            candidate_read_only_tools=('version',),\n"
+            "        ),\n"
+            "    )\n",
+            encoding="utf-8",
+        )
 
     # 2. 静态 manifest 冻结同一 MCP 合同，server 只写 disposable lifecycle。
     (plugin_root / "restart_probe_server.py").write_text(
@@ -316,7 +324,8 @@ def _write_mcp_plugin(
     runtime = plugin_root / ".venv"
     if stage_runtime and not runtime.exists():
         venv.EnvBuilder(with_pip=False).create(runtime)
-    (plugin_root / "akashic.plugin.toml").write_text(
+    atomic_write_text(
+        plugin_root / "akashic.plugin.toml",
         "schema_version = 1\n"
         "name = 'restart_probe'\n"
         f"version = {version!r}\n"
@@ -331,7 +340,7 @@ def _write_mcp_plugin(
         f"LIFECYCLE_LOG = {str(lifecycle)!r}}}\n"
         "required_tools = ['version']\n"
         "candidate_read_only_tools = ['version']\n",
-        encoding="utf-8",
+        domain="restart_gate_fixture",
     )
 
 
