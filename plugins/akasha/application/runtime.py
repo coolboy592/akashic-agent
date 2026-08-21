@@ -373,6 +373,9 @@ class OnlineMemoryRuntime:
                 "memory snapshot contains more turns than sessions source"
             )
         prefix = turns[:persisted]
+        exact_source_hash = (
+            sha256_file(self.index_path) if persisted == len(turns) else None
+        )
         (
             graph,
             events,
@@ -384,7 +387,7 @@ class OnlineMemoryRuntime:
             self.memory_path,
             turns=prefix,
             config=self.config,
-            source_index_sha256=sha256_file(self.index_path),
+            source_index_sha256=exact_source_hash,
         )
         cycle = MemoryCycle.restore(
             config=self.config,

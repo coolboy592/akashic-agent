@@ -3344,6 +3344,70 @@ def test_online_runtime_reopens_unchanged_sidecars_without_rebuilding(
     assert hashlib.sha256(memory_path.read_bytes()).hexdigest() == memory_sha
 
 
+def test_online_runtime_replays_an_appended_suffix_without_rebuilding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """进程离线期间新增的 Turn 必须增量追平而不是重建完整图。"""
+
+    # 1. 先持久化一个与稀疏索引完全对齐的记忆快照。
+    sessions_path = tmp_path / "sessions.db"
+    index_path = tmp_path / "memory" / "akasha-v2-index.db"
+    memory_path = tmp_path / "memory" / "akasha.db"
+    _create_sessions(sessions_path)
+    _append_turn(
+        sessions_path,
+        sequence=0,
+        user="alpha request",
+        assistant="beta reply",
+        started=datetime(2026, 8, 5, tzinfo=timezone.utc),
+        with_embeddings=True,
+    )
+    first = OnlineMemoryRuntime(
+        sessions_path=sessions_path,
+        index_path=index_path,
+        memory_path=memory_path,
+        embedding_model="embedding-model",
+        embedding_dimension=2,
+        config=MemoryConfig(),
+    )
+    first.close()
+
+    # 2. 模拟 Core 停机窗口新增一个合法 append-only Turn。
+    _append_turn(
+        sessions_path,
+        sequence=2,
+        user="gamma request",
+        assistant="delta reply",
+        started=datetime(2026, 8, 5, 0, 1, tzinfo=timezone.utc),
+        with_embeddings=True,
+    )
+
+    def reject_rebuild(_runtime: OnlineMemoryRuntime) -> MemoryCycle:
+        raise AssertionError("append-only suffix must not rebuild")
+
+    monkeypatch.setattr(
+        OnlineMemoryRuntime,
+        "_fresh_rebuild_from_source",
+        reject_rebuild,
+    )
+
+    # 3. 重启只回放新增后缀，并发布新的完整配对快照。
+    reopened = OnlineMemoryRuntime(
+        sessions_path=sessions_path,
+        index_path=index_path,
+        memory_path=memory_path,
+        embedding_model="embedding-model",
+        embedding_dimension=2,
+        config=MemoryConfig(),
+    )
+    try:
+        assert reopened.cycle.state_version == 2
+        assert len(reopened.cycle.turns) == 2
+    finally:
+        reopened.close()
+
+
 @pytest.mark.parametrize(
     ("context_mass", "query", "context", "expected_node"),
     (
