@@ -479,7 +479,7 @@ requirements = ["SEC-005", "SCH-001", "SCH-002", "ERR-001", "TST-001", "TST-003"
 groups = ["companion_schedule"]
 environment = "public_clean_workspace"
 timeout_seconds = 60
-command = ["python", "-m", "pytest", "-q", "tests/semantic/test_companion_contract.py::test_schedule_capacity_rejects_unbounded_add_mutant", "tests/test_schedule_tool.py", "tests/test_scheduler_service.py"]
+command = ["python", "-m", "pytest", "-q", "tests/semantic/test_companion_contract.py::test_schedule_capacity_rejects_unbounded_add_mutant", "tests/test_scheduler_v3_shadow.py", "tests/test_job_store.py", "tests/test_fire_at.py", "tests/test_time_parsing.py"]
 observes = ["active_job_count", "candidate_commit", "schedule_capacity_error", "existing_jobs_unchanged", "failure_semantics"]
 mutants = ["companion_schedule_unbounded"]
 
@@ -497,7 +497,7 @@ requirements = ["SEC-007", "SH-001", "SH-002", "RUN-003", "ERR-001", "TST-001", 
 groups = ["companion_shell"]
 environment = "public_clean_workspace"
 timeout_seconds = 60
-command = ["python", "-m", "pytest", "-q", "tests/semantic/test_companion_contract.py::test_shell_cleanup_rejects_turn_rewrite_mutant", "tests/test_shell_tool.py", "tests/test_spawn_tool.py", "tests/test_shell_background_probe.py", "tests/test_subagent_manager.py", "tests/test_unified_exec.py"]
+command = ["python", "-m", "pytest", "-q", "tests/semantic/test_companion_contract.py::test_shell_cleanup_rejects_turn_rewrite_mutant", "tests/test_shell_tool.py", "tests/test_shell_background_probe.py", "tests/test_subagent_v3_runtime.py", "tests/test_unified_exec.py"]
 observes = ["execution_owner", "retained_log", "cleanup_diagnostic", "shared_admission", "turn_finality", "failure_semantics"]
 mutants = ["companion_shell_cleanup_rewrites_turn"]
 

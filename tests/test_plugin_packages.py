@@ -60,7 +60,24 @@ def test_manager_discover_reads_each_package_file_once(
     assert [(mod["name"], mod["package_id"], mod["source_type"]) for mod in mods] == [
         ("akasha", "", "builtin"),
         ("default_memory", "", "builtin"),
+        ("scheduler", "", "builtin"),
+        ("subagent", "", "builtin"),
     ]
+
+
+def test_manager_can_disable_one_builtin_without_hiding_installed_plugins(
+    tmp_path: Path,
+) -> None:
+    root = Path(__file__).resolve().parents[1]
+    manager = PluginManager(
+        [root / "plugins"],
+        event_bus=EventBus(),
+        workspace=tmp_path / "workspace",
+        installed_cache_root=tmp_path / "cache",
+        disabled_builtin_plugins=frozenset({"subagent"}),
+    )
+
+    assert "subagent" not in {item["name"] for item in manager.discover()}
 
 
 def test_proactive_runtime_is_exclusive(tmp_path: Path) -> None:
@@ -117,8 +134,7 @@ def test_package_manifest_rejects_non_schema_values(tmp_path: Path) -> None:
     package_dir.mkdir(parents=True)
 
     (package_dir / "package.toml").write_text(
-        '[package]\nid = "broken"\nmembers = ["broken"]\n'
-        'dashboard = "false"\n',
+        '[package]\nid = "broken"\nmembers = ["broken"]\n' 'dashboard = "false"\n',
         encoding="utf-8",
     )
     with pytest.raises(ValueError, match="dashboard 无效"):

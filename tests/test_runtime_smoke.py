@@ -228,6 +228,58 @@ system_prompt = "test"
     assert cfg.memory_optimizer_interval_seconds == 64800
 
 
+def test_load_config_projects_generic_disabled_builtin_plugins(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        """
+[llm]
+main = "test_main"
+
+[llm.runtimes.test_main]
+provider = "openai"
+model = "test-model"
+api_key = "test-key"
+context_window = 64000
+
+[agent]
+system_prompt = "test"
+
+[agent.plugins]
+disabled_builtin = ["subagent", "scheduler"]
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    cfg = load_config(config_path, workspace=tmp_path)
+
+    assert cfg.disabled_builtin_plugins == frozenset({"subagent", "scheduler"})
+
+
+def test_load_config_rejects_removed_spawn_switch(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        """
+[llm]
+main = "test_main"
+
+[llm.runtimes.test_main]
+provider = "openai"
+model = "test-model"
+api_key = "test-key"
+context_window = 64000
+
+[agent.tools]
+spawn_enabled = false
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="spawn_enabled 已移除"):
+        load_config(config_path, workspace=tmp_path)
+
+
 def test_config_load_resolves_secrets_from_explicit_workspace(tmp_path: Path) -> None:
     config_path = tmp_path / "config.toml"
     first_workspace = tmp_path / "first"
@@ -474,12 +526,8 @@ async def test_serve_smoke_loads_config_and_runs_shutdown(monkeypatch, tmp_path)
         runtime = original_build_core_runtime(config, workspace, http_resources, **kwargs)
         agent_loop = runtime.loop
         bus = runtime.bus
-        scheduler = runtime.scheduler
 
         async def _agent_loop_run():
-            return None
-
-        async def _scheduler_run():
             return None
 
         agent_loop.run = _agent_loop_run  # type: ignore[assignment]
@@ -489,8 +537,12 @@ async def test_serve_smoke_loads_config_and_runs_shutdown(monkeypatch, tmp_path)
             lambda *args, **kwargs: types.SimpleNamespace(run=_agent_loop_run),
         )
         monkeypatch.setattr(bus, "dispatch_outbound", _agent_loop_run)
-        scheduler.run = _scheduler_run  # type: ignore[assignment]
-        observed["scheduler"] = scheduler
+        assert runtime.plugin_manager is not None
+        monkeypatch.setattr(
+            runtime.plugin_manager,
+            "run_runtime_services",
+            _agent_loop_run,
+        )
         observed["bus"] = bus
         observed["http_resources"] = http_resources
         return runtime
@@ -510,7 +562,6 @@ async def test_serve_smoke_loads_config_and_runs_shutdown(monkeypatch, tmp_path)
     await main.serve(str(config_path), tmp_path)
 
     assert socket_path.exists() is False
-    assert "scheduler" in observed
     assert "bus" in observed
     assert cast(SharedHttpResources, observed["http_resources"]).closed is True
 
@@ -847,7 +898,6 @@ async def test_app_runtime_start_preserves_startup_error_when_rollback_fails(
         tools=object(),
         push_tool=object(),
         session_manager=object(),
-        scheduler=object(),
         provider=object(),
         light_provider=None,
         memory_runtime=types.SimpleNamespace(aclose=bootstrap_app._noop_async),

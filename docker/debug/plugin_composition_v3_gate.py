@@ -43,12 +43,11 @@ PROTOCOL_SOURCE_PATHS = (
     "agent/tools/events.py",
     "agent/tools/executor.py",
 )
-EXPECTED_PLUGIN_IDS = ("shell_restore", "shell_safety", "tool_loop_guard")
+EXPECTED_PLUGIN_IDS = ("shell_restore", "shell_safety")
 SCENARIO_PROFILE = "plugin-tool-v3-v1"
 EXPECTED_LISTENERS = (
     "transform:tool.input.prepare[akashic.tool-input.v1]:shell_restore",
     "serial:tool.execution.authorize[bail=akashic.tool-deny-reason.v1]:shell_safety",
-    "serial:tool.execution.authorize[bail=akashic.tool-deny-reason.v1]:tool_loop_guard",
 )
 ToolInvoker = Callable[[str, dict[str, Any]], Awaitable[Any]]
 
@@ -120,7 +119,7 @@ SCENARIO_CATALOG = (
     ),
     ScenarioCase("repeat-1", "repeat", "rm /tmp/repeat.txt", "success", True),
     ScenarioCase("repeat-2", "repeat", "rm /tmp/repeat.txt", "success", True),
-    ScenarioCase("repeat-3", "repeat", "rm /tmp/repeat.txt", "denied", False),
+    ScenarioCase("repeat-3", "repeat", "rm /tmp/repeat.txt", "success", True),
 )
 
 
@@ -318,8 +317,12 @@ async def _verify_composition(
             reset_runtime_snapshot(token)
             await lease.release()
 
-        if len(invocations) != 5:
-            raise RuntimeError(f"真实 invoker 调用次数错误: {len(invocations)}")
+        expected_invocations = sum(case.expected_invoked for case in SCENARIO_CATALOG)
+        if len(invocations) != expected_invocations:
+            raise RuntimeError(
+                "真实 invoker 调用次数错误: "
+                f"expected={expected_invocations} actual={len(invocations)}"
+            )
         result = topology.listeners, scenarios, invocations
     finally:
         await manager.terminate_all()
@@ -393,8 +396,6 @@ def _assert_scenario(
     elif case_id == "sudo-mode-denied":
         if "普通命令执行" not in str(result.output):
             raise RuntimeError(f"场景 {case_id} 未由 Safety 拒绝 sudo mode: {result.output}")
-    elif case_id == "repeat-3" and not str(result.output).startswith("tool_loop_guard:"):
-        raise RuntimeError(f"场景 {case_id} 未由 Loop Guard 拒绝: {result.output}")
 
 
 def _sha256(path: Path) -> str:

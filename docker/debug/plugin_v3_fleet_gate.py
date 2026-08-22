@@ -50,7 +50,6 @@ EXPECTED_PLUGIN_IDS = (
     "meme",
     "shell_restore",
     "shell_safety",
-    "tool_loop_guard",
     "calendar-mcp",
     "daynight_gate",
     "emotion",
@@ -156,7 +155,6 @@ E2E_CATALOG = (
         (
             "shell_restore",
             "shell_safety",
-            "tool_loop_guard",
             "calendar-mcp",
             "feed-mcp",
             "fitbit-mcp",
@@ -281,7 +279,7 @@ def _parse_args() -> argparse.Namespace:
 
 
 def _load_lock(path: Path) -> tuple[PluginLock, ...]:
-    """Strictly parse the exact 20-plugin fleet and its hard exclusions."""
+    """Strictly parse the exact locked plugin fleet and its hard exclusions."""
 
     raw = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(raw, dict) or set(raw) != {"schema_version", "plugins"}:

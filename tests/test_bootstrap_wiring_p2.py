@@ -118,7 +118,7 @@ def test_config_load_reads_wiring_block(tmp_path: Path):
                     "context": "default",
                     "memory": "default",
                     "memory_engine": "default",
-                    "toolsets": ["schedule", "mcp"],
+                    "toolsets": ["fixture", "mcp"],
                 },
             },
         },
@@ -128,10 +128,10 @@ def test_config_load_reads_wiring_block(tmp_path: Path):
 
     assert cfg.wiring.context == "default"
     assert cfg.wiring.memory == "default"
-    assert cfg.wiring.toolsets == ["schedule", "mcp"]
+    assert cfg.wiring.toolsets == ["fixture", "mcp"]
 
 
-@pytest.mark.parametrize("toolsets", ["schedule", [1, 2], ["schedule", ""]])
+@pytest.mark.parametrize("toolsets", ["fixture", [1, 2], ["fixture", ""]])
 def test_config_load_rejects_invalid_wiring_toolsets(
     tmp_path: Path,
     toolsets: object,
@@ -565,16 +565,12 @@ def test_build_registered_tools_respects_toolset_order_and_subset(
         lambda name, readonly_tools=None: _ToolsetProvider(name),
     )
     monkeypatch.setattr("bootstrap.tools.build_readonly_tools", lambda *_, **__: {})
-    monkeypatch.setattr(
-        "bootstrap.tools.build_scheduler",
-        lambda *_args, **_kwargs: SimpleNamespace(),
-    )
     config = ConfigModel(
         provider="openai",
         model="m",
         api_key="k",
         system_prompt="s",
-        wiring=WiringConfig(toolsets=["schedule", "mcp"]),
+        wiring=WiringConfig(toolsets=["fixture", "mcp"]),
     )
     build_registered_tools(
         config=config,
@@ -589,7 +585,7 @@ def test_build_registered_tools_respects_toolset_order_and_subset(
         agent_loop_provider=lambda: None,
     )
 
-    assert calls == ["memory", "schedule", "mcp"]
+    assert calls == ["memory", "fixture", "mcp"]
 
 
 def test_build_registered_tools_failure_preserves_external_session_store(
@@ -615,10 +611,6 @@ def test_build_registered_tools_failure_preserves_external_session_store(
         lambda name, readonly_tools=None: _FailingToolsetProvider(),
     )
     monkeypatch.setattr("bootstrap.tools.build_readonly_tools", lambda *_, **__: {})
-    monkeypatch.setattr(
-        "bootstrap.tools.build_scheduler",
-        lambda *_args, **_kwargs: SimpleNamespace(),
-    )
     store = SessionStore(tmp_path / "sessions.db")
     try:
         config = ConfigModel(
@@ -626,7 +618,7 @@ def test_build_registered_tools_failure_preserves_external_session_store(
             model="m",
             api_key="k",
             system_prompt="s",
-            wiring=WiringConfig(toolsets=["schedule"]),
+            wiring=WiringConfig(toolsets=["fixture"]),
         )
         with pytest.raises(RuntimeError, match="toolset registration failed"):
             build_registered_tools(
@@ -858,18 +850,14 @@ def test_build_registered_tools_without_mcp_toolset_still_returns_empty_registry
         ),
     )
     monkeypatch.setattr("bootstrap.tools.build_readonly_tools", lambda *_, **__: {})
-    monkeypatch.setattr(
-        "bootstrap.tools.build_scheduler",
-        lambda *_args, **_kwargs: SimpleNamespace(),
-    )
     config = ConfigModel(
         provider="openai",
         model="m",
         api_key="k",
         system_prompt="s",
-        wiring=WiringConfig(toolsets=["schedule"]),
+        wiring=WiringConfig(toolsets=["fixture"]),
     )
-    _, _, _, memory_runtime = build_registered_tools(
+    _, _, memory_runtime = build_registered_tools(
         config=config,
         workspace=tmp_path,
         http_resources=cast(Any, SimpleNamespace()),

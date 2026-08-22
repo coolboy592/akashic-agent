@@ -57,7 +57,8 @@ from agent.tool_runtime import (
     tool_call_batch_snapshot,
 )
 from agent.tools.base import normalize_tool_result
-from agent.tools.events import ToolExecutionRequest, ToolExecutionResult
+from agent.tools.events import ToolExecutionRequest, ToolExecutionResult, ToolGrant
+from agent.control.turn_scope import get_current_turn_scope
 from agent.tools.executor import ToolExecutor
 from agent.tools.registry import begin_turn_search_scope, end_turn_search_scope
 from agent.turns.outbound import OutboundDispatch, OutboundPort
@@ -242,13 +243,6 @@ def _phase_error_reason(phase: str) -> str:
         "before_reasoning": "before_reasoning_error",
         "reasoner": "provider_error",
     }[phase]
-
-
-def _is_tool_loop_guard_denial(exec_result: ToolExecutionResult) -> bool:
-    return (
-        exec_result.status == "denied"
-        and str(exec_result.output).startswith("tool_loop_guard:")
-    )
 
 
 def _disabled_tools_from_msg(msg: object) -> set[str]:
@@ -741,7 +735,7 @@ class PassiveTurnPipeline:
             )
             return outbound
 
-    # 供外部调用方（如 spawn completion）复用 AfterReasoning + dispatch 流程。
+    # 供已准入的外部消息复用 AfterReasoning + dispatch 流程。
     async def post_reasoning(
         self,
         msg: InboundMessage,
@@ -1245,6 +1239,13 @@ class DefaultReasoner(Reasoner):
             else None
         )
         disabled_tools = _disabled_tools_from_msg(msg)
+        turn_scope = get_current_turn_scope()
+        if turn_scope is not None:
+            disabled_tools |= {
+                name
+                for name in self._tools.get_registered_names()
+                if not turn_scope.tool_grant.allows(name)
+            }
         rollout_fact = str(
             (getattr(msg, "metadata", None) or {}).get("_plugin_rollout_fact", "")
         )
@@ -1256,6 +1257,8 @@ class DefaultReasoner(Reasoner):
                 + " 这是 Core 已核实的上一轮结果；请用自然语言告诉用户，"
                 "不要要求用户查询状态。",
             ]
+        if turn_scope is not None and turn_scope.prompt_hints:
+            extra_hints = [*(extra_hints or []), *turn_scope.prompt_hints]
         raw_turn_input_source = (getattr(msg, "metadata", None) or {}).get(
             "_control_turn_input_source"
         )
@@ -1452,6 +1455,7 @@ class DefaultReasoner(Reasoner):
                 reply="模型流响应中断，请刷新对话重试。",
                 context_retry=retry_trace,
             )
+
     async def run(
         self,
         initial_messages: list[dict],
@@ -1488,6 +1492,7 @@ class DefaultReasoner(Reasoner):
         react_usages: list[ModelUsage] = []
         react_finish_reasons: list[str | None] = []
         disabled = set(disabled_tools or set())
+        turn_scope = get_current_turn_scope()
         if compaction_state is None:
             raise RuntimeError("session compaction gate required")
         compactor = compaction_state.compactor
@@ -1793,12 +1798,21 @@ class DefaultReasoner(Reasoner):
                                 call_id=tool_call.id,
                                 tool_name=tool_call.name,
                                 arguments=tool_call.arguments,
-                                source="passive",
+                                source=(
+                                    turn_scope.tool_source
+                                    if turn_scope is not None
+                                    else "passive"
+                                ),
                                 session_key=tool_event_session_key,
                                 channel=tool_event_channel,
                                 chat_id=tool_event_chat_id,
                                 tool_batch=tool_batch,
                                 tool_batch_index=tool_batch_index,
+                                grant=(
+                                    turn_scope.tool_grant
+                                    if turn_scope is not None
+                                    else ToolGrant()
+                                ),
                             )
                         )
                         await self._observe_tool_call_started(
@@ -1810,86 +1824,6 @@ class DefaultReasoner(Reasoner):
                             tool_name=tool_call.name,
                             arguments=tool_call.arguments,
                         )
-                        if _is_tool_loop_guard_denial(exec_result):
-                            result = str(exec_result.output)
-                            append_tool_result(
-                                messages,
-                                tool_call_id=tool_call.id,
-                                content=result,
-                                tool_name=tool_call.name,
-                                execution_status=exec_result.status,
-                            )
-                            await self._observe_tool_call_completed(
-                                session_key=tool_event_session_key,
-                                channel=tool_event_channel,
-                                chat_id=tool_event_chat_id,
-                                iteration=iteration + 1,
-                                call_id=tool_call.id,
-                                tool_name=tool_call.name,
-                                arguments=tool_call.arguments,
-                                final_arguments=exec_result.final_arguments,
-                                status=exec_result.status,
-                                result_preview=support.log_preview(result),
-                            )
-                            iter_calls.append(
-                                {
-                                    "call_id": tool_call.id,
-                                    "name": tool_call.name,
-                                    "status": exec_result.status,
-                                    "arguments": tool_call.arguments,
-                                    "final_arguments": exec_result.final_arguments,
-                                    "result": result,
-                                }
-                            )
-                            for skipped in response.tool_calls[tool_batch_index + 1 :]:
-                                append_tool_result(
-                                    messages,
-                                    tool_call_id=skipped.id,
-                                    content="工具调用已因重复循环检测跳过。",
-                                    tool_name=skipped.name,
-                                    execution_status="skipped",
-                                )
-                            tool_chain.append(
-                                {"text": response.content, "calls": iter_calls}
-                            )
-                            compactor.record_completed_batch(
-                                messages,
-                                batch_start=batch_start,
-                            )
-                            summary, summary_usages = (
-                                await self._summarize_incomplete_progress(
-                                    messages,
-                                    reason="tool_call_loop",
-                                    iteration=iteration + 1,
-                                    tools_used=tools_used,
-                                    compaction_state=compaction_state,
-                                )
-                            )
-                            react_usages.extend(summary_usages)
-                            result = self._build_result(
-                                reply=summary,
-                                tools_used=tools_used,
-                                tool_chain=tool_chain,
-                                media=outbound_media,
-                                visible_names=visible_names,
-                                thinking=None,
-                                streamed=False,
-                                react_input_samples=react_input_samples,
-                                cache_prompt_tokens=react_cache_prompt_tokens,
-                                cache_hit_tokens=react_cache_hit_tokens,
-                                cache_seen=react_cache_seen,
-                                tools_unlocked=tools_unlocked,
-                                model_usages=react_usages,
-                                finish_reasons=react_finish_reasons,
-                                mobile_attention=mobile_attention,
-                            )
-                            await self._lock_turn_input_source(turn_input_source)
-                            await self._observe_output_completed(
-                                session_key=tool_event_session_key,
-                                channel=tool_event_channel,
-                                chat_id=tool_event_chat_id,
-                            )
-                            return result
                         logger.warning(
                             "[工具未解锁] LLM 尝试调用 '%s'，但该工具 schema 不可见，引导模型先 tool_search",
                             tool_call.name,
@@ -1937,9 +1871,7 @@ class DefaultReasoner(Reasoner):
                             internal_arguments["excluded_names"] = (
                                 visible_names | disabled
                             )
-                            max_schemas = _provider_max_tool_schemas(
-                                self._llm.provider
-                            )
+                            max_schemas = _provider_max_tool_schemas(self._llm.provider)
                             if max_schemas > 0:
                                 internal_arguments["max_unlocked"] = max_schemas - 1
                         if name == "message_push":
@@ -1947,6 +1879,11 @@ class DefaultReasoner(Reasoner):
                         return await self._tools.execute(
                             name,
                             arguments,
+                            tool_override=(
+                                turn_scope.tool_overrides.get(name)
+                                if turn_scope is not None
+                                else None
+                            ),
                             internal_arguments=internal_arguments,
                             raise_errors=True,
                         )
@@ -1979,12 +1916,21 @@ class DefaultReasoner(Reasoner):
                             call_id=tool_call.id,
                             tool_name=tool_call.name,
                             arguments=tool_call.arguments,
-                            source="passive",
+                            source=(
+                                turn_scope.tool_source
+                                if turn_scope is not None
+                                else "passive"
+                            ),
                             session_key=tool_event_session_key,
                             channel=tool_event_channel,
                             chat_id=tool_event_chat_id,
                             tool_batch=tool_batch,
                             tool_batch_index=tool_batch_index,
+                            grant=(
+                                turn_scope.tool_grant
+                                if turn_scope is not None
+                                else ToolGrant()
+                            ),
                         ),
                         _execute_tool,
                     )
@@ -2071,9 +2017,11 @@ class DefaultReasoner(Reasoner):
                                 )
                                 retained = _project_tool_order(
                                     [*always_on_order, *visible_order],
-                                    max(1, max_schemas - len(_newly_unlocked))
-                                    if max_schemas > 0
-                                    else 0,
+                                    (
+                                        max(1, max_schemas - len(_newly_unlocked))
+                                        if max_schemas > 0
+                                        else 0
+                                    ),
                                 )
                                 visible_order = _project_tool_order(
                                     [
@@ -2109,62 +2057,6 @@ class DefaultReasoner(Reasoner):
                             "result": normalized.preview(),
                         }
                     )
-                    if _is_tool_loop_guard_denial(exec_result):
-                        logger.warning(
-                            "[循环检测] 插件截断重复工具调用，进入收尾 (iteration=%d, tool=%s)",
-                            iteration + 1,
-                            tool_call.name,
-                        )
-                        for skipped in response.tool_calls[tool_batch_index + 1 :]:
-                            append_tool_result(
-                                messages,
-                                tool_call_id=skipped.id,
-                                content="工具调用已因重复循环检测跳过。",
-                                tool_name=skipped.name,
-                                execution_status="skipped",
-                            )
-                        tool_chain.append(
-                            {"text": response.content, "calls": iter_calls}
-                        )
-                        compactor.record_completed_batch(
-                            messages,
-                            batch_start=batch_start,
-                        )
-                        summary, summary_usages = (
-                            await self._summarize_incomplete_progress(
-                                messages,
-                                reason="tool_call_loop",
-                                iteration=iteration + 1,
-                                tools_used=tools_used,
-                                compaction_state=compaction_state,
-                            )
-                        )
-                        react_usages.extend(summary_usages)
-                        result = self._build_result(
-                            reply=summary,
-                            tools_used=tools_used,
-                            tool_chain=tool_chain,
-                            media=outbound_media,
-                            visible_names=visible_names,
-                            thinking=None,
-                            streamed=False,
-                            react_input_samples=react_input_samples,
-                            cache_prompt_tokens=react_cache_prompt_tokens,
-                            cache_hit_tokens=react_cache_hit_tokens,
-                            cache_seen=react_cache_seen,
-                            tools_unlocked=tools_unlocked,
-                            model_usages=react_usages,
-                            finish_reasons=react_finish_reasons,
-                            mobile_attention=mobile_attention,
-                        )
-                        await self._lock_turn_input_source(turn_input_source)
-                        await self._observe_output_completed(
-                            session_key=tool_event_session_key,
-                            channel=tool_event_channel,
-                            chat_id=tool_event_chat_id,
-                        )
-                        return result
-
                 # 7. 本轮工具执行完后，记录 tool_chain。
                 tool_chain_group = {"text": response.content, "calls": iter_calls}
                 if response.thinking is not None:

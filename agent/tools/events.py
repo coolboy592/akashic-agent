@@ -5,9 +5,14 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Literal, cast
 
-from agent.plugin_composition import ObserveEventKey, SerialEventKey, TransformEventKey
+from agent.control.turn_scope import ToolGrant, ToolSource
 
-ToolSource = Literal["passive", "proactive", "subagent"]
+from agent.plugin_composition.events import (
+    ObserveEventKey,
+    SerialEventKey,
+    TransformEventKey,
+)
+
 ToolStatus = Literal["success", "denied", "error"]
 
 
@@ -25,6 +30,7 @@ class ToolExecutionRequest:
     request_text: str = ""
     tool_batch: tuple[dict[str, Any], ...] = field(default_factory=tuple)
     tool_batch_index: int = 0
+    grant: ToolGrant = ToolGrant()
 
 
 def _empty_str_list() -> list[str]:

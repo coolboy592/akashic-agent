@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import logging
 import inspect
 import os
@@ -22,7 +21,6 @@ from agent.plugin_composition.channels import (
     ChannelCommitRole,
     ChannelDeliveryReceipt,
     ChannelTerminalStatus,
-    DeliveryStatus as ChannelDeliveryStatus,
     JsonValue,
     OutboundEnvelope,
 )
@@ -41,14 +39,12 @@ from agent.looping.ports import (
 from agent.provider import LLMProvider
 from agent.model_runtime.registry import ModelRegistry
 from agent.retrieval.default_pipeline import DefaultMemoryRetrievalPipeline
-from agent.scheduler import SchedulerService
 from agent.tools.base import ToolExecutionContext, get_current_tool_context
 from agent.tools.message_push import MessagePushTool
 from agent.tools.registry import ToolRegistry
 from agent.turns.outbound import OutboundPort, PushToolOutboundPort
 from bootstrap.toolsets.meta import build_readonly_tools
 from bootstrap.toolsets.protocol import ToolsetDeps
-from bootstrap.toolsets.schedule import build_scheduler
 from bootstrap.wiring import (
     wire_turn_lifecycle,
     resolve_context_factory,
@@ -56,7 +52,7 @@ from bootstrap.wiring import (
     resolve_toolset_provider,
 )
 from agent.lifecycle.facade import TurnLifecycle
-from bootstrap.providers import build_model_registry, build_providers, build_vl_provider
+from bootstrap.providers import build_model_registry
 from bootstrap.cleanup import run_cleanup_steps
 from bootstrap.workspace_lock import PluginPublicationLock
 from bus.event_bus import EventBus
@@ -95,14 +91,18 @@ async def _dispatch_v3_channel_push(
     binding = None
     try:
         catalog = source.snapshot.channel_catalog
-        registry = catalog.registry if catalog is not None else source.snapshot.channel_registry
-        descriptor = None if registry is None else next(
-            (
-                item
-                for item in registry.descriptors
-                if item.name == message.channel
-            ),
-            None,
+        registry = (
+            catalog.registry
+            if catalog is not None
+            else source.snapshot.channel_registry
+        )
+        descriptor = (
+            None
+            if registry is None
+            else next(
+                (item for item in registry.descriptors if item.name == message.channel),
+                None,
+            )
         )
         if descriptor is None:
             raise RuntimeError(
@@ -151,9 +151,7 @@ async def _dispatch_v3_channel_push(
                 metadata=cast(Mapping[str, JsonValue], message.metadata),
                 attachments=attachment_refs,
                 commit_role=(
-                    ChannelCommitRole.PASSIVE
-                    if passive
-                    else ChannelCommitRole.DIRECT
+                    ChannelCommitRole.PASSIVE if passive else ChannelCommitRole.DIRECT
                 ),
                 thinking=message.thinking,
                 reply_to=message.reply_to,
@@ -183,7 +181,6 @@ class CoreRuntime:
     tools: ToolRegistry
     push_tool: MessagePushTool
     session_manager: SessionManager
-    scheduler: SchedulerService
     provider: LLMProvider
     light_provider: LLMProvider | None
     memory_runtime: MemoryRuntime
@@ -208,12 +205,6 @@ class CoreRuntime:
     def bind_conversation_runtime(self, runtime: object) -> None:
         """Bind the unique ConversationRuntime before plugin job admission."""
 
-        host = self.background_job_host
-        if host is None:
-            return
-        bind = getattr(host, "bind_conversation_runtime", None)
-        if not callable(bind):
-            raise RuntimeError("BackgroundJob Host 缺少 ConversationRuntime binding")
         session_creator = getattr(
             self.session_manager.control_store,
             "create_session",
@@ -228,11 +219,25 @@ class CoreRuntime:
         )
         if not callable(session_reader):
             raise RuntimeError("Core SessionManager 缺少 programmatic session reader")
-        bind(
-            runtime,
-            programmatic_session_creator=session_creator,
-            programmatic_session_reader=session_reader,
-        )
+        manager = self.plugin_manager
+        if manager is not None:
+            manager.bind_conversation_runtime(
+                runtime,
+                programmatic_session_creator=session_creator,
+                programmatic_session_reader=session_reader,
+            )
+        host = self.background_job_host
+        if host is not None:
+            bind = getattr(host, "bind_conversation_runtime", None)
+            if not callable(bind):
+                raise RuntimeError(
+                    "BackgroundJob Host 缺少 ConversationRuntime binding"
+                )
+            bind(
+                runtime,
+                programmatic_session_creator=session_creator,
+                programmatic_session_reader=session_reader,
+            )
 
     async def start(self) -> None:
         """启动外部连接和插件扩展。"""
@@ -365,15 +370,7 @@ class CoreRuntime:
     async def stop(self) -> None:
         """按所有权逆序关闭核心运行时资源。"""
 
-        # 1. 将动态 spawn 工具和同步 session close 适配为异步清理步骤。
-        async def _stop_spawn() -> None:
-            spawn_tool = self.tools.get_tool("spawn")
-            shutdown = getattr(spawn_tool, "shutdown", None)
-            if callable(shutdown):
-                result = shutdown()
-                if inspect.isawaitable(result):
-                    await cast(Awaitable[object], result)
-
+        # 1. 将同步 session close 和 shell cleanup 适配为异步清理步骤。
         async def _stop_shell() -> None:
             shell_tool = self.tools.get_tool("shell")
             shutdown = getattr(shell_tool, "shutdown", None)
@@ -387,15 +384,16 @@ class CoreRuntime:
 
         # 2. 由统一 cleanup runner 完成全部步骤并保留失败。
         await run_cleanup_steps(
-            ("spawn.shutdown", _stop_spawn),
             ("shell.shutdown", _stop_shell),
             ("compaction.shutdown", self.loop.shutdown_compaction),
             ("event_bus.aclose", self.event_bus.aclose),
             (
                 "plugin_manager.terminate_all",
-                self.plugin_manager.terminate_all
-                if self.plugin_manager is not None
-                else _noop_async,
+                (
+                    self.plugin_manager.terminate_all
+                    if self.plugin_manager is not None
+                    else _noop_async
+                ),
             ),
             ("plugin_publication_lock.release", self._release_plugin_publication),
             ("session_manager.close", _close_session_manager),
@@ -422,12 +420,13 @@ def build_registered_tools(
     tools: ToolRegistry | None = None,
     event_publisher=None,
     agent_loop_provider: Callable[[], Any] | None = None,
-    tool_context_provider: Callable[[], ToolExecutionContext | None] = get_current_tool_context,
+    tool_context_provider: Callable[
+        [], ToolExecutionContext | None
+    ] = get_current_tool_context,
     restart_coordinator: "RestartCoordinator | None" = None,
 ) -> tuple[
     ToolRegistry,
     MessagePushTool,
-    SchedulerService,
     MemoryRuntime,
 ]:
     """按配置顺序构造并注册核心工具资源。"""
@@ -436,6 +435,7 @@ def build_registered_tools(
 
     # 1. 构造共享服务；外部传入的 session_store 和 http_resources 不转移 ownership。
     wiring = config.wiring
+    _ = agent_loop_provider
     tools = tools if tools is not None else ToolRegistry()
     multimodal = config.multimodal
     vl_available = not multimodal and config.vl_model != ""
@@ -464,11 +464,6 @@ def build_registered_tools(
         ),
     )
     memory_runtime = memory_result.extras["memory_runtime"]
-    scheduler = build_scheduler(
-        workspace,
-        push_tool,
-        agent_loop_provider=agent_loop_provider,
-    )
     # 2. 保持 wiring.toolsets 顺序注册。
     for name in wiring.toolsets:
         provider_obj = resolve_toolset_provider(
@@ -489,7 +484,6 @@ def build_registered_tools(
                 vl_model=config.vl_model,
                 bus=bus,
                 memory_engine=memory_runtime.engine,
-                scheduler=scheduler,
                 event_publisher=event_publisher,
             ),
         )
@@ -514,7 +508,6 @@ def build_registered_tools(
     return (
         tools,
         push_tool,
-        scheduler,
         memory_runtime,
     )
 
@@ -587,6 +580,7 @@ def _build_loop_deps(
         outbound_port=outbound_port,
     )
 
+
 def build_core_runtime(
     config: Config,
     workspace: Path,
@@ -617,20 +611,18 @@ def build_core_runtime(
         session_manager.clear_stale_admissions()
     bus.bind_mobile_session_admission_owner(session_manager)
     loop_ref: dict[str, AgentLoop] = {}
-    tools, push_tool, scheduler, memory_runtime = (
-        build_registered_tools(
-            config,
-            workspace,
-            http_resources,
-            bus=bus,
-            provider=provider,
-            light_provider=light_provider,
-            vl_provider=vl_provider,
-            session_store=session_manager._store,
-            event_publisher=event_bus,
-            agent_loop_provider=lambda: loop_ref.get("loop"),
-            restart_coordinator=restart_coordinator,
-        )
+    tools, push_tool, memory_runtime = build_registered_tools(
+        config,
+        workspace,
+        http_resources,
+        bus=bus,
+        provider=provider,
+        light_provider=light_provider,
+        vl_provider=vl_provider,
+        session_store=session_manager._store,
+        event_publisher=event_bus,
+        agent_loop_provider=lambda: loop_ref.get("loop"),
+        restart_coordinator=restart_coordinator,
     )
     presence = PresenceStore(session_manager._store)
     processing_state = ProcessingState()
@@ -682,8 +674,8 @@ def build_core_runtime(
     session_services = loop_deps.session_services
     if session_services is None:
         raise RuntimeError("AgentLoop 缺少 SessionServices")
-    session_services.outbound_attachment_importer = (
-        ChannelOutboundAttachmentImporter(channel_attachment_store)
+    session_services.outbound_attachment_importer = ChannelOutboundAttachmentImporter(
+        channel_attachment_store
     )
     plugin_manager = _PluginManager(
         plugin_dirs=_resolve_plugin_dirs(workspace),
@@ -694,7 +686,10 @@ def build_core_runtime(
         memory_engine=memory_runtime.engine,
         installed_cache_root=plugins_root() / "cache",
         channel_attachment_store=channel_attachment_store,
+        disabled_builtin_plugins=config.disabled_builtin_plugins,
     )
+    plugin_manager.bind_continuation_publisher(bus.publish_inbound)
+    plugin_manager.bind_delivery_sender(push_tool.dispatch)
     from agent.plugins.generation_activity_host import ActivityHost
     from agent.plugins.generation_job_host import BackgroundJobActivityAdapter
     from agent.plugins.generation_proactive_host import ProactiveActivityAdapter
@@ -742,7 +737,6 @@ def build_core_runtime(
         tools=tools,
         push_tool=push_tool,
         session_manager=session_manager,
-        scheduler=scheduler,
         provider=provider,
         light_provider=light_provider,
         agent_provider=agent_provider,
@@ -761,8 +755,6 @@ def _resolve_plugin_dirs(workspace: Path) -> list[Path]:
     roots = [project_root / "plugins"]
     extra = os.environ.get("AKASHIC_EXTRA_PLUGIN_DIRS", "")
     roots.extend(
-        Path(item).expanduser()
-        for item in extra.split(os.pathsep)
-        if item.strip()
+        Path(item).expanduser() for item in extra.split(os.pathsep) if item.strip()
     )
     return roots

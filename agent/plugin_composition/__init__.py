@@ -6,6 +6,7 @@ from agent.plugin_composition.context import (
     HealthHandle,
     Plugin,
 )
+from agent.control.turn_scope import ToolGrant, TurnExecutionScope
 from agent.plugin_composition.dashboard import DashboardContext
 from agent.plugin_composition.commands import (
     COMMANDS,
@@ -59,6 +60,19 @@ from agent.plugin_composition.session_read import (
     SESSION_READ,
     SessionReadService,
     SessionReadSnapshot,
+)
+from agent.plugin_composition.scoped_turns import PluginScopedTurns, SCOPED_TURNS
+from agent.plugin_composition.continuations import (
+    CONTINUATIONS,
+    PluginContinuations,
+)
+from agent.plugin_composition.deliveries import DELIVERIES, PluginDeliveries
+from agent.plugin_composition.timers import TIMERS, PluginTimers
+from agent.plugin_composition.runtime_lifecycle import (
+    RUNTIME_STARTED,
+    RUNTIME_STOPPING,
+    RuntimeStarted,
+    RuntimeStopping,
 )
 from agent.plugin_composition.interaction_undo import (
     INTERACTION_UNDO,
@@ -114,6 +128,7 @@ from agent.plugin_composition.tool_catalog import (
     PluginToolCatalog,
     PluginToolDefinition,
     PluginToolDescriptor,
+    PluginToolHandler,
     PluginTools,
     ToolRisk,
 )
@@ -259,6 +274,7 @@ __all__ = [
     "PluginToolCatalog",
     "PluginToolDefinition",
     "PluginToolDescriptor",
+    "PluginToolHandler",
     "PluginTools",
     "PluginUiSlots",
     "resolve_mobile_ui_asset",
@@ -291,11 +307,25 @@ __all__ = [
     "SessionReadSnapshot",
     "ServiceKey",
     "ServiceView",
+    "PluginScopedTurns",
+    "SCOPED_TURNS",
+    "CONTINUATIONS",
+    "PluginContinuations",
+    "DELIVERIES",
+    "PluginDeliveries",
+    "TIMERS",
+    "PluginTimers",
+    "RUNTIME_STARTED",
+    "RUNTIME_STOPPING",
+    "RuntimeStarted",
+    "RuntimeStopping",
     "SerialEventKey",
     "SyncTask",
     "StopReceipt",
     "TopologyFiberView",
     "TopologyView",
+    "ToolGrant",
+    "TurnExecutionScope",
     "TransformEventKey",
     "UI_SLOTS",
     "FetchItems",
