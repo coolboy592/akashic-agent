@@ -76,10 +76,59 @@ def test_static_manifest_is_import_free_and_exposes_runtime_policy(
     assert manifest.name == "calendar"
     assert manifest.version == "3.0.0"
     assert manifest.entrypoint == "plugin.py"
+    assert manifest.candidate_data_mode == "isolated_copy"
     assert manifest.requirements == ("mcp/requirements.txt",)
     assert manifest.python[0].runtime_root == "mcp"
     assert manifest.exclude_data_paths == (".env", "token.json")
     assert len(manifest.identity_digest) == 64
+
+
+def test_static_manifest_shared_read_is_validated_identity(tmp_path: Path) -> None:
+    root = tmp_path / "calendar"
+    (root / "mcp").mkdir(parents=True)
+    (root / "plugin.py").write_text("", encoding="utf-8")
+    (root / "mcp" / "requirements.txt").write_text("", encoding="utf-8")
+    manifest_path = root / "akashic.plugin.toml"
+    manifest_path.write_text(
+        _manifest().replace(
+            'entrypoint = "plugin.py"\n\n',
+            'entrypoint = "plugin.py"\ncandidate_data_mode = "shared_read"\n\n',
+        ),
+        encoding="utf-8",
+    )
+
+    shared = load_static_plugin_manifest(root)
+    manifest_path.write_text(_manifest(), encoding="utf-8")
+    isolated = load_static_plugin_manifest(root)
+
+    assert shared.candidate_data_mode == "shared_read"
+    assert isolated.candidate_data_mode == "isolated_copy"
+    assert shared.identity_digest != isolated.identity_digest
+
+
+@pytest.mark.parametrize(
+    "candidate_data_mode",
+    ['"writer_handoff"', "[]", "{}"],
+)
+def test_static_manifest_rejects_invalid_candidate_data_mode(
+    tmp_path: Path,
+    candidate_data_mode: str,
+) -> None:
+    root = tmp_path / "calendar"
+    (root / "mcp").mkdir(parents=True)
+    (root / "plugin.py").write_text("", encoding="utf-8")
+    (root / "mcp" / "requirements.txt").write_text("", encoding="utf-8")
+    (root / "akashic.plugin.toml").write_text(
+        _manifest().replace(
+            'entrypoint = "plugin.py"\n\n',
+            'entrypoint = "plugin.py"\n'
+            f"candidate_data_mode = {candidate_data_mode}\n\n",
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="candidate_data_mode"):
+        load_static_plugin_manifest(root)
 
 
 def test_static_manifest_freezes_channel_credential_paths_before_import(
@@ -185,8 +234,8 @@ readiness_path = "/health"
 name = "calendar"
 command = ["python", "mcp/run_mcp.py"]
 cwd = "mcp"
-required_tools = ["get_proactive_events"]
-candidate_read_only_tools = ["get_proactive_events"]
+required_tools = ["list_events"]
+candidate_read_only_tools = ["list_events"]
 endpoint_env = [{env = "PORT", process = "calendar_api"}]
 candidate_env = {CALENDAR_BACKEND = "recording"}
 """,

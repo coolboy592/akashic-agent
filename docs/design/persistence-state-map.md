@@ -30,7 +30,7 @@ Git repository / worktree
 Akashic <workspace>
 ├── 用户与 Agent 的对话：sessions.db、uploads/
 ├── 记忆：memory/*.md、memory2.db、akasha.db
-├── 自主运行：proactive.db、wake_proactive.db、drift/drift.db
+├── 旧主动岛保留数据：proactive.db、wake_proactive.db、drift/drift.db
 ├── 操作状态：schedules.json、proactive_quota.json
 ├── 插件运行数据：plugin-data/
 ├── 插件能力投影：skills/、drift/skills/ 软链接
@@ -92,19 +92,24 @@ workspace 仍不是完整运行环境的全部。模型 Provider credential 已�
 
 | 对象 | 正常增加 | 允许的原位或逻辑变化 | 允许物理减少的条件 |
 |---|---|---|---|
-| `proactive.db` | tick、step 和 delivery 证据持续 INSERT | session/delivery/cooldown 状态按 key UPSERT | 日志可以另定 retention；delivery dedupe、cooldown 和连续性状态必须恢复，不能随整库清理 |
-| `wake_proactive.db` | run、observation、reservoir event 和待 ack 记录增加 | hazard、context、drift、消费状态按状态机更新 | `pending_acknowledgements` 只在外部 ack 成功后由协议 owner 删除；ack、消费和 timer 状态必须恢复 |
+| `proactive.db` | H3 后当前 runtime 不再写；H2 historical decoder 只读旧 tick、step、delivery 与 continuity | 只有名称明确的 owner handoff 可以推进连续性；当前无写 owner | 不随代码升级清理；delivery dedupe、cooldown 和连续性状态在交接前阻止 activation |
+| `wake_proactive.db` | H3 后当前 runtime 不再写；H2 historical decoder 只读 runs、observations、hazard monitor，inventory 读取 active continuity | reservoir/ACK 只由目标 source adapter 交接；其余 continuity 当前无写 owner | 不随代码升级清理；未交接 ACK、tombstone、quarantine、消费、hazard/context/timer 状态阻止 activation |
 | `drift/drift.db` | run、step、journal 持续追加 | continuum、cursor、global note 和 self state 原位更新 | 日志可以另定 retention；cursor、journal 和下一轮选择所需状态必须恢复，不能按临时 trace 清空 |
 | `schedules.json` | 获授权的 add 创建 job | reschedule 更新同一 job；one-shot 执行完成或错过 grace 后保留为 `enabled=false` 逻辑终态；整份 JSON 以 candidate 原子替换 | 只有明确 cancel 操作可以移除 job；损坏文件不能解释成用户取消了全部任务 |
 | `proactive_quota.json` | 动作增加当前窗口计数 | 新窗口滚动时重置计数并更新当前状态 | 这是当前计数器的状态迁移，不是用户历史删除；损坏不得静默重置 |
-| `PROACTIVE_CONTEXT.md` | workspace 初始化时只在缺失时写入模板；Skill 可通过既有 owner 形成待合并内容 | 用户或获授权文件工具可以修改规则面板；v3 ActivityHost 仅可通过 `ProactiveDocuments` 的 invocation-bound paired intent，把获授权 merge 与 `proactive_pending.md` 同一恢复协议发布 | 当前没有 runtime 自动清空或删除协议；代码升级不得用默认模板覆盖已有内容；ActivityHost 失败只能从 pair intent 恢复 old bytes 或按已有 DB receipt forward-complete，不能回退默认模板 |
-| `proactive_pending.md` | Skill owner 追加待处理 proactive 内容 | v3 ActivityHost 仅可通过 `ProactiveDocuments` 与 `PROACTIVE_CONTEXT.md` 成对提交已授权 merge；成功后 pending 内容按 intent 固定的新 bytes 原子替换 | 只有对应 merge 的 DB receipt、pair terminal receipt 与两份文档最终 digest 一致时，才允许减少已合并 pending；失败/取消恢复 old bytes，无 receipt orphan 只清 staging、不改变正文 |
+| `PROACTIVE_CONTEXT.md` | H3 后初始化与 runtime 均不再创建或写入；H2 按 exact bytes/digest 只读归档 | 用户或获授权文件工具仍可修改既有文件；Wake archive consumer 未接通前 activation `BLOCK` | 当前没有自动清空或删除协议；代码升级不得用默认模板覆盖已有内容 |
+| `proactive_pending.md` | H3 后旧 paired-documents writer 已删除；H2 只盘点既有非空内容和 intents | 只有后续名称明确的目标领域 owner handoff 可以改变 | 非空 pending 或 active intent 在 owner 缺失时阻止 activation；代码升级不减少正文或 intent |
 | `plugin-data/` | 已激活插件在自己的 opaque 目录增加数据 | 由插件 schema 和 owner 决定 | 普通卸载只删除代码和能力投影，保留数据；永久删除必须使用名称不同的用户操作、影响预览、备份和再次确认 |
 | `runtime/plugin-reloads.sqlite3` | 每次热重载增加 transaction 与阶段事件；首次启动 candidate/formal runtime 前固定 old/new snapshot、old/new generation、base/candidate artifact pointer 与 `runtime_owner_boot_id`；已有 candidate 时 stable watchdog 加入同一 transaction，不另建 owner | 同一 transaction 按状态机更新 phase、failure resource、recovery target/action、单调 attempt 和 retry receipt；failure 只允许 `cleanup_failed → degraded` 单调强化且 target 不可覆盖，终态只能由 exact Host retry 成功后收束；同 boot 不做进程清理，新 supervised boot 只按已记录 old boot ID 恢复 | 当前没有自动 retention；恢复和事故审计仍依赖的记录不得自动删除，artifact/Host tombstone 只在对应 retry receipt 成功后减少 |
 | `runtime/plugin-jobs/outcomes.sqlite` | generation-scoped plugin job 首次 admission INSERT semantic job/event/interval identity、exact snapshot/plugin/model generation、artifact/source/handler/lifecycle identity 与 queued 状态 | 同一 invocation 只按 queued→running→terminal/retry_pending 状态机更新 attempt、phase（handler/provider/documents）、error 与 result digest；跨 generation redelivery 复用同一 semantic key，不新建第二次 effect；documents phase 只由 ActivityHost forward recovery | 当前没有自动 retention；这是 event dedupe、取消与 crash recovery 证据，普通插件卸载、重载或日志清理不得删除。workspace 备份应以 SQLite online backup + integrity_check 保存；只有后续名称明确的 retention/插件数据管理操作可减少 |
+| `runtime/deliveries/settlements.sqlite` | Core 为每个 accepted Turn INSERT 一条 immutable delivery envelope 与 stable logical id | 只按 `prepared → provider_started → delivered → projected → settled` 前向更新 exact binding、provider receipt、Session message 与 opaque domain receipt；provider 调用中断进入 `uncertain`，明确拒绝进入 `rejected`；候选只读检查 `prepared/delivered/projected` 的 target service 仍可解析 | 当前没有 DELETE 或自动 retention；Core ledger 是 provider effect、Session projection 与领域 settle 的恢复证据。备份应覆盖数据库、WAL/SHM 并使用 SQLite online backup + `integrity_check`；只有后续名称明确的 delivery retention 操作可以减少 |
 | `runtime/proactive-documents/intents/<invocation-id>/` | `ProactiveDocuments.prepare_pair()` 在 DB effect 前创建，保存两份 old state（bytes 或 absent marker）、完整 new bytes、expected digest、idempotency key 与 fsync receipt | 无 DB receipt 时只允许 abort 并保持正文原状态；有 DB receipt 时只允许 ordered replace/forward recovery；partial replace 依据 old bytes 恢复两份原始状态 | commit/abort terminal receipt、目标 digest 与目录 fsync 均完成后才能删除该 intent；启动恢复不得按年龄猜测 orphan。workspace 备份必须与 outcomes.sqlite、两份 Markdown 一起覆盖该目录 |
 | `runtime/plugin-rollout-fact.json` | turn 后 install/uninstall 产生一条待反馈事实 | 新结果原子替换尚未消费的旧事实 | 下一次非 programmatic 用户 turn 注入后删除；它是可重建反馈，不是会话或长期记忆 |
 | `runtime/plugin-skill-links.json` | legacy adoption 或首次插件 Skill/Drift skill 投影时创建 ownership registry；每次链接切换先原子写入含 old/new 的 pending journal | 目录项切换后原子提交 `links` 并清除对应 pending；进程重启只在实际链接仍等于 old 或 new 时收敛，用户文件、未登记软链接和第三种状态 fail-loud | 只有插件 disable/uninstall 或 generation 切换的 linker owner 可以删除已登记且 target 匹配的投影链接并移除对应 ownership；不得删除用户文件、普通目录、未登记链接或外部 canonical source。registry 是重建与恢复证据，当前没有整文件自动删除协议 |
+
+H4 后 Core 配置、Setup、Prompt、Dashboard 与 Mobile Runtime Inspection 均不再读取旧主动岛状态。
+任意空或非空 `[proactive]` 在打开 workspace-backed Model Registry 前失败；这只删除代码入口，
+不授权修改上述旧数据库、Markdown、quota 或 plugin-data。
 | `migrations.sqlite3` | Yoyo 在 migration step 成功后记录唯一 migration ID | 已应用回执保持不变；新增迁移只追加新的成功回执 | runtime 没有删除或回滚回执权限；只随用户明确删除整个 workspace 而减少，恢复依赖 workspace 备份与 SQLite 完整性检查 |
 | `model-registry.sqlite3` | onboarding 或设置事务增加含 credential payload 的 connection、model 和 role binding，并增加单调 revision；`model_definitions.context_window`/`max_output_tokens` 与各自 source 保存模型 capability snapshot | connection 的 key/token、Base URL、模型字段和角色绑定可原位更新；Codex token refresh 不增加模型 revision，其余成功模型事务增加 revision，旧 execution generation 只在 lease 归零后失效。预算 owner 只读取当前 generation 的 `context_window`、`max_output_tokens` 及字段来源；遗留 `effective_context_percent`/`compaction_trigger_percent` 列仅为 v1 schema identity 保留，完全惰性，不是配置或 capability source | 只有独立模型/来源删除操作可以减少；被 role 或 session 引用时必须拒绝，普通模型切换不得 cascade；数据库、WAL/SHM 与备份均按 secret 使用 `0600` |
 | `data/mobile/master-keys.json` | 文件型密钥 provider 初始化或轮换时追加随机 master key；离线迁移可按既有 ID 导入同一密钥 | 完整集合以 `0600` 原子替换发布；同 ID 同内容导入幂等，不同内容 fail-loud；旧 key 继续支持历史 keyset 回滚 | 当前没有自动删除协议；只能由名称明确的移动身份重置或密钥退役操作在备份、引用扫描和恢复验证后减少；Mobile key store owner 与 keyset manifest 提供恢复证据 |
@@ -217,11 +222,11 @@ workspace 之外还有两组明确的全局状态：
 │   └── staging/                         未提交候选；可证明 orphan 后才清理
 ├── sessions/                         目前只创建目录，未找到生产写入者
 ├── schedules.json
-├── PROACTIVE_CONTEXT.md
-├── proactive_pending.md
-├── proactive.db
-├── wake_proactive.db                 Wake runtime 启用时
-├── proactive_quota.json              default proactive AnyAction 启用时
+├── PROACTIVE_CONTEXT.md              旧安装可保留；新 init 不创建
+├── proactive_pending.md              旧安装可保留；H2 只读盘点
+├── proactive.db                      旧安装可保留；H2 只读
+├── wake_proactive.db                 旧安装可保留；H2 只读/交接
+├── proactive_quota.json              旧安装可保留；无目标 owner 时 BLOCK
 ├── uploads/
 ├── plugin-data/
 │   ├── default_memory-builtin/
@@ -262,6 +267,7 @@ workspace 之外还有两组明确的全局状态：
 ├── runtime/
 │   ├── plugin-reloads.sqlite3         插件热重载事务与恢复阶段
 │   ├── plugin-jobs/outcomes.sqlite    插件 background job 幂等与恢复状态
+│   ├── deliveries/settlements.sqlite  通用 delivery、provider、Session projection 与领域 settle
 │   ├── proactive-documents/
 │   │   └── intents/<invocation-id>/   paired Markdown old/new bytes 与恢复回执
 │   ├── plugin-rollout-fact.json       下一用户 turn 消费的一条派生结果
@@ -275,7 +281,7 @@ workspace 之外还有两组明确的全局状态：
 └── akashic.sock                       Unix 控制面启用时
 ```
 
-`bootstrap/init_workspace.py` 只预创建基础 Markdown（包括缺失时的 `memory/VEDA.md`）、`schedules.json`、`memes/manifest.json`、目录、`sessions.db`、`consolidation_writes.db`、`proactive.db` 和当前 memory engine 声明的存储。新安装不创建 `memory/RECENT_CONTEXT.md`；已有 Veda 即使在 `init --force` 下也不覆盖；`wake_proactive.db`、quota、附件、诊断记录和部分插件文件按功能首次使用时创建。
+`bootstrap/init_workspace.py` 只预创建基础 Markdown（包括缺失时的 `memory/VEDA.md`）、`schedules.json`、`memes/manifest.json`、目录、`sessions.db`、`consolidation_writes.db` 和当前 memory engine 声明的存储。新安装不创建 `memory/RECENT_CONTEXT.md`、`PROACTIVE_CONTEXT.md` 或 `proactive.db`；已有这些旧文件即使在 `init --force` 下也不覆盖或删除。附件、诊断记录和插件私有文件按对应普通能力首次使用时创建。
 
 ## 7. 会话、消息与附件
 
@@ -283,7 +289,7 @@ workspace 之外还有两组明确的全局状态：
 
 | 表 | 写入 owner | 上层使用者 | 代码事实 |
 |---|---|---|---|
-| `sessions` | `session.store.SessionStore`，由 `SessionManager` 协调 | channel、AgentLoop、presence、dashboard | session metadata、时间、高水位和当前 compaction generation |
+| `sessions` | `session.store.SessionStore`，由 `SessionManager` 协调 | channel、AgentLoop、`session.activity.PresenceStore`、dashboard | session metadata、时间、高水位和当前 compaction generation |
 | `channel_identities` | `SessionStore` 原子事务，由 `SessionManager`/Core Channel Host 协调 | v3 channel inbound 与 proactive recipient resolve | `(channel, identity)` 唯一 durable recipient；legacy Session metadata 只作一次性迁移输入，显式 Session 删除由同一审计事务级联并可从整库 backup 恢复 |
 | `channel_identity_migrations` | `SessionStore` | v3 channel identity rebuild | 每个 channel 的一次性 migration marker；identity 表删除到空也禁止重新扫描 legacy metadata |
 | `session_compactions` | `session.store.SessionStore`，由 Core checkpoint owner 请求 | prompt replay、Markdown reconciliation、删除恢复 | append-only generation lineage、source provenance、retained tail、summary、usage 和失效状态 |
@@ -316,9 +322,9 @@ workspace 之外还有两组明确的全局状态：
 
 | 文件 | 写入 owner | 当前用途 | 状态性质 |
 |---|---|---|---|
-| `memory/MEMORY.md` | `MemoryOptimizer` 通过 `MarkdownMemoryStore` 重写 | 稳定用户档案，进入 prompt | 人类可读长期事实 |
-| `memory/SELF.md` | `MemoryOptimizer` | Akashic 自我认知，进入 prompt | 人类可读长期事实 |
-| `memory/VEDA.md` | Main Agent 仅响应用户明确指令；`main.py veda-reset` 是独立恢复 owner | Main、Proactive、Drift 每次组装 prompt 时读取的人格真源 | 用户可维护的权威人格状态 |
+| `memory/MEMORY.md` | `core.memory.optimizer.MemoryOptimizer` 通过 `MarkdownMemoryStore` 重写 | 稳定用户档案，进入 prompt | 人类可读长期事实 |
+| `memory/SELF.md` | `core.memory.optimizer.MemoryOptimizer` | Akashic 自我认知，进入 prompt | 人类可读长期事实 |
+| `memory/VEDA.md` | Main Agent 仅响应用户明确指令；`main.py veda-reset` 是独立恢复 owner | React 链路与已安装插件按各自生命周期读取的人格真源 | 用户可维护的权威人格状态 |
 | `memory/PENDING.md` | consolidation 追加，optimizer 消费 | 待归档事实队列 | 事务中的 canonical 输入 |
 | `memory/RECENT_CONTEXT.md` | 旧安装遗留文件；新运行时无 writer/reader | 不再进入 prompt、proactive、Wake 或 Drift | 只由最后阶段 R06 带备份、校验并归档删除 |
 
@@ -360,7 +366,7 @@ Akasha V2 保存 turn 指针、稀疏特征、engram hub、有向关系、activa
 
 ### 9.1 `proactive.db`
 
-`ProactiveStateStore` 由 `bootstrap/proactive.py` 构造，保存：
+H3 前的 `ProactiveStateStore` 由 `bootstrap/proactive.py` 构造并保存以下表；H3 后生产 runtime 不再实例化 writer，H2 只读 decoder/inventory 继续解释旧库：
 
 - `deliveries`：按 session 和 delivery key 去重的已发送时间。
 - `session_state`：last tick、delivery、drift、context-only 等 session 级时间状态。
@@ -372,16 +378,21 @@ Akasha V2 保存 turn 指针、稀疏特征、engram hub、有向关系、activa
 
 ### 9.2 `wake_proactive.db`
 
-`WakeStateStore` 保存：
+H3 前的 `WakeStateStore` 保存以下表；H3 后旧 writer 已删除，H2 只读 decoder 与 owner handoff 继续处理已有库：
 
-- `wake_runs`、`wake_observations`：一次 wake 的调查、消息和输入证据。
+- `wake_runs`、`wake_observations`：一次 wake 的调查、消息和输入证据；只用于历史读取。
 - `reservoir_events`：未读/已消费 source event 与 embedding。
-- `hazard_state`、`hazard_monitor`：唤醒压力和最近 wake 状态。
+- `reservoir_quarantine`、`reservoir_tombstones`：无效输入的有界诊断连续性，以及成功 expire ACK 后防止相同 identity 重收的连续性。
+- `hazard_state`：下一轮唤醒计算读取的压力与最近 wake 状态。
+- `hazard_monitor`：Dashboard 和只读诊断消费的最近计算观测；runtime 下一轮不把它作为决策输入。
 - `context_state`、`context_reevaluate_state`：外部上下文及重评节流。
 - `drift_state`：每个 session 的 drift 计时与重复指纹。
 - `pending_acknowledgements`：尚未成功回写外部 source 的 ack 队列。
 
-**F-009：** 该库含 pending ack、消费状态和计时器。它不是只影响 dashboard 的可丢弃缓存；丢失可能造成重复消费、漏 ack 或行为时间线重置。
+**F-009：** 该库含 pending ack、tombstone、quarantine、消费状态、hazard/context 和计时器。
+这些连续性表不是只影响 dashboard 的可丢弃缓存；丢失可能造成重复摄入、重复消费、漏 ack 或
+行为时间线重置。`wake_runs`、`wake_observations` 与 `hazard_monitor` 可以走只读历史投影，但这不
+授权物理删除原表或把其余表解释为历史。
 
 ### 9.3 `drift/drift.db`
 
@@ -400,6 +411,15 @@ Akasha V2 保存 turn 指针、稀疏特征、engram hub、有向关系、activa
 - `proactive_quota.json` 由 `QuotaStore` 保存每日窗口、已用次数和最后动作时间。损坏不会静默重置。
 
 **F-011：** 两者都会决定重启后的外部行为。它们是体积很小但不能随意丢弃的操作状态。
+
+### 9.5 v3 Content 与通用 delivery
+
+- `plugin-data/content-builtin/content.sqlite3` 由 Content 插件拥有。source submit 追加 revision 与 batch receipt；Wake 只把 selected item 前向变成 `ready_for_delivery`；`CONTENT_DELIVERY` 只暴露无正文 pending/lookup，并以一个 stable settlement ref 幂等提交 `delivered` 或 `settled`。
+- `runtime/deliveries/settlements.sqlite` 由 Core 拥有。Core 不读取 Content DB，也不持有 Content closure；它只保存通用 envelope、exact channel attempt/receipt、Session projection message id 和 opaque Content receipt。
+- Wake 是普通组合 owner：先让 Core 到 `projected`，再让 Content settle，最后把 Content 的稳定 receipt 交回 Core confirm。两库之间不宣称原子事务；任一崩溃窗口都只向前补尚未完成的一步。
+- `rejected` 与 `uncertain` 是可观察终态，不自动重发、不投影 Session、不消费 Content。source-bound ACK 失败只保留 Content `delivered`，由该 source 的 `unsettled/ack` 窄口重试，不重做 Turn 或 provider delivery。
+
+**F-012：** provider effect、Session message 和 Content settle 各有唯一 owner。候选 generation 不能移除仍被 `prepared/delivered/projected` ledger row 引用的 target service；`settled/rejected/uncertain` 不形成该发布 fence。
 
 ## 10. 插件数据与 Skill/MCP 能力发布
 

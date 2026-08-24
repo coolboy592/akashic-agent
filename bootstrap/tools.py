@@ -24,6 +24,11 @@ from agent.plugin_composition.channels import (
     JsonValue,
     OutboundEnvelope,
 )
+from agent.plugin_composition.durable_deliveries import (
+    DurableBindingAttempt,
+    DurableDeliveryRequest,
+    ProviderStarted,
+)
 from agent.plugins.manifest import plugins_root
 from agent.plugins.snapshot import lease_current_runtime_snapshot
 from agent.context import ContextBuilder
@@ -67,7 +72,7 @@ from bus.processing import ProcessingState
 from bus.queue import MessageBus
 from core.memory.runtime import MemoryRuntime
 from core.net.http import SharedHttpResources
-from proactive_v2.presence import PresenceStore
+from session.activity import PresenceStore
 from session.manager import SessionManager
 
 
@@ -166,6 +171,83 @@ async def _dispatch_v3_channel_push(
             ),
             binding,
             passive=passive,
+        )
+    finally:
+        await binding.aclose()
+
+
+async def _dispatch_v3_durable_delivery(
+    plugin_manager: PluginManager,
+    bus: MessageBus,
+    request: DurableDeliveryRequest,
+    provider_started: ProviderStarted,
+) -> ChannelDeliveryReceipt:
+    """Persist one exact binding attempt before its direct provider dispatch."""
+
+    # 1. Resolve and retain the same committed Channel boundary as ordinary sends.
+    source = lease_current_runtime_snapshot()
+    if source is None:
+        source = await plugin_manager.snapshot_store.acquire()
+    binding = None
+    try:
+        catalog = source.snapshot.channel_catalog
+        registry = (
+            catalog.registry
+            if catalog is not None
+            else source.snapshot.channel_registry
+        )
+        descriptor = (
+            None
+            if registry is None
+            else next(
+                (item for item in registry.descriptors if item.name == request.channel),
+                None,
+            )
+        )
+        if descriptor is None:
+            raise RuntimeError(
+                f"committed Channel catalog 缺少目标渠道: {request.channel!r}"
+            )
+        binding = plugin_manager.channel_generation_host.acquire_binding(
+            source, request.channel
+        )
+    finally:
+        try:
+            await source.release()
+        except BaseException:
+            if binding is not None:
+                await binding.aclose()
+            raise
+
+    # 2. Freeze the exact binding; MessageBus commits provider_started at its adapter edge.
+    if binding is None:
+        raise RuntimeError("durable delivery exact Channel binding 未建立")
+    try:
+        attempt = DurableBindingAttempt(
+            attempt_id=request.logical_delivery_id,
+            snapshot_id=binding.snapshot_id,
+            generation_id=binding.generation_id,
+            binding_token=binding.binding_token,
+        )
+        envelope = OutboundEnvelope(
+            logical_delivery_id=request.logical_delivery_id,
+            delivery_id=request.logical_delivery_id,
+            attempt_sequence=1,
+            snapshot_id=binding.snapshot_id,
+            generation_id=binding.generation_id,
+            binding_token=binding.binding_token,
+            channel=request.channel,
+            recipient=request.recipient,
+            body=request.body,
+            metadata=cast(Mapping[str, JsonValue], request.metadata),
+            commit_role=ChannelCommitRole.DIRECT,
+            control_turn_id=request.accepted_turn.turn_id,
+        )
+        return await bus.publish_channel_outbound_awaited(
+            envelope,
+            binding,
+            passive=False,
+            before_provider=lambda: provider_started(attempt),
         )
     finally:
         await binding.aclose()
@@ -690,27 +772,24 @@ def build_core_runtime(
     )
     plugin_manager.bind_continuation_publisher(bus.publish_inbound)
     plugin_manager.bind_delivery_sender(push_tool.dispatch)
+    plugin_manager.bind_durable_delivery_sender(
+        lambda request, provider_started: _dispatch_v3_durable_delivery(
+            plugin_manager,
+            bus,
+            request,
+            provider_started,
+        )
+    )
     from agent.plugins.generation_activity_host import ActivityHost
     from agent.plugins.generation_job_host import BackgroundJobActivityAdapter
-    from agent.plugins.generation_proactive_host import ProactiveActivityAdapter
-    from agent.plugins.generation_private_proactive_host import (
-        PrivateProactiveHost,
-    )
 
-    proactive_activity = ProactiveActivityAdapter(
-        plugin_manager.composition_generation_host,
-    )
     background_jobs = BackgroundJobActivityAdapter(
-        event_bus,
         plugin_manager.snapshot_store,
         model_provider=provider,
         model_registry=model_registry,
         workspace=str(workspace),
     )
-    private_proactive = PrivateProactiveHost(config.proactive.lifecycle)
-    plugin_manager.bind_activity_host(
-        ActivityHost((proactive_activity, private_proactive, background_jobs))
-    )
+    plugin_manager.bind_activity_host(ActivityHost((background_jobs,)))
     bus.bind_channel_outbound_dispatcher(
         plugin_manager.channel_generation_host.dispatch_outbound
     )

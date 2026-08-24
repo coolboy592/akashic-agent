@@ -161,6 +161,135 @@ python docker/debug/restart_probe.py --soak
 MCP handshake/readiness、进程/stdio cleanup 和无残留资源；不能用旧 workspace MCP probe
 替代 v3 插件 Gate。
 
+## Content / Wake / Drift 真实插件互操作 Gate
+
+`content_source_interop_gate.py` 不复制 Calendar、Fitbit、Feed、Steam、Emotion 或 Observe
+实现。它先把调用方提供的 canonical checkout 与 exact lock 对账，再运行 Core 已有的
+Content/Wake/Drift/Session 组合 fixture，最后在每个插件自己的目录运行其原样 fixture。
+因此修改一个插件的业务模型只需要更新该插件与 exact revision，不会给 Core 增加来源分支。
+
+```text
+exact lock ──► checkout SHA/manifest/no old seam
+                         │
+                         ├─► Core owned composition fixtures
+                         └─► plugin owned domain/reload/ACK fixtures
+```
+
+每个 root 必须显式绑定。完整行为 Gate 还要求每个插件显式绑定它实际安装依赖的
+测试 Python；Gate 会运行受控探针并在 receipt 记录 executable realpath 与 Python 版本，
+不会悄悄借用 Core Python：
+
+```bash
+python docker/debug/content_source_interop_gate.py \
+  --plugin-root calendar=/absolute/calendar-checkout \
+  --plugin-root fitbit=/absolute/fitbit-checkout \
+  --plugin-root feed=/absolute/feed-checkout \
+  --plugin-root steam=/absolute/steam-checkout \
+  --plugin-root github-watch=/absolute/github-watch-checkout \
+  --plugin-root proactive_feedback=/absolute/proactive-feedback-checkout \
+  --plugin-root emotion=/absolute/emotion-checkout \
+  --plugin-root observe=/absolute/observe-checkout \
+  --plugin-python calendar=/absolute/calendar-python \
+  --plugin-python fitbit=/absolute/fitbit-python \
+  --plugin-python feed=/absolute/feed-python \
+  --plugin-python steam=/absolute/steam-python \
+  --plugin-python github-watch=/absolute/github-watch-python \
+  --plugin-python proactive_feedback=/absolute/proactive-feedback-python \
+  --plugin-python emotion=/absolute/emotion-python \
+  --plugin-python observe=/absolute/observe-python
+```
+
+默认 pending 调查会让 Gate 非零；开发期间只核对已完成 revision 可使用
+`--identity-only --allow-pending`，`--allow-pending` 不能放宽完整行为 Gate。GitHub Watch
+在这个 Core Gate 中只证明真实插件可以 mount/activate 且 Content mailbox 完整逻辑状态零变化；
+BACKGROUND_JOBS 的 dispatch、ledger 和失败不重放由 GitHub Watch 自己的 exact fixture 证明。
+`cross_repo` 套件只声明参与的 exact plugin ids、fixture 和显式 Python；runner 不包含插件
+业务分支。当前 PF→Emotion fixture 用真实 `CompositionRoot` 按两种 mount 顺序分别执行
+普通 follow-up 与 explicit quote，证明 accepted history 在提交当轮不被 Emotion 抢读，只由
+下一个普通 Timer tick 拉取一次；普通 scoring 仅把 embedding provider 换成确定性测试边界。
+报告写入
+`docker/debug/reports/content-source-interop/gate.json`，不读取或写入正式 workspace。
+
+## Content / Wake H5 组合证据
+
+`content_wake_h5_e2e.py` 不实现插件或 runtime 行为。它只在一个显式的一次性 root 中，按顺序
+调用正式 `plugin-install-trusted-batch`、Content source interoperability Gate 和 manifest
+列出的既有 pytest fixture，并把各 owner 报告的路径、SHA-256 与状态组合为
+`reports/h5-index.json`：
+
+```bash
+python docker/debug/content_wake_h5_e2e.py \
+  --run-root /absolute/new/h5-run \
+  --protected-workspace /absolute/empty/protected-fixture \
+  --seed-protected-fixture
+```
+
+`run-root` 必须尚不存在；runner 在其中创建 `workspace/`、`plugin-home/`、`reports/` 和
+`home/`。插件 root 只取 trusted batch 回执中的 `installedPath`，revision 只取
+`content-source-interop.lock.json`。显式 `--seed-protected-fixture` 只接受空的隔离目录，并写入
+带一行数据的 `sessions.db`、旧 proactive/wake/drift DB 与历史 Markdown/JSON；不复制正式数据。
+不使用 seed 时，调用者也必须提供至少包含非空 Session、旧 proactive DB 和 archive 的 fixture，
+空 protected target 会在安装前失败。runner 复用 Wake provider 的快照，对账 path、inode、hash、
+size、SQLite integrity/quick_check/row counts，前后不相等时本次组合失败。owner pytest 由
+Core dev Python 运行，实际插件 service 只通过 `AKASHIC_PLUGIN_FIXTURE_PYTHON` 使用回执中的
+artifact runtime；一次性 root 内固定版本的 pytest layer 仅验证 artifact 隔离，不进入 owner
+fixture，Core site-packages 不会暴露给插件 service 解释器。
+真实 DeepSeek 命令只作为 `PENDING` 项进入 index；没有单独授权时 runner 不调用外部 provider。
+生成的证据留在一次性 root，不提交进 Git。
+
+## Wake v3 真 provider E2E
+
+`wake_v3_provider_e2e.py` 只把临时目录当作测试 data root，并通过正式
+`PluginManager → CompositionRoot → ConversationRuntime → execute_control_turn → AgentLoop.react`
+安装链运行 Content、Drift、Wake、普通 Content source fixture 和普通 recording Channel。
+它不调用 `init_workspace`，也不把 production workspace 复制进沙盒。
+
+```text
+fixture source ── Timer ──▶ content.source.v1 submit
+                                  │
+                                  ▼
+                         Wake scoped Turn ──▶ AgentLoop.react
+                                  │
+                                  ▼
+ recording Channel ◀── durable delivery ◀── provider response
+          │                       │
+          └── receipt ──▶ Session projection ──▶ Content settle ──▶ source ACK
+```
+
+真实 selected case 固定使用 `deepseek-v4-flash`。runner 先用正式 `load_config → build_providers
+→ LLMProvider.from_runtime` 语义组装 `context_window/reasoning_effort/enable_thinking/max_output`
+和 system prompt 边界；caller 已组合 system message 时仍由 `react` 的消息占优，不重复注入。
+credential 只从进程环境读取；可选 endpoint 在 validated config 后只做内存替换，不写入临时
+TOML 或报告。运行前先完成确定性的 settlement crash/restart、
+ACK retry、quiet 和 empty-poll 检查，之后才允许一次真实 logical provider request：
+
+```bash
+PR_G_DEEPSEEK_API_KEY='...' \
+python docker/debug/wake_v3_provider_e2e.py \
+  --protected-workspace /absolute/formal/workspace \
+  --report /tmp/wake-v3-provider-e2e.json
+```
+
+可选自定义 provider 地址使用 `PR_G_DEEPSEEK_BASE_URL`。报告不会包含 prompt、response
+正文、secret 或 endpoint；只保留计数、状态和 identity digest。缺少 secret、provider
+非 2xx、identity 不一致或未 settled 都会返回非零。
+protected workspace 检查包括 `sessions.db` 与旧 proactive island 目标文件的 hash/size、
+SQLite integrity/row counts 和旧 island archive hash/size；整个检查只读。
+
+正式 runtime 可能在 E2E 期间自行推进旧 island。runner 因此先连续读取两份 baseline，
+随后分别报告 isolated 产品链与 formal deployment evidence：若 formal target 在窗口内变化，
+结果标为 `formal_concurrent_change`，只列 changed path/type/count，不把外部并发写误判成
+E2E 写入，也不宣称 formal unchanged。严格 digest 只在 baseline 稳定且 after 完全相等时
+设置 `deployment_gate_verified=true`。失败报告只增加固定 `failure_stage/failure_code`，仍不
+包含异常正文、prompt、response、credential 或 endpoint。即使 provider 或 selected 链失败，
+runner 也会在临时 data root 删除前读取 logical/HTTP/provider terminal/Control Turn/
+delivery/Channel/Session/Content/ACK 计数和 identity digest，再执行 formal-after 快照。
+Control Turn 只报告 status、retryable 分类和 error type digest，不保留 error message。
+非流式 provider 的 HTTP attempt 复用既有
+`nonstream.start` 与结构化 retry 记录计数，handler 不保存 warning 中的 endpoint 或正文。
+loopback 200/400/503 fixture 分别冻结 completed+settled、nonretryable+invalidated 与
+retryable+deferred 三条边界，不访问外部 provider。
+
 确定性模型 sidecar 的控制协议：
 
 - `PUT /control/script`：装载一个脚本对象或脚本数组。`mode` 支持 `complete`、
@@ -258,19 +387,17 @@ python docker/debug/plugin_passive_webui_v3_e2e.py --require-clean-core
 ```bash
 python docker/debug/plugin_v3_e1_gate.py
 python docker/debug/plugin_v3_e2_gate.py --require-clean-core
-python docker/debug/plugin_v3_e3_gate.py --require-clean-core
 python docker/debug/plugin_v3_e4_gate.py \
   --source-workspace /path/to/source-workspace \
   --source-config /path/to/config.toml \
   --plugin-home /path/to/plugin-home
 ```
 
-所有集中 Gate 默认使用 Python/操作系统选择的临时目录；E1～E4 可通过 `--tmp-root`
+所有集中 Gate 默认使用 Python/操作系统选择的临时目录；E1、E2 与 E4 可通过 `--tmp-root`
 显式选择已有目录。测试源码不绑定维护者 HOME、正式 workspace 或一次性试运行路径。
 
 E1 覆盖 Default Memory/Akasha、Citation/Meme、Observe、Emotion、Proactive Feedback 与
-Plugin Undo；E2 覆盖 Shell 三件与 MCP/process 插件；E3 覆盖 Channel、Command、
-Proactive source/job 与 GitHub Watcher。E4 不重复逐插件运行，而是从同一 Core head
+Plugin Undo；E2 覆盖 Shell 三件与 MCP/process 插件；E4 覆盖正式来源 workspace 的组合激活边界。E4 不重复逐插件运行，而是从同一 Core head
 的 E1～E3 报告建立覆盖集，再在复制 workspace 中验证 SQLite 完整性、messages
 只追加、plugin-data 权威文件与 artifact/pointer 不变，以及进程内失败/子进程崩溃恢复。
 SQLite 在线备份可能在只读源旁创建或触碰 `-wal`/`-shm`/`-journal` 运行 sidecar；
@@ -506,79 +633,6 @@ AKASHIC_RACE_CONFIG    指定 config.toml；不指定时生成无外部 channel 
 AKASHIC_RACE_WORKSPACE 指定临时 workspace；不指定时使用临时目录
 ```
 
-## 主动链路操作沙盒
-
-`proactive_sandbox.py` 使用隔离 workspace、真实插件加载器、Slot Lifecycle、Feed MCP 子进程和消息发送编排器。模型使用可预测驱动器，测试失败时可以排除模型随机性。
-
-同一脚本通过 `--lifecycle default` 和 `--lifecycle wake` 分别验证两套主动生命周期。Wake 验证会走真实正文抓取、消息提交与 Feed ACK，不把消费事件误记为兴趣反馈。
-
-```text
-┌─ operator
-│  ├─ inject-content ──> feed_mcp.sqlite3
-│  ├─ clear-content ───> empty gateway
-│  ├─ tick-content
-│  ├─ tick-drift
-│  └─ status
-│
-└─ Docker sandbox
-   ├─ PluginManager ──> runtime/module/lifecycle factories
-   ├─ ToolRegistry  ──> Feed MCP stdio process
-   ├─ ProactiveLoop ──> compiled Slot Graph
-   └─ state
-      ├─ proactive.db
-      ├─ sessions.db
-      ├─ plugin-data/feed-github/feed_mcp.sqlite3
-      └─ drift/drift.db
-```
-
-完整验证：
-
-```bash
-docker compose -f docker/debug/docker-compose.yml build akashic-debug
-docker compose -f docker/debug/docker-compose.yml run --rm akashic-debug \
-  python docker/debug/proactive_sandbox.py run-all
-```
-
-Wake package 已启用的 profile 使用：
-
-```bash
-AKASHIC_DEBUG_PROFILE=wake-profile \
-  docker compose -f docker/debug/docker-compose.yml run --rm akashic-debug \
-  python docker/debug/proactive_sandbox.py run-all --lifecycle wake
-```
-
-使用当前 profile 的真实模型配置：
-
-```bash
-AKASHIC_DEBUG_PROFILE=dev_verify \
-docker compose -f docker/debug/docker-compose.yml run --rm akashic-debug \
-  python docker/debug/proactive_sandbox.py run-all --config /sandbox/config.toml
-```
-
-手动控制：
-
-```bash
-docker compose -f docker/debug/docker-compose.yml run --rm akashic-debug \
-  python docker/debug/proactive_sandbox.py reset
-docker compose -f docker/debug/docker-compose.yml run --rm akashic-debug \
-  python docker/debug/proactive_sandbox.py inject-content
-docker compose -f docker/debug/docker-compose.yml run --rm akashic-debug \
-  python docker/debug/proactive_sandbox.py tick-content
-docker compose -f docker/debug/docker-compose.yml run --rm akashic-debug \
-  python docker/debug/proactive_sandbox.py status
-```
-
-验证 paused skill 能从已有计划的停点继续，而不是重新执行说明书前置步骤：
-
-```bash
-AKASHIC_DEBUG_PROFILE=drift-current-runtime \
-docker compose -f docker/debug/docker-compose.yml run --rm akashic-debug \
-  python docker/debug/proactive_sandbox.py verify-paused-resume \
-  --config /sandbox/config.toml
-```
-
-探针会预置已读取需求、已生成 `plan.json`、执行阶段遇到临时 502 的状态。验证要求模型直接使用已有计划写出结果；若重新读取需求或重写计划则失败。
-
 ## 真实 Runtime 时间回放基础
 
 `replay_controller.py` 只维护隔离 profile 下的模拟时钟、历史事件和捕获消息，不读取或挂载正式 workspace。`docker-compose.yml` 会让真实 `main.py` 加载调试插件目录；`replay_debug` 插件注册 `replay` 渠道，把 outbound 原样写入 profile。
@@ -639,7 +693,7 @@ python docker/debug/replay_controller.py \
   --profile wake-replay status
 ```
 
-`events.jsonl` 是供后续 `plugins/wake_proactive` 消费的稳定输入面；当前旧 proactive 不读取它，也不会因为推进时钟自动触发。
+`events.jsonl` 只由 replay controller 保存为调试输入；当前 Core 没有隐式消费者，推进时钟不会自动触发 Turn。需要验证 Content/Wake 时使用上面的普通插件互操作 Gate。
 
 `agent-loop-runtime` 场景会启动真实 `AgentLoop.run()`，读取 `config.toml`，但不启动 Telegram / QQ / CLI server。它用 fake reasoner 卡住 passive turn，再并发触发 drift 发送和 scheduler soft 的 `process_direct`，验证 runtime lock 与 ChatLane 的联动。
 
@@ -659,7 +713,7 @@ python docker/debug/replay_controller.py \
 └─────────────────────────────────────────────────────────────┘
 ```
 
-`config-runtime-llm` 场景会读取真实 `config.toml` 并调用其中配置的 LLM。它通过 `build_core_runtime()` 构建真实 runtime，加载真实 provider、memory、tool、plugin、scheduler 接线，但不启动 Telegram / QQ / CLI server；外部 channel sender 用 fake 记录发送顺序，proactive / drift 生成也用 fake 直接提交到 `message_push(_commit_role="non_passive")`。
+`config-runtime-llm` 场景会读取真实 `config.toml` 并调用其中配置的 LLM。它通过 `build_core_runtime()` 构建真实 runtime，加载真实 provider、memory、tool、plugin、scheduler 接线，但不启动 Telegram / QQ / CLI server；外部 channel sender 用 fake 记录发送顺序，Wake / Drift 输入也用 fake 直接提交到 `message_push(_commit_role="non_passive")`。
 
 ```bash
 docker compose -f docker/debug/docker-compose.yml run --rm akashic-debug \

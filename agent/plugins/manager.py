@@ -29,11 +29,11 @@ from agent.plugin_composition import (
     MEMORY_RUNTIME,
     MEMORY_TURN_RUNTIME,
     INTERACTION_UNDO,
-    PROACTIVE_COMPONENTS,
     SESSION_READ,
     SCOPED_TURNS,
     CONTINUATIONS,
     DELIVERIES,
+    DURABLE_DELIVERIES,
     TIMERS,
     BACKGROUND_JOBS,
     TOOL_CATALOG,
@@ -47,7 +47,6 @@ from agent.plugin_composition import (
     PluginChannels,
     PluginUiSlots,
     PluginCommands,
-    PluginProactiveComponents,
     PluginBackgroundJobs,
     PluginToolBinding,
     PluginToolCatalog,
@@ -57,6 +56,7 @@ from agent.plugin_composition import (
     PluginScopedTurns,
     PluginContinuations,
     PluginDeliveries,
+    PluginDurableDeliveries,
     PluginTimers,
     ServiceView,
     RUNTIME_STARTED,
@@ -80,6 +80,12 @@ from agent.plugin_composition.model import (
     resolve_declared_workspace_root,
 )
 from agent.control.timer import AsyncioOneShotTimer
+from agent.plugin_composition.durable_deliveries import (
+    DurableProjector,
+    DurableDeliveryRequest,
+    DurableSender,
+)
+from agent.plugin_composition.durable_delivery_store import DurableDeliveryStore
 from bus.events import ChannelMessage
 from agent.plugin_composition.channels import ChannelDeliveryReceipt
 from agent.plugins.composable import ComposablePlugin
@@ -155,11 +161,6 @@ from agent.plugins.generation_activity_host import (
     ActivityCatalog,
     ActivityHost,
     ActivityTransaction,
-)
-from agent.plugins.private_proactive import (
-    PRIVATE_PROACTIVE_DEFINITIONS,
-    admit_private_proactive_module,
-    build_private_proactive_catalog,
 )
 from agent.plugins.snapshot import (
     RuntimeSnapshot,
@@ -378,6 +379,8 @@ class PluginManager:
         self._delivery_sender: (
             Callable[[ChannelMessage], Awaitable[ChannelDeliveryReceipt]] | None
         ) = None
+        self._durable_delivery_sender: DurableSender | None = None
+        self._durable_delivery_recovered = False
 
     @property
     def loaded_count(self) -> int:
@@ -417,6 +420,13 @@ class PluginManager:
         if self._delivery_sender is not None:
             raise RuntimeError("PluginManager delivery sender 已绑定")
         self._delivery_sender = sender
+
+    def bind_durable_delivery_sender(self, sender: DurableSender) -> None:
+        """Bind the two-stage provider boundary before loading durable consumers."""
+
+        if self._durable_delivery_sender is not None:
+            raise RuntimeError("PluginManager durable delivery sender 已绑定")
+        self._durable_delivery_sender = sender
 
     async def run_runtime_services(self) -> None:
         """Follow stable Roots without retaining Turn admission across reloads."""
@@ -598,7 +608,7 @@ class PluginManager:
         self._channel_provider_factory_resolver = resolver
 
     def bind_activity_host(self, host: ActivityHost) -> None:
-        """Bind the single Core owner for proactive and background activity."""
+        """Bind the single Core owner for background activity."""
 
         if self._activity_host is not None:
             raise RuntimeError("ActivityHost 已绑定")
@@ -608,14 +618,10 @@ class PluginManager:
     def _activity_catalog_identity(snapshot: RuntimeSnapshot | None) -> str | None:
         if snapshot is None:
             return None
-        proactive = snapshot.proactive_component_catalog
         jobs = snapshot.background_job_catalog
-        private = snapshot.private_proactive_catalog
-        if proactive is None and jobs is None and private is None:
+        if jobs is None:
             return None
-        descriptors = (() if proactive is None else proactive.descriptors) + (
-            () if jobs is None else jobs.descriptors
-        )
+        descriptors = jobs.descriptors
         owners = sorted({descriptor.owner for descriptor in descriptors})
         bindings: list[str] = []
         for owner in owners:
@@ -625,20 +631,9 @@ class PluginManager:
             bindings.append(
                 f"{owner}:{generation.generation_id}:{generation.source_revision}"
             )
-        if private is not None:
-            for member in private.members:
-                bindings.append(
-                    f"{member.member}:{member.generation_id}:{member.source_revision}"
-                )
         return "|".join(
             (
-                "proactive:" + ("" if proactive is None else proactive.identity),
-                "jobs:" + ("" if jobs is None else jobs.identity),
-                (
-                    "private-proactive:" + private.identity
-                    if private is not None
-                    else "private-proactive:"
-                ),
+                "jobs:" + jobs.identity,
                 "bindings:" + ",".join(bindings),
             )
         )
@@ -1527,9 +1522,7 @@ class PluginManager:
                     )
                 activity = self._activity_host.active
                 expected_activity = ActivityCatalog(
-                    proactive=snapshot.proactive_component_catalog,
                     background_jobs=snapshot.background_job_catalog,
-                    private_proactive=snapshot.private_proactive_catalog,
                 ).identity
                 if (
                     activity is None
@@ -2483,6 +2476,7 @@ class PluginManager:
         promote_latest: bool,
         force_provisional: bool = False,
         provisional_started: bool = False,
+        reopen_previous_on_failure: bool = True,
         before_open: Callable[[], None] | None = None,
         after_open: Callable[[], None] | None = None,
     ) -> SnapshotTransaction:
@@ -2661,7 +2655,7 @@ class PluginManager:
             await self._snapshot_store.rollback_provisional(
                 provisional,
                 keep_candidate_latest=promote_latest,
-                reopen_previous=not rollback_errors,
+                reopen_previous=(reopen_previous_on_failure and not rollback_errors),
             )
             if not rollback_errors and channel_state is not None:
                 self._reopen_restored_channel_publication(channel_state)
@@ -2725,14 +2719,6 @@ class PluginManager:
                 generations,
                 snapshot_revision=catalog_id,
                 composition_root=composition_root,
-                private_proactive_catalog=build_private_proactive_catalog(
-                    generations.values(),
-                    root_instance_token=(
-                        None
-                        if composition_root is None
-                        else composition_root.instance_token
-                    ),
-                ),
                 core_channel_definitions=self._core_channel_definitions,
             )
             _validate_static_manifest_runtime(snapshot, generations)
@@ -2765,6 +2751,10 @@ class PluginManager:
             old_commands = self.stable_telegram_command_catalog()
             new_commands = self._snapshot_bot_commands(ready.snapshot)
             stable_snapshot = self.current_snapshot
+            shared_handoff = _requires_shared_candidate_handoff(
+                ready.previous,
+                generation,
+            )
             v3_runtime_handoff = self._composition_runtime_declared(
                 ready.snapshot,
                 plugin_id,
@@ -2784,11 +2774,14 @@ class PluginManager:
                 exclusive_endpoint_changed
                 or command_catalog_changed
                 or v3_channel_catalog_changed
+                or shared_handoff
             )
             from agent.plugins.snapshot import get_current_runtime_lease
 
             if (
-                exclusive_endpoint_changed or v3_channel_catalog_changed
+                exclusive_endpoint_changed
+                or v3_channel_catalog_changed
+                or shared_handoff
             ) and get_current_runtime_lease() is not None:
                 raise RuntimeError(
                     "持有 RuntimeSnapshot lease 时不能切换 Channel runtime"
@@ -2803,24 +2796,46 @@ class PluginManager:
                 ready.snapshot
             )
             quiesced_snapshot = (
-                self._snapshot_store.pause_admission() if publication_gated else None
+                self._snapshot_store.pause_admission()
+                if publication_gated and not shared_handoff
+                else None
             )
             runtime_restore_started = False
+            shared_stable_stopped = False
             provisional_transaction: SnapshotTransaction | None = None
             provisional_cancelled = False
             if publication_gated:
                 try:
+                    if shared_handoff:
+                        await self._snapshot_store.wait_for_no_leases(ready.snapshot)
+                        self._snapshot_store.seal_candidate_validation(ready.snapshot)
+                        quiesced_snapshot = self._snapshot_store.pause_admission()
                     if (
                         exclusive_endpoint_changed
                         and self._endpoint_quiescer is not None
                     ):
                         await self._endpoint_quiescer()
                     if quiesced_snapshot is not None and (
-                        exclusive_endpoint_changed or v3_channel_catalog_changed
+                        exclusive_endpoint_changed
+                        or v3_channel_catalog_changed
+                        or shared_handoff
                     ):
                         await self._snapshot_store.wait_for_no_leases(quiesced_snapshot)
-                    await self._snapshot_store.wait_for_no_leases(ready.snapshot)
-                    self._snapshot_store.seal_candidate_validation(ready.snapshot)
+                    if shared_handoff:
+                        assert quiesced_snapshot is not None
+                        try:
+                            await self._stop_shared_read_stable_runtime(
+                                generation,
+                                quiesced_snapshot,
+                            )
+                        finally:
+                            shared_stable_stopped = (
+                                generation.replaced_composition_runtime_generation
+                                is not None
+                            )
+                    else:
+                        await self._snapshot_store.wait_for_no_leases(ready.snapshot)
+                        self._snapshot_store.seal_candidate_validation(ready.snapshot)
                     (
                         provisional_transaction,
                         provisional_cancelled,
@@ -2833,7 +2848,16 @@ class PluginManager:
                     new_commands = self._snapshot_bot_commands(ready.snapshot)
                 except BaseException:
                     gated_runtime_error: BaseException | None = None
-                    if runtime_restore_started:
+                    if shared_stable_stopped:
+                        assert quiesced_snapshot is not None
+                        try:
+                            await self._recover_shared_read_stable_runtime(
+                                generation,
+                                quiesced_snapshot,
+                            )
+                        except BaseException as error:
+                            gated_runtime_error = error
+                    elif runtime_restore_started:
                         try:
                             await self._rollback_composition_runtime_replacement(
                                 generation
@@ -2960,6 +2984,7 @@ class PluginManager:
                         promote_latest=True,
                         force_provisional=exclusive_endpoint_changed,
                         provisional_started=provisional_transaction is not None,
+                        reopen_previous_on_failure=not shared_handoff,
                         before_open=before_open,
                         after_open=after_open,
                     )
@@ -2981,7 +3006,16 @@ class PluginManager:
                         skill_linker.sync(stable_skill_plugins)
                     except BaseException as error:
                         skill_error = error
-                if runtime_restore_started:
+                if shared_stable_stopped:
+                    assert quiesced_snapshot is not None
+                    try:
+                        await self._recover_shared_read_stable_runtime(
+                            generation,
+                            quiesced_snapshot,
+                        )
+                    except BaseException as error:
+                        runtime_error = error
+                elif runtime_restore_started:
                     try:
                         await self._rollback_composition_runtime_replacement(generation)
                     except BaseException as error:
@@ -3344,6 +3378,10 @@ class PluginManager:
         expected_mcp_catalog_digests = (
             None if candidate_runtime is None else candidate_runtime.mcp_catalog_digests
         )
+        candidate_data_access = _snapshot_candidate_data_access(
+            generation,
+            ready.snapshot,
+        )
 
         # 1. 隔离 Root 已封存，先停止其任务，再进入任何 formal await。
         if self._dashboard_validation_releaser is not None:
@@ -3359,12 +3397,16 @@ class PluginManager:
         replacement = await self._compile_generation_snapshot(
             generation,
         )
-        if replacement.snapshot_id != ready.snapshot.snapshot_id:
-            await self._dispose_unreferenced_composition_root(replacement)
-            raise RuntimeError(
-                "候选隔离资源恢复后 snapshot identity 发生变化: "
-                f"{ready.snapshot.snapshot_id} -> {replacement.snapshot_id}"
+        try:
+            _validate_candidate_formal_snapshot_identity(
+                generation,
+                candidate=ready.snapshot,
+                formal=replacement,
+                candidate_data_access=candidate_data_access,
             )
+        except RuntimeError:
+            await self._dispose_unreferenced_composition_root(replacement)
+            raise
         try:
             await self._stop_replaced_composition_runtime(generation)
             await self._start_composition_generation_runtime(
@@ -3373,10 +3415,19 @@ class PluginManager:
                 mode="formal",
                 expected_mcp_catalog_digests=expected_mcp_catalog_digests,
             )
+            if _requires_shared_candidate_handoff(
+                generation.replaced_composition_runtime_generation,
+                generation,
+            ):
+                await self._start_runtime_snapshot(replacement)
         except BaseException:
             try:
                 await self._stop_composition_generation_runtime(generation)
-                await self._restore_replaced_composition_runtime(generation)
+                if not _requires_shared_candidate_handoff(
+                    generation.replaced_composition_runtime_generation,
+                    generation,
+                ):
+                    await self._restore_replaced_composition_runtime(generation)
             except BaseException as restore_error:
                 raise RuntimeError(
                     "candidate formal runtime 失败后旧 stable runtime 恢复失败"
@@ -3586,6 +3637,7 @@ class PluginManager:
             raise RuntimeError("插件候选已被 runtime recovery 撤销准入")
         active = self._active_generations.get(plugin_id)
         stage_latest = _installed_generation_is_candidate(generation)
+        shared_handoff = _requires_shared_candidate_handoff(active, generation)
         try:
             if stage_latest:
                 if (
@@ -3669,6 +3721,7 @@ class PluginManager:
             exclusive_endpoint_changed
             or command_catalog_changed
             or v3_channel_catalog_changed
+            or shared_handoff
         )
         if self._dashboard_preparer is not None:
             try:
@@ -3693,7 +3746,17 @@ class PluginManager:
                 )
 
         quiesced_snapshot: RuntimeSnapshot | None = None
-        if publication_gated:
+        if shared_handoff:
+            from agent.plugins.snapshot import get_current_runtime_lease
+
+            if get_current_runtime_lease() is not None:
+                error_text = "持有 RuntimeSnapshot lease 时不能交接 shared-read writer"
+                await self.discard_prepared(
+                    plugin_id,
+                    error=f"shared_read_lease: {error_text}",
+                )
+                raise RuntimeError(error_text)
+        if publication_gated and not shared_handoff:
             from agent.plugins.snapshot import get_current_runtime_lease
 
             if (
@@ -3751,9 +3814,29 @@ class PluginManager:
 
         provisional_started = False
         provisional_cancelled = False
+        shared_stable_stopped = False
         if not stage_latest:
             try:
                 self._snapshot_store.seal_pending_validation(snapshot)
+                if shared_handoff:
+                    quiesced_snapshot = self._snapshot_store.pause_admission()
+                    if (
+                        exclusive_endpoint_changed
+                        and self._endpoint_quiescer is not None
+                    ):
+                        await self._endpoint_quiescer()
+                    assert quiesced_snapshot is not None
+                    await self._snapshot_store.wait_for_no_leases(quiesced_snapshot)
+                    try:
+                        await self._stop_shared_read_stable_runtime(
+                            generation,
+                            quiesced_snapshot,
+                        )
+                    finally:
+                        shared_stable_stopped = (
+                            generation.replaced_composition_runtime_generation
+                            is not None
+                        )
                 if publication_gated:
                     _, provisional_cancelled = await _complete_critical(
                         self._snapshot_store.commit_provisional(transaction)
@@ -3765,6 +3848,16 @@ class PluginManager:
                 )
             except (asyncio.CancelledError, Exception) as error:
                 error_text = str(error) or type(error).__name__
+                shared_recovery_error: BaseException | None = None
+                if shared_stable_stopped:
+                    assert quiesced_snapshot is not None
+                    try:
+                        await self._recover_shared_read_stable_runtime(
+                            generation,
+                            quiesced_snapshot,
+                        )
+                    except BaseException as recovery_error:
+                        shared_recovery_error = recovery_error
                 self._record_failed_gate(
                     plugin_id=plugin_id,
                     revision=generation.source_revision,
@@ -3783,13 +3876,13 @@ class PluginManager:
                 ):
                     self._record_composition_runtime_failure(
                         generation,
-                        error,
+                        shared_recovery_error or error,
                         formal_effects=(
                             "candidate_pointer_restored",
                             "old_runtime_restore_uncertain",
                         ),
                     )
-                runtime_restore_uncertain = (
+                runtime_restore_uncertain = shared_recovery_error is not None or (
                     previous_runtime is not None
                     and self._composition_generation_host.get(
                         previous_runtime.generation_id
@@ -3857,6 +3950,7 @@ class PluginManager:
                         promote_latest=False,
                         force_provisional=exclusive_endpoint_changed,
                         provisional_started=provisional_started,
+                        reopen_previous_on_failure=not shared_handoff,
                         before_open=open_candidate,
                         after_open=(
                             None
@@ -3888,13 +3982,23 @@ class PluginManager:
                 reopen_previous=not isinstance(
                     commit_error,
                     _PublicationParticipantRestoreError,
-                ),
+                )
+                and not shared_stable_stopped,
             )
             runtime_restore_error: BaseException | None = None
             try:
-                await self._restore_replaced_composition_runtime(generation)
+                if shared_stable_stopped:
+                    assert quiesced_snapshot is not None
+                    await self._recover_shared_read_stable_runtime(
+                        generation,
+                        quiesced_snapshot,
+                    )
+                else:
+                    await self._restore_replaced_composition_runtime(generation)
             except BaseException as error:
                 runtime_restore_error = error
+            if runtime_restore_error is None and shared_stable_stopped:
+                await self._snapshot_store.resume(quiesced_snapshot)
             participant_restore_error = isinstance(
                 commit_error,
                 _PublicationParticipantRestoreError,
@@ -4023,6 +4127,10 @@ class PluginManager:
         expected_mcp_catalog_digests = (
             None if candidate_runtime is None else candidate_runtime.mcp_catalog_digests
         )
+        candidate_data_access = _snapshot_candidate_data_access(
+            generation,
+            validation_snapshot,
+        )
         if self._dashboard_validation_releaser is not None:
             await self._dashboard_validation_releaser(validation_snapshot)
         await self._stop_composition_generation_runtime(generation)
@@ -4036,13 +4144,16 @@ class PluginManager:
             production_snapshot = await self._compile_generation_snapshot(
                 generation,
             )
-            if production_snapshot.snapshot_id != validation_snapshot.snapshot_id:
-                await self._dispose_unreferenced_composition_root(production_snapshot)
-                raise RuntimeError(
-                    "候选隔离资源恢复后 snapshot identity 发生变化: "
-                    f"{validation_snapshot.snapshot_id} -> "
-                    f"{production_snapshot.snapshot_id}"
+            try:
+                _validate_candidate_formal_snapshot_identity(
+                    generation,
+                    candidate=validation_snapshot,
+                    formal=production_snapshot,
+                    candidate_data_access=candidate_data_access,
                 )
+            except RuntimeError:
+                await self._dispose_unreferenced_composition_root(production_snapshot)
+                raise
             await self._stop_replaced_composition_runtime(generation)
             await self._start_composition_generation_runtime(
                 generation,
@@ -4050,10 +4161,19 @@ class PluginManager:
                 mode="formal",
                 expected_mcp_catalog_digests=expected_mcp_catalog_digests,
             )
+            if _requires_shared_candidate_handoff(
+                generation.replaced_composition_runtime_generation,
+                generation,
+            ):
+                await self._start_runtime_snapshot(production_snapshot)
         except BaseException:
             try:
                 await self._stop_composition_generation_runtime(generation)
-                await self._restore_replaced_composition_runtime(generation)
+                if not _requires_shared_candidate_handoff(
+                    generation.replaced_composition_runtime_generation,
+                    generation,
+                ):
+                    await self._restore_replaced_composition_runtime(generation)
             except BaseException as restore_error:
                 raise RuntimeError(
                     "production runtime 失败后旧 stable runtime 恢复失败"
@@ -4652,29 +4772,6 @@ class PluginManager:
                 error="plugin_api: plugin.py 必须声明 api_version = 3",
             )
             raise RuntimeError(f"插件只接受 api_version = 3: {initial_plugin_id}")
-        private_members = {item.member for item in PRIVATE_PROACTIVE_DEFINITIONS}
-        if (
-            isinstance(loaded_module, ModuleType)
-            and getattr(loaded_module, "name", None) in private_members
-        ):
-            try:
-                admit_private_proactive_module(loaded_module)
-            except Exception as error:
-                self._remove_module_tree(mp)
-                error_text = str(error) or type(error).__name__
-                self._record_failed_gate(
-                    plugin_id=initial_plugin_id,
-                    revision=source_revision,
-                    check_id="private_proactive_admission",
-                    reason=error_text,
-                )
-                self._abort_reload_attempt(
-                    reload_tx_id,
-                    error=f"private_proactive_admission: {error_text}",
-                )
-                raise RuntimeError(
-                    f"private proactive admission 失败: {initial_plugin_id}: {error_text}"
-                ) from error
         try:
             if not isinstance(loaded_module, ModuleType):
                 raise RuntimeError("v3 插件模块未保留在 import registry")
@@ -4871,19 +4968,20 @@ class PluginManager:
             if not activate and _installed_generation_is_candidate(generation):
                 generation.production_contributions = contributions
                 generation.production_data_dir = generation.data_dir
-                assert generation.validation_workspace is not None
-                validation_data_dir = (
-                    generation.validation_workspace
-                    / "plugin-data"
-                    / generation.data_dir.name
-                )
-                validation_data_dir.parent.mkdir(parents=True, exist_ok=True)
-                generation.validation_data_inventory = _copy_validation_data(
-                    generation.data_dir,
-                    validation_data_dir,
-                    _candidate_data_exclude_paths(generation),
-                )
-                generation.data_dir = validation_data_dir
+                if not _generation_uses_shared_candidate_data(generation):
+                    assert generation.validation_workspace is not None
+                    validation_data_dir = (
+                        generation.validation_workspace
+                        / "plugin-data"
+                        / generation.data_dir.name
+                    )
+                    validation_data_dir.parent.mkdir(parents=True, exist_ok=True)
+                    generation.validation_data_inventory = _copy_validation_data(
+                        generation.data_dir,
+                        validation_data_dir,
+                        _candidate_data_exclude_paths(generation),
+                    )
+                    generation.data_dir = validation_data_dir
             if not activate:
                 generation.runtime_snapshot = await self._compile_generation_snapshot(
                     generation,
@@ -4965,6 +5063,7 @@ class PluginManager:
         *,
         allow_pending_composition: bool = False,
         candidate_owner: PluginGeneration | None = None,
+        force_fresh_composition: bool = False,
     ) -> RuntimeSnapshot:
         generations = dict(self._active_generations)
         generations[generation.plugin_id] = generation
@@ -4972,25 +5071,19 @@ class PluginManager:
             generations,
             allow_pending=allow_pending_composition,
             candidate_owner=candidate_owner,
+            force_fresh=force_fresh_composition,
         )
         try:
-            private_proactive_catalog = build_private_proactive_catalog(
-                generations.values(),
-                root_instance_token=(
-                    None
-                    if composition_root is None
-                    else composition_root.instance_token
-                ),
-            )
             snapshot = self._snapshot_compiler.compile(
                 generations,
                 catalog_generation=generation,
                 composition_root=composition_root,
-                private_proactive_catalog=private_proactive_catalog,
                 core_channel_definitions=self._core_channel_definitions,
                 require_composition_ready=True,
             )
             _validate_static_manifest_runtime(snapshot, generations)
+            if candidate_owner is not None:
+                self._preflight_durable_delivery_targets(snapshot)
             snapshot.tool_registry = self._compile_snapshot_tools(
                 generations,
                 snapshot.plugin_tool_catalog,
@@ -5025,6 +5118,7 @@ class PluginManager:
         *,
         allow_pending: bool = False,
         candidate_owner: PluginGeneration | None = None,
+        force_fresh: bool = False,
     ) -> tuple[CompositionRoot | None, bool]:
         """复用 stable Root，或挂载一个完整且隔离的 v3 generation 拓扑。"""
 
@@ -5048,6 +5142,7 @@ class PluginManager:
         )
         if (
             candidate_owner is None
+            and not force_fresh
             and current is not None
             and len(ordered) == len(current_ordered)
             and all(
@@ -5097,14 +5192,6 @@ class PluginManager:
                 _ = await root.context.provide(
                     MANAGED_PROCESSES,
                     PluginManagedProcesses(root.instance_token),
-                )
-            if any(
-                PROACTIVE_COMPONENTS in cast(ComposablePlugin, item.instance).inject
-                for item in ordered
-            ):
-                _ = await root.context.provide(
-                    PROACTIVE_COMPONENTS,
-                    PluginProactiveComponents(root.instance_token),
                 )
             if any(
                 BACKGROUND_JOBS in cast(ComposablePlugin, item.instance).inject
@@ -5186,6 +5273,16 @@ class PluginManager:
                     else PluginDeliveries.candidate_validation()
                 )
                 _ = await root.context.provide(DELIVERIES, deliveries)
+            if any(
+                DURABLE_DELIVERIES in cast(ComposablePlugin, item.instance).inject
+                for item in ordered
+            ):
+                durable_deliveries = (
+                    self._formal_durable_deliveries()
+                    if candidate_owner is None
+                    else PluginDurableDeliveries.candidate_validation()
+                )
+                _ = await root.context.provide(DURABLE_DELIVERIES, durable_deliveries)
             if self._interaction_undo is not None and any(
                 INTERACTION_UNDO in cast(ComposablePlugin, item.instance).inject
                 for item in ordered
@@ -5282,6 +5379,55 @@ class PluginManager:
             self._composition_memory_runtime,
         )
 
+    def _formal_durable_deliveries(self) -> PluginDurableDeliveries:
+        """Build one Root-local port over the process-owned delivery ledger."""
+
+        sender = self._durable_delivery_sender
+        session_manager = self._session_manager
+        projector: DurableProjector | None = None
+        if session_manager is not None:
+
+            async def project(request: DurableDeliveryRequest) -> str:
+                return await session_manager.append_durable_delivery(
+                    session_key=request.projection_session_id,
+                    content=request.body,
+                    delivery_id=request.logical_delivery_id,
+                    control_turn_id=request.accepted_turn.turn_id,
+                )
+
+            projector = project
+
+        service = PluginDurableDeliveries(
+            DurableDeliveryStore(
+                self._workspace / "runtime" / "deliveries" / "settlements.sqlite"
+            ),
+            sender,
+            projector,
+            recover_started=not self._durable_delivery_recovered,
+        )
+        self._durable_delivery_recovered = True
+        return service
+
+    def _preflight_durable_delivery_targets(self, snapshot: RuntimeSnapshot) -> None:
+        """Fence forward-completable rows whose target vanished from candidate."""
+
+        store = DurableDeliveryStore(
+            self._workspace / "runtime" / "deliveries" / "settlements.sqlite",
+            read_only=True,
+        )
+        forward_targets = store.forward_targets()
+        if not forward_targets:
+            return
+        topology = snapshot.composition_topology
+        if topology is None:
+            raise RuntimeError("durable delivery candidate 缺少 composition topology")
+        missing = tuple(sorted(forward_targets.difference(topology.services)))
+        if missing:
+            raise RuntimeError(
+                "durable delivery forward target service 不可解析: "
+                + ", ".join(missing)
+            )
+
     def _composition_service_view(self) -> ServiceView:
         """冻结静态 v3 声明可读取的 Core service 输入。"""
 
@@ -5310,6 +5456,7 @@ class PluginManager:
             if self._delivery_sender is not None
             else PluginDeliveries.candidate_validation()
         )
+        values[DURABLE_DELIVERIES] = PluginDurableDeliveries.candidate_validation()
         return ServiceView.freeze(values)
 
     @staticmethod
@@ -5347,6 +5494,7 @@ class PluginManager:
                 config=generation.config,
                 workspace_roots=plugin.workspace_roots,
                 workspace_files=plugin.workspace_files,
+                data_access="read_write",
             ),
         )
 
@@ -5370,12 +5518,26 @@ class PluginManager:
             "candidate_attempt_data",
             lambda: _remove_validation_data_dir(attempt_root),
         )
-        clones: list[tuple[PluginGeneration, ComposablePlugin, str, Path, object]] = []
+        clones: list[
+            tuple[
+                PluginGeneration,
+                ComposablePlugin,
+                str,
+                Path,
+                object,
+                Literal["read_write", "read_only"],
+            ]
+        ] = []
         for generation in ordered:
             clone, module_path, data_dir, config = self._clone_candidate_composable(
                 generation,
                 candidate_owner=candidate_owner,
                 attempt_workspace=attempt_workspace,
+            )
+            data_access: Literal["read_write", "read_only"] = (
+                "read_only"
+                if _generation_uses_shared_candidate_data(generation)
+                else "read_write"
             )
             root._defer_internal_cleanup(  # pyright: ignore[reportPrivateUsage]
                 f"candidate_module:{module_path}",
@@ -5392,7 +5554,9 @@ class PluginManager:
                     "candidate workspace_files 与 generation 冻结声明不一致: "
                     f"{generation.plugin_id}"
                 )
-            clones.append((generation, clone, module_path, data_dir, config))
+            clones.append(
+                (generation, clone, module_path, data_dir, config, data_access)
+            )
         self._project_candidate_workspace_roots(
             tuple(item[1] for item in clones),
             attempt_workspace,
@@ -5401,7 +5565,7 @@ class PluginManager:
             tuple(item[1] for item in clones),
             attempt_workspace,
         )
-        for generation, clone, _module_path, data_dir, config in clones:
+        for generation, clone, _module_path, data_dir, config, data_access in clones:
             _ = await root.mount(
                 clone,
                 name=generation.plugin_id,
@@ -5413,6 +5577,7 @@ class PluginManager:
                     config=config,
                     workspace_roots=clone.workspace_roots,
                     workspace_files=clone.workspace_files,
+                    data_access=data_access,
                 ),
             )
 
@@ -5460,13 +5625,17 @@ class PluginManager:
         """重新导入一个 stable v3 插件并绑定 candidate 临时数据。"""
 
         plugin_dir = generation.plugin_dir
-        data_dir = attempt_workspace / "plugin-data" / generation.data_dir.name
-        _ = data_dir.parent.mkdir(parents=True, exist_ok=True)
-        inventory = _copy_validation_data(
-            generation.data_dir,
-            data_dir,
-            _candidate_data_exclude_paths(generation),
-        )
+        if _generation_uses_shared_candidate_data(generation):
+            data_dir = generation.production_data_dir or generation.data_dir
+            inventory: tuple[str, ...] = ()
+        else:
+            data_dir = attempt_workspace / "plugin-data" / generation.data_dir.name
+            _ = data_dir.parent.mkdir(parents=True, exist_ok=True)
+            inventory = _copy_validation_data(
+                generation.data_dir,
+                data_dir,
+                _candidate_data_exclude_paths(generation),
+            )
         if generation is candidate_owner:
             generation.validation_data_inventory = inventory
         module_path = (
@@ -5575,6 +5744,65 @@ class PluginManager:
             return
         await self._stop_composition_generation_runtime(previous)
         generation.replaced_composition_runtime_generation = previous
+
+    async def _stop_shared_read_stable_runtime(
+        self,
+        generation: PluginGeneration,
+        stable_snapshot: RuntimeSnapshot,
+    ) -> None:
+        """Settle the old shared-data Root and retain its generation for recovery."""
+
+        # 1. Lifecycle handlers close and join plugin-owned writers.
+        await self._stop_runtime_snapshot(stable_snapshot)
+
+        # 2. Exact managed runtimes stop before a fresh formal Root can start.
+        previous = self._active_generations.get(generation.plugin_id)
+        if previous is None:
+            raise RuntimeError("shared-read handoff 缺少 stable generation")
+        generation.replaced_composition_runtime_generation = previous
+        await self._stop_composition_generation_runtime(previous)
+
+    async def _recover_shared_read_stable_runtime(
+        self,
+        generation: PluginGeneration,
+        stable_snapshot: RuntimeSnapshot,
+    ) -> None:
+        """Rebuild a stopped stable generation on a fresh read-write Root."""
+
+        previous = generation.replaced_composition_runtime_generation
+        if previous is None:
+            raise RuntimeError("shared-read recovery 缺少 stopped stable generation")
+        old_root = stable_snapshot.composition_root
+        replacement: RuntimeSnapshot | None = None
+
+        # 1. Remove any unpublished new owner before rebuilding stable.
+        candidate_snapshot = generation.runtime_snapshot
+        if candidate_snapshot is not None:
+            await self._stop_runtime_snapshot(candidate_snapshot)
+        await self._stop_composition_generation_runtime(generation)
+        if old_root is not None:
+            await old_root.dispose()
+        try:
+            # 2. Recompile formal generations without reusing the terminal old Root.
+            replacement = await self._compile_generation_snapshot(
+                previous,
+                force_fresh_composition=True,
+            )
+            await self._start_composition_generation_runtime(
+                previous,
+                replacement,
+                mode="formal",
+            )
+            await self._start_runtime_snapshot(replacement)
+        except BaseException:
+            await self._stop_composition_generation_runtime(previous)
+            if replacement is not None:
+                await self._dispose_unreferenced_composition_root(replacement)
+            raise
+
+        # 3. Replace the closed stable payload only after fresh STARTED succeeds.
+        _replace_snapshot_payload(stable_snapshot, replacement)
+        generation.replaced_composition_runtime_generation = None
 
     async def _restore_replaced_composition_runtime(
         self,
@@ -6709,6 +6937,62 @@ def _candidate_data_exclude_paths(
     return tuple(sorted(excluded))
 
 
+def _generation_uses_shared_candidate_data(generation: PluginGeneration) -> bool:
+    manifest = generation.static_manifest
+    return manifest is not None and manifest.candidate_data_mode == "shared_read"
+
+
+def _requires_shared_candidate_handoff(
+    previous: PluginGeneration | None,
+    candidate: PluginGeneration,
+) -> bool:
+    return previous is not None and (
+        _generation_uses_shared_candidate_data(previous)
+        or _generation_uses_shared_candidate_data(candidate)
+    )
+
+
+def _validate_candidate_formal_snapshot_identity(
+    generation: PluginGeneration,
+    *,
+    candidate: RuntimeSnapshot,
+    formal: RuntimeSnapshot,
+    candidate_data_access: Literal["read_write", "read_only"] | None,
+) -> None:
+    """Allow only the declared shared-read access change during formal rebuild."""
+
+    # 1. A shared candidate changes exactly one Core-owned access assignment.
+    if _generation_uses_shared_candidate_data(generation):
+        formal_root = formal.composition_root
+        if formal_root is None:
+            raise RuntimeError("shared-read candidate 缺少 composition Root")
+        formal_access = formal_root.plugin_runtime(generation.plugin_id).data_access
+        if candidate_data_access != "read_only" or formal_access != "read_write":
+            raise RuntimeError(
+                "shared-read candidate data_access 变化无效: "
+                f"{candidate_data_access} -> {formal_access}"
+            )
+
+    # 2. Topology and every frozen catalog remain content-identical.
+    if candidate.snapshot_id != formal.snapshot_id:
+        raise RuntimeError(
+            "候选隔离资源恢复后 snapshot identity 发生变化: "
+            f"{candidate.snapshot_id} -> {formal.snapshot_id}"
+        )
+
+
+def _snapshot_candidate_data_access(
+    generation: PluginGeneration,
+    snapshot: RuntimeSnapshot,
+) -> Literal["read_write", "read_only"] | None:
+    if not _generation_uses_shared_candidate_data(generation):
+        return None
+    root = snapshot.composition_root
+    if root is None:
+        raise RuntimeError("shared-read candidate 缺少 composition Root")
+    return root.plugin_runtime(generation.plugin_id).data_access
+
+
 def _copy_validation_data(
     source: Path,
     target: Path,
@@ -6754,7 +7038,7 @@ def _copy_validation_data(
                 ignored.append(name)
         return ignored
 
-    shutil.copytree(source_root, target, ignore=ignore)
+    _ = shutil.copytree(source_root, target, ignore=ignore)
 
     # 4. Freeze a relative file inventory for review and Gate evidence.
     inventory: list[str] = []
@@ -6797,10 +7081,6 @@ def _replace_snapshot_payload(
         "tool_registry",
         "plugin_skill_index",
         "command_registry",
-        "proactive_component_catalog",
-        "proactive_component_catalog_identity",
-        "private_proactive_catalog",
-        "private_proactive_catalog_identity",
         "background_job_catalog",
         "background_job_catalog_identity",
         "plugin_tool_catalog",

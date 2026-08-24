@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import sqlite3
 import sys
 from collections.abc import Mapping
 from pathlib import Path
@@ -15,7 +17,6 @@ import agent.plugins.manager as plugin_manager_module
 from agent.plugin_composition import (
     BACKGROUND_JOBS,
     CHANNELS,
-    PROACTIVE_COMPONENTS,
     AttachmentKind,
     ChannelCapability,
     ChannelDefinition,
@@ -24,7 +25,6 @@ from agent.plugin_composition import (
     InboundIdentity,
     PluginBackgroundJobs,
     PluginChannels,
-    PluginProactiveComponents,
     PluginRuntime,
     ProviderClientFactory,
     ServiceView,
@@ -36,7 +36,6 @@ from agent.plugins.generation import PluginGeneration
 from agent.plugins.generation_activity_host import ActivityHost
 from agent.plugins.manager import PluginManager
 from agent.plugins.manifest import write_plugin_manifest
-from agent.plugins.private_proactive import PrivateProactiveCatalog
 from agent.plugins.snapshot import (
     RuntimeSnapshotCompiler,
     RuntimeSnapshotStore,
@@ -80,13 +79,7 @@ async def test_installed_plugin_without_static_manifest_fails_before_import(
     """在任何插件代码或正式数据写入前拒绝无 manifest 的 installed artifact。"""
 
     # 1. 构造缺少静态 admission manifest 的旧 installed artifact。
-    plugin_base = (
-        tmp_path
-        / "home"
-        / "cache"
-        / "lab"
-        / "missing_manifest"
-    )
+    plugin_base = tmp_path / "home" / "cache" / "lab" / "missing_manifest"
     plugin_dir = plugin_base / ".artifacts" / "1.0.0-test"
     plugin_dir.mkdir(parents=True)
     import_marker = plugin_dir / "imported"
@@ -100,8 +93,7 @@ async def test_installed_plugin_without_static_manifest_fails_before_import(
         encoding="utf-8",
     )
     (plugin_base / ".pointers.json").write_text(
-        '{"stable":".artifacts/1.0.0-test",'
-        '"latest":".artifacts/1.0.0-test"}\n',
+        '{"stable":".artifacts/1.0.0-test",' '"latest":".artifacts/1.0.0-test"}\n',
         encoding="utf-8",
     )
     manager = _manager(tmp_path)
@@ -113,25 +105,19 @@ async def test_installed_plugin_without_static_manifest_fails_before_import(
     assert manager.current_snapshot is None
     assert manager.generation("missing_manifest@lab") is None
     assert not (
-        tmp_path
-        / "workspace"
-        / "plugin-data"
-        / "missing_manifest-lab"
+        tmp_path / "workspace" / "plugin-data" / "missing_manifest-lab"
     ).exists()
 
 
 @pytest.mark.asyncio
-async def test_replace_snapshot_payload_rebinds_all_exact_root_activity_catalogs(
-) -> None:
+async def test_replace_snapshot_payload_rebinds_all_exact_root_activity_catalogs() -> (
+    None
+):
     """让全部 activity catalog 随载荷一起切换到正式 Root。"""
 
     async def compile_snapshot(label: str):
-        # 1. 每棵 Root 独立拥有三类 activity catalog。
+        # 1. 每棵 Root 独立拥有 background-job activity catalog。
         root = CompositionRoot(label)
-        _ = await root.context.provide(
-            PROACTIVE_COMPONENTS,
-            PluginProactiveComponents(root.instance_token),
-        )
         _ = await root.context.provide(
             BACKGROUND_JOBS,
             PluginBackgroundJobs(root.instance_token),
@@ -139,10 +125,6 @@ async def test_replace_snapshot_payload_rebinds_all_exact_root_activity_catalogs
         snapshot = RuntimeSnapshotCompiler().compile(
             {},
             composition_root=root,
-            private_proactive_catalog=PrivateProactiveCatalog(
-                (),
-                root_instance_token=root.instance_token,
-            ),
         )
         return root, snapshot
 
@@ -150,11 +132,7 @@ async def test_replace_snapshot_payload_rebinds_all_exact_root_activity_catalogs
     formal_root, source = await compile_snapshot("activity:formal")
     try:
         # 2. identity 值应等价，但对象保持可区分，确保六个字段都真实替换。
-        identity_fields = (
-            "proactive_component_catalog_identity",
-            "private_proactive_catalog_identity",
-            "background_job_catalog_identity",
-        )
+        identity_fields = ("background_job_catalog_identity",)
         for name in identity_fields:
             target_identity = getattr(target, name)
             source_identity = getattr(source, name)
@@ -165,11 +143,7 @@ async def test_replace_snapshot_payload_rebinds_all_exact_root_activity_catalogs
             assert distinct_source_identity is not target_identity
             setattr(source, name, distinct_source_identity)
 
-        old_catalogs = (
-            target.proactive_component_catalog,
-            target.private_proactive_catalog,
-            target.background_job_catalog,
-        )
+        old_catalogs = (target.background_job_catalog,)
         assert all(catalog is not None for catalog in old_catalogs)
         target.state = "validating"
 
@@ -179,11 +153,7 @@ async def test_replace_snapshot_payload_rebinds_all_exact_root_activity_catalogs
         )
 
         # 3. catalog、identity 与 Root 必须来自同一份 formal snapshot。
-        catalog_fields = (
-            "proactive_component_catalog",
-            "private_proactive_catalog",
-            "background_job_catalog",
-        )
+        catalog_fields = ("background_job_catalog",)
         for name, old_catalog in zip(catalog_fields, old_catalogs, strict=True):
             catalog = getattr(target, name)
             assert catalog is getattr(source, name)
@@ -265,9 +235,7 @@ def _channel_plugin_source(
         "    async def deliver(self, request):\n"
         "        self._in_flight += 1\n"
         "        self._drained.clear()\n"
-        "        try:\n"
-        + delivery_body
-        + "        finally:\n"
+        "        try:\n" + delivery_body + "        finally:\n"
         "            self._in_flight -= 1\n"
         "            if self._in_flight == 0: self._drained.set()\n"
         "    async def stop(self):\n"
@@ -291,15 +259,453 @@ def _channel_static_manifest(version: str) -> str:
     )
 
 
-def _write_static_v3_manifest(root: Path, name: str, version: str) -> None:
+def _write_static_v3_manifest(
+    root: Path,
+    name: str,
+    version: str,
+    *,
+    candidate_data_mode: str | None = None,
+) -> None:
+    candidate_data = (
+        ""
+        if candidate_data_mode is None
+        else f"candidate_data_mode = {candidate_data_mode!r}\n"
+    )
     (root / "akashic.plugin.toml").write_text(
         "schema_version = 1\n"
         f"name = {name!r}\n"
         f"version = {version!r}\n"
         "api_version = 3\n"
-        "entrypoint = 'plugin.py'\n",
+        f"entrypoint = 'plugin.py'\n{candidate_data}",
         encoding="utf-8",
     )
+
+
+def _shared_writer_source(version: str) -> str:
+    return f"""\
+api_version = 3
+name = 'shared_writer'
+version = {version!r}
+import asyncio
+import sqlite3
+from agent.plugin_composition import RUNTIME_STARTED, RUNTIME_STOPPING
+writer_task = None
+
+async def apply(ctx, config):
+    database = ctx.data_root / 'writer.sqlite3'
+    root_token = id(ctx._root_instance_token())
+    if ctx.data_access == 'read_only':
+        connection = sqlite3.connect(f'file:{{database}}?mode=ro', uri=True)
+        connection.execute('SELECT COUNT(*) FROM writes').fetchone()
+        connection.close()
+    else:
+        ctx.data_root.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(database)
+        connection.execute(
+            'CREATE TABLE IF NOT EXISTS owner ('
+            'slot INTEGER PRIMARY KEY CHECK (slot = 1), version TEXT NOT NULL)'
+        )
+        connection.execute(
+            'CREATE TABLE IF NOT EXISTS trace ('
+            'seq INTEGER PRIMARY KEY AUTOINCREMENT, event TEXT NOT NULL)'
+        )
+        connection.execute(
+            'CREATE TABLE IF NOT EXISTS writes ('
+            'seq INTEGER PRIMARY KEY AUTOINCREMENT, version TEXT NOT NULL, '
+            'root_token INTEGER NOT NULL)'
+        )
+        connection.commit()
+        connection.close()
+
+    async def started(_event):
+        global writer_task
+        connection = sqlite3.connect(database)
+        connection.execute('INSERT INTO owner VALUES (1, ?)', ({version!r},))
+        connection.execute('INSERT INTO trace(event) VALUES (?)', ('start:{version}',))
+        connection.commit()
+        connection.close()
+
+        async def write_forever():
+            connection = sqlite3.connect(database)
+            try:
+                while True:
+                    connection.execute(
+                        'INSERT INTO writes(version, root_token) VALUES (?, ?)',
+                        ({version!r}, root_token),
+                    )
+                    connection.commit()
+                    await asyncio.sleep(0)
+            finally:
+                connection.close()
+
+        writer_task = asyncio.create_task(write_forever())
+
+    async def stopping(_event):
+        global writer_task
+        if writer_task is not None:
+            writer_task.cancel()
+            try:
+                await writer_task
+            except asyncio.CancelledError:
+                pass
+            writer_task = None
+        connection = sqlite3.connect(database)
+        connection.execute('DELETE FROM owner WHERE version = ?', ({version!r},))
+        connection.execute('INSERT INTO trace(event) VALUES (?)', ('stop:{version}',))
+        connection.commit()
+        connection.close()
+
+    await ctx.on(RUNTIME_STARTED, started)
+    await ctx.on(RUNTIME_STOPPING, stopping)
+"""
+
+
+def _sqlite_scalar(database: Path, query: str) -> object:
+    connection = sqlite3.connect(database)
+    try:
+        return connection.execute(query).fetchone()[0]
+    finally:
+        connection.close()
+
+
+@pytest.mark.asyncio
+async def test_shared_read_candidate_uses_formal_data_without_copy(
+    tmp_path: Path,
+) -> None:
+    _ = _write_plugin(
+        tmp_path / "plugins",
+        "isolated_reader",
+        "api_version = 3\n"
+        "name = 'isolated_reader'\n"
+        "version = '1.0.0'\n"
+        "async def apply(ctx, config):\n"
+        "    assert ctx.data_access == 'read_write'\n"
+        "    ctx.data_root.mkdir(parents=True, exist_ok=True)\n"
+        "    (ctx.data_root / 'isolated.txt').write_text('isolated')\n",
+    )
+    plugin_dir = _write_plugin(
+        tmp_path / "plugins",
+        "shared_reader",
+        "api_version = 3\n"
+        "name = 'shared_reader'\n"
+        "version = '1.0.0'\n"
+        "async def apply(ctx, config):\n"
+        "    import sqlite3\n"
+        "    assert ctx.data_access == 'read_write'\n"
+        "    ctx.data_root.mkdir(parents=True, exist_ok=True)\n"
+        "    connection = sqlite3.connect(ctx.data_root / 'state.sqlite3')\n"
+        "    connection.execute('CREATE TABLE IF NOT EXISTS items (id INTEGER PRIMARY KEY)')\n"
+        "    connection.execute('INSERT INTO items DEFAULT VALUES')\n"
+        "    connection.commit()\n"
+        "    connection.close()\n",
+    )
+    _write_static_v3_manifest(
+        plugin_dir,
+        "shared_reader",
+        "1.0.0",
+        candidate_data_mode="shared_read",
+    )
+    manager = _manager(tmp_path)
+    await manager.load_all()
+    stable = manager.generation("shared_reader")
+    isolated = manager.generation("isolated_reader")
+    assert stable is not None and isolated is not None
+    assert stable.source_type == "builtin"
+    assert stable.static_manifest is not None
+    assert stable.static_manifest.candidate_data_mode == "shared_read"
+    database = stable.data_dir / "state.sqlite3"
+    sparse = stable.data_dir / "large.sparse"
+    with sparse.open("wb") as stream:
+        stream.truncate(512 * 1024 * 1024)
+    formal_inode = database.stat().st_ino
+    formal_digest = hashlib.sha256(database.read_bytes()).hexdigest()
+    proactive = tmp_path / "workspace" / "proactive.db"
+    wake_proactive = tmp_path / "workspace" / "wake_proactive.db"
+    proactive.write_bytes(b"legacy proactive island")
+    wake_proactive.write_bytes(b"legacy wake island")
+    proactive_inode = proactive.stat().st_ino
+    wake_proactive_inode = wake_proactive.stat().st_ino
+
+    (plugin_dir / "plugin.py").write_text(
+        "api_version = 3\n"
+        "name = 'shared_reader'\n"
+        "version = '2.0.0'\n"
+        "async def apply(ctx, config):\n"
+        "    import json, sqlite3\n"
+        "    assert ctx.data_access == 'read_only'\n"
+        "    database = ctx.data_root / 'state.sqlite3'\n"
+        "    connection = sqlite3.connect(f'file:{database}?mode=ro', uri=True)\n"
+        "    rows = connection.execute('SELECT COUNT(*) FROM items').fetchone()[0]\n"
+        "    rejected = False\n"
+        "    try:\n"
+        "        connection.execute('INSERT INTO items DEFAULT VALUES')\n"
+        "    except sqlite3.OperationalError:\n"
+        "        rejected = True\n"
+        "    connection.close()\n"
+        "    ctx.runtime.workspace.mkdir(parents=True, exist_ok=True)\n"
+        "    (ctx.runtime.workspace / 'shared-read.json').write_text(\n"
+        "        json.dumps({'rows': rows, 'write_rejected': rejected})\n"
+        "    )\n",
+        encoding="utf-8",
+    )
+    _write_static_v3_manifest(
+        plugin_dir,
+        "shared_reader",
+        "2.0.0",
+        candidate_data_mode="shared_read",
+    )
+
+    candidate = await manager.prepare_candidate("shared_reader")
+
+    assert candidate is not None and candidate.runtime_snapshot is not None
+    assert candidate.validation_workspace is not None
+    assert candidate.validation_data_inventory == ()
+    candidate_root = candidate.runtime_snapshot.composition_root
+    assert candidate_root is not None
+    candidate_fibers = {
+        fiber.name: fiber for fiber in candidate_root.root_fiber.children
+    }
+    candidate_runtime = candidate_fibers["shared_reader"].runtime
+    isolated_runtime = candidate_fibers["isolated_reader"].runtime
+    assert candidate_runtime is not None
+    assert isolated_runtime is not None
+    assert candidate_runtime.data_dir == stable.data_dir
+    assert candidate_runtime.data_access == "read_only"
+    assert isolated_runtime.data_dir != isolated.data_dir
+    assert isolated_runtime.data_access == "read_write"
+    assert (isolated_runtime.data_dir / "isolated.txt").read_text() == "isolated"
+    validation_root = candidate.validation_workspace.parent
+    observations = tuple(validation_root.rglob("shared-read.json"))
+    assert len(observations) == 1
+    assert json.loads(observations[0].read_text(encoding="utf-8")) == {
+        "rows": 1,
+        "write_rejected": True,
+    }
+    assert not tuple(validation_root.rglob("state.sqlite3"))
+    assert not tuple(validation_root.rglob("large.sparse"))
+    assert not tuple(validation_root.rglob("proactive.db"))
+    assert not tuple(validation_root.rglob("wake_proactive.db"))
+    assert sum(path.stat().st_blocks * 512 for path in validation_root.rglob("*")) < (
+        1024 * 1024
+    )
+    assert database.stat().st_ino == formal_inode
+    assert hashlib.sha256(database.read_bytes()).hexdigest() == formal_digest
+    assert proactive.stat().st_ino == proactive_inode
+    assert wake_proactive.stat().st_ino == wake_proactive_inode
+    formal = sqlite3.connect(database)
+    try:
+        assert formal.execute("SELECT COUNT(*) FROM items").fetchone() == (1,)
+    finally:
+        formal.close()
+
+    await manager.discard_prepared("shared_reader")
+    assert not validation_root.exists()
+    assert database.is_file() and sparse.is_file()
+    assert proactive.is_file() and wake_proactive.is_file()
+    await manager.terminate_all()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owner_commit_fails", [False, True])
+@pytest.mark.parametrize("new_data_mode", ["shared_read", "isolated_copy"])
+async def test_shared_read_direct_publish_drains_old_writer_before_new_start(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    owner_commit_fails: bool,
+    new_data_mode: str,
+) -> None:
+    plugin_dir = _write_plugin(
+        tmp_path / "plugins",
+        "shared_writer",
+        _shared_writer_source("v1"),
+    )
+    _write_static_v3_manifest(
+        plugin_dir,
+        "shared_writer",
+        "v1",
+        candidate_data_mode="shared_read",
+    )
+    manager = _manager(tmp_path)
+    await manager.load_all()
+    stable = manager.generation("shared_writer")
+    stable_snapshot = manager.current_snapshot
+    assert stable is not None and stable_snapshot is not None
+    assert stable_snapshot.composition_root is not None
+    old_root_token = id(stable_snapshot.composition_root.instance_token)
+    database = stable.data_dir / "writer.sqlite3"
+    runtime_services = asyncio.create_task(manager.run_runtime_services())
+    while stable.instance.module.writer_task is None:
+        await asyncio.sleep(0)
+
+    (plugin_dir / "plugin.py").write_text(
+        _shared_writer_source("v2"),
+        encoding="utf-8",
+    )
+    _write_static_v3_manifest(
+        plugin_dir,
+        "shared_writer",
+        "v2",
+        candidate_data_mode=new_data_mode,
+    )
+    candidate = await manager.prepare_candidate("shared_writer")
+    assert candidate is not None
+    assert candidate.instance.module.writer_task is None
+    assert candidate.runtime_snapshot is not None
+    candidate_root = candidate.runtime_snapshot.composition_root
+    assert candidate_root is not None
+    assert candidate_root.plugin_runtime("shared_writer").data_access == (
+        "read_only" if new_data_mode == "shared_read" else "read_write"
+    )
+    if owner_commit_fails:
+
+        def fail_owner_commit(*_args: object) -> None:
+            raise RuntimeError("candidate owner commit failed")
+
+        monkeypatch.setattr(
+            manager,
+            "_activate_published_generation",
+            fail_owner_commit,
+        )
+
+    # 1. An accepted old Turn keeps the old writer alive while publication waits.
+    old_lease = await manager.snapshot_store.acquire()
+    publication = asyncio.create_task(manager.publish_prepared("shared_writer"))
+    while stable_snapshot.accepting_leases:
+        await asyncio.sleep(0)
+    before_wait = cast(
+        int,
+        _sqlite_scalar(
+            database,
+            "SELECT COUNT(*) FROM writes "
+            f"WHERE version = 'v1' AND root_token = {old_root_token}",
+        ),
+    )
+    for _ in range(20):
+        await asyncio.sleep(0)
+    during_wait = cast(
+        int,
+        _sqlite_scalar(
+            database,
+            "SELECT COUNT(*) FROM writes "
+            f"WHERE version = 'v1' AND root_token = {old_root_token}",
+        ),
+    )
+    assert during_wait > before_wait
+    waiting_admission = asyncio.create_task(manager.snapshot_store.acquire())
+    await asyncio.sleep(0)
+    assert not publication.done()
+    assert not waiting_admission.done()
+
+    # 2. Releasing the Turn lets STOPPING settle v1 before v2 receives STARTED.
+    await old_lease.release()
+    if owner_commit_fails:
+        with pytest.raises(RuntimeError, match="candidate owner commit failed"):
+            await publication
+        result = None
+    else:
+        result = await publication
+    new_lease = await waiting_admission
+    await new_lease.release()
+    if result is not None:
+        assert result["publication_state"] == "committed"
+    connection = sqlite3.connect(database)
+    trace = [
+        row[0] for row in connection.execute("SELECT event FROM trace ORDER BY seq")
+    ]
+    owners = connection.execute("SELECT version FROM owner").fetchall()
+    old_writes = connection.execute(
+        "SELECT COUNT(*) FROM writes WHERE version = 'v1' AND root_token = ?",
+        (old_root_token,),
+    ).fetchone()[0]
+    connection.close()
+    if owner_commit_fails:
+        assert trace == [
+            "start:v1",
+            "stop:v1",
+            "start:v2",
+            "stop:v2",
+            "start:v1",
+        ]
+        assert owners == [("v1",)]
+        assert candidate.instance.module.writer_task is None
+        assert stable.instance.module.writer_task is not None
+    else:
+        assert trace == ["start:v1", "stop:v1", "start:v2"]
+        assert owners == [("v2",)]
+        assert stable.instance.module.writer_task is None
+
+    # 3. The terminal old Root cannot write again after the new writer is open.
+    for _ in range(20):
+        await asyncio.sleep(0)
+    assert (
+        _sqlite_scalar(
+            database,
+            "SELECT COUNT(*) FROM writes "
+            f"WHERE version = 'v1' AND root_token = {old_root_token}",
+        )
+        == old_writes
+    )
+    runtime_services.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await runtime_services
+    await manager.terminate_all()
+
+
+@pytest.mark.asyncio
+async def test_shared_read_formal_rebuild_rejects_other_topology_drift(
+    tmp_path: Path,
+) -> None:
+    plugin_dir = _write_plugin(
+        tmp_path / "plugins",
+        "shared_writer",
+        _shared_writer_source("v1"),
+    )
+    _write_static_v3_manifest(
+        plugin_dir,
+        "shared_writer",
+        "v1",
+        candidate_data_mode="shared_read",
+    )
+    manager = _manager(tmp_path)
+    await manager.load_all()
+    stable = manager.generation("shared_writer")
+    stable_snapshot = manager.current_snapshot
+    assert stable is not None and stable_snapshot is not None
+    old_root = stable_snapshot.composition_root
+    assert old_root is not None
+    runtime_services = asyncio.create_task(manager.run_runtime_services())
+    while old_root.instance_token not in manager._runtime_started_roots:
+        await asyncio.sleep(0)
+
+    mutant = _shared_writer_source("v2").replace(
+        "    await ctx.on(RUNTIME_STOPPING, stopping)\n",
+        "    await ctx.on(RUNTIME_STOPPING, stopping)\n"
+        "    if ctx.data_access == 'read_write':\n"
+        "        await ctx.on(RUNTIME_STARTED, lambda _: None)\n",
+    )
+    (plugin_dir / "plugin.py").write_text(mutant, encoding="utf-8")
+    _write_static_v3_manifest(
+        plugin_dir,
+        "shared_writer",
+        "v2",
+        candidate_data_mode="shared_read",
+    )
+    candidate = await manager.prepare_candidate("shared_writer")
+    assert candidate is not None
+
+    with pytest.raises(RuntimeError, match="snapshot identity"):
+        await manager.publish_prepared("shared_writer")
+
+    replacement_root = stable_snapshot.composition_root
+    assert replacement_root is not None and replacement_root is not old_root
+    assert manager.current_snapshot is stable_snapshot
+    assert manager.generation("shared_writer") is stable
+    assert stable_snapshot.accepting_leases
+    assert manager.prepared_generation("shared_writer") is None
+    runtime_services.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await runtime_services
+    await manager.terminate_all()
 
 
 @pytest.mark.asyncio
@@ -313,9 +719,7 @@ async def test_v3_channel_registry_redacts_candidate_credentials_before_import(
     )
     manifest_path = plugin_dir / "akashic.plugin.toml"
     manifest_path.write_text(_channel_static_manifest("1.0.0"), encoding="utf-8")
-    data_dir = (
-        tmp_path / "workspace" / "plugin-data" / "channel_probe-builtin"
-    )
+    data_dir = tmp_path / "workspace" / "plugin-data" / "channel_probe-builtin"
     data_dir.mkdir(parents=True)
     config_path = data_dir / "config.local.toml"
     secret = "candidate-must-never-read-this-secret"
@@ -944,9 +1348,7 @@ async def test_v3_channel_old_restart_failure_keeps_durable_recovery_owner(
     assert manager.active_channel_generation is None
     record = manager.reload_journal.get(candidate.reload_tx_id)
     assert record.phase == "degraded"
-    assert record.failure_resource == (
-        f"channel-publication:{candidate.generation_id}"
-    )
+    assert record.failure_resource == (f"channel-publication:{candidate.generation_id}")
 
     recovered = await manager.retry_runtime_recovery("channel_probe")
     assert recovered["publication_state"] == "recovered"
@@ -1115,9 +1517,7 @@ async def test_v3_channel_candidate_cleanup_failure_blocks_old_restore_until_ret
     active = manager.active_channel_generation
     assert active is not None and active.channel("feishu").admission_open
     assert (
-        manager.channel_generation_host.failure(
-            candidate.runtime_snapshot.snapshot_id
-        )
+        manager.channel_generation_host.failure(candidate.runtime_snapshot.snapshot_id)
         is None
     )
     await manager.terminate_all()
@@ -1335,8 +1735,7 @@ async def test_v3_channel_manifest_and_root_declaration_must_match(
     source = _channel_plugin_source("1.0.0")
     if source_mutation[0] == "inject = (CHANNELS,)":
         source = source[: source.index("async def apply")] + (
-            "async def apply(ctx, config):\n"
-            "    pass\n"
+            "async def apply(ctx, config):\n" "    pass\n"
         )
     source = source.replace(*source_mutation)
     plugin_dir = _write_plugin(
@@ -1348,9 +1747,7 @@ async def test_v3_channel_manifest_and_root_declaration_must_match(
         _channel_static_manifest("1.0.0"),
         encoding="utf-8",
     )
-    data_dir = (
-        tmp_path / "workspace" / "plugin-data" / "channel_probe-builtin"
-    )
+    data_dir = tmp_path / "workspace" / "plugin-data" / "channel_probe-builtin"
     data_dir.mkdir(parents=True)
     config_path = data_dir / "config.local.toml"
     original_config = b"app_id = 'app-1'\nappSecret = 'secret'\n"
@@ -1541,15 +1938,14 @@ async def test_v3_loader_publishes_declared_package_contributions(
     generation = manager.generation("package_contributor")
     snapshot = manager.current_snapshot
     assert generation is not None and snapshot is not None
-    assert generation.contributions.skill_roots == (
-        (plugin_dir / "skills").resolve(),
-    )
+    assert generation.contributions.skill_roots == ((plugin_dir / "skills").resolve(),)
     assert generation.contributions.drift_skill_roots == (
         (plugin_dir / "drift" / "skills").resolve(),
     )
-    assert generation.contributions.dashboard_module == (
-        plugin_dir / "dashboard.py"
-    ).resolve()
+    assert (
+        generation.contributions.dashboard_module
+        == (plugin_dir / "dashboard.py").resolve()
+    )
     active = {item.plugin_id: item for item in manager.active_plugins()}
     assert active["package_contributor"].skill_roots == (
         (plugin_dir / "skills").resolve(),
@@ -1623,8 +2019,7 @@ async def test_v3_dashboard_rejects_legacy_register_signature(tmp_path: Path) ->
     ("dashboard_source", "message"),
     [
         (
-            "plugin_enabled = 1\n"
-            "def register(app, context): return None\n",
+            "plugin_enabled = 1\n" "def register(app, context): return None\n",
             "plugin_enabled 必须是可调用对象",
         ),
         (
@@ -2144,9 +2539,7 @@ async def test_v3_loader_fails_loud_when_required_service_never_appears(
     assert manager._snapshot_store.retained_snapshot_ids == ()
     assert manager._active_generations == {}
     assert manager._scopes == {}
-    assert not (
-        tmp_path / "workspace" / "plugin-data" / "waiting-builtin"
-    ).exists()
+    assert not (tmp_path / "workspace" / "plugin-data" / "waiting-builtin").exists()
 
     await manager.terminate_all()
 
@@ -2463,6 +2856,7 @@ async def test_direct_v3_invariant_failure_never_applies_to_formal_data(
     first_attempt_root = candidate_runtime.workspace.parent
 
     original_invariants = manager._post_publish_invariants
+
     async def fail_invariant(*_args: object) -> None:
         raise RuntimeError("candidate invariant failed")
 
@@ -2559,9 +2953,7 @@ async def test_cancelled_candidate_mount_cleans_partial_clones_and_data(
 
     attempt_root = marker.parent.parent
     clone_modules = {
-        module_name
-        for module_name in sys.modules
-        if "__candidate_" in module_name
+        module_name for module_name in sys.modules if "__candidate_" in module_name
     }
     assert len(clone_modules) == 2
 
@@ -2591,7 +2983,7 @@ async def test_installed_v3_candidate_rebuilds_runtime_then_promotes(
     source = (
         "from pydantic import BaseModel\n"
         "from agent.plugin_composition import (\n"
-        "    BACKGROUND_JOBS, MEMORY_RUNTIME, PROACTIVE_COMPONENTS,\n"
+        "    BACKGROUND_JOBS, MEMORY_RUNTIME,\n"
         ")\n"
         "api_version = 3\n"
         "name = 'installed_v3'\n"
@@ -2599,7 +2991,7 @@ async def test_installed_v3_candidate_rebuilds_runtime_then_promotes(
         "skill_roots = ('skills',)\n"
         "drift_skill_roots = ('drift/skills',)\n"
         "dashboard_module = 'dashboard.py'\n"
-        "inject = (MEMORY_RUNTIME, PROACTIVE_COMPONENTS, BACKGROUND_JOBS)\n"
+        "inject = (MEMORY_RUNTIME, BACKGROUND_JOBS)\n"
         "class Config(BaseModel):\n"
         "    marker: str = 'default'\n"
         "applied = []\n"
@@ -2653,9 +3045,7 @@ async def test_installed_v3_candidate_rebuilds_runtime_then_promotes(
     def describe_memory_runtime() -> object:
         nonlocal describe_calls
         describe_calls += 1
-        return SimpleNamespace(
-            name="default" if describe_calls == 1 else "drifted"
-        )
+        return SimpleNamespace(name="default" if describe_calls == 1 else "drifted")
 
     manager = _manager(
         tmp_path,
@@ -2667,9 +3057,9 @@ async def test_installed_v3_candidate_rebuilds_runtime_then_promotes(
     stable_snapshot = manager.current_snapshot
     assert stable is not None and stable_snapshot is not None
     assert stable_snapshot.plugin_skill_index is not None
-    assert "body v1" in stable_snapshot.plugin_skill_index.get(
-        "installed-skill"
-    ).content  # type: ignore[union-attr]
+    assert (
+        "body v1" in stable_snapshot.plugin_skill_index.get("installed-skill").content
+    )  # type: ignore[union-attr]
     stable_lease = manager.snapshot_store.lease()
 
     write_pointers(plugin_base, stable=stable_pointer, latest=latest_pointer)
@@ -2684,12 +3074,14 @@ async def test_installed_v3_candidate_rebuilds_runtime_then_promotes(
     candidate_snapshot = candidate.runtime_snapshot
     assert candidate_snapshot is not None
     assert candidate_snapshot.plugin_skill_index is not None
-    assert "body v2" in candidate_snapshot.plugin_skill_index.get(
-        "installed-skill"
-    ).content  # type: ignore[union-attr]
-    assert candidate.contributions.dashboard_module == (
-        latest_root / "dashboard.py"
-    ).resolve()
+    assert (
+        "body v2"
+        in candidate_snapshot.plugin_skill_index.get("installed-skill").content
+    )  # type: ignore[union-attr]
+    assert (
+        candidate.contributions.dashboard_module
+        == (latest_root / "dashboard.py").resolve()
+    )
     candidate_root = candidate_snapshot.composition_root
     stable_root_runtime = manager.current_snapshot.composition_root
     assert candidate_root is not None
@@ -2712,30 +3104,26 @@ async def test_installed_v3_candidate_rebuilds_runtime_then_promotes(
     promoted_snapshot = manager.current_snapshot
     assert promoted_snapshot is not None
     assert promoted_snapshot.composition_root is not None
-    assert promoted_snapshot.proactive_component_catalog is not None
     assert promoted_snapshot.background_job_catalog is not None
-    assert (
-        promoted_snapshot.proactive_component_catalog.root_instance_token
-        is promoted_snapshot.composition_root.instance_token
-    )
     assert (
         promoted_snapshot.background_job_catalog.root_instance_token
         is promoted_snapshot.composition_root.instance_token
     )
     assert promoted_snapshot.plugin_skill_index is not None
-    assert "body v2" in promoted_snapshot.plugin_skill_index.get(
-        "installed-skill"
-    ).content  # type: ignore[union-attr]
+    assert (
+        "body v2" in promoted_snapshot.plugin_skill_index.get("installed-skill").content
+    )  # type: ignore[union-attr]
     promoted_catalog_id = promoted_snapshot.skill_catalog_generation_id
     assert promoted_catalog_id is not None
     promoted_catalog = manager._skill_host.get(promoted_catalog_id)
     assert promoted_catalog is not None
-    assert "drift v2" in promoted_catalog.drift.get(
-        "installed-drift"
-    ).content  # type: ignore[union-attr]
-    assert promoted_snapshot.generations[
-        "installed_v3@lab"
-    ].contributions.dashboard_module == (latest_root / "dashboard.py").resolve()
+    assert (
+        "drift v2" in promoted_catalog.drift.get("installed-drift").content
+    )  # type: ignore[union-attr]
+    assert (
+        promoted_snapshot.generations["installed_v3@lab"].contributions.dashboard_module
+        == (latest_root / "dashboard.py").resolve()
+    )
     assert candidate.instance.module.applied[-1] == (
         str(tmp_path / "workspace"),
         "default",
@@ -2816,9 +3204,7 @@ async def test_installed_v3_dashboard_uses_composition_runtime_until_promotion(
     manager = _manager(tmp_path)
     await manager.load_all()
     manager.sync_skill_links()
-    skill_link = (
-        tmp_path / "workspace" / "drift" / "skills" / "dashboard-v3-static"
-    )
+    skill_link = tmp_path / "workspace" / "drift" / "skills" / "dashboard-v3-static"
     assert skill_link.exists()
     stable_snapshot = manager.current_snapshot
     assert stable_snapshot is not None
@@ -2977,13 +3363,12 @@ async def test_inactive_v3_does_not_claim_active_plugin_skill_name(
         "active_owner"
     }
     link = tmp_path / "workspace" / "drift" / "skills" / "shared-static-skill"
-    assert link.resolve() == (
-        plugin_root
-        / "active_owner"
-        / "drift"
-        / "skills"
-        / "shared-static-skill"
-    ).resolve()
+    assert (
+        link.resolve()
+        == (
+            plugin_root / "active_owner" / "drift" / "skills" / "shared-static-skill"
+        ).resolve()
+    )
     await manager.terminate_all()
 
 
@@ -2997,8 +3382,8 @@ async def test_builtin_v3_dashboard_candidate_clones_data_root_before_publish(
         "api_version = 3\n"
         "name = 'dashboard_builtin_v3'\n"
         "version = '1.0.0'\n"
-        "from agent.plugin_composition import PROACTIVE_COMPONENTS\n"
-        "inject = (PROACTIVE_COMPONENTS,)\n"
+        "from agent.plugin_composition import BACKGROUND_JOBS\n"
+        "inject = (BACKGROUND_JOBS,)\n"
         "dashboard_module = 'dashboard.py'\n"
         "def apply(ctx, config): pass\n",
     )
@@ -3025,8 +3410,8 @@ async def test_builtin_v3_dashboard_candidate_clones_data_root_before_publish(
         "api_version = 3\n"
         "name = 'dashboard_builtin_v3'\n"
         "version = '2.0.0'\n"
-        "from agent.plugin_composition import PROACTIVE_COMPONENTS\n"
-        "inject = (PROACTIVE_COMPONENTS,)\n"
+        "from agent.plugin_composition import BACKGROUND_JOBS\n"
+        "inject = (BACKGROUND_JOBS,)\n"
         "dashboard_module = 'dashboard.py'\n"
         "def apply(ctx, config): pass\n",
         encoding="utf-8",
@@ -3048,9 +3433,9 @@ async def test_builtin_v3_dashboard_candidate_clones_data_root_before_publish(
     current = manager.current_snapshot
     assert current is not None
     assert current.composition_root is not None
-    assert current.proactive_component_catalog is not None
+    assert current.background_job_catalog is not None
     assert (
-        current.proactive_component_catalog.root_instance_token
+        current.background_job_catalog.root_instance_token
         is current.composition_root.instance_token
     )
     binding = current.dashboard_bindings[0]
@@ -3191,9 +3576,13 @@ async def test_installed_v3_candidate_incident_overflow_blocks_promotion(
 
 
 @pytest.mark.asyncio
-async def test_installed_v3_owner_commit_failure_discards_production_root(
+@pytest.mark.parametrize("owner_commit_fails", [False, True])
+@pytest.mark.parametrize("new_data_mode", ["shared_read", "isolated_copy"])
+async def test_installed_v3_shared_handoff_success_and_owner_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    owner_commit_fails: bool,
+    new_data_mode: str,
 ) -> None:
     plugin_base = tmp_path / "home" / "cache" / "lab" / "installed_v3"
     stable_artifact = plugin_base / ".artifacts" / "1.0.0-aaaa"
@@ -3204,8 +3593,16 @@ async def test_installed_v3_owner_commit_failure_discards_production_root(
         "api_version = 3\n"
         "name = 'installed_v3'\n"
         "version = '1.0.0'\n"
+        "from agent.plugin_composition import RUNTIME_STARTED, RUNTIME_STOPPING\n"
         "disposed = False\n"
+        "started_roots = []\n"
+        "stopped_roots = []\n"
         "async def apply(ctx, config):\n"
+        "    global disposed\n"
+        "    disposed = False\n"
+        "    token = id(ctx._root_instance_token())\n"
+        "    await ctx.on(RUNTIME_STARTED, lambda _: started_roots.append(token))\n"
+        "    await ctx.on(RUNTIME_STOPPING, lambda _: stopped_roots.append(token))\n"
         "    def cleanup():\n"
         "        global disposed\n"
         "        disposed = True\n"
@@ -3216,8 +3613,18 @@ async def test_installed_v3_owner_commit_failure_discards_production_root(
         source.replace("version = '1.0.0'", "version = '2.0.0'"),
         encoding="utf-8",
     )
-    _write_static_v3_manifest(stable_artifact, "installed_v3", "1.0.0")
-    _write_static_v3_manifest(latest_artifact, "installed_v3", "2.0.0")
+    _write_static_v3_manifest(
+        stable_artifact,
+        "installed_v3",
+        "1.0.0",
+        candidate_data_mode="shared_read",
+    )
+    _write_static_v3_manifest(
+        latest_artifact,
+        "installed_v3",
+        "2.0.0",
+        candidate_data_mode=new_data_mode,
+    )
     stable_pointer = ArtifactPointer(".artifacts/1.0.0-aaaa")
     latest_pointer = ArtifactPointer(".artifacts/2.0.0-bbbb")
     write_pointers(plugin_base, stable=stable_pointer, latest=stable_pointer)
@@ -3230,6 +3637,11 @@ async def test_installed_v3_owner_commit_failure_discards_production_root(
     stable = manager.generation("installed_v3@lab")
     stable_snapshot = manager.current_snapshot
     assert stable is not None and stable_snapshot is not None
+    old_root = stable_snapshot.composition_root
+    assert old_root is not None
+    runtime_services = asyncio.create_task(manager.run_runtime_services())
+    while old_root.instance_token not in manager._runtime_started_roots:
+        await asyncio.sleep(0)
 
     write_pointers(plugin_base, stable=stable_pointer, latest=latest_pointer)
     assert (await manager.reconcile_changed())[0]["publication_state"] == "latest_ready"
@@ -3237,21 +3649,66 @@ async def test_installed_v3_owner_commit_failure_discards_production_root(
     assert candidate is not None and candidate.reload_tx_id is not None
     original_activate = manager._activate_published_generation
 
-    def fail_owner_commit(*_args: object) -> None:
-        raise RuntimeError("candidate owner commit failed")
+    if owner_commit_fails:
 
-    monkeypatch.setattr(manager, "_activate_published_generation", fail_owner_commit)
-    with pytest.raises(RuntimeError, match="candidate owner commit failed"):
-        await manager.switch_ready("installed_v3@lab")
+        def fail_owner_commit(*_args: object) -> None:
+            raise RuntimeError("candidate owner commit failed")
+
+        monkeypatch.setattr(
+            manager,
+            "_activate_published_generation",
+            fail_owner_commit,
+        )
+        with pytest.raises(RuntimeError, match="candidate owner commit failed"):
+            await manager.switch_ready("installed_v3@lab")
+    else:
+        result = await manager.switch_ready("installed_v3@lab")
+        assert result["publication_state"] == "promoted"
+        promoted_snapshot = manager.current_snapshot
+        assert promoted_snapshot is not None
+        promoted_root = promoted_snapshot.composition_root
+        assert promoted_root is not None and promoted_root is not old_root
+        assert promoted_root.instance_token in manager._runtime_started_roots
+        assert old_root.instance_token not in manager._runtime_started_roots
+        assert manager.generation("installed_v3@lab") is candidate
+        assert manager.ready_candidate is None
+        assert candidate.instance.module.started_roots == [
+            id(promoted_root.instance_token)
+        ]
+        assert candidate.instance.module.stopped_roots == []
+        assert stable.instance.module.stopped_roots == [id(old_root.instance_token)]
+        assert read_pointer(plugin_base, "stable") == latest_pointer
+        assert read_pointer(plugin_base, "latest") == latest_pointer
+        runtime_services.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await runtime_services
+        await manager.terminate_all()
+        return
 
     assert manager.current_snapshot is stable_snapshot
     assert manager.generation("installed_v3@lab") is stable
     assert manager.ready_candidate is None
     assert manager.latest_snapshot is stable_snapshot
+    replacement_root = stable_snapshot.composition_root
+    assert replacement_root is not None and replacement_root is not old_root
+    assert replacement_root.instance_token in manager._runtime_started_roots
+    assert old_root.instance_token not in manager._runtime_started_roots
     assert candidate.instance.module.disposed is True
     assert candidate.scope.closed is True
     assert read_pointer(plugin_base, "stable") == stable_pointer
     assert read_pointer(plugin_base, "latest") == stable_pointer
     assert stable.instance.module.disposed is False
+    assert stable.instance.module.started_roots == [
+        id(old_root.instance_token),
+        id(replacement_root.instance_token),
+    ]
+    assert stable.instance.module.stopped_roots == [id(old_root.instance_token)]
+    assert len(candidate.instance.module.started_roots) == 1
+    assert candidate.instance.module.stopped_roots == (
+        candidate.instance.module.started_roots
+    )
     monkeypatch.setattr(manager, "_activate_published_generation", original_activate)
+    runtime_services.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await runtime_services
     await manager.terminate_all()
