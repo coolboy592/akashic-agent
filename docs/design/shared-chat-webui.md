@@ -4,7 +4,7 @@
 - 日期：2026-08-01
 - 决策：[0018](../decisions/0018-chat-webui-has-one-source-and-two-adapters.md)
 - 关联条款：WEBUI-001～WEBUI-007、MOB-001、TST-007～TST-008
-- 视觉系统：[0023](../decisions/0023-akashic-tokens-own-material-3-semantics.md)
+- 视觉系统：[0043](../decisions/0043-paper-brand-tokens-replace-material-visual-semantics.md)；[纸张品牌系统](akashic-paper-brand-system.md)
 
 ## 1. 用户意图
 
@@ -24,9 +24,9 @@
 ```text
 ┌──────────────────────── akasic-agent ─────────────────────────┐
 │ frontend/theme                                               │
-│ ├─ theme-catalog.json       Akashic Material 与领域颜色目录   │
-│ ├─ material-tokens.css      共享形状、排版、间距和动效 token  │
-│ └─ material-react.tsx       Material Web 的 React 适配器      │
+│ ├─ theme-catalog.json       主题色值与领域状态目录             │
+│ ├─ brand-tokens.css         paper / ink / rule / type          │
+│ └─ material-tokens.css      迁移期兼容与既有适配器             │
 │ frontend/chat                                                │
 │ ├─ theme.css                共享 WebUI token 入口             │
 │ ├─ message-view.tsx          共享消息、工具、流式正文          │
@@ -34,7 +34,8 @@
 │ ├─ message-actions.tsx       共享引用、复制与引用预览          │
 │ ├─ conversation-navigation.* 共享功能入口、会话与底部操作      │
 │ ├─ main.tsx                  桌面适配器 + QR 配对能力          │
-│ └─ mobile-native.tsx         Android 适配器 + Native bridge   │
+│ ├─ mobile-native.tsx         Mobile React 应用                │
+│ └─ mobile-entry.tsx          Android transport + 挂载入口     │
 └───────────────┬──────────────────────────────┬─────────────────┘
                 │ desktop Vite build           │ clean commit build
                 ▼                              ▼
@@ -109,10 +110,14 @@
 - WebUI 构建失败不会改变移动端原生状态；产物升级只替换 APK 构建输入。
 - 回滚主仓库到上一个 WebUI commit并重新打包；移动仓库恢复上一个 ZIP、摘要和 source lock。两边都不需要迁移数据库或 workspace。
 
-## 7. 试点验收
+## 7. 视觉语法
+
+桌面与 Mobile 使用同一纸张品牌 token、`ChatMessageView` 和 `message-view.css`。用户气泡、Akashic 正文、Markdown 与工具过程由共享 WebUI 拥有；Mobile 只补 viewport、触摸、抽屉、Bridge、草稿、outbox 与离线状态，不增加装饰性角色标题或平行消息组件。Android 原生能力和 Bridge owner 不随视觉变化。
+
+## 8. 试点验收
 
 - 主仓库：typecheck、chat build、mobile web build、mobile state tests、lint。
-- 视觉：桌面和 mobile showcase 同时渲染，核对主题 token、布局、流式状态与 reduced motion。
-- 离线共享组件验收：打开 `/?preview=chat`，直接观察生产 `ChatMessageView` 的 thinking、工具开始/完成和正文生长；该入口不连接 Runtime、不读取正式会话。
+- 视觉：以生产桌面 Chat 与 `/?preview=chat-product` 方案页核对主题 token、布局与工具轨迹呈现。
+- 离线对话方案验收：打开 `/?preview=chat-product`（兼容旧 `/?preview=chat`），在「现状 1:1 / Gemini 式 / 生产力台」之间切换；消息本体仍用生产 `ChatMessageView`，不连接 Runtime、不读取正式会话。
 - 移动仓库：ZIP 正向校验、篡改失败测试、Gradle debug build。
 - 报告两仓库 commit/tree、ZIP digest；真机 WebView、内存、掉帧和冷启动单独列为未验证或设备证据。

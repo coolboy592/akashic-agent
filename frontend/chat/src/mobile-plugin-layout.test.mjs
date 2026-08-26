@@ -74,7 +74,7 @@ const runtimeDashboardStyles = await readFile(
 test("process plugin slots align with thinking and tool content", () => {
   assert.match(
     sharedStyles,
-    /\.process-item\s*\{[\s\S]*?grid-template-columns:\s*var\(--process-rail-width\) minmax\(0, 1fr\);[\s\S]*?column-gap:\s*12px;/,
+    /\.process-item\s*\{[\s\S]*?grid-template-columns:\s*var\(--process-rail-width\) minmax\(0, 1fr\);[\s\S]*?column-gap:\s*10px;/,
   );
   assert.match(
     sharedStyles,
@@ -83,7 +83,7 @@ test("process plugin slots align with thinking and tool content", () => {
   assert.doesNotMatch(platformStyles, /\.mobile-plugin-slot\[data-slot="turn\.before_reasoning"\]/);
   assert.match(
     sharedStyles,
-    /\.process-line\s*\{[\s\S]*?bottom:\s*0;[\s\S]*?left:\s*var\(--process-content-inset\);[\s\S]*?width:\s*var\(--process-rail-width\);/,
+    /\.process-line\s*\{[\s\S]*?bottom:\s*0;[\s\S]*?left:\s*0;[\s\S]*?width:\s*var\(--process-rail-width\);/,
   );
   assert.match(
     sharedStyles,
@@ -93,8 +93,12 @@ test("process plugin slots align with thinking and tool content", () => {
   assert.doesNotMatch(sharedStyles, /transition:\s*height/);
   assert.match(
     sharedStyles,
-    /\.process-node\.diamond\s*\{[^}]*width:\s*8px;[^}]*height:\s*8px;/,
+    /\.process-node\.diamond\s*\{[^}]*width:\s*6px;[^}]*height:\s*6px;/,
   );
+  assert.match(sharedStyles, /\.process-panel\s*\{/);
+  assert.match(sharedStyles, /\.process-panel-body\s*\{/);
+  assert.match(sharedStyles, /\.process-collapse\s*\{/);
+  assert.doesNotMatch(sharedStyles, /max-height:\s*min\(52vh/);
 });
 
 test("streaming thinking uses the shared Streamdown renderer", () => {
@@ -146,7 +150,7 @@ test("desktop and mobile keep one shared conversation owner", () => {
 test("shared navigation keeps the compact mobile drawer language", () => {
   assert.doesNotMatch(navigationSource, /对话与知识/);
   assert.doesNotMatch(navigationSource, />Akashic</);
-  assert.match(navigationSource, /conversation-navigation__heading">会话/);
+  assert.match(navigationSource, /conversation-navigation__heading[^>]*">会话/);
   assert.match(navigationSource, /featuredDestinations/);
   assert.match(mobileSource, /label: "知识与运行",[\s\S]*?featured: true,/);
   assert.match(

@@ -1,4 +1,6 @@
 @import "../../theme/src/material-tokens.css";
+@import "../../theme/src/brand-tokens.css";
+@import "../../theme/src/paper-surface.css";
 
 @tailwind base;
 @tailwind components;
@@ -15,9 +17,9 @@
   --t-fast: var(--ak-sys-duration-short);
   --t-base: var(--ak-sys-duration-medium);
   --t-slow: 400ms;
-  --display: var(--md-ref-typeface-brand);
-  --sans: var(--md-ref-typeface-plain);
-  --mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  --display: var(--ak-type-reading);
+  --sans: var(--ak-type-reading);
+  --mono: var(--ak-type-technical);
 }
 
 html,
@@ -27,14 +29,14 @@ body,
 }
 
 body {
-  font-family: var(--md-ref-typeface-plain);
+  font-family: var(--ak-type-reading);
   font-feature-settings: "cv02", "cv03", "cv04", "cv11", "ss01";
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
-  background: var(--md-sys-color-surface);
-  color: var(--md-sys-color-on-surface);
+  background: var(--ak-paper-canvas);
+  color: var(--ak-ink-primary);
 }
 
 /* Public plugin preset. Plugins may use these classes or the matching SDK components. */
@@ -99,15 +101,15 @@ body {
 
 .ak-control-input {
   min-height: 3.5rem;
-  border: 1px solid var(--md-sys-color-outline);
+  border: 1px solid var(--ak-rule-strong);
   border-radius: var(--md-sys-shape-corner-extra-small);
   padding-inline: 1rem;
   color: var(--md-sys-color-on-surface);
   background: transparent;
 }
 .ak-control-input:focus-visible {
-  border-color: var(--md-sys-color-primary);
-  outline: 2px solid var(--md-sys-color-primary);
+  border-color: var(--ak-rule-focus);
+  outline: 2px solid var(--ak-rule-focus);
   outline-offset: -2px;
 }
 
@@ -174,62 +176,92 @@ body {
   /* ── Layout ── */
 
   .unified-shell {
+    --shell-band-height: 48px;
+    --shell-band-gap: 8px;
+    --shell-nav-gap: 6px;
+    --shell-group-gap: 16px;
+    --shell-band-inline: 16px;
     display: grid;
-    width: 100vw;
+    width: 100%;
     height: 100dvh;
-    grid-template-columns: 48px minmax(0, 1fr);
-    gap: 0.5rem;
+    grid-template-rows: calc(var(--shell-band-height) + env(safe-area-inset-top, 0px)) minmax(0, 1fr);
+    grid-template-columns: minmax(0, 1fr);
+    gap: 0;
     overflow: hidden;
-    padding: 0.5rem;
-    background: var(--md-sys-color-surface);
+    padding: 0;
   }
 
-  .primary-rail {
+  .primary-band {
     display: flex;
-    min-height: 0;
-    flex-direction: column;
+    min-width: 0;
     align-items: center;
-    border-radius: var(--radius-xl);
-    padding: 0.375rem 0.25rem;
-    border: 1px solid var(--md-sys-color-outline-variant);
-    background: var(--md-sys-color-surface-container-low);
-    box-shadow: var(--shell-shadow);
+    gap: var(--shell-band-gap);
+    padding-block: env(safe-area-inset-top, 0px) 0;
+    padding-inline: max(var(--shell-band-inline), env(safe-area-inset-left, 0px))
+      max(var(--shell-band-inline), env(safe-area-inset-right, 0px));
+    border-block-end: 1px solid var(--ak-rule-subtle);
   }
 
-  .primary-rail-brand {
-    display: grid;
-    width: 40px;
-    height: 40px;
-    flex: 0 0 40px;
-    place-items: center;
+  .primary-band-brand {
+    display: flex;
+    flex: 0 0 auto;
+    align-items: center;
+    gap: var(--shell-band-gap);
+    margin-inline-end: var(--shell-group-gap);
+    color: var(--md-sys-color-primary);
   }
 
-  .primary-rail-brand img {
-    width: 30px;
-    height: 30px;
+  .primary-band-brand img {
+    width: 22px;
+    height: 22px;
     object-fit: contain;
   }
 
-  .primary-rail-nav {
-    display: grid;
-    width: 100%;
-    gap: 0.5rem;
-    margin-top: 0.75rem;
+  .primary-band-brand strong {
+    font-size: 0.9375rem;
+    font-weight: 650;
+    letter-spacing: 0.01em;
+  }
+
+  .primary-band-nav {
+    display: flex;
+    min-width: 0;
+    flex: 1 1 auto;
+    align-items: center;
+    gap: var(--shell-nav-gap);
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+
+  .primary-band-nav::-webkit-scrollbar {
+    display: none;
+  }
+
+  .primary-band-footer {
+    display: flex;
+    flex: 0 0 auto;
+    align-items: center;
+    gap: var(--shell-nav-gap);
+    margin-inline-start: auto;
+    padding-inline-start: var(--shell-group-gap);
   }
 
   .primary-rail-button {
-    display: grid;
-    min-height: 46px;
-    place-items: center;
-    gap: 0.25rem;
+    display: inline-flex;
+    min-height: 36px;
+    min-width: 36px;
+    align-items: center;
+    gap: 0.4rem;
     border: 0;
-    border-radius: var(--radius-lg);
-    padding: 0;
+    border-radius: 8px;
+    padding-block: 0;
+    padding-inline: 12px;
     color: var(--md-sys-color-on-surface-variant);
     background: transparent;
     font: inherit;
-    font-size: 0.75rem;
-    font-weight: 600;
+    font-size: 0.875rem;
+    font-weight: 550;
+    white-space: nowrap;
     cursor: pointer;
     transition-property: color, background-color, scale;
     transition-duration: var(--t-fast);
@@ -237,32 +269,32 @@ body {
   }
 
   .primary-rail-button svg {
-    width: 24px;
-    height: 24px;
-    stroke-width: 2;
+    width: 16px;
+    height: 16px;
+    stroke-width: 1.75;
   }
 
   .primary-rail-button span {
-    position: absolute;
-    width: 1px;
-    height: 1px;
-    overflow: hidden;
-    clip: rect(0 0 0 0);
-    clip-path: inset(50%);
+    position: static;
+    width: auto;
+    height: auto;
+    overflow: visible;
+    clip: auto;
+    clip-path: none;
     white-space: nowrap;
   }
 
-  :root[data-theme="light"] .primary-rail-brand img,
-  :root[data-theme="warm-paper"] .primary-rail-brand img {
+  :root[data-theme="light"] .primary-band-brand img {
     filter: brightness(0);
   }
 
-  :root[data-theme="dark"] .primary-rail-brand img {
+  :root[data-theme="dark"] .primary-band-brand img {
     filter: brightness(0) invert(1);
   }
 
   .primary-rail-button:hover {
-    background: var(--md-sys-color-surface-container-high);
+    color: var(--md-sys-color-on-surface);
+    background: color-mix(in oklch, var(--md-sys-color-on-surface) 5%, transparent);
   }
 
   .primary-rail-button:active {
@@ -270,24 +302,17 @@ body {
   }
 
   .primary-rail-button.is-active {
-    color: var(--md-sys-color-on-secondary-container);
-    background: var(--md-sys-color-secondary-container);
+    color: var(--md-sys-color-on-surface);
+    background: color-mix(in oklch, var(--md-sys-color-on-surface) 8%, transparent);
   }
 
-  .primary-rail-footer {
-    width: 100%;
-    margin-top: auto;
+  .primary-rail-button:focus-visible {
+    outline: 2px solid var(--md-sys-color-primary);
+    outline-offset: 2px;
   }
 
-  .primary-rail-footer .theme-cycle-button {
-    width: 100%;
-    min-height: 40px;
-    padding: 0;
-    border: 0;
-    border-radius: var(--radius-lg);
-  }
-
-  .primary-rail-footer .theme-cycle-button span {
+  /* Legacy class kept for any residual selectors during migration. */
+  .primary-rail {
     display: none;
   }
 
@@ -303,10 +328,10 @@ body {
   .shell-view-stack {
     position: relative;
     overflow: hidden;
-    border: 1px solid var(--md-sys-color-outline-variant);
-    border-radius: var(--radius-xl);
-    background: var(--md-sys-color-surface-container-low);
-    box-shadow: var(--shell-shadow);
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+    box-shadow: none;
   }
 
   .shell-view {
@@ -321,7 +346,19 @@ body {
   .shell-view iframe {
     display: block;
     border: 0;
-    background: var(--md-sys-color-surface);
+    background: transparent;
+  }
+
+  .primary-band-footer .theme-cycle-button {
+    min-height: 34px;
+    padding: 0 10px;
+    border: 0;
+    border-radius: 8px;
+    background: transparent;
+  }
+
+  .primary-band-footer .theme-cycle-button span {
+    display: none;
   }
 
   .runtime-unavailable {
@@ -360,7 +397,7 @@ body {
   .content-shell {
     @apply flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden;
     border-radius: 0;
-    background: var(--md-sys-color-surface);
+    background: transparent;
     box-shadow: none;
   }
 
@@ -372,8 +409,7 @@ body {
     @apply h-8 w-8 flex-shrink-0 object-contain;
   }
 
-  :root[data-theme="light"] .brand-mark,
-  :root[data-theme="warm-paper"] .brand-mark {
+  :root[data-theme="light"] .brand-mark {
     filter: brightness(0);
   }
 
@@ -545,36 +581,36 @@ body {
   /* ── Workspace ── */
 
   .workspace {
-    @apply flex min-h-0 flex-1 overflow-hidden p-3;
+    @apply flex min-h-0 flex-1 overflow-hidden;
+    padding: 0;
+    background: transparent;
   }
 
   /* ── Panes ── */
 
-  /* Side panes read as raised metal panels (hairline top highlight); the center
-     log surface is the darkest layer and sits recessed between them. */
+  /* Paper stage: hairline divisions on one parchment plane, no floating cards. */
   .sessions-pane {
     @apply flex min-h-0 flex-shrink-0 flex-col overflow-hidden;
     margin: 0;
     width: clamp(280px, 18vw, 320px);
-    border-inline-end: 1px solid var(--md-sys-color-outline-variant);
+    border-inline-end: 1px solid var(--ak-rule-subtle);
     border-radius: 0;
-    background: var(--md-sys-color-surface-container-low);
     box-shadow: none;
   }
 
   .messages-pane {
-    @apply flex min-h-0 min-w-0 flex-1 flex-col bg-surface overflow-hidden;
-    border: 1px solid var(--ak-color-border-default);
-    background: var(--ak-color-bg-surface);
+    @apply flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden;
+    border: 0;
+    background: transparent;
   }
 
   .detail-pane {
-    @apply min-h-0 flex-shrink-0 bg-surface;
+    @apply min-h-0 flex-shrink-0;
     position: relative;
     width: 0;
     overflow-y: auto;
-    border: 0 solid var(--ak-color-border-default);
-    background: var(--ak-color-bg-surface);
+    border: 0;
+    border-inline-start: 0 solid var(--ak-rule-subtle);
     opacity: 0;
     pointer-events: none;
     container-name: detail-pane;
@@ -584,8 +620,7 @@ body {
 
   .detail-pane.is-open {
     width: clamp(360px, 26vw, 460px);
-    border-width: 1px;
-    border-inline-start: 0;
+    border-inline-start-width: 1px;
     opacity: 1;
     pointer-events: auto;
   }
@@ -1633,63 +1668,41 @@ body {
     }
 
     .workspace {
-      @apply gap-2 p-2;
+      padding: 0;
     }
   }
 
   @media (max-width: 760px) {
     .unified-shell {
-      display: block;
-      padding: 0.5rem 0.5rem 5.5rem;
+      display: grid;
+      grid-template-rows: calc(var(--shell-band-height) + env(safe-area-inset-top, 0px)) minmax(0, 1fr);
+      padding: 0;
     }
 
-    .primary-rail {
-      position: fixed;
-      right: 0.5rem;
-      bottom: 0.5rem;
-      left: 0.5rem;
-      z-index: 300;
-      min-height: 72px;
-      flex-direction: row;
-      padding: 0.375rem;
-      border-radius: var(--radius-xl);
+    .primary-band {
+      --shell-band-inline: 12px;
     }
 
-    .primary-rail-brand,
-    .primary-rail-footer {
+    .primary-band-brand strong {
       display: none;
     }
 
-    .primary-rail-nav {
-      grid-template-columns: repeat(4, minmax(0, 1fr));
-      gap: 0.25rem;
-      margin: 0;
-    }
-
     .primary-rail-button {
-      min-height: 60px;
-      border-radius: var(--radius-lg);
-    }
-
-    .primary-rail-button span {
-      position: static;
-      width: auto;
-      height: auto;
-      overflow: visible;
-      clip: auto;
-      clip-path: none;
-      white-space: normal;
+      min-height: 36px;
+      padding-inline: 10px;
+      font-size: 0.8125rem;
     }
 
     .shell-view-stack {
       height: 100%;
-      border-radius: var(--radius-lg);
+      border-radius: 0;
+      box-shadow: none;
     }
 
     .detail-pane.is-open {
-      inset: 8px;
-      width: calc(100% - 16px);
-      border-radius: var(--md-sys-shape-corner-large, 16px);
+      inset: 0;
+      width: 100%;
+      border-radius: 0;
     }
 
     .shell {
@@ -1701,9 +1714,9 @@ body {
       margin: 0;
       width: 100%;
       height: 58dvh;
-      border-radius: var(--radius-lg);
+      border-radius: 0;
       border-inline-end: 0;
-      border-block-end: 1px solid var(--md-sys-color-outline-variant);
+      border-block-end: 1px solid var(--ak-rule-subtle);
     }
 
     .brand {

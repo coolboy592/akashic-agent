@@ -1,0 +1,39 @@
+/*
+ * Akashic paper brand contract.
+ *
+ * Components consume these semantic axes instead of naming a visual component
+ * such as a card, chip, or Material surface. The older color namespaces remain
+ * transport aliases while the theme catalog migrates; they are not the brand API.
+ */
+
+:root {
+  /* Paper: one continuous sheet, with only purposeful local planes. */
+  --ak-paper-canvas: var(--ak-color-bg-canvas);
+  --ak-paper-editing: var(--ak-color-bg-surface);
+  --ak-paper-quiet: var(--ak-color-bg-surface-low);
+  --ak-paper-sheet: var(--md-sys-color-surface-container);
+  --ak-paper-raised: var(--ak-color-bg-surface-high);
+
+  /* Ink: reading hierarchy. Ink never doubles as a surface. */
+  --ak-ink-primary: var(--ak-color-text-primary);
+  --ak-ink-secondary: var(--ak-color-text-secondary);
+  --ak-ink-muted: var(--ak-color-text-muted);
+
+  /* Rules: structure and focus, never decorative elevation. */
+  --ak-rule-subtle: color-mix(in oklch, var(--ak-ink-primary) 10%, transparent);
+  --ak-rule-default: var(--ak-color-border-default);
+  --ak-rule-strong: var(--ak-color-border-strong);
+  --ak-rule-focus: var(--ak-color-action-primary);
+  --ak-rule-focus-soft: color-mix(in oklch, var(--ak-rule-focus) 55%, rgb(28 31 37 / 25%));
+
+  /* Typography: reading and technical content stay visibly distinct. */
+  --ak-type-reading: var(--md-ref-typeface-plain);
+  --ak-type-technical: var(--md-ref-typeface-mono);
+}
+
+@media (prefers-contrast: more) {
+  :root {
+    --ak-rule-subtle: var(--ak-rule-default);
+    --ak-rule-default: var(--ak-rule-strong);
+  }
+}

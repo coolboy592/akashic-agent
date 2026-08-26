@@ -37,8 +37,9 @@ test("desktop rich content upgrades near the viewport without hiding fallback te
 });
 
 test("desktop static code fallback remains visually contained", () => {
-  assert.match(styles, /\.static-code-block\s*\{[\s\S]*?border:[^;]+;[\s\S]*?overflow-x:\s*auto;/);
+  assert.match(styles, /\.static-code-block\s*\{[\s\S]*?width:\s*fit-content;[\s\S]*?border:[^;]+;/);
   assert.match(styles, /\.static-code-block\s*\{[\s\S]*?background:[^;]+;/);
+  assert.match(styles, /\.static-code-block\s*>\s*pre\s*\{[\s\S]*?overflow-x:\s*auto;/);
 });
 
 test("desktop reply availability uses one history index", () => {
@@ -52,7 +53,7 @@ test("shared message contracts no longer import the desktop entry", async () => 
   const sources = await Promise.all([
     "message-view.tsx",
     "mobile-native.tsx",
-    "shared-chat-showcase.tsx",
+    "chat-product-variants.tsx",
     "web-stream-projection.ts",
   ].map((path) => readFile(new URL(`./${path}`, import.meta.url), "utf8")));
   for (const source of sources) assert.doesNotMatch(source, /from "\.\/main(?:\.tsx)?"/);

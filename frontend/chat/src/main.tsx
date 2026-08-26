@@ -7,20 +7,14 @@ import { WebUiErrorBoundary } from "./webui-error-boundary";
 
 export type { AgentBlock, ChatMessage, MessageAttachment, ThinkingBlock, ToolBlock } from "./chat-message";
 
-const LazyMobileShowcase = lazy(() =>
-  import("./mobile-showcase").then(({ MobileShowcase }) => ({ default: MobileShowcase })),
+const LazyChatProductVariants = lazy(() =>
+  import("./chat-product-variants").then(({ ChatProductVariants }) => ({ default: ChatProductVariants })),
 );
-const LazySharedChatShowcase = lazy(() =>
-  import("./shared-chat-showcase").then(({ SharedChatShowcase }) => ({ default: SharedChatShowcase })),
+const LazyMediaRenderShowcase = lazy(() =>
+  import("./media-render-showcase").then(({ MediaRenderShowcase }) => ({ default: MediaRenderShowcase })),
 );
-const LazyTraceMotionShowcase = lazy(() =>
-  import("./trace-motion-showcase").then(({ TraceMotionShowcase }) => ({ default: TraceMotionShowcase })),
-);
-const LazyDrawerIslandShowcase = lazy(() =>
-  import("./drawer-island-showcase").then(({ DrawerIslandShowcase }) => ({ default: DrawerIslandShowcase })),
-);
-const LazyModelExperienceShowcase = lazy(() =>
-  import("./model-experience-showcase").then(({ ModelExperienceShowcase }) => ({ default: ModelExperienceShowcase })),
+const LazyPaperShellShowcase = lazy(() =>
+  import("./paper-shell-showcase").then(({ PaperShellShowcase }) => ({ default: PaperShellShowcase })),
 );
 const LazySettingsApp = lazy(() =>
   import("./settings-app").then(({ SettingsApp }) => ({ default: SettingsApp })),
@@ -50,11 +44,9 @@ function rootContent() {
   if (window.location.pathname === "/settings" || window.location.pathname.startsWith("/settings/")) {
     return <LazySettingsApp />;
   }
-  if (preview === "mobile") return <LazyMobileShowcase />;
-  if (preview === "chat") return <LazySharedChatShowcase />;
-  if (preview === "trace-motion") return <LazyTraceMotionShowcase />;
-  if (preview === "drawer-islands") return <LazyDrawerIslandShowcase />;
-  if (preview === "model-experience") return <LazyModelExperienceShowcase />;
+  if (preview === "chat-product" || preview === "chat") return <LazyChatProductVariants />;
+  if (preview === "media-render") return <LazyMediaRenderShowcase />;
+  if (preview === "paper-shell") return <LazyPaperShellShowcase />;
   return <DesktopChatApp embeddedShell={embeddedShell} embeddedRuntime={embeddedRuntime} />;
 }
 

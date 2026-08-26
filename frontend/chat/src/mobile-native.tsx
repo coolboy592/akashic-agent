@@ -1,6 +1,3 @@
-import "./mobile-polyfills";
-import { installMobileBridge } from "./mobile-bridge";
-
 import React, {
   lazy,
   startTransition,
@@ -15,7 +12,6 @@ import React, {
   useState,
   useSyncExternalStore,
 } from "react";
-import { createRoot } from "react-dom/client";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { createUuid } from "./browser-uuid.ts";
 import {
@@ -54,7 +50,7 @@ import codexIcon from "./assets/provider-icons/codex.svg";
 import deepseekIcon from "./assets/provider-icons/deepseek.svg";
 import opencodeIcon from "./assets/provider-icons/opencode.svg";
 import openrouterIcon from "./assets/provider-icons/openrouter.svg";
-import { cycleTheme, initializeTheme, setTheme, useTheme } from "../../theme/src/theme-runtime";
+import { cycleTheme, setTheme, useTheme } from "../../theme/src/theme-runtime";
 import { ComposerActionButton } from "./composer-action";
 import { ConversationNavigation } from "./conversation-navigation";
 import {
@@ -133,7 +129,6 @@ import {
   replaceMobileSurface,
   type MobileSurface,
 } from "./mobile-surface-history";
-import "./mobile-native.css";
 import "./message-view.css";
 
 const LazyChatMessageView = lazy(() =>
@@ -1033,7 +1028,7 @@ declare global {
   }
 }
 
-function MobileNativeApp() {
+export function MobileNativeApp() {
   const pluginDashboards = useMobilePluginDashboards();
   const [snapshot, setSnapshot] = useState<MobileSnapshot | null>(null);
   const [streamStore] = useState(() => new StreamProjectionStore<MobileMessage>());
@@ -1517,8 +1512,13 @@ function MobileNativeApp() {
     return () => window.cancelAnimationFrame(frame);
   }, [snapshot]);
 
-  // 渲染期调整：停止中/不可停止/连接错误时立即复位 stopRequested，无需等待 effect 提交
-  if (snapshot?.composer.isStopping || !snapshot?.composer.canStop || snapshot?.connection.error) {
+  // 渲染期调整：只在本地确有待复位状态时写入，避免初始空 snapshot 重复 setState。
+  if (stopRequested && (
+    snapshot === null
+    || snapshot.composer.isStopping
+    || !snapshot.composer.canStop
+    || snapshot.connection.error
+  )) {
     setStopRequested(false);
   }
 
@@ -4596,49 +4596,3 @@ function toAgentBlock(block: MobileProcessBlock): AgentBlock {
     durationMs: block.durationMillis,
   };
 }
-
-class MobileErrorBoundary extends React.Component<React.PropsWithChildren, { message: string | null }> {
-  state: { message: string | null } = { message: null };
-
-  static getDerivedStateFromError(error: unknown) {
-    return { message: error instanceof Error ? error.message : "会话界面发生未知错误" };
-  }
-
-  componentDidCatch(error: unknown) {
-    console.error("[mobile] render failed", error);
-  }
-
-  render() {
-    if (!this.state.message) return this.props.children;
-    return (
-      <main className="mobile-fatal" role="alert">
-        <AlertCircle className="mobile-fatal__mark" size={28} />
-        <h1>会话界面没有正常载入</h1>
-        <p>{this.state.message}</p>
-        <button type="button" onClick={() => window.location.reload()}>
-          <RefreshCw size={18} />
-          重新载入
-        </button>
-      </main>
-    );
-  }
-}
-
-// Activity 的 adjustResize 已拥有 IME 高度；visualViewport 会在部分 Pixel WebView 上重复扣除键盘。
-function syncMobileViewportHeight() {
-  const viewportHeight = Math.max(1, Math.round(window.innerHeight));
-  document.documentElement.style.setProperty("--mobile-viewport-height", `${viewportHeight}px`);
-}
-
-syncMobileViewportHeight();
-window.addEventListener("resize", syncMobileViewportHeight);
-initializeTheme();
-installMobileBridge();
-
-const root = document.getElementById("root");
-if (!root) throw new Error("Mobile Web root 不存在");
-createRoot(root).render(
-  <MobileErrorBoundary>
-    <MobileNativeApp />
-  </MobileErrorBoundary>,
-);
