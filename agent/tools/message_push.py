@@ -89,7 +89,8 @@ class MessagePushTool(Tool):
         metadata_object = cast(dict[object, object], raw_outbound_metadata)
         if not all(isinstance(key, str) for key in metadata_object):
             raise TypeError("message_push _outbound_metadata 必须是字符串键对象")
-        outbound_metadata = cast(dict[str, object], metadata_object)
+        outbound_metadata = dict(cast(dict[str, object], metadata_object))
+        outbound_metadata.setdefault("source", "message_push")
 
         if not message and not file and not image:
             return "错误：message、file、image 至少提供一个"

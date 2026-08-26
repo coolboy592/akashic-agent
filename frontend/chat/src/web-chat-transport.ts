@@ -1,12 +1,11 @@
 import type { ChatMessage, ToolBlock } from "./chat-message";
-import { createUuid } from "./browser-uuid.ts";
 import type { ChatStatus } from "./web-chat-status";
 import { blocksWithFinalThinking, mediaToAttachments, mergeAttachments } from "./web-chat-message-data.ts";
 import type { WebTurnTraceKind } from "./web-turn-trace";
 
 export type ChatFrame =
   | { type: "session.created"; request_id: string; session_id: string }
-  | { type: "turn.started"; session_id: string; turn_id: string; content: string }
+  | { type: "turn.started"; session_id: string; turn_id: string; client_message_id: string; content: string }
   | { type: "react.thinking.delta"; session_id: string; turn_id: string; delta: string }
   | { type: "react.tool.started"; session_id: string; turn_id: string; call_id: string; tool_name: string; arguments: unknown }
   | { type: "react.tool.completed"; session_id: string; turn_id: string; call_id: string; tool_name: string; status: string; result_preview: string }
@@ -39,6 +38,8 @@ export interface WebChatFrameContext {
   getStatus: () => ChatStatus;
   setStatus: (status: ChatStatus) => void;
   getActiveTurnId: () => string | null;
+  isSettledTurn: (turnId: string) => boolean;
+  markSettledTurn: (turnId: string) => void;
   setActiveTurnId: (turnId: string | null) => void;
   loadSessions: () => Promise<void>;
   loadMessages: (sessionId: string) => Promise<void>;
@@ -61,7 +62,7 @@ export function parseChatFrame(value: unknown): ChatFrame {
       requireStrings(frame, ["request_id", "session_id"]);
       break;
     case "turn.started":
-      requireStrings(frame, ["session_id", "turn_id", "content"]);
+      requireStrings(frame, ["session_id", "turn_id", "client_message_id", "content"]);
       break;
     case "react.thinking.delta":
       requireStrings(frame, ["session_id", "turn_id", "delta"]);
@@ -197,21 +198,41 @@ export function applyChatFrame(frame: ChatFrame, context: WebChatFrameContext): 
   }
   if (frame.type === "turn.started") {
     console.debug("[chat-transport] turn.started", { turn_id: frame.turn_id });
+    if (context.isSettledTurn(frame.turn_id)) return;
     context.setStatus("streaming");
     context.setActiveTurnId(frame.turn_id);
-    context.setMessages((messages) => [...messages, {
-      id: frame.turn_id,
-      role: "assistant",
-      content: "",
-      blocks: [],
-      streaming: true,
-      startedAt: Date.now(),
-    }]);
+    context.setMessages((messages) => {
+      const next = [...messages];
+      if (
+        frame.content !== ""
+        && !next.some((message) => message.id === frame.client_message_id)
+      ) {
+        next.push({
+          id: frame.client_message_id,
+          role: "user",
+          content: frame.content,
+          blocks: [],
+          createdAt: new Date().toISOString(),
+          canonical: false,
+        });
+      }
+      if (!next.some((message) => message.id === frame.turn_id)) {
+        next.push({
+          id: frame.turn_id,
+          role: "assistant",
+          content: "",
+          blocks: [],
+          streaming: true,
+          startedAt: Date.now(),
+        });
+      }
+      return next;
+    });
     return;
   }
   if (frame.type === "react.thinking.delta") {
     context.setStatus("streaming");
-    context.setMessages((messages) => updateLastAssistant(messages, (message) => {
+    context.setMessages((messages) => updateAssistantById(messages, frame.turn_id, (message) => {
       const blocks = [...message.blocks];
       const last = blocks.at(-1);
       if (last?.kind === "thinking") blocks[blocks.length - 1] = { ...last, content: last.content + frame.delta };
@@ -221,7 +242,7 @@ export function applyChatFrame(frame: ChatFrame, context: WebChatFrameContext): 
     return;
   }
   if (frame.type === "react.tool.started") {
-    context.setMessages((messages) => updateLastAssistant(messages, (message) => ({
+    context.setMessages((messages) => updateAssistantById(messages, frame.turn_id, (message) => ({
       ...message,
       blocks: [...message.blocks, {
         kind: "tool",
@@ -238,7 +259,7 @@ export function applyChatFrame(frame: ChatFrame, context: WebChatFrameContext): 
   }
   if (frame.type === "react.tool.completed") {
     const succeeded = frame.status === "success";
-    context.setMessages((messages) => updateTool(messages, frame.call_id, {
+    context.setMessages((messages) => updateTool(messages, frame.turn_id, frame.call_id, {
       status: succeeded ? "output-available" : "output-error",
       output: frame.result_preview,
       errorText: succeeded ? undefined : frame.result_preview,
@@ -247,7 +268,7 @@ export function applyChatFrame(frame: ChatFrame, context: WebChatFrameContext): 
   }
   if (frame.type === "answer.delta") {
     console.debug("[chat-transport] answer.delta", { turn_id: frame.turn_id });
-    context.setMessages((messages) => updateLastAssistant(messages, (message) => ({
+    context.setMessages((messages) => updateAssistantById(messages, frame.turn_id, (message) => ({
       ...message,
       content: message.content + frame.delta,
       streaming: true,
@@ -273,16 +294,17 @@ export function applyChatFrame(frame: ChatFrame, context: WebChatFrameContext): 
       session_id: frame.session_id,
       turn_id: frame.turn_id,
     });
-    context.setMessages((messages) => updateLastAssistant(messages, (message) => ({
+    context.setMessages((messages) => updateAssistantById(messages, frame.turn_id, (message) => ({
       ...message,
       content: message.content || frame.content,
       attachments: mergeAttachments(message.attachments, mediaToAttachments(frame.media)),
       blocks: blocksWithFinalThinking(message.blocks, frame.thinking),
-      streaming: message.streaming,
+      streaming: false,
     })));
     void context.loadSessions();
     return;
   }
+  if (frame.terminal_status === "completed") context.markSettledTurn(frame.turn_id);
   const isActiveTerminal = frame.turn_id === context.getActiveTurnId();
   const isRecoveredTerminal = context.getActiveTurnId() === null;
   const failed = frame.terminal_status === "failed";
@@ -380,17 +402,6 @@ export function sendWhenOpen(
   });
 }
 
-function updateLastAssistant(messages: ChatMessage[], updater: (message: ChatMessage) => ChatMessage): ChatMessage[] {
-  const next = [...messages];
-  for (let index = next.length - 1; index >= 0; index -= 1) {
-    if (next[index].role === "assistant") {
-      next[index] = updater(next[index]);
-      return next;
-    }
-  }
-  return [...messages, updater({ id: createUuid(), role: "assistant", content: "", blocks: [] })];
-}
-
 function updateAssistantById(
   messages: ChatMessage[],
   messageId: string,
@@ -407,10 +418,11 @@ function updateAssistantById(
 
 function updateTool(
   messages: ChatMessage[],
+  messageId: string,
   callId: string,
   patch: Pick<ToolBlock, "status" | "output" | "errorText">,
 ): ChatMessage[] {
-  return updateLastAssistant(messages, (message) => ({
+  return updateAssistantById(messages, messageId, (message) => ({
     ...message,
     blocks: message.blocks.map((block) => block.kind === "tool" && block.callId === callId
       ? { ...block, ...patch }

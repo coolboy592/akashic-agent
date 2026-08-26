@@ -39,12 +39,16 @@ test("failed terminal exposes provider error and reconciles durable messages", (
     getStatus: () => status,
     setStatus: (next) => { status = next; },
     getActiveTurnId: () => activeTurnId,
+    isSettledTurn: (turnId) => messages.some((message) => (
+      message.id === turnId && message.role === "assistant" && message.streaming === false
+    )),
+    markSettledTurn: () => {},
     setActiveTurnId: (next) => { activeTurnId = next; },
     loadSessions: async () => {},
     loadMessages: async (sessionId) => { loadedMessages.push(sessionId); },
   };
 
-  applyChatFrame(parseChatFrame({ type: "turn.started", session_id: "session", turn_id: "turn", content: "" }), context);
+  applyChatFrame(parseChatFrame({ type: "turn.started", session_id: "session", turn_id: "turn", client_message_id: "client", content: "" }), context);
   applyChatFrame(parseChatFrame({
     type: "message.final",
     session_id: "session",
@@ -79,12 +83,14 @@ test("frame controller preserves thinking, tool, answer, and terminal lifecycle"
     getStatus: () => status,
     setStatus: (next) => { status = next; },
     getActiveTurnId: () => activeTurnId,
+    isSettledTurn: () => false,
+    markSettledTurn: () => {},
     setActiveTurnId: (next) => { activeTurnId = next; },
     loadSessions: async () => { loadedSessions.push(activeSessionId); },
     loadMessages: async (sessionId) => { loadedMessages.push(sessionId); },
   };
 
-  applyChatFrame(parseChatFrame({ type: "turn.started", session_id: "session", turn_id: "turn", content: "" }), context);
+  applyChatFrame(parseChatFrame({ type: "turn.started", session_id: "session", turn_id: "turn", client_message_id: "client", content: "" }), context);
   applyChatFrame(parseChatFrame({ type: "react.thinking.delta", session_id: "session", turn_id: "turn", delta: "思考" }), context);
   applyChatFrame(parseChatFrame({ type: "react.tool.started", session_id: "session", turn_id: "turn", call_id: "call", tool_name: "shell", arguments: { cmd: "pwd" } }), context);
   applyChatFrame(parseChatFrame({ type: "react.tool.completed", session_id: "session", turn_id: "turn", call_id: "call", tool_name: "shell", status: "success", result_preview: "ok" }), context);
@@ -118,8 +124,11 @@ test("frame controller preserves thinking, tool, answer, and terminal lifecycle"
   assert.deepEqual(loadedSessions, ["session"]);
 });
 
-test("foreign frames cannot mutate the active session and push terminal lands immediately", () => {
+test("foreign frames stay isolated and message push does not own the active turn", () => {
+  let status = "streaming";
+  let activeTurnId = "turn";
   let messages = [{ id: "turn", role: "assistant", content: "", blocks: [], streaming: true }];
+  const settledTurnIds = new Set();
   const context = {
     activeSessionId: () => "active",
     activateSession: () => {},
@@ -127,10 +136,12 @@ test("foreign frames cannot mutate the active session and push terminal lands im
     setMessages: (updater) => {
       messages = updater(messages);
     },
-    getStatus: () => "streaming",
-    setStatus: () => {},
-    getActiveTurnId: () => "turn",
-    setActiveTurnId: () => {},
+    getStatus: () => status,
+    setStatus: (next) => { status = next; },
+    getActiveTurnId: () => activeTurnId,
+    isSettledTurn: (turnId) => settledTurnIds.has(turnId),
+    markSettledTurn: (turnId) => { settledTurnIds.add(turnId); },
+    setActiveTurnId: (next) => { activeTurnId = next; },
     loadSessions: async () => {},
     loadMessages: async () => {},
   };
@@ -139,12 +150,108 @@ test("foreign frames cannot mutate the active session and push terminal lands im
   applyChatFrame(parseChatFrame({
     type: "message.final",
     session_id: "active",
-    turn_id: "turn",
+    turn_id: "delivery:push",
     content: "push",
     metadata: { source: "message_push" },
   }), context);
-  assert.equal(messages[0].content, "push");
+  assert.equal(messages[0].content, "");
   assert.equal(messages[0].streaming, true);
+  assert.equal(messages[1].id, "delivery:push");
+  assert.equal(messages[1].content, "push");
+  assert.equal(messages[1].streaming, false);
+  assert.equal(status, "streaming");
+  assert.equal(activeTurnId, "turn");
+  assert.equal(settledTurnIds.size, 0);
+
+  applyChatFrame(parseChatFrame({
+    type: "turn.interrupted",
+    request_id: "stop",
+    session_id: "active",
+    status: "interrupted",
+    message: "已中断",
+  }), context);
+  applyChatFrame(parseChatFrame({
+    type: "turn.started",
+    session_id: "active",
+    turn_id: "turn",
+    client_message_id: "client:continued",
+    content: "继续",
+  }), context);
+  assert.equal(status, "streaming");
+  assert.equal(activeTurnId, "turn");
+  assert.equal(messages.some((message) => message.id === "client:continued"), true);
+});
+
+test("stream events keep their turn identity across an inserted message push", () => {
+  let status = "streaming";
+  let activeTurnId = "turn:active";
+  let messages = [{ id: "turn:active", role: "assistant", content: "", blocks: [], streaming: true }];
+  const settledTurnIds = new Set();
+  const context = {
+    activeSessionId: () => "active",
+    activateSession: () => {},
+    setError: () => {},
+    setMessages: (updater) => { messages = updater(messages); },
+    getStatus: () => status,
+    setStatus: (next) => { status = next; },
+    getActiveTurnId: () => activeTurnId,
+    isSettledTurn: (turnId) => settledTurnIds.has(turnId),
+    markSettledTurn: (turnId) => { settledTurnIds.add(turnId); },
+    setActiveTurnId: (next) => { activeTurnId = next; },
+    loadSessions: async () => {},
+    loadMessages: async () => {},
+  };
+
+  applyChatFrame(parseChatFrame({
+    type: "react.tool.started",
+    session_id: "active",
+    turn_id: "turn:active",
+    call_id: "call:push",
+    tool_name: "message_push",
+    arguments: { message: "推送" },
+  }), context);
+  applyChatFrame(parseChatFrame({
+    type: "message.final",
+    session_id: "active",
+    turn_id: "delivery:push",
+    content: "推送",
+    metadata: { source: "message_push" },
+  }), context);
+  applyChatFrame(parseChatFrame({
+    type: "react.tool.completed",
+    session_id: "active",
+    turn_id: "turn:active",
+    call_id: "call:push",
+    tool_name: "message_push",
+    status: "success",
+    result_preview: "delivered",
+  }), context);
+  applyChatFrame(parseChatFrame({
+    type: "answer.delta",
+    session_id: "active",
+    turn_id: "turn:active",
+    delta: "答案",
+  }), context);
+  applyChatFrame(parseChatFrame({
+    type: "message.final",
+    session_id: "active",
+    turn_id: "turn:active",
+    content: "最终答案",
+    terminal_status: "completed",
+  }), context);
+
+  const turn = messages.find((message) => message.id === "turn:active");
+  const push = messages.find((message) => message.id === "delivery:push");
+  assert.equal(turn.content, "最终答案");
+  assert.equal(turn.streaming, false);
+  assert.equal(turn.blocks[0].status, "output-available");
+  assert.equal(turn.blocks[0].output, "delivered");
+  assert.equal(push.content, "推送");
+  assert.equal(push.streaming, false);
+  assert.deepEqual(push.blocks, []);
+  assert.equal(status, "idle");
+  assert.equal(activeTurnId, null);
+  assert.equal(settledTurnIds.has("turn:active"), true);
 });
 
 test("output completed enters finalizing then terminal returns to idle", () => {
@@ -158,12 +265,14 @@ test("output completed enters finalizing then terminal returns to idle", () => {
     getStatus: () => status,
     setStatus: (next) => { status = next; },
     getActiveTurnId: () => activeTurnId,
+    isSettledTurn: () => false,
+    markSettledTurn: () => {},
     setActiveTurnId: (next) => { activeTurnId = next; },
     loadSessions: async () => {},
     loadMessages: async () => {},
   };
 
-  applyChatFrame(parseChatFrame({ type: "turn.started", session_id: "session", turn_id: "turn", content: "" }), context);
+  applyChatFrame(parseChatFrame({ type: "turn.started", session_id: "session", turn_id: "turn", client_message_id: "client", content: "" }), context);
   assert.equal(status, "streaming");
 
   applyChatFrame(parseChatFrame({ type: "answer.delta", session_id: "session", turn_id: "turn", delta: "答案" }), context);
@@ -187,12 +296,14 @@ test("late output completed after terminal is ignored and keeps idle", () => {
     getStatus: () => status,
     setStatus: (next) => { status = next; },
     getActiveTurnId: () => activeTurnId,
+    isSettledTurn: () => false,
+    markSettledTurn: () => {},
     setActiveTurnId: (next) => { activeTurnId = next; },
     loadSessions: async () => {},
     loadMessages: async () => {},
   };
 
-  applyChatFrame(parseChatFrame({ type: "turn.started", session_id: "session", turn_id: "turn", content: "" }), context);
+  applyChatFrame(parseChatFrame({ type: "turn.started", session_id: "session", turn_id: "turn", client_message_id: "client", content: "" }), context);
   assert.equal(status, "streaming");
 
   // /stop terminal 先到，composer 回 idle
@@ -215,19 +326,21 @@ test("stale output completed from previous turn does not pollute next turn", () 
     getStatus: () => status,
     setStatus: (next) => { status = next; },
     getActiveTurnId: () => activeTurnId,
+    isSettledTurn: () => false,
+    markSettledTurn: () => {},
     setActiveTurnId: (next) => { activeTurnId = next; },
     loadSessions: async () => {},
     loadMessages: async () => {},
   };
 
   // T1 开始 → 中断 → idle
-  applyChatFrame(parseChatFrame({ type: "turn.started", session_id: "session", turn_id: "turn-1", content: "" }), context);
+  applyChatFrame(parseChatFrame({ type: "turn.started", session_id: "session", turn_id: "turn-1", client_message_id: "client-1", content: "" }), context);
   assert.equal(status, "streaming");
   applyChatFrame(parseChatFrame({ type: "turn.interrupted", request_id: "r", session_id: "session", status: "interrupted", message: "已中断" }), context);
   assert.equal(status, "idle");
 
   // T2 开始（新 turn）
-  applyChatFrame(parseChatFrame({ type: "turn.started", session_id: "session", turn_id: "turn-2", content: "" }), context);
+  applyChatFrame(parseChatFrame({ type: "turn.started", session_id: "session", turn_id: "turn-2", client_message_id: "client-2", content: "" }), context);
   assert.equal(status, "streaming");
   assert.equal(activeTurnId, "turn-2");
 
@@ -249,15 +362,17 @@ test("stale final closes its own row without terminating the next turn", () => {
     getStatus: () => status,
     setStatus: (next) => { status = next; },
     getActiveTurnId: () => activeTurnId,
+    isSettledTurn: (turnId) => messages.some((message) => message.id === turnId && message.streaming === false),
+    markSettledTurn: () => {},
     setActiveTurnId: (next) => { activeTurnId = next; },
     loadSessions: async () => {},
     loadMessages: async () => {},
   };
 
-  applyChatFrame(parseChatFrame({ type: "turn.started", session_id: "session", turn_id: "turn-1", content: "" }), context);
+  applyChatFrame(parseChatFrame({ type: "turn.started", session_id: "session", turn_id: "turn-1", client_message_id: "client-1", content: "" }), context);
   applyChatFrame(parseChatFrame({ type: "answer.delta", session_id: "session", turn_id: "turn-1", delta: "T1 partial" }), context);
   applyChatFrame(parseChatFrame({ type: "turn.output.completed", session_id: "session", turn_id: "turn-1" }), context);
-  applyChatFrame(parseChatFrame({ type: "turn.started", session_id: "session", turn_id: "turn-2", content: "" }), context);
+  applyChatFrame(parseChatFrame({ type: "turn.started", session_id: "session", turn_id: "turn-2", client_message_id: "client-2", content: "" }), context);
   applyChatFrame(parseChatFrame({ type: "answer.delta", session_id: "session", turn_id: "turn-2", delta: "T2 partial" }), context);
 
   applyChatFrame(parseChatFrame({ type: "message.final", session_id: "session", turn_id: "turn-1", content: "T1 final" }), context);
@@ -271,6 +386,174 @@ test("stale final closes its own row without terminating the next turn", () => {
       { id: "turn-2", content: "T2 partial", streaming: true },
     ],
   );
+});
+
+test("turn started mirrors a message sent by another client exactly once", () => {
+  let messages = [];
+  let activeTurnId = null;
+  const context = {
+    activeSessionId: () => "akashic:session",
+    activateSession: () => {},
+    setError: () => {},
+    setMessages: (updater) => { messages = updater(messages); },
+    getStatus: () => "idle",
+    setStatus: () => {},
+    getActiveTurnId: () => activeTurnId,
+    isSettledTurn: (turnId) => messages.some((message) => message.id === turnId && message.streaming === false),
+    markSettledTurn: () => {},
+    setActiveTurnId: (next) => { activeTurnId = next; },
+    loadSessions: async () => {},
+    loadMessages: async () => {},
+  };
+  const started = parseChatFrame({
+    type: "turn.started",
+    session_id: "akashic:session",
+    turn_id: "turn:mobile",
+    client_message_id: "01JREMOTE",
+    content: "手机发出的消息",
+  });
+
+  applyChatFrame(started, context);
+  applyChatFrame(started, context);
+
+  assert.deepEqual(
+    messages.map(({ id, role, content }) => ({ id, role, content })),
+    [
+      { id: "01JREMOTE", role: "user", content: "手机发出的消息" },
+      { id: "turn:mobile", role: "assistant", content: "" },
+    ],
+  );
+});
+
+test("replayed turn started does not reopen a settled turn", () => {
+  let status = "idle";
+  let activeTurnId = null;
+  let messages = [];
+  const settledTurnIds = new Set();
+  const context = {
+    activeSessionId: () => "akashic:session",
+    activateSession: () => {},
+    setError: () => {},
+    setMessages: (updater) => { messages = updater(messages); },
+    getStatus: () => status,
+    setStatus: (next) => { status = next; },
+    getActiveTurnId: () => activeTurnId,
+    isSettledTurn: (turnId) => settledTurnIds.has(turnId),
+    markSettledTurn: (turnId) => { settledTurnIds.add(turnId); },
+    setActiveTurnId: (next) => { activeTurnId = next; },
+    loadSessions: async () => {},
+    loadMessages: async () => {},
+  };
+  const started = parseChatFrame({
+    type: "turn.started",
+    session_id: "akashic:session",
+    turn_id: "turn:mobile",
+    client_message_id: "01JREMOTE",
+    content: "手机发出的消息",
+  });
+
+  applyChatFrame(started, context);
+  applyChatFrame(parseChatFrame({
+    type: "message.final",
+    session_id: "akashic:session",
+    turn_id: "turn:mobile",
+    content: "回复",
+    terminal_status: "completed",
+  }), context);
+  messages = [
+    { id: "akashic:session:1", role: "user", content: "手机发出的消息", blocks: [], canonical: true },
+    { id: "akashic:session:2", role: "assistant", content: "回复", blocks: [], canonical: true },
+  ];
+  applyChatFrame(started, context);
+
+  assert.equal(status, "idle");
+  assert.equal(activeTurnId, null);
+  assert.equal(messages.length, 2);
+  assert.equal(messages[1].content, "回复");
+  assert.equal(messages[1].canonical, true);
+});
+
+test("interrupted terminal does not settle a continued interaction", () => {
+  let status = "idle";
+  let activeTurnId = null;
+  let messages = [];
+  const settledTurnIds = new Set();
+  const context = {
+    activeSessionId: () => "akashic:session",
+    activateSession: () => {},
+    setError: () => {},
+    setMessages: (updater) => { messages = updater(messages); },
+    getStatus: () => status,
+    setStatus: (next) => { status = next; },
+    getActiveTurnId: () => activeTurnId,
+    isSettledTurn: (turnId) => settledTurnIds.has(turnId),
+    markSettledTurn: (turnId) => { settledTurnIds.add(turnId); },
+    setActiveTurnId: (next) => { activeTurnId = next; },
+    loadSessions: async () => {},
+    loadMessages: async () => {},
+  };
+
+  applyChatFrame(parseChatFrame({
+    type: "turn.started",
+    session_id: "akashic:session",
+    turn_id: "turn:continued",
+    client_message_id: "client:first",
+    content: "第一次输入",
+  }), context);
+  applyChatFrame(parseChatFrame({
+    type: "message.final",
+    session_id: "akashic:session",
+    turn_id: "turn:continued",
+    content: "已中断",
+    terminal_status: "interrupted",
+  }), context);
+  applyChatFrame(parseChatFrame({
+    type: "turn.started",
+    session_id: "akashic:session",
+    turn_id: "turn:continued",
+    client_message_id: "client:continued",
+    content: "继续完成",
+  }), context);
+
+  assert.equal(settledTurnIds.has("turn:continued"), false);
+  assert.equal(status, "streaming");
+  assert.equal(activeTurnId, "turn:continued");
+  assert.equal(messages.some((message) => message.id === "client:continued"), true);
+});
+
+test("turn started reuses the Web optimistic message identity", () => {
+  let messages = [{
+    id: "client:web",
+    role: "user",
+    content: "网页发出的消息",
+    blocks: [],
+    canonical: false,
+  }];
+  const context = {
+    activeSessionId: () => "akashic:session",
+    activateSession: () => {},
+    setError: () => {},
+    setMessages: (updater) => { messages = updater(messages); },
+    getStatus: () => "submitted",
+    setStatus: () => {},
+    getActiveTurnId: () => null,
+    isSettledTurn: (turnId) => messages.some((message) => message.id === turnId && message.streaming === false),
+    markSettledTurn: () => {},
+    setActiveTurnId: () => {},
+    loadSessions: async () => {},
+    loadMessages: async () => {},
+  };
+
+  applyChatFrame(parseChatFrame({
+    type: "turn.started",
+    session_id: "akashic:session",
+    turn_id: "turn:web",
+    client_message_id: "client:web",
+    content: "网页发出的消息",
+  }), context);
+
+  assert.equal(messages.filter((message) => message.role === "user").length, 1);
+  assert.equal(messages.filter((message) => message.role === "assistant").length, 1);
 });
 
 test("send transport serializes once, waits for open, and aborts before delivery", async () => {
