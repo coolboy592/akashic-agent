@@ -422,7 +422,7 @@ _MOBILE_TOOL_SECRET_TEXT_PATTERN = re.compile(
 class MobileRealtimeChannel:
     """把移动协议接入现有消息、生命周期和主动推送总线。"""
 
-    name = "mobile"
+    name = "akashic"
     v3_inbound_identity = InboundIdentity.PROVIDER_MESSAGE_ID
 
     def __init__(self, runtime: MobileGatewayRuntime) -> None:
@@ -588,7 +588,7 @@ class MobileRealtimeChannel:
     ) -> None:
         """把客户端残留的活动 turn 与 SessionDB 权威终态对账。"""
 
-        # 1. 只接受属于移动会话且已被手机声明过的权威 turn
+        # 1. 只接受属于共享 Akashic 会话的权威 turn
         if not active_turns:
             return
         store = self._require_ctx().session_manager.control_store
@@ -596,8 +596,7 @@ class MobileRealtimeChannel:
             turn = store.read_turn(turn_id)
             if (
                 turn is None
-                or not turn.thread_id.startswith("mobile:")
-                or not self._runtime.storage.has_session_claim(turn.thread_id)
+                or not turn.thread_id.startswith(f"{self.name}:")
             ):
                 continue
 
@@ -1555,9 +1554,12 @@ class MobileRealtimeChannel:
         if frame.type == "session.list":
             return await self._list_sessions(device_id, frame)
         if frame.type == "session.create":
-            raise MobileCommandError(
-                "unsupported_command",
-                "当前版本由手机本地生成 mobile session_id",
+            _expect_keys(frame.payload, set())
+            session_id = self._session_id(uuid4().hex)
+            return CommandReply(
+                type="session.created",
+                session_id=session_id,
+                payload={"session_id": session_id},
             )
         if frame.type == "session.open":
             return await self._open_session(device_id, frame)
@@ -2112,7 +2114,10 @@ class MobileRealtimeChannel:
                     if first_content
                     else "新对话"
                 ),
-                "updated_at": str(session["updated_at"]),
+                "updated_at": _format_server_timestamp(
+                    session["updated_at"],
+                    field=f"sessions.updated_at:{session_id}",
+                ),
                 "message_count": dashboard_total,
             }
             if history_snapshot_version == 1:
@@ -2344,7 +2349,7 @@ class MobileRealtimeChannel:
                 metadata["attachment_ids"] = [ref.artifact_id for ref in refs]
             raw = RawInbound(
                 message_id=frame.payload.client_message_id,
-                provider_identity=f"device:{device_id}",
+                provider_identity=self._chat_id(session_id),
                 recipient=self._chat_id(session_id),
                 message=ChannelInboundMessage(
                     channel=self.name,
@@ -3714,7 +3719,7 @@ class MobileRealtimeChannel:
     def _normalize_session_id(self, value: object) -> str:
         if not isinstance(value, str) or not value.startswith(f"{self.name}:"):
             raise MobileCommandError(
-                "invalid_session", "session_id 必须属于 mobile 渠道"
+                "invalid_session", "session_id 必须属于 akashic 渠道"
             )
         raw_id = value[len(self.name) + 1 :]
         try:
@@ -3722,12 +3727,12 @@ class MobileRealtimeChannel:
         except ValueError as error:
             raise MobileCommandError(
                 "invalid_session",
-                "mobile session_id 必须包含 UUID",
+                "akashic session_id 必须包含 UUID",
             ) from error
         if raw_id not in {str(parsed), parsed.hex}:
             raise MobileCommandError(
                 "invalid_session",
-                "mobile session_id 必须使用规范小写 UUID",
+                "akashic session_id 必须使用规范小写 UUID",
             )
         return value
 
@@ -4454,6 +4459,20 @@ def _mobile_ui_catalog_identity(
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _format_server_timestamp(value: object, *, field: str) -> str:
+    """在 Mobile 协议边界输出严格的 RFC 3339 UTC 时间。"""
+
+    if not isinstance(value, str) or not value.strip():
+        raise RuntimeError(f"{field} 不是有效时间文本")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise RuntimeError(f"{field} 不是有效 ISO 时间: {value!r}") from error
+    if parsed.tzinfo is None:
+        raise RuntimeError(f"{field} 缺少时区: {value!r}")
+    return parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 __all__ = ["CommandReply", "MobileRealtimeChannel"]
