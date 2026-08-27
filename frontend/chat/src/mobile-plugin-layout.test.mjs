@@ -185,6 +185,29 @@ test("shared navigation keeps the compact mobile drawer language", () => {
     platformStyles,
     /\.mobile-drawer\s*\{[^}]*box-shadow:\s*4px 0 12px rgb\(var\(--md-sys-color-shadow-rgb\) \/ 0\.16\);/,
   );
+  assert.match(
+    platformStyles,
+    /\.mobile-drawer\s*\{[^}]*width:\s*min\(84vw, 360px\);/,
+  );
+  assert.match(
+    platformStyles,
+    /\.mobile-drawer-scrim\s*\{[^}]*background:\s*rgb\(var\(--ak-color-shadow-rgb\) \/ 0\.54\);/,
+  );
+});
+
+test("composer growth stays inside one capsule and keeps mobile text optically centered", () => {
+  assert.match(
+    desktopStyles,
+    /\.composer\.is-expanded\s*\{[^}]*height:\s*auto;[^}]*border-radius:\s*999px;/,
+  );
+  assert.match(
+    desktopStyles,
+    /\.composer\s*\{[^}]*overflow:\s*hidden;/,
+  );
+  assert.match(
+    platformStyles,
+    /\.mobile-composer textarea\s*\{[^}]*min-height:\s*44px;[^}]*padding:\s*10px 6px 12px;/,
+  );
 });
 
 test("Material shadow roles always declare opacity at use sites", () => {

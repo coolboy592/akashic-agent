@@ -929,7 +929,7 @@ input {
 .composer {
   /* Stadium shell: height H → end radius H/2 (true semicircles + flat middle). */
   min-height: 0;
-  overflow: visible;
+  overflow: hidden;
   border: 1px solid var(--ak-rule-default);
   border-radius: var(--composer-compact-radius);
   padding: 4px 4px 4px 14px;
@@ -953,7 +953,8 @@ input {
   height: auto;
   min-height: var(--composer-compact-h);
   max-height: none;
-  border-radius: var(--composer-expanded-radius);
+  /* 输入增长时仍保持同一个胶囊，不切换成固定圆角纸片。 */
+  border-radius: 999px;
   padding: 8px 8px 6px 12px;
 }
 
@@ -983,7 +984,7 @@ input {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
   align-items: end;
-  overflow: visible !important;
+  overflow: hidden !important;
   border: 0;
   border-radius: 0;
   background: transparent;

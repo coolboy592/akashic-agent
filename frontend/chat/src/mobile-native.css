@@ -1650,8 +1650,8 @@ button {
   flex: 1;
   resize: none;
   border: 0;
-  /* 单行光学中心对齐两侧 44 钮：(44 - 1.4×0.9375rem) / 2 ≈ 11px。 */
-  padding: 11px 6px;
+  /* 中文字形在几何中心略显偏下，将墨迹上移 1px。 */
+  padding: 10px 6px 12px;
   color: var(--ak-color-text-primary);
   background: transparent;
   font-size: 0.9375rem;
@@ -2456,7 +2456,7 @@ button {
   position: absolute;
   inset: 0;
   border: 0;
-  background: rgb(var(--ak-color-shadow-rgb) / 0.72);
+  background: rgb(var(--ak-color-shadow-rgb) / 0.54);
   opacity: 0;
   transition-property: opacity;
   transition-duration: 180ms;
