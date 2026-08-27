@@ -2467,7 +2467,8 @@ button {
   opacity: 1;
 }
 
-.mobile-drawer {
+/* Beat .conversation-navigation { width: 100% } on the same element. */
+.conversation-navigation.mobile-drawer {
   position: absolute;
   inset: 0 auto 0 0;
   display: flex;

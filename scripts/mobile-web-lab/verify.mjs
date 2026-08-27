@@ -49,6 +49,17 @@ try {
     roles: ["user", "assistant", "user", "assistant"],
     decorativeRoleLabels: 0,
   });
+  await focusMobileFrame.getByRole("button", { name: "打开会话" }).click();
+  await focusMobileFrame.waitForFunction(
+    () => document.querySelector(".mobile-drawer-layer")?.classList.contains("open"),
+  );
+  await focusMobileFrame.waitForTimeout(250);
+  assert.deepEqual(await inspectDrawerLayout(focusMobileFrame), {
+    viewportWidth: 320,
+    drawerWidth: 269,
+    visibleContentWidth: 51,
+    scrimWidth: 320,
+  });
   assert.deepEqual(await scanAccessibility(focusPage), []);
   assert.deepEqual(await scanAccessibility(focusMobileFrame), []);
   assert.deepEqual(errors, []);
@@ -79,6 +90,24 @@ async function inspectNarrowLayout(frame) {
       .map((node) => node.classList.contains("user") ? "user" : "assistant"),
     decorativeRoleLabels: document.querySelectorAll(".mobile-manuscript-kicker").length,
   }));
+}
+
+async function inspectDrawerLayout(frame) {
+  return frame.evaluate(() => {
+    const drawer = document.querySelector(".mobile-drawer");
+    const scrim = document.querySelector(".mobile-drawer-scrim");
+    if (!(drawer instanceof HTMLElement) || !(scrim instanceof HTMLElement)) {
+      throw new Error("mobile drawer fixture is missing");
+    }
+    const drawerRect = drawer.getBoundingClientRect();
+    const scrimRect = scrim.getBoundingClientRect();
+    return {
+      viewportWidth: window.innerWidth,
+      drawerWidth: Math.round(drawerRect.width),
+      visibleContentWidth: Math.round(window.innerWidth - drawerRect.right),
+      scrimWidth: Math.round(scrimRect.width),
+    };
+  });
 }
 
 function chromiumExecutable() {
