@@ -576,7 +576,7 @@ async def test_provider_chat_stream_parses_content_reasoning_and_tool_calls(
                 choices=[
                     SimpleNamespace(
                         delta=SimpleNamespace(
-                            content="好", reasoning_content="法", tool_calls=[]
+                            content="好", reasoning="法", tool_calls=[]
                         ),
                         finish_reason="stop",
                     )

@@ -201,6 +201,8 @@ class DeepSeekStrategy(ProviderStrategy):
     ) -> tuple[str | None, str | None, dict[str, Any]]:
         reasoning = _get_field(msg, "reasoning_content")
         if reasoning is None:
+            reasoning = _get_field(msg, "reasoning")
+        if reasoning is None:
             return raw, None, {}
         text = str(reasoning)
         return raw, text, {"reasoning_content": text}
@@ -737,6 +739,8 @@ class ChatCompletionsRuntime:
                     continue
 
                 reasoning_piece = _get_field(delta, "reasoning_content")
+                if reasoning_piece is None:
+                    reasoning_piece = _get_field(delta, "reasoning")
                 tool_call_deltas = _iter_tool_call_deltas(delta)
                 content_piece = _get_field(delta, "content")
                 response_id = str(getattr(chunk, "id", "") or "")
