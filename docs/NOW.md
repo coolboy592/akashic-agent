@@ -25,12 +25,6 @@ Session/Message 全身份迁移、配置、Akasha 和 Android 强制全量同步
 - 建立受保护路径 policy：`semantic_delta: none` 的普通实现改动不能同时修改 P0 oracle、mutant 或 coverage baseline 来获得全绿。
 - 建立轻量 `change-intent` 校验，检查实际 diff、允许路径、受保护状态和副作用是否超出声明。
 
-## P0 · Content / Wake 正式激活
-
-- Core 的旧 proactive runtime、配置、Prompt、Dashboard 和 Mobile 投影已经退出；Daynight 已按四类零消费者证据退出最终 fleet，Observe #5、Emotion #6、Feed #7 已合并，最终 H5 已固定 exact source lock。正式激活只剩 quiesced hua-home 备份、yoyo、安装与运行验收。
-- H2 preflight 报告的未交接 continuity、quota、pending documents 和 Wake rules archive consumer 必须由各自 owner 收口；在这些 `BLOCK` 清零前不得切换正式 workspace，也不得删除旧数据库或 Markdown。
-- H2 已增加 exact-digest、verified-backup 的 operator retirement yoyo，Feed 侧同时冻结并 supersede 完整 pre-cutover provider backlog，不向 Content 补发旧条目；正式运行前仍须在 quiesced hua-home 快照上重跑 plan/apply/verify，并完成上一条的其余 canonical activation 条件。
-
 ## P1 · Agent Harness 抽象收敛
 
 - 目标骨架只使用 `Message`、`Turn`、`Session`：Message 组成 Turn，Turn 归入 Session；`Loop` 表达“输入 Message → 内部 `react` → 输出 Message”。当前从 `AgentLoop._react → PassiveTurnPipeline` 继续向内审查；只有独占权威状态、不变量、控制流、生命周期或真实边界的层才保留。纯转发、重复结果包装、字段复制、内部重复校验和平行模型分批内联、合并或删除；命名使用普通英语和 Python 风格，不再引入 `Unit` 一类没有独立事实的概念。

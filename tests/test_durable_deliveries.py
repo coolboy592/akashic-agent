@@ -34,7 +34,7 @@ def _request(logical_id: str = "delivery:one") -> DurableDeliveryRequest:
     return DurableDeliveryRequest(
         logical_delivery_id=logical_id,
         accepted_turn=TurnAcceptedReceipt("wake:default", "turn:one"),
-        target_service="content.delivery.v1",
+        target_service="eventmail.delivery.v1",
         channel="recording",
         recipient="recipient:one",
         projection_session_id="recipient-session",
@@ -114,6 +114,26 @@ async def test_provider_receipt_precedes_one_append_only_session_projection(
     assert store.confirm_settled("delivery:one", "domain:one")["state"] == "settled"
     assert store.confirm_settled("delivery:one", "domain:one")["state"] == "settled"
     sessions.close()
+
+
+def test_prepared_delivery_can_be_closed_before_provider_io(tmp_path: Path) -> None:
+    store = DurableDeliveryStore(tmp_path / "settlements.sqlite")
+    request = _request()
+    _ = store.prepare(_envelope_for_test(request))
+    service = PluginDurableDeliveries(store, None, None, recover_started=False)
+
+    cancelled = service.cancel_prepared(
+        request.accepted_turn,
+        reason="source fact expired before provider I/O",
+    )
+
+    assert cancelled.state == "rejected"
+    assert cancelled.provider_receipt == {
+        "status": "rejected",
+        "error": "source fact expired before provider I/O",
+        "provider_started": False,
+    }
+    assert service.recoverable() == ()
 
 
 @pytest.mark.asyncio
@@ -278,7 +298,7 @@ async def test_akashic_provider_started_restart_recovers_from_session_without_re
     request = DurableDeliveryRequest(
         logical_delivery_id="delivery:akashic-crash",
         accepted_turn=TurnAcceptedReceipt("wake:default", "turn:akashic-crash"),
-        target_service="content.delivery.v1",
+        target_service="eventmail.delivery.v1",
         channel="akashic",
         recipient="chat:one",
         projection_session_id="akashic:chat:one",
@@ -443,7 +463,7 @@ def test_delivery_body_preserves_surrounding_newlines(tmp_path: Path) -> None:
     assert DurableDeliveryRequest(
         logical_delivery_id="delivery:body",
         accepted_turn=TurnAcceptedReceipt("session:body", "turn:body"),
-        target_service="content.delivery.v1",
+        target_service="eventmail.delivery.v1",
         channel="recording",
         recipient="recipient:body",
         projection_session_id="projection:body",
@@ -492,7 +512,7 @@ def test_candidate_fence_keeps_akashic_crash_recovery_target(
         )
 
     manager._preflight_durable_delivery_targets(  # pyright: ignore[reportPrivateUsage]
-        candidate(("content.delivery.v1",))
+        candidate(("eventmail.delivery.v1",))
     )
     with pytest.raises(RuntimeError, match="target service 不可解析"):
         manager._preflight_durable_delivery_targets(  # pyright: ignore[reportPrivateUsage]
@@ -592,7 +612,7 @@ def test_oversized_logical_id_is_rejected_before_any_write_or_provider(
         DurableDeliveryRequest(
             logical_delivery_id="d" * 129,
             accepted_turn=TurnAcceptedReceipt("session:long", "turn:long"),
-            target_service="content.delivery.v1",
+            target_service="eventmail.delivery.v1",
             channel="recording",
             recipient="recipient:long",
             projection_session_id="projection:long",

@@ -29,7 +29,7 @@ from docker.debug.wake_v3_provider_e2e import (
     _eventually,
     _write_plugin_configs,
 )
-from plugins.content.store import ContentStore
+from plugins.eventmail.store import EventMailStore
 from tests.fixtures.content_clock_source.plugin import FixtureSourceStore
 
 _FIXTURE_PATH = (
@@ -50,13 +50,37 @@ class InvalidThenValidProvider:
         tools = kwargs.get("tools")
         if not isinstance(tools, list) or not tools:
             return LLMResponse(content="Wake decision recorded.")
-        self.decision_requests += 1
-        if self.decision_requests == 1:
-            return LLMResponse(content=f"Useful items. {_INVALID_MARKER}")
+        tool_names = {
+            str(cast(Mapping[str, object], tool.get("function", {})).get("name"))
+            for tool in tools
+            if isinstance(tool, Mapping)
+        }
         prompt = json.dumps(kwargs.get("messages"), ensure_ascii=False)
         candidate = re.search(r"candidate_[0-9a-f]{16}", prompt)
         if candidate is None:
             raise RuntimeError("Wake repair fixture prompt is missing candidate_id")
+        if "screen_content" in tool_names:
+            return LLMResponse(
+                content=None,
+                tool_calls=[
+                    ToolCall(
+                        "call:wake-screen",
+                        "screen_content",
+                        {
+                            "items": [
+                                {
+                                    "candidate_id": candidate.group(0),
+                                    "initial_interest": "likely_interesting",
+                                    "question": "Is this genuinely useful?",
+                                }
+                            ]
+                        },
+                    )
+                ],
+            )
+        self.decision_requests += 1
+        if self.decision_requests == 1:
+            return LLMResponse(content=f"Useful items. {_INVALID_MARKER}")
         return LLMResponse(
             content=None,
             tool_calls=[
@@ -139,6 +163,7 @@ async def run_runtime_fixture(root: Path) -> dict[str, object]:
         workspace / "plugin-data" / "content_clock_source-builtin" / "source.sqlite3"
     )
     candidates = cast(list[dict[str, object]], fixture["candidates"])
+    seeded_at = datetime.now(UTC)
     source_store.seed(
         tuple(
             {
@@ -147,18 +172,17 @@ async def run_runtime_fixture(root: Path) -> dict[str, object]:
                 "title": candidate["title"],
                 "summary": candidate["summary"],
                 "preprocess_score": candidate["preprocess_score"],
+                "published_at": seeded_at.isoformat(),
             }
             for candidate in candidates
         ),
-        datetime.now(UTC),
+        seeded_at,
     )
     scripted = InvalidThenValidProvider()
     counted = CountingProvider(scripted)
     timer = ControlledTimer()
     original_timer = plugin_manager_module.AsyncioOneShotTimer
-    original_random = wake_plugin_module.random.random
     plugin_manager_module.AsyncioOneShotTimer = lambda: timer
-    wake_plugin_module.random.random = lambda: 0.0
     stack = _build_stack(workspace, root, timer, counted)
     try:
         await stack.start()
@@ -170,8 +194,8 @@ async def run_runtime_fixture(root: Path) -> dict[str, object]:
         )
         await _eventually(lambda: timer.pending_count() >= 1, "WAKE_TIMER_NOT_ARMED")
         timer.fire_earliest()
-        content = ContentStore(
-            workspace / "plugin-data" / "content-builtin" / "content.sqlite3"
+        content = EventMailStore(
+            workspace / "plugin-data" / "eventmail-builtin" / "eventmail.sqlite3"
         )
         ledger = DurableDeliveryStore(
             workspace / "runtime" / "deliveries" / "settlements.sqlite"
@@ -212,7 +236,6 @@ async def run_runtime_fixture(root: Path) -> dict[str, object]:
         }
     finally:
         plugin_manager_module.AsyncioOneShotTimer = original_timer
-        wake_plugin_module.random.random = original_random
         await stack.close()
 
 

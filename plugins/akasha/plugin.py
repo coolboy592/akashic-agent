@@ -32,6 +32,7 @@ from agent.plugin_composition import (
     PluginDiagnostics,
     ConversationSemanticInterest,
     SourceMutationFence,
+    ServiceKey,
 )
 from agent.prompting import PromptSectionRender
 from agent.retrieval.events import build_retrieval_completed
@@ -62,6 +63,8 @@ inject = (TOOL_CATALOG, UI_SLOTS, TEXT_EMBEDDING_SETTINGS, INTERACTION_UNDO)
 workspace_roots = ("memory",)
 workspace_files = ("sessions.db",)
 dashboard_module = "dashboard.py"
+
+MEMORY_RECALL = ServiceKey[object]("memory.recall.v1")
 
 _MOBILE_RECALL_SCHEMA = "akasha.recall-card.v1"
 _MOBILE_RECALL_USER_PREVIEW_CHARS = 100
@@ -206,6 +209,7 @@ async def apply(ctx: Context, config: object) -> None:
     # 1. Claim first, so duplicate memory plugins fail before opening any storage.
     _ = config
     _ = await ctx.provide(EMBEDDING_MEMORY_PLUGIN, object())
+    _ = await ctx.provide(MEMORY_RECALL, object())
     runtime, http = _build_runtime(ctx)
 
     async def bind_undo_fence():
@@ -374,6 +378,7 @@ async def _register_tools(ctx: Context, runtime: AkashaMemoryEngine) -> None:
                 search_hint=spec.search_hint or None,
             ),
             _tool_handler(tool),
+            provided_for=(MEMORY_RECALL if spec is profile.recall else None),
         )
 
 

@@ -33,6 +33,7 @@ from agent.looping.ports import AgentLoopConfig, AgentLoopDeps, LLMConfig
 from agent.plugin_composition.durable_delivery_store import DurableDeliveryStore
 from agent.plugins.manager import PluginManager
 from agent.provider import LLMProvider, LLMResponse
+from agent.tools.base import Tool
 from agent.tools.registry import ToolRegistry
 from bootstrap.control_execution import execute_control_turn
 from bootstrap.providers import build_providers
@@ -41,11 +42,11 @@ from bus.event_bus import EventBus
 from bus.queue import MessageBus
 from core.memory.markdown import build_markdown_memory_runtime
 from core.memory.runtime import MemoryRuntime
-from plugins.content.store import ContentStore
+from plugins.eventmail.store import EventMailStore
 from session.manager import SessionManager
 from tests.fixtures.content_clock_source.plugin import FixtureSourceStore
 
-MODEL = "deepseek-v4-flash"
+MODEL = os.environ.get("PR_G_DEEPSEEK_MODEL", "deepseek-v4-flash").strip()
 _SELECTED_CONTEXT_WINDOW = 1_000_000
 _SELECTED_REASONING_EFFORT = "max"
 _BUILDER_SYSTEM_MARKER = "Wake provider E2E control turn."
@@ -176,7 +177,7 @@ class CountingProvider:
 
 
 class ScriptedProvider:
-    """Return one typed Wake decision, then the ordinary loop summary."""
+    """Return one typed result for each Wake Content phase."""
 
     context_window = 64_000
 
@@ -190,6 +191,31 @@ class ScriptedProvider:
             candidate = re.search(r"candidate_[0-9a-f]{16}", prompt)
             if candidate is None:
                 raise RuntimeError("Wake E2E prompt 缺少 candidate_id")
+            names = {
+                str(item.get("function", {}).get("name"))
+                for item in tools
+                if isinstance(item, dict)
+                and isinstance(item.get("function"), dict)
+            }
+            if "screen_content" in names:
+                return LLMResponse(
+                    content=None,
+                    tool_calls=[
+                        ToolCall(
+                            id="call:wake-screen",
+                            name="screen_content",
+                            arguments={
+                                "items": [
+                                    {
+                                        "candidate_id": candidate.group(0),
+                                        "initial_interest": "likely_interesting",
+                                        "question": "这是否有用户真正关心的新能力？",
+                                    }
+                                ]
+                            },
+                        )
+                    ],
+                )
             return LLMResponse(
                 content=None,
                 tool_calls=[
@@ -209,6 +235,23 @@ class ScriptedProvider:
         self, messages: list[dict[str, object]], tools: list[dict[str, object]]
     ) -> int:
         return max(1, len(json.dumps([messages, tools], ensure_ascii=False)) // 4)
+
+
+class FixtureWebFetch(Tool):
+    """Expose the production Tool shape with deterministic isolated evidence."""
+
+    name = "web_fetch"
+    description = "Fetch a candidate URL for evidence."
+    parameters = {
+        "type": "object",
+        "properties": {"url": {"type": "string"}},
+        "required": ["url"],
+        "additionalProperties": False,
+    }
+
+    async def execute(self, **kwargs: object) -> str:
+        _ = kwargs
+        return "The update reports benchmark gains but no new model capability."
 
 
 class ProviderMilestones(logging.Handler):
@@ -254,7 +297,11 @@ class ProviderMilestones(logging.Handler):
         )
         return nonstream_starts + self.nonstream_retries
 
-    def logical_identity(self, expected_calls: int = 1) -> tuple[tuple[str, ...], str]:
+    def logical_identity(
+        self,
+        expected_calls: int = 1,
+        expected_turns: int = 1,
+    ) -> tuple[tuple[str, ...], tuple[str, ...]]:
         """Return exact provider call identities bound to one control Turn."""
 
         # 1. Every logical/transport/HTTP start must retain one provider call id.
@@ -272,12 +319,14 @@ class ProviderMilestones(logging.Handler):
             _field(str(event.get("counts") or ""), "provider_call_id")
             for event in starts
         }
-        turn_ids = {str(event.get("turn_id") or "") for event in starts}
+        turn_ids = tuple(
+            dict.fromkeys(str(event.get("turn_id") or "") for event in starts)
+        )
         if len(call_ids) != expected_calls or "" in call_ids:
             raise GateFailure("PROVIDER_CALL_IDENTITY_MISMATCH")
-        if len(turn_ids) != 1 or "" in turn_ids:
+        if len(turn_ids) != expected_turns or "" in turn_ids:
             raise GateFailure("PROVIDER_CONTROL_IDENTITY_MISMATCH")
-        return tuple(sorted(call_ids)), next(iter(turn_ids))
+        return tuple(sorted(call_ids)), turn_ids
 
     def safe_evidence(self) -> dict[str, object]:
         """Summarize provider identities as counts and optional single digests."""
@@ -383,40 +432,24 @@ async def run_suite(
     source_store = FixtureSourceStore(
         workspace / "plugin-data" / "content_clock_source-builtin" / "source.sqlite3"
     )
+    seeded_at = datetime.now(UTC)
     source_store.seed(
         (
             {
                 "kind": "fixture",
                 "wake_action": "select",
                 "preprocess_score": 0.9,
+                "published_at": seeded_at.isoformat(),
             },
         ),
-        datetime.now(UTC),
+        seeded_at,
     )
     source_store.fail_next_acks(ack_failures)
     counted = request_counter or CountingProvider(provider)
     timer = ControlledTimer()
     original_timer = plugin_manager_module.AsyncioOneShotTimer
     plugin_manager_module.AsyncioOneShotTimer = lambda: timer
-    original_random = wake_plugin_module.random.random
-    wake_plugin_module.random.random = lambda: 0.0
-    original_settle = ContentStore.settle_delivery
     settlement_failures = 0
-
-    if inject_settlement_failure:
-
-        def fail_once(
-            self: ContentStore,
-            selection_token: str,
-            settlement_ref: str,
-        ) -> dict[str, object]:
-            nonlocal settlement_failures
-            if settlement_failures == 0:
-                settlement_failures += 1
-                raise RuntimeError("fixture settlement interruption")
-            return original_settle(self, selection_token, settlement_ref)
-
-        ContentStore.settle_delivery = fail_once
 
     first: RuntimeStack | None = None
     restarted: RuntimeStack | None = None
@@ -424,6 +457,27 @@ async def run_suite(
         # 2. Install through the formal manager and run the ordinary source Timer.
         first = _build_stack(workspace, root, timer, counted, llm_config=llm_config)
         await first.start()
+        if inject_settlement_failure:
+            snapshot = first.manager.current_snapshot
+            if snapshot is None or snapshot.composition_root is None:
+                raise GateFailure("EVENTMAIL_SETTLEMENT_SERVICE_MISSING")
+            delivery_service = cast(
+                Any,
+                snapshot.composition_root.context.require(
+                    wake_plugin_module.EVENTMAIL_DELIVERY
+                ),
+            )
+
+            def fail_before_restart(
+                selection_token: str,
+                settlement_ref: str,
+            ) -> dict[str, object]:
+                nonlocal settlement_failures
+                del selection_token, settlement_ref
+                settlement_failures += 1
+                raise RuntimeError("fixture settlement interruption")
+
+            delivery_service.settle = fail_before_restart
         await _eventually(lambda: timer.pending_count() >= 1, "SOURCE_TIMER_NOT_ARMED")
         timer.fire_earliest()
         await _eventually(
@@ -449,7 +503,6 @@ async def run_suite(
         if inject_settlement_failure:
             await first.close()
             first = None
-            ContentStore.settle_delivery = original_settle
             restarted = _build_stack(
                 workspace,
                 root,
@@ -463,8 +516,11 @@ async def run_suite(
                 "DELIVERY_RESTART_NOT_SETTLED",
             )
 
-        # 4. Fire the source Timer until its source-owned ACK reaches Content.
-        for _ in range(ack_failures + 1):
+        # 4. Drive competing source and Wake heartbeats until source ACK settles.
+        max_fires = 2 * (ack_failures + 1) + 2
+        for _ in range(max_fires):
+            if source_store.acknowledgements():
+                break
             await _eventually(lambda: timer.pending_count() >= 1, "ACK_TIMER_NOT_ARMED")
             timer.fire_earliest()
             await asyncio.sleep(0)
@@ -473,8 +529,8 @@ async def run_suite(
             "SOURCE_ACK_NOT_COMMITTED",
         )
         await _eventually(
-            lambda: ContentStore(
-                workspace / "plugin-data" / "content-builtin" / "content.sqlite3"
+            lambda: EventMailStore(
+                workspace / "plugin-data" / "eventmail-builtin" / "eventmail.sqlite3"
             ).state_counts()
             == {"settled": 1},
             "CONTENT_NOT_SETTLED",
@@ -490,11 +546,14 @@ async def run_suite(
             "wake-provider-e2e"
         )
         turns = active.sessions.control_store.list_turns("wake-provider-e2e")
-        if len(channel_rows) != 1 or len(session_rows) != 1 or len(turns) != 1:
+        if len(channel_rows) != 1 or len(session_rows) != 1 or len(turns) != 2:
             raise GateFailure("DURABLE_ORACLE_MULTIPLICITY_MISMATCH")
-        turn = turns[0]
-        if turn.status is not TurnStatus.COMPLETED:
+        if any(turn.status is not TurnStatus.COMPLETED for turn in turns):
             raise GateFailure("CONTROL_TURN_NOT_COMPLETED")
+        accepted_turn_id = str(delivery["accepted_turn_id"])
+        turn = next((item for item in turns if item.id == accepted_turn_id), None)
+        if turn is None:
+            raise GateFailure("DELIVERY_CONTROL_TURN_MISSING")
         identities = {
             str(delivery["logical_delivery_id"]),
             str(channel_rows[0]["delivery_id"]),
@@ -520,7 +579,7 @@ async def run_suite(
             "source_ack_attempts": _source_count(source_store, "ack_attempts"),
             "content_submission_count": len(
                 _rows(
-                    workspace / "plugin-data" / "content-builtin" / "content.sqlite3",
+                    workspace / "plugin-data" / "eventmail-builtin" / "eventmail.sqlite3",
                     "submissions",
                 )
             ),
@@ -531,9 +590,7 @@ async def run_suite(
             "restart_count": int(inject_settlement_failure),
         }
     finally:
-        ContentStore.settle_delivery = original_settle
         plugin_manager_module.AsyncioOneShotTimer = original_timer
-        wake_plugin_module.random.random = original_random
         if first is not None:
             await first.close()
         if restarted is not None:
@@ -554,6 +611,7 @@ def _build_stack(
     event_bus = EventBus()
     sessions = SessionManager(workspace)
     tools = ToolRegistry()
+    tools.register(FixtureWebFetch(), always_on=True, risk="read-only")
     markdown = build_markdown_memory_runtime(
         workspace=workspace,
         provider=cast(Any, provider),
@@ -583,11 +641,12 @@ def _build_stack(
     )
     plugin_dirs = [
         Path(__file__).resolve().parents[2] / "plugins" / name
-        for name in ("content", "drift", "wake")
+        for name in ("eventmail", "drift", "wake")
     ] + [
         Path(__file__).resolve().parents[2] / "tests" / "fixtures" / name
         for name in (
             "content_clock_source",
+            "memory_recall",
             "recording_channel",
             "semantic_interest",
         )
@@ -640,14 +699,14 @@ def _write_selected_runtime_config(root: Path) -> Path:
     # 1. Keep credential values in environment interpolation, never on disk.
     path = root / "selected-runtime.toml"
     _ = path.write_text(
-        """
+        f"""
 [llm]
 main = "main"
 
 [llm.runtimes.main]
 provider = "deepseek"
-model = "deepseek-v4-flash"
-api_key = "${PR_G_DEEPSEEK_API_KEY}"
+model = "{MODEL}"
+api_key = "${{PR_G_DEEPSEEK_API_KEY}}"
 base_url = "https://runtime-endpoint-injected.invalid/v1"
 context_window = 1000000
 max_output_tokens = 0
@@ -756,22 +815,22 @@ async def run_quiet_suite(root: Path) -> dict[str, object]:
     source_store = FixtureSourceStore(
         workspace / "plugin-data" / "content_clock_source-builtin" / "source.sqlite3"
     )
+    seeded_at = datetime.now(UTC)
     source_store.seed(
         (
             {
                 "kind": "fixture",
                 "wake_action": "decline",
                 "preprocess_score": 0.9,
+                "published_at": seeded_at.isoformat(),
             },
         ),
-        datetime.now(UTC),
+        seeded_at,
     )
     counted = CountingProvider(ScriptedProvider("unexpected"))
     timer = ControlledTimer()
     original_timer = plugin_manager_module.AsyncioOneShotTimer
     plugin_manager_module.AsyncioOneShotTimer = lambda: timer
-    original_random = wake_plugin_module.random.random
-    wake_plugin_module.random.random = lambda: 0.0
     stack: RuntimeStack | None = None
     try:
         stack = _build_stack(workspace, root, timer, counted)
@@ -797,13 +856,22 @@ async def run_quiet_suite(root: Path) -> dict[str, object]:
         await _eventually(
             lambda: timer.pending_count() >= 1, "QUIET_EMPTY_POLL_TIMER_NOT_ARMED"
         )
-        timer.fire_earliest()
+        poll_count = _source_count(source_store, "poll_count")
+        for _ in range(4):
+            if _source_count(source_store, "poll_count") > poll_count:
+                break
+            await _eventually(
+                lambda: timer.pending_count() >= 1,
+                "QUIET_EMPTY_POLL_TIMER_NOT_ARMED",
+            )
+            timer.fire_earliest()
+            await asyncio.sleep(0)
         await _eventually(
             lambda: _source_count(source_store, "poll_count") >= 2,
             "QUIET_EMPTY_POLL_NOT_COMMITTED",
         )
         turns = stack.sessions.control_store.list_turns("wake-provider-e2e")
-        content_db = workspace / "plugin-data" / "content-builtin" / "content.sqlite3"
+        content_db = workspace / "plugin-data" / "eventmail-builtin" / "eventmail.sqlite3"
         messages = stack.sessions.control_store.fetch_session_messages(
             "wake-provider-e2e"
         )
@@ -830,7 +898,6 @@ async def run_quiet_suite(root: Path) -> dict[str, object]:
         }
     finally:
         plugin_manager_module.AsyncioOneShotTimer = original_timer
-        wake_plugin_module.random.random = original_random
         if stack is not None:
             await stack.close()
 
@@ -935,7 +1002,7 @@ def _selected_failure_evidence(
         ("wake-provider-e2e",),
     )
     content_rows = _read_failure_rows(
-        workspace / "plugin-data/content-builtin/content.sqlite3",
+        workspace / "plugin-data/eventmail-builtin/eventmail.sqlite3",
         "items",
         "SELECT status, COUNT(*) FROM items GROUP BY status ORDER BY status",
     )
@@ -1233,8 +1300,11 @@ async def _run(args: argparse.Namespace) -> dict[str, object]:
                     raise GateFailure("SELECTED_LOGICAL_REQUEST_COUNT_MISMATCH")
                 if milestones.http_attempts() < 1:
                     raise GateFailure("SELECTED_HTTP_ATTEMPT_MISSING")
-                provider_call_ids, provider_turn_id = milestones.logical_identity(2)
-                if _digest_text(provider_turn_id) != selected["control_id_digest"]:
+                provider_call_ids, provider_turn_ids = milestones.logical_identity(2, 2)
+                if (
+                    _digest_text(provider_turn_ids[-1])
+                    != selected["control_id_digest"]
+                ):
                     raise GateFailure("SELECTED_PROVIDER_CONTROL_IDENTITY_MISMATCH")
                 report.update(
                     {

@@ -18,12 +18,12 @@ from agent.plugin_composition.durable_deliveries import (
     PluginDurableDeliveries,
 )
 from agent.plugin_composition.durable_delivery_store import DurableDeliveryStore
-from plugins.content.plugin import (
+from plugins.eventmail.plugin import (
     ContentDeliveryServices,
     _DeliveryServices,
     _WakeServices as _ContentWakeServices,
 )
-from plugins.content.store import ContentStore
+from plugins.eventmail.store import EventMailStore
 from plugins.drift.plugin import (
     DriftDeliveryServices,
     _DeliveryServices as _DriftDeliveryServices,
@@ -31,6 +31,7 @@ from plugins.drift.plugin import (
 )
 from plugins.drift.store import DriftStore
 from plugins.wake.plugin import DeliveryTarget, DriftWakeServices, WakeRuntime
+from plugins.wake.state import WakeState
 from session.manager import SessionManager
 
 
@@ -89,10 +90,10 @@ def _ready_content(
     path: Path,
     *,
     requires_ack: bool = False,
-) -> tuple[ContentStore, TurnAcceptedReceipt, str]:
+) -> tuple[EventMailStore, TurnAcceptedReceipt, str]:
     now = datetime(2026, 8, 23, 9, tzinfo=UTC)
     accepted = TurnAcceptedReceipt("wake:default", "turn:delivery")
-    store = ContentStore(path)
+    store = EventMailStore(path)
     _ = store.submit(
         "fitbit",
         "poll:delivery",
@@ -121,7 +122,7 @@ def _ready_content(
 
 def _runtime(
     accepted: TurnAcceptedReceipt,
-    content: ContentStore,
+    content: EventMailStore,
     deliveries: PluginDurableDeliveries,
     *,
     response: str = "Wake says hello",
@@ -143,6 +144,7 @@ def _runtime(
             recipient="recipient:one",
             session_id="recipient-session",
         ),
+        state=WakeState(content.path.with_name("wake.sqlite3")),
     )
 
 
@@ -152,7 +154,7 @@ async def test_drift_share_uses_same_provider_session_and_settlement_chain(
 ) -> None:
     now = datetime(2026, 8, 23, 9, tzinfo=UTC)
     accepted = TurnAcceptedReceipt("wake:default", "turn:drift-delivery")
-    content = ContentStore(tmp_path / "content.sqlite3")
+    content = EventMailStore(tmp_path / "content.sqlite3")
     content.initialize()
     drift = DriftStore(tmp_path / "drift.sqlite3")
     drift.initialize()
@@ -211,6 +213,7 @@ async def test_drift_share_uses_same_provider_session_and_settlement_chain(
             recipient="recipient:one",
             session_id="recipient-session",
         ),
+        state=WakeState(tmp_path / "wake.sqlite3"),
     )
 
     await runtime.start()
@@ -292,6 +295,14 @@ async def test_v1_ready_turn_with_message_only_decision_recovers_once(
         connection.executescript("""
             DROP INDEX content_selection_members_order_idx;
             DROP INDEX content_selection_status_idx;
+            DROP INDEX context_projection_expiry_idx;
+            DROP INDEX alert_projection_due_idx;
+            DROP INDEX mail_transitions_mail_seq_idx;
+            DROP INDEX mail_envelopes_kind_seq_idx;
+            DROP TABLE context_projection;
+            DROP TABLE alert_projection;
+            DROP TABLE mail_transitions;
+            DROP TABLE mail_envelopes;
             DROP TABLE content_selection_members;
             DROP TABLE content_selections;
             PRAGMA user_version = 1;
@@ -438,7 +449,7 @@ async def test_uncertain_batch_locks_only_cited_member_from_next_selection(
     tmp_path: Path,
 ) -> None:
     now = datetime(2026, 8, 23, 9, tzinfo=UTC)
-    content = ContentStore(tmp_path / "content.sqlite3")
+    content = EventMailStore(tmp_path / "content.sqlite3")
     _ = content.submit(
         "feed",
         "poll:first",
@@ -534,7 +545,7 @@ def _prepare_delivery(
             "logical_delivery_id": logical_id,
             "accepted_session_id": accepted.session_id,
             "accepted_turn_id": accepted.turn_id,
-            "target_service": "content.delivery.v1",
+            "target_service": "eventmail.delivery.v1",
             "channel": "recording",
             "recipient": "recipient:one",
             "projection_session_id": "recipient-session",

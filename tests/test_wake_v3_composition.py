@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import random
 import shutil
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
@@ -31,17 +30,12 @@ from agent.plugins.manager import PluginManager
 from agent.plugins.snapshot import bind_runtime_snapshot, reset_runtime_snapshot
 from agent.tools.registry import ToolRegistry
 from bus.event_bus import EventBus
-from plugins.content.plugin import CONTENT_SOURCE, CONTENT_WAKE
-from plugins.content.store import ContentStore
+from plugins.eventmail.plugin import EVENTMAIL_CONTENT_SOURCE, EVENTMAIL_WAKE
+from plugins.eventmail.store import EventMailStore
 from plugins.drift.plugin import DRIFT_PROPOSALS, DRIFT_WAKE
 from plugins.wake.plugin import _candidate_id, _message_with_source_links
 from session.manager import SessionManager
 from session.store import SessionStore
-
-
-@pytest.fixture(autouse=True)
-def _deterministic_wake_admission(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(random, "random", lambda: 0.0)
 
 
 class _TimerHandle:
@@ -97,7 +91,7 @@ async def _eventually(predicate) -> None:
 def _copy_plugins(tmp_path: Path) -> list[Path]:
     root = Path(__file__).resolve().parents[1]
     paths = []
-    for name in ("content", "drift", "wake"):
+    for name in ("eventmail", "drift", "wake"):
         target = tmp_path / "plugins" / name
         shutil.copytree(root / "plugins" / name, target)
         paths.append(target)
@@ -121,6 +115,9 @@ async def apply(ctx, config):
         encoding="utf-8",
     )
     paths.append(semantic_provider)
+    memory_recall = tmp_path / "plugins" / "memory_recall"
+    shutil.copytree(root / "tests" / "fixtures" / "memory_recall", memory_recall)
+    paths.append(memory_recall)
     return paths
 
 
@@ -148,7 +145,7 @@ async def test_wake_fails_loud_without_semantic_interest_provider(
 ) -> None:
     root = Path(__file__).resolve().parents[1]
     plugin_dirs: list[Path] = []
-    for name in ("content", "drift", "wake"):
+    for name in ("eventmail", "drift", "wake"):
         target = tmp_path / "plugins" / name
         shutil.copytree(root / "plugins" / name, target)
         plugin_dirs.append(target)
@@ -176,7 +173,7 @@ async def test_wake_fails_loud_without_semantic_interest_provider(
         "decision_name",
         "decision_arguments",
         "decision_status",
-        "expected_content_state",
+        "expected_content_counts",
         "expected_body",
     ),
     [
@@ -195,7 +192,7 @@ async def test_wake_fails_loud_without_semantic_interest_provider(
                 ],
             },
             "success",
-            "settled",
+            {"settled": 1},
             (
                 "fixture share body\n\n来源：\n"
                 "- Fixture sleep source：<https://example.test/sleep/e2e>"
@@ -205,18 +202,24 @@ async def test_wake_fails_loud_without_semantic_interest_provider(
             "skip_content",
             {"reason": "fixture candidate is irrelevant"},
             "success",
-            "pending",
+            {"pending": 1},
             None,
         ),
-        (None, {}, None, "deferred", None),
+        (None, {}, None, {"deferred": 1}, None),
         (
             "share_content",
             {"message": "   ", "items": []},
             "error",
-            "deferred",
+            {"deferred": 1},
             None,
         ),
-        ("skip_content", {"reason": "\t"}, "error", "deferred", None),
+        (
+            "skip_content",
+            {"reason": "\t"},
+            "error",
+            {"deferred": 1},
+            None,
+        ),
     ],
 )
 async def test_real_wake_plugin_uses_typed_decision_not_model_response(
@@ -225,7 +228,7 @@ async def test_real_wake_plugin_uses_typed_decision_not_model_response(
     decision_name: str | None,
     decision_arguments: dict[str, object],
     decision_status: str | None,
-    expected_content_state: str,
+    expected_content_counts: dict[str, int],
     expected_body: str | None,
 ) -> None:
     timer = _Timer()
@@ -260,23 +263,41 @@ session_id = "recipient-session"
             turn_id=turn_id,
         )
         await run_composition_lifecycle(CONTEXT_PREPARED_EVENT, ctx)
-        items = (
-            []
-            if decision_name is None
-            else [
-                TurnItem(
-                    TurnItemKind.TOOL_CALL,
-                    f"item:{decision_name}",
+        if ctx.extra_hints[0].startswith("【Wake Content 初筛】"):
+            tool_name = "screen_content"
+            tool_status = "success"
+            tool_arguments: dict[str, object] = {
+                "items": [
                     {
-                        "callId": f"call:{decision_name}",
-                        "name": decision_name,
-                        "status": decision_status,
-                        "arguments": decision_arguments,
-                        "resultPreview": '{"recorded":true}',
-                    },
-                )
-            ]
-        )
+                        "candidate_id": _candidate_id(
+                            {
+                                "source_id": "fitbit-e2e",
+                                "item_id": "sleep:e2e",
+                                "revision": "1",
+                            }
+                        ),
+                        "initial_interest": "likely_interesting",
+                        "question": "Does this match the user's preference?",
+                    }
+                ]
+            }
+        else:
+            tool_name = decision_name
+            tool_status = decision_status
+            tool_arguments = decision_arguments
+        items = [] if tool_name is None else [
+            TurnItem(
+                TurnItemKind.TOOL_CALL,
+                f"item:{tool_name}",
+                {
+                    "callId": f"call:{tool_name}",
+                    "name": tool_name,
+                    "status": tool_status,
+                    "arguments": tool_arguments,
+                    "resultPreview": '{"recorded":true}',
+                },
+            )
+        ]
         return ControlExecutionResult(
             response="过滤，不推送（事故诱饵，绝不能发给用户）",
             items=items,
@@ -336,7 +357,7 @@ session_id = "recipient-session"
             await lease.release()
     root = manager.current_snapshot.composition_root
     assert root is not None
-    source = root.context.require(CONTENT_SOURCE).bind("fitbit-e2e")
+    source = root.context.require(EVENTMAIL_CONTENT_SOURCE).bind("fitbit-e2e")
     _ = source.submit(
         "poll:e2e",
         (
@@ -344,9 +365,10 @@ session_id = "recipient-session"
                 "item_id": "sleep:e2e",
                 "revision": "1",
                 "payload": {
-                    "kind": "sleep",
-                    "preprocess_score": 0.9,
-                    "title": "Fixture sleep source",
+                        "kind": "sleep",
+                        "preprocess_score": 0.9,
+                        "published_at": datetime.now(UTC).isoformat(),
+                        "title": "Fixture sleep source",
                     "url": "https://example.test/sleep/e2e",
                 },
                 "not_before": datetime.now(UTC),
@@ -357,24 +379,39 @@ session_id = "recipient-session"
     ledger = DurableDeliveryStore(
         workspace / "runtime" / "deliveries" / "settlements.sqlite"
     )
-    content_store = ContentStore(
-        workspace / "plugin-data" / "content-builtin" / "content.sqlite3"
+    content_store = EventMailStore(
+        workspace / "plugin-data" / "eventmail-builtin" / "eventmail.sqlite3"
     )
     lifecycle = asyncio.create_task(manager.run_runtime_services())
     try:
-        await _eventually(lambda: len(timer.handles) == 1)
-        timer.handles[0].fire()
+        await _eventually(lambda: len(timer.handles) == 2)
+        min(timer.handles, key=lambda handle: handle.deadline).fire()
         await _eventually(
-            lambda: bool(store.list_turns("recipient-session"))
-            and store.list_turns("recipient-session")[0].status is TurnStatus.COMPLETED
+            lambda: len(store.list_turns("recipient-session")) == 2
+            and all(
+                turn.status is TurnStatus.COMPLETED
+                for turn in store.list_turns("recipient-session")
+            )
         )
         await _eventually(
-            lambda: content_store.state_counts() == {expected_content_state: 1}
+            lambda: content_store.state_counts() == expected_content_counts
         )
 
         turns = store.list_turns("recipient-session")
-        assert len(turns) == 1
-        accepted = TurnAcceptedReceipt("recipient-session", turns[0].id)
+        assert len(turns) == 2
+        decision_turn = next(
+            (
+                turn
+                for turn in turns
+                if any(
+                    item.kind is TurnItemKind.TOOL_CALL
+                    and item.data.get("name") in {"share_content", "skip_content"}
+                    for item in turn.items
+                )
+            ),
+            turns[0],
+        )
+        accepted = TurnAcceptedReceipt("recipient-session", decision_turn.id)
         delivery = PluginDurableDeliveries(ledger, None, None, recover_started=False)
         view = delivery.lookup(accepted)
         messages = sessions.control_store.fetch_session_messages("recipient-session")
@@ -386,7 +423,7 @@ session_id = "recipient-session"
             assert provider_calls == [expected_body]
             assert len(messages) == 1
             assert messages[0]["content"] == expected_body
-            assert messages[0]["control_turn_id"] == turns[0].id
+            assert messages[0]["control_turn_id"] == decision_turn.id
             assert messages[0]["tools_used"] == ["message_push"]
             assert messages[0]["evidence_item_ids"] == ["fitbit-e2e:sleep:e2e:1"]
             assert messages[0]["source_refs"] == [
@@ -442,7 +479,7 @@ async def test_wake_candidate_has_zero_timer_turn_and_formal_domain_write(
     root = manager.current_snapshot.composition_root
     assert root is not None
     now = datetime.now(UTC)
-    source = root.context.require(CONTENT_SOURCE).bind("candidate-source")
+    source = root.context.require(EVENTMAIL_CONTENT_SOURCE).bind("candidate-source")
     _ = source.submit(
         "batch:candidate",
         (
@@ -462,7 +499,7 @@ async def test_wake_candidate_has_zero_timer_turn_and_formal_domain_write(
         now,
         next_due=now + timedelta(minutes=5),
     )
-    before_content = root.context.require(CONTENT_WAKE).snapshot(now)
+    before_content = root.context.require(EVENTMAIL_WAKE).snapshot(now)
     before_drift = root.context.require(DRIFT_WAKE).snapshot(now)
     wake_dir = next(path for path in plugin_dirs if path.name == "wake")
     with (wake_dir / "plugin.py").open("a", encoding="utf-8") as handle:
@@ -472,7 +509,7 @@ async def test_wake_candidate_has_zero_timer_turn_and_formal_domain_write(
         assert candidate is not None
         assert timer.handles == []
         assert executions == []
-        assert root.context.require(CONTENT_WAKE).snapshot(now) == before_content
+        assert root.context.require(EVENTMAIL_WAKE).snapshot(now) == before_content
         assert root.context.require(DRIFT_WAKE).snapshot(now) == before_drift
         await manager.discard_prepared("wake")
     finally:
@@ -482,7 +519,7 @@ async def test_wake_candidate_has_zero_timer_turn_and_formal_domain_write(
 
 
 @pytest.mark.asyncio
-async def test_real_root_selected_content_runs_one_scoped_react_and_not_drift(
+async def test_real_root_selected_content_runs_two_stage_react_and_not_drift(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -507,7 +544,43 @@ async def test_real_root_selected_content_runs_one_scoped_react_and_not_drift(
         )
         await run_composition_lifecycle(CONTEXT_PREPARED_EVENT, ctx)
         prepared.append(ctx)
-        return ControlExecutionResult(response="" if ctx.abort else "wake response")
+        candidate_id = _candidate_id(
+            {
+                "source_id": "e2e-source",
+                "item_id": "content:1",
+                "revision": "1",
+            }
+        )
+        if ctx.extra_hints[0].startswith("【Wake Content 初筛】"):
+            name = "screen_content"
+            arguments: dict[str, object] = {
+                "items": [
+                    {
+                        "candidate_id": candidate_id,
+                        "initial_interest": "likely_interesting",
+                        "question": "Is this useful?",
+                    }
+                ]
+            }
+        else:
+            name = "skip_content"
+            arguments = {"reason": "fixture skip"}
+        return ControlExecutionResult(
+            response="wake response",
+            items=[
+                TurnItem(
+                    TurnItemKind.TOOL_CALL,
+                    f"item:{name}",
+                    {
+                        "callId": f"call:{name}",
+                        "name": name,
+                        "status": "success",
+                        "arguments": arguments,
+                        "resultPreview": '{"recorded":true}',
+                    },
+                )
+            ],
+        )
 
     conversation = ConversationRuntime(store, execute)
     manager = PluginManager(
@@ -524,7 +597,7 @@ async def test_real_root_selected_content_runs_one_scoped_react_and_not_drift(
     await manager.load_all()
     root = manager.current_snapshot.composition_root
     assert root is not None
-    content = root.context.require(CONTENT_SOURCE).bind("e2e-source")
+    content = root.context.require(EVENTMAIL_CONTENT_SOURCE).bind("e2e-source")
     now = datetime.now(UTC)
     _ = content.submit(
         "batch:1",
@@ -532,7 +605,11 @@ async def test_real_root_selected_content_runs_one_scoped_react_and_not_drift(
             {
                 "item_id": "content:1",
                 "revision": "1",
-                "payload": {"kind": "fitbit", "preprocess_score": 0.9},
+                    "payload": {
+                        "kind": "fitbit",
+                        "preprocess_score": 0.9,
+                        "published_at": now.isoformat(),
+                    },
                 "not_before": now,
                 "requires_ack": False,
             },
@@ -547,20 +624,27 @@ async def test_real_root_selected_content_runs_one_scoped_react_and_not_drift(
     )
     lifecycle = asyncio.create_task(manager.run_runtime_services())
     try:
-        await _eventually(lambda: len(timer.handles) == 1)
-        timer.handles[0].fire()
+        await _eventually(lambda: len(timer.handles) == 2)
+        min(timer.handles, key=lambda handle: handle.deadline).fire()
         await _eventually(
-            lambda: bool(store.list_turns("wake:default"))
-            and store.list_turns("wake:default")[0].status is TurnStatus.COMPLETED
+            lambda: len(store.list_turns("wake:default")) == 2
+            and all(
+                turn.status is TurnStatus.COMPLETED
+                for turn in store.list_turns("wake:default")
+            )
         )
-        wake_content = root.context.require(CONTENT_WAKE)
+        wake_content = root.context.require(EVENTMAIL_WAKE)
         await _eventually(lambda: wake_content.selected() == ())
 
         turns = store.list_turns("wake:default")
-        assert len(turns) == 1
-        assert turns[0].final_response == "wake response"
-        assert prepared[0].abort is False
-        assert '"owner":"content"' in prepared[0].extra_hints[0]
+        assert len(turns) == 2
+        assert [turn.final_response for turn in turns] == [
+            "wake response",
+            "wake response",
+        ]
+        assert all(ctx.abort is False for ctx in prepared)
+        assert prepared[0].extra_hints[0].startswith("【Wake Content 初筛】")
+        assert prepared[1].extra_hints[0].startswith("【Wake Content 找证据】")
         assert root.context.require(DRIFT_WAKE).selected() == ()
         drift_snapshot = root.context.require(DRIFT_WAKE).snapshot(datetime.now(UTC))
         assert len(cast(Sequence[object], drift_snapshot["proposals"])) == 1
@@ -621,7 +705,7 @@ async def test_real_root_both_decline_is_quiet_but_keeps_control_diagnostics(
     root = manager.current_snapshot.composition_root
     assert root is not None
     now = datetime.now(UTC)
-    content = root.context.require(CONTENT_SOURCE).bind("quiet-source")
+    content = root.context.require(EVENTMAIL_CONTENT_SOURCE).bind("quiet-source")
     _ = content.submit(
         "batch:quiet",
         (
@@ -643,8 +727,8 @@ async def test_real_root_both_decline_is_quiet_but_keeps_control_diagnostics(
     )
     lifecycle = asyncio.create_task(manager.run_runtime_services())
     try:
-        await _eventually(lambda: len(timer.handles) == 1)
-        timer.handles[0].fire()
+        await _eventually(lambda: len(timer.handles) == 2)
+        min(timer.handles, key=lambda handle: handle.deadline).fire()
         await _eventually(
             lambda: bool(store.list_turns("wake:default"))
             and store.list_turns("wake:default")[0].status is TurnStatus.COMPLETED
@@ -660,7 +744,7 @@ async def test_real_root_both_decline_is_quiet_but_keeps_control_diagnostics(
         ]
         assert provider_calls == 0
         assert prepared[0].abort is True and prepared[0].abort_reply == ""
-        assert root.context.require(CONTENT_WAKE).selected() == ()
+        assert root.context.require(EVENTMAIL_WAKE).selected() == ()
         assert root.context.require(DRIFT_WAKE).selected() == ()
     finally:
         lifecycle.cancel()
