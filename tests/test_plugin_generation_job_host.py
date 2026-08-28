@@ -22,6 +22,7 @@ from agent.plugin_composition.background_jobs import (
 from agent.plugin_composition.model import FiberState
 from agent.plugin_composition.context import FiberHandle, HealthHandle
 from agent.plugins.composable import ComposablePlugin
+from agent.plugins.generation_activity_host import ActivityHost
 from agent.plugins.generation_job_host import BackgroundJobActivityAdapter
 from agent.plugins.job_outcome_ledger import (
     JobOutcomeIdentity,
@@ -419,7 +420,8 @@ async def test_llm_lease_is_invocation_scoped_and_invalid_after_handler(
         provider=provider,
     )
     runtime = await adapter.materialize_closed("tx-1", plan)
-    await adapter.open(runtime)
+    await adapter.open_components("tx-1", runtime)
+    adapter.finalize_components("tx-1", runtime)
     await adapter.enqueue_interval(
         runtime, "drift:merge_pending", interval_bucket="llm-event"
     )
@@ -1171,7 +1173,8 @@ async def test_cancel_running_releases_snapshot_lease_and_marks_cancelled(
         provider=Provider(),
     )
     runtime = await adapter.materialize_closed("tx-1", plan)
-    await adapter.open(runtime)
+    await adapter.open_components("tx-1", runtime)
+    adapter.finalize_components("tx-1", runtime)
     await adapter.enqueue_interval(
         runtime, "drift:merge_pending", interval_bucket="cancel-event"
     )
@@ -1204,7 +1207,8 @@ async def test_completed_child_failure_prevents_handler_success(tmp_path) -> Non
 
     adapter, plan, target_lease, _store, ledger = _fixture(tmp_path, handler)
     runtime = await adapter.materialize_closed("tx-1", plan)
-    await adapter.open(runtime)
+    await adapter.open_components("tx-1", runtime)
+    adapter.finalize_components("tx-1", runtime)
     await adapter.enqueue_interval(
         runtime, "drift:merge_pending", interval_bucket="child-failure"
     )
@@ -1236,7 +1240,8 @@ async def test_cancel_intent_wins_when_handler_swallows_cancelled_error(
 
     adapter, plan, target_lease, store, ledger = _fixture(tmp_path, handler)
     runtime = await adapter.materialize_closed("tx-1", plan)
-    await adapter.open(runtime)
+    await adapter.open_components("tx-1", runtime)
+    adapter.finalize_components("tx-1", runtime)
     await adapter.enqueue_interval(
         runtime, "drift:merge_pending", interval_bucket="swallowed-cancel"
     )
@@ -1277,7 +1282,8 @@ async def test_close_components_drains_queued_request_after_running_cancel(
         coalesce=False,
     )
     runtime = await adapter.materialize_closed("tx-1", plan)
-    await adapter.open(runtime)
+    await adapter.open_components("tx-1", runtime)
+    adapter.finalize_components("tx-1", runtime)
     await adapter.enqueue_interval(
         runtime, "drift:merge_pending", interval_bucket="running-close"
     )
@@ -1346,7 +1352,8 @@ async def test_queued_request_selects_model_generation_at_execution_start(
         coalesce=False,
     )
     runtime = await adapter.materialize_closed("tx-1", plan)
-    await adapter.open(runtime)
+    await adapter.open_components("tx-1", runtime)
+    adapter.finalize_components("tx-1", runtime)
     await adapter.enqueue_interval(
         runtime, "drift:merge_pending", interval_bucket="model-running"
     )
@@ -1402,7 +1409,8 @@ async def test_restart_requeues_exact_queued_interval_once(tmp_path) -> None:
         ledger_path=path,
     )
     runtime = await adapter.materialize_closed("tx-1", plan)
-    await adapter.open(runtime)
+    await adapter.open_components("tx-1", runtime)
+    adapter.finalize_components("tx-1", runtime)
     for _ in range(100):
         outcome = ledger.get("restart-interval-invocation")
         if outcome is not None and outcome.state is JobOutcomeState.SUCCEEDED:
@@ -1447,13 +1455,38 @@ async def test_restart_closes_orphaned_running_outcome_without_replay(tmp_path) 
     )
     await first_lease.release()
 
-    adapter, plan, target_lease, _store, ledger = _fixture(
+    adapter, plan, target_lease, store, ledger = _fixture(
         tmp_path,
         handler,
         ledger_path=path,
     )
-    runtime = await adapter.materialize_closed("tx-1", plan)
-    await adapter.open(runtime)
+    adapter.discard_plan("tx-1", plan)
+
+    class _BlockingRecoveryAdapter(BackgroundJobActivityAdapter):
+        def __init__(self) -> None:
+            super().__init__(cast(RuntimeSnapshotStore, store), ledger=ledger)
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def _recover_pending(self, runtime):
+            self.entered.set()
+            await self.release.wait()
+            return await super()._recover_pending(runtime)
+
+    recovering = _BlockingRecoveryAdapter()
+    host = ActivityHost((recovering,))
+    transaction = await host.prepare_transaction(target_lease)
+    await host.pause_and_drain(transaction)
+    staged = await host.materialize_closed(transaction)
+    host.finalize(transaction)
+    opening = asyncio.create_task(host.open(transaction))
+    await recovering.entered.wait()
+
+    runtime = staged.child_bindings[recovering.name]
+    assert not staged.admission_open
+    assert not runtime.admission_open
+    recovering.release.set()
+    await opening
 
     recovered = ledger.require(invocation_id)
     assert calls == []
@@ -1464,10 +1497,9 @@ async def test_restart_closes_orphaned_running_outcome_without_replay(tmp_path) 
     )
     assert any(
         "automatic replay is disabled" in report
-        for report in adapter.recovery_reports
+        for report in recovering.recovery_reports
     )
-    await adapter.close_components("tx-1", runtime)
-    await target_lease.release()
+    await host.close()
 
 
 @pytest.mark.asyncio
@@ -1514,7 +1546,8 @@ async def test_process_restart_marks_submitting_programmatic_turn_for_reconcile(
         programmatic_session_creator=conversation.create_session,
     )
     runtime = await adapter.materialize_closed("tx-1", plan)
-    await adapter.open(runtime)
+    await adapter.open_components("tx-1", runtime)
+    adapter.finalize_components("tx-1", runtime)
 
     recovered = ledger.require(invocation_id)
     assert calls == []

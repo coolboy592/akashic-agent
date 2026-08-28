@@ -63,6 +63,12 @@ class ActivityChildAdapter(Protocol):
         binding: Any,
     ) -> None: ...
 
+    async def open_components(
+        self,
+        transaction_id: str,
+        binding: Any,
+    ) -> None: ...
+
     def pause_components(self, binding: Any) -> None: ...
 
     async def restore_components(
@@ -101,6 +107,7 @@ class ActivityTransaction:
     plans: Mapping[str, object]
     staged: ActivityBinding | None = None
     stopped_children: list[str] = field(default_factory=list)
+    opened_children: list[str] = field(default_factory=list)
     partial_bindings: dict[str, object] = field(default_factory=dict)
     finalized: bool = False
     settled: bool = False
@@ -277,13 +284,7 @@ class ActivityHost:
             raise RuntimeError("Activity target 尚未 materialize")
         if transaction.finalized:
             raise RuntimeError("Activity transaction 已 finalize")
-        for name, child in self._children.items():
-            child.finalize_components(
-                transaction.transaction_id,
-                transaction.staged.child_bindings[name],
-            )
         self._active = transaction.staged
-        transaction.staged.admission_open = True
         transaction.finalized = True
 
     async def open(self, transaction: ActivityTransaction) -> None:
@@ -323,7 +324,7 @@ class ActivityHost:
             raise RuntimeError("Activity transaction 尚未选择 recovery direction")
 
     async def _complete_commit(self, transaction: ActivityTransaction) -> None:
-        """Close the stopped old child owners after the public pointer moved."""
+        """Close old owners and finish target child startup after pointer commit."""
 
         self._require(transaction)
         if not transaction.finalized or self._active is not transaction.staged:
@@ -337,20 +338,27 @@ class ActivityHost:
                         previous.child_bindings[name],
                     )
                     transaction.stopped_children.remove(name)
-        except BaseException:
             assert transaction.staged is not None
             for name, child in self._children.items():
-                child.pause_components(transaction.staged.child_bindings[name])
-            transaction.staged.admission_open = False
-            raise
-        assert transaction.staged is not None
-        if not transaction.staged.admission_open:
+                if name in transaction.opened_children:
+                    continue
+                await child.open_components(
+                    transaction.transaction_id,
+                    transaction.staged.child_bindings[name],
+                )
+                transaction.opened_children.append(name)
             for name, child in self._children.items():
                 child.finalize_components(
                     transaction.transaction_id,
                     transaction.staged.child_bindings[name],
                 )
             transaction.staged.admission_open = True
+        except BaseException:
+            assert transaction.staged is not None
+            for name, child in self._children.items():
+                child.pause_components(transaction.staged.child_bindings[name])
+            transaction.staged.admission_open = False
+            raise
         if transaction.target_lease.active:
             await transaction.target_lease.release()
         transaction.settled = True

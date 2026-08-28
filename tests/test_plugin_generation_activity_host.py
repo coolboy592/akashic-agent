@@ -42,6 +42,9 @@ class _RecordingChild:
     def finalize_components(self, transaction_id, binding):
         self.events.append(f"finalize:{binding}")
 
+    async def open_components(self, transaction_id, binding):
+        self.events.append(f"open:{binding}")
+
     def pause_components(self, binding):
         self.events.append(f"pause:{binding}")
 
@@ -103,9 +106,14 @@ async def test_activity_host_prepare_is_pure_and_open_controls_admission() -> No
     assert not staged.admission_open
     host.finalize(transaction)
     assert host.active is staged
-    assert staged.admission_open
+    assert not staged.admission_open
 
     await host.open(transaction)
+
+    assert child.events[-2:] == [
+        f"open:{staged.child_bindings['recording']}",
+        f"finalize:{staged.child_bindings['recording']}",
+    ]
 
     source_lease = store.lease(staged.snapshot_id)
     lease = host.acquire(source_lease)
@@ -284,6 +292,78 @@ async def test_committed_old_cleanup_failure_pauses_new_until_retry() -> None:
     await host.close()
     await old_store.close()
     await new_store.close()
+
+
+@pytest.mark.asyncio
+async def test_committed_child_open_failure_pauses_new_until_retry() -> None:
+    class _FailOpenOnce(_RecordingChild):
+        def __init__(self) -> None:
+            super().__init__()
+            self.fail_open = True
+
+        async def open_components(self, transaction_id, binding):
+            self.events.append(f"open:{binding}")
+            if self.fail_open:
+                self.fail_open = False
+                raise RuntimeError("open failed")
+
+    child = _FailOpenOnce()
+    host = ActivityHost((child,))
+    store, target = _stable_lease("open-retry")
+    transaction = await host.prepare_transaction(target)
+    await host.pause_and_drain(transaction)
+    staged = await host.materialize_closed(transaction)
+    host.finalize(transaction)
+
+    with pytest.raises(RuntimeError, match="open failed"):
+        await host.open(transaction)
+
+    assert host.active is staged
+    assert not staged.admission_open
+    assert target.active
+    await host.retry_recovery()
+    assert staged.admission_open
+    assert child.events.count(f"open:{staged.child_bindings['recording']}") == 2
+    assert not target.active
+    await host.close()
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_activity_admission_stays_closed_while_child_open_is_blocked() -> None:
+    class _BlockingOpen(_RecordingChild):
+        def __init__(self) -> None:
+            super().__init__()
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def open_components(self, transaction_id, binding):
+            self.events.append(f"open:{binding}")
+            self.entered.set()
+            await self.release.wait()
+
+    child = _BlockingOpen()
+    host = ActivityHost((child,))
+    store, target = _stable_lease("blocked-open")
+    transaction = await host.prepare_transaction(target)
+    await host.pause_and_drain(transaction)
+    staged = await host.materialize_closed(transaction)
+    host.finalize(transaction)
+    opening = asyncio.create_task(host.open(transaction))
+    await child.entered.wait()
+
+    assert host.active is staged
+    assert not staged.admission_open
+    rejected = store.lease(staged.snapshot_id)
+    with pytest.raises(RuntimeError, match="admission"):
+        host.acquire(rejected)
+    await rejected.release()
+
+    child.release.set()
+    await opening
+    assert staged.admission_open
+    await host.close()
+    await store.close()
 
 
 @pytest.mark.asyncio

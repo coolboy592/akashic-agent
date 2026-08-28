@@ -931,9 +931,14 @@ class BackgroundJobActivityAdapter:
         if admission_errors:
             raise admission_errors[0]
 
-    async def open(self, binding: BackgroundJobRuntimeBinding) -> None:
-        """Open one finalized binding for interval admission."""
+    async def open_components(
+        self,
+        transaction_id: str,
+        binding: BackgroundJobRuntimeBinding,
+    ) -> None:
+        """Recover durable work after the shared publication pointer commits."""
 
+        self._require_binding(transaction_id, binding, allow_missing_plan=True)
         if binding.closed:
             raise RuntimeError("BackgroundJob binding 已关闭")
         if binding.snapshot_id not in self._bindings:
@@ -957,9 +962,6 @@ class BackgroundJobActivityAdapter:
                     await self._release_request_lease(request)
                 raise
             binding.recovery_scanned = True
-        binding.admission_open = True
-        self._active = binding
-
     def finalize_components(
         self,
         transaction_id: str,
