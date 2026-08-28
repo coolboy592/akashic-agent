@@ -307,12 +307,16 @@ python main.py exec --new --runtime latest --json "验证新插件的目标行�
 语义：
 
 - `--runtime` 只接受 `stable|latest`；默认 `stable`。
-- `--new` 创建独立 programmatic session；默认在 thread metadata 写入 `skip_post_memory=true`。
+- `--new` 创建独立 programmatic session；Control 默认让它的 Turn 声明 `effects.post_commit=suppress`。
 - 默认仍允许 `recall_memory`、`search_messages` 和 `fetch_messages`。
-- 显式 `--persist-memory` 才允许该新 session 沉淀长期语义记忆；该参数只能在创建 thread 时使用。
+- 显式 `--persist-memory` 才在 thread metadata 写入 `effects.post_commit=allow`，允许该 session 沉淀长期语义记忆；该参数只能在创建 thread 时使用。
 - SessionDB 中的 thread、turn、user/assistant message 和 tool items 始终正常持久化，便于审计和回读。
 - `--json` 输出当前 control event 流；terminal 至少包含 `threadId`、`turn id`、`status`、`finalResponse`、`items`、`usage` 和 `error`。
 - Control 两端共享显式 2 MiB 单帧上限；超过 asyncio 默认 64 KiB 的合法 terminal 必须完整送达，超过协议上限则 fail-loud。
+
+2026-08-29 起，新 thread 会把默认 `suppress` 或显式 `allow` 写成 session
+事实。旧版 `--persist-memory` 与旧版默认 thread 都可能没有 effect，历史数据无法
+安全区分；迁移只修复已经持久化明确 `suppress` 的 Turn，不猜测空 metadata。
 
 Shell 是异步可观察传输：命令在初始窗口没有结束时返回 `execution_id`，父 T 用 `write_stdin` 读取增量输出。它不创建第二个 Akashic runtime；CLI 仍连接当前 Gateway，所以能租用内存中的 latest。
 

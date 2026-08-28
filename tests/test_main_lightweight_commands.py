@@ -90,8 +90,9 @@ def test_init_records_yoyo_origin_in_workspace_ledger(tmp_path: Path) -> None:
         ("20260827_02_migrate_legacy_mobile_client_ids",),
         ("20260828_01_migrate_eventmail_state",),
         ("20260828_02_add_wake_content_scores",),
-        ("20260829_01_backfill_plugin_programmatic_effects",),
-    ]
+            ("20260829_01_backfill_plugin_programmatic_effects",),
+            ("20260829_02_backfill_explicit_programmatic_effects",),
+        ]
     assert not config_path.with_name("config.toml.migration-cursor").exists()
 
 

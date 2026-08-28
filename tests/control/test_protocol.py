@@ -498,9 +498,13 @@ async def test_start_thread_preserves_plugin_owned_metadata(tmp_path: Path) -> N
     thread = service.start_thread({"plugin_state": {"enabled": True}})
     thread_id = cast(str, thread["id"])
 
-    assert thread["metadata"] == {"plugin_state": {"enabled": True}}
+    assert thread["metadata"] == {
+        "plugin_state": {"enabled": True},
+        "effects": {"post_commit": "suppress"},
+    }
     assert sessions.control_store.get_session_meta(thread_id)["metadata"] == {
-        "plugin_state": {"enabled": True}
+        "plugin_state": {"enabled": True},
+        "effects": {"post_commit": "suppress"},
     }
     await runtime.shutdown()
     sessions.close()
@@ -517,8 +521,50 @@ async def test_start_thread_does_not_interpret_plugin_metadata(tmp_path: Path) -
     service = ControlService(runtime, sessions, tmp_path)
 
     thread = service.start_thread({"skip_post_memory": "plugin-owned"})
-    assert thread["metadata"] == {"skip_post_memory": "plugin-owned"}
+    assert thread["metadata"] == {
+        "skip_post_memory": "plugin-owned",
+        "effects": {"post_commit": "suppress"},
+    }
     assert len(sessions.list_sessions()) == 1
+    await runtime.shutdown()
+    sessions.close()
+
+
+@pytest.mark.asyncio
+async def test_programmatic_thread_defaults_to_suppress_and_requires_explicit_opt_in(
+    tmp_path: Path,
+) -> None:
+    sessions = SessionManager(tmp_path)
+    seen: list[TurnRequest] = []
+
+    async def execute(request: TurnRequest) -> str:
+        seen.append(request)
+        return request.input
+
+    runtime = ConversationRuntime(sessions.control_store, execute)
+    service = ControlService(runtime, sessions, tmp_path)
+
+    default_thread = service.start_thread({})
+    assert default_thread["metadata"] == {
+        "effects": {"post_commit": "suppress"}
+    }
+    default = await service.start_turn(cast(str, default_thread["id"]), "default", {})
+    assert (await default.result()).status.value == "completed"
+
+    persistent_thread = service.start_thread(
+        {"effects": {"post_commit": "allow"}}
+    )
+    persistent = await service.start_turn(
+        cast(str, persistent_thread["id"]),
+        "persistent",
+        {},
+    )
+    assert (await persistent.result()).status.value == "completed"
+
+    assert seen[0].metadata["inboundMetadata"] == {
+        "effects": {"post_commit": "suppress"}
+    }
+    assert "inboundMetadata" not in seen[1].metadata
     await runtime.shutdown()
     sessions.close()
 

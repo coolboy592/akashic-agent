@@ -1207,7 +1207,19 @@ class BackgroundJobActivityAdapter:
             for record in ledger.list_pending():
                 if record.programmatic_turn_state is not None:
                     detail = _programmatic_turn_reconcile_error(record)
-                    self._transition_outcome(
+                    _ = self._transition_outcome(
+                        record.invocation_id,
+                        JobOutcomeState.FAILED,
+                        error=detail,
+                    )
+                    _report_recovery(runtime, record, detail)
+                    continue
+                if record.state is JobOutcomeState.RUNNING:
+                    detail = (
+                        "runtime restarted before the handler wrote a terminal outcome; "
+                        "external effects are unknown and automatic replay is disabled"
+                    )
+                    _ = self._transition_outcome(
                         record.invocation_id,
                         JobOutcomeState.FAILED,
                         error=detail,

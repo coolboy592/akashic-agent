@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import secrets
 from datetime import UTC, datetime
 from pathlib import Path
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from typing import Any, Literal, cast
 
 from agent.control.errors import (
@@ -19,7 +19,13 @@ from agent.control.models import ThreadRecord, ThreadSource, TurnRequest
 from agent.control.protocol.models import InitializeParams
 from agent.control.protocol.errors import JsonRpcError, UNAUTHORIZED
 from agent.control.runtime import ConversationRuntime, TurnHandle
+from agent.control.turn_scope import TurnExecutionScope
 from agent.restart import RestartCoordinator
+from agent.turn_effects import (
+    PostCommitEffect,
+    post_commit_effect,
+    set_post_commit_effect,
+)
 from session.manager import SessionManager
 
 PluginInstall = Callable[..., Awaitable[dict[str, object]]]
@@ -49,6 +55,22 @@ def _reject_plugin_rollout_metadata(
             f"{boundary} metadata 包含 Core 保留的插件 rollout 字段: "
             + ", ".join(reserved)
         )
+
+
+def _set_programmatic_thread_default(metadata: dict[str, object]) -> None:
+    """Persist the default unless the new thread explicitly opts in."""
+
+    raw_effects = metadata.get("effects")
+    if raw_effects is None:
+        set_post_commit_effect(metadata, PostCommitEffect.SUPPRESS)
+        return
+    if not isinstance(raw_effects, Mapping):
+        raise ValueError("Turn effects metadata 必须是 object")
+    effects = cast(Mapping[str, object], raw_effects)
+    if effects.get("post_commit") is None:
+        set_post_commit_effect(metadata, PostCommitEffect.SUPPRESS)
+        return
+    _ = post_commit_effect(metadata)
 
 
 class ControlService:
@@ -144,6 +166,7 @@ class ControlService:
         if "runtime" in stored_metadata:
             raise ValueError("thread metadata 的 runtime 为协议保留字段")
         _reject_plugin_rollout_metadata(stored_metadata, boundary="thread")
+        _set_programmatic_thread_default(stored_metadata)
         thread_id = new_thread_id()
         if plugin_rollout_capability:
             if self._plugin_child_binding is None:
@@ -211,6 +234,7 @@ class ControlService:
         _reject_plugin_rollout_metadata(turn_metadata, boundary="turn")
         session_metadata = session_meta["metadata"]
         assert isinstance(session_metadata, dict)
+        session_effect = post_commit_effect(cast(dict[str, object], session_metadata))
         requested = _require_runtime_selector(
             runtime
             if runtime is not None
@@ -240,8 +264,16 @@ class ControlService:
                 "latest runtime 只能由已绑定的 attached 插件验证子 turn 使用"
             )
         turn_metadata["runtime"] = selected
+        turn_effect = post_commit_effect(turn_metadata)
+        execution_scope = (
+            TurnExecutionScope(post_commit_effect=PostCommitEffect.SUPPRESS)
+            if session_effect is PostCommitEffect.SUPPRESS
+            or turn_effect is PostCommitEffect.SUPPRESS
+            else None
+        )
         return await self.runtime.start_turn(
-            TurnRequest(thread_id, input_text, turn_metadata)
+            TurnRequest(thread_id, input_text, turn_metadata),
+            execution_scope=execution_scope,
         )
 
     def read_turn(self, thread_id: str, turn_id: str) -> dict[str, object]:

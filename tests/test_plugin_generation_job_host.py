@@ -1420,6 +1420,57 @@ async def test_restart_requeues_exact_queued_interval_once(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_restart_closes_orphaned_running_outcome_without_replay(tmp_path) -> None:
+    calls: list[str] = []
+    path = tmp_path / "restart-running.sqlite"
+
+    async def handler(ctx) -> None:
+        calls.append(ctx.reason)
+
+    first, first_plan, first_lease, _store, first_ledger = _fixture(
+        tmp_path,
+        handler,
+        ledger_path=path,
+    )
+    invocation_id = "restart-running-invocation"
+    _ = first_ledger.admit(
+        _pending_identity(
+            first_plan,
+            invocation_id=invocation_id,
+            interval_bucket="restart-running",
+        )
+    )
+    _ = first_ledger.transition(
+        invocation_id,
+        JobOutcomeState.RUNNING,
+        model_generation_id="model-restart",
+    )
+    await first_lease.release()
+
+    adapter, plan, target_lease, _store, ledger = _fixture(
+        tmp_path,
+        handler,
+        ledger_path=path,
+    )
+    runtime = await adapter.materialize_closed("tx-1", plan)
+    await adapter.open(runtime)
+
+    recovered = ledger.require(invocation_id)
+    assert calls == []
+    assert recovered.state is JobOutcomeState.FAILED
+    assert (
+        recovered.error is not None
+        and "external effects are unknown" in recovered.error
+    )
+    assert any(
+        "automatic replay is disabled" in report
+        for report in adapter.recovery_reports
+    )
+    await adapter.close_components("tx-1", runtime)
+    await target_lease.release()
+
+
+@pytest.mark.asyncio
 async def test_process_restart_marks_submitting_programmatic_turn_for_reconcile(
     tmp_path,
 ) -> None:

@@ -43,6 +43,9 @@ _MOBILE_CLIENT_ID_ID = "20260827_02_migrate_legacy_mobile_client_ids"
 _EVENTMAIL_STATE_ID = "20260828_01_migrate_eventmail_state"
 _WAKE_CONTENT_SCORES_ID = "20260828_02_add_wake_content_scores"
 _PROGRAMMATIC_EFFECTS_ID = "20260829_01_backfill_plugin_programmatic_effects"
+_EXPLICIT_PROGRAMMATIC_EFFECTS_ID = (
+    "20260829_02_backfill_explicit_programmatic_effects"
+)
 _CURRENT_IDS = (
     _ORIGIN_ID,
     _AKASHA_V9_ID,
@@ -69,6 +72,7 @@ _CURRENT_IDS = (
     _EVENTMAIL_STATE_ID,
     _WAKE_CONTENT_SCORES_ID,
     _PROGRAMMATIC_EFFECTS_ID,
+    _EXPLICIT_PROGRAMMATIC_EFFECTS_ID,
 )
 _CURRENT_LEDGER_IDS = tuple(sorted(_CURRENT_IDS))
 
@@ -351,8 +355,8 @@ def test_toolset_wiring_migration_retires_only_the_exact_legacy_default(
     )
     config.chmod(0o640)
 
-    legacy_repo = _catalog(tmp_path / "legacy-repo", _CURRENT_IDS[:-11])
-    assert _runner(root, repo_root=legacy_repo).run().migrations == _CURRENT_IDS[:-11]
+    legacy_repo = _catalog(tmp_path / "legacy-repo", _CURRENT_IDS[:-12])
+    assert _runner(root, repo_root=legacy_repo).run().migrations == _CURRENT_IDS[:-12]
     before = config.read_bytes()
 
     outcome = _runner(root).run()
@@ -369,6 +373,7 @@ def test_toolset_wiring_migration_retires_only_the_exact_legacy_default(
         _EVENTMAIL_STATE_ID,
         _WAKE_CONTENT_SCORES_ID,
         _PROGRAMMATIC_EFFECTS_ID,
+        _EXPLICIT_PROGRAMMATIC_EFFECTS_ID,
     )
     migrated = tomllib.loads(config.read_text(encoding="utf-8"))
     assert migrated["agent"]["wiring"]["toolsets"] == ["meta_common"]
@@ -405,7 +410,7 @@ def test_toolset_wiring_migration_leaves_nonlegacy_values_untouched(
         encoding="utf-8",
     )
 
-    legacy_repo = _catalog(tmp_path / "legacy-repo", _CURRENT_IDS[:-11])
+    legacy_repo = _catalog(tmp_path / "legacy-repo", _CURRENT_IDS[:-12])
     _ = _runner(root, repo_root=legacy_repo).run()
     before = config.read_bytes()
 
@@ -423,6 +428,7 @@ def test_toolset_wiring_migration_leaves_nonlegacy_values_untouched(
         _EVENTMAIL_STATE_ID,
         _WAKE_CONTENT_SCORES_ID,
         _PROGRAMMATIC_EFFECTS_ID,
+        _EXPLICIT_PROGRAMMATIC_EFFECTS_ID,
     )
     assert config.read_bytes() == before
     assert not (root / "workspace/backups/retire-legacy-toolset-wiring").exists()
@@ -441,7 +447,7 @@ def test_toolset_wiring_migration_preserves_config_symlink_identity(
     config = root / "config.toml"
     config.symlink_to(source.name)
 
-    legacy_repo = _catalog(tmp_path / "legacy-repo", _CURRENT_IDS[:-11])
+    legacy_repo = _catalog(tmp_path / "legacy-repo", _CURRENT_IDS[:-12])
     _ = _runner(root, repo_root=legacy_repo).run()
 
     outcome = _runner(root).run()
@@ -458,6 +464,7 @@ def test_toolset_wiring_migration_preserves_config_symlink_identity(
         _EVENTMAIL_STATE_ID,
         _WAKE_CONTENT_SCORES_ID,
         _PROGRAMMATIC_EFFECTS_ID,
+        _EXPLICIT_PROGRAMMATIC_EFFECTS_ID,
     )
     assert config.is_symlink()
     assert os.readlink(config) == source.name
@@ -508,9 +515,9 @@ def test_embedding_backfill_runs_after_selection_is_already_recorded(
 
     # 1. Recreate a workspace that already ran every migration through selection.
     root = tmp_path / "state"
-    prior_repo = _catalog(tmp_path / "prior-repo", _CURRENT_IDS[:-7])
+    prior_repo = _catalog(tmp_path / "prior-repo", _CURRENT_IDS[:-8])
     first = _runner(root, repo_root=prior_repo).run()
-    assert first.migrations == _CURRENT_IDS[:-7]
+    assert first.migrations == _CURRENT_IDS[:-8]
     assert _AKASHA_PLUGIN_SELECTION_ID in _applied_ids(
         root / "workspace/migrations.sqlite3"
     )
@@ -525,6 +532,7 @@ def test_embedding_backfill_runs_after_selection_is_already_recorded(
         _EVENTMAIL_STATE_ID,
         _WAKE_CONTENT_SCORES_ID,
         _PROGRAMMATIC_EFFECTS_ID,
+        _EXPLICIT_PROGRAMMATIC_EFFECTS_ID,
     )
 
 
@@ -868,6 +876,7 @@ api_key = "secret"
         _EVENTMAIL_STATE_ID,
         _WAKE_CONTENT_SCORES_ID,
         _PROGRAMMATIC_EFFECTS_ID,
+        _EXPLICIT_PROGRAMMATIC_EFFECTS_ID,
     )
     assert (
         CredentialStore.for_workspace(root / "workspace").api_key("model_deepseek_main")

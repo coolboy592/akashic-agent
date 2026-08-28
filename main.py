@@ -474,16 +474,20 @@ async def run_exec(args: list[str], config_path: str, workspace: Path) -> int:
         workspace_token=workspace_token,
     ) as client:
         if new_thread:
+            thread_metadata: dict[str, object] = {}
+            if "--persist-memory" in args:
+                set_post_commit_effect(
+                    thread_metadata,
+                    PostCommitEffect.ALLOW,
+                )
             thread = await client.start_thread(
-                {},
+                thread_metadata,
                 runtime=runtime_value or "stable",
                 plugin_rollout_capability=rollout_capability,
             )
             thread_id = str(thread["id"])
         assert thread_id is not None
         turn_metadata: dict[str, object] = {}
-        if new_thread and "--persist-memory" not in args:
-            set_post_commit_effect(turn_metadata, PostCommitEffect.SUPPRESS)
         handle = await client.start_turn(
             thread_id,
             prompt,

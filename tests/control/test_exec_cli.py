@@ -320,14 +320,22 @@ async def test_exec_new_rejects_unbound_latest_and_defaults_to_stable(
         assert forged_owner == (0, "forged-owner\n", "")
         assert persistent == (0, "remember\n", "")
         rows = sessions.list_sessions()
-        metadata = [
-            {key: value for key, value in request.metadata.items() if key == "effects"}
-            for request in seen
-        ]
-        assert metadata == [
-            {"effects": {"post_commit": "suppress"}},
-            {},
-        ]
+        assert seen[0].metadata["inboundMetadata"] == {
+            "effects": {"post_commit": "suppress"}
+        }
+        assert "inboundMetadata" not in seen[1].metadata
+        stored_metadata = {
+            str(row["key"]): sessions.control_store.get_session_meta(
+                str(row["key"])
+            )["metadata"]
+            for row in rows
+        }
+        assert list(stored_metadata.values()).count(
+            {"effects": {"post_commit": "suppress"}}
+        ) == 1
+        assert list(stored_metadata.values()).count(
+            {"effects": {"post_commit": "allow"}}
+        ) == 1
         assert [request.metadata["runtime"] for request in seen] == [
             "stable",
             "stable",
