@@ -549,6 +549,11 @@ async def test_programmatic_turn_uses_bootstrap_bound_real_conversation_runtime(
         record = session_store.read_turn(receipt.turn_id)
         assert record is not None
         assert record.thread_id == receipt.session_id
+        assert record.metadata["inboundMetadata"] == {
+            "disabled_prompt_sections": ["memory"],
+            "effects": {"post_commit": "suppress"},
+        }
+        assert record.items[0].data["metadata"] == record.metadata["inboundMetadata"]
         for _ in range(100):
             if snapshot_store.leases == 1:
                 break

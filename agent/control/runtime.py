@@ -34,6 +34,7 @@ from agent.control.turn_scope import (
     bind_turn_scope,
     reset_turn_scope,
 )
+from agent.turn_effects import PostCommitEffect, set_post_commit_effect
 from agent.control.replay_format import (
     METADATA_ATTEMPT_REPLAY,
     METADATA_PRIOR_TOOL_CHAIN,
@@ -124,6 +125,41 @@ def _build_effective_turn_request(
     if previous_attempts:
         metadata[_CONTINUED_FROM_TURN_ID] = previous_attempts[-1].id
     return TurnRequest(request.thread_id, request.input, metadata)
+
+
+def _persist_execution_scope(
+    request: TurnRequest,
+    scope: TurnExecutionScope | None,
+) -> TurnRequest:
+    """Project durable scope facts before the Runtime locks and stores the input."""
+
+    if scope is None:
+        return request
+    raw_inbound = request.metadata.get("inboundMetadata", {})
+    if not isinstance(raw_inbound, dict) or not all(
+        isinstance(key, str) for key in raw_inbound
+    ):
+        raise ValueError("control inboundMetadata 必须是字符串键对象")
+    inbound: dict[str, object] = dict(cast(dict[str, object], raw_inbound))
+    if scope.disabled_prompt_sections:
+        raw_disabled = inbound.get("disabled_prompt_sections", [])
+        if not isinstance(raw_disabled, list) or not all(
+            isinstance(section, str) and section for section in raw_disabled
+        ):
+            raise ValueError(
+                "control inboundMetadata disabled_prompt_sections 必须是非空字符串数组"
+            )
+        disabled = cast(list[str], raw_disabled)
+        inbound["disabled_prompt_sections"] = sorted(
+            {*disabled, *scope.disabled_prompt_sections}
+        )
+    if scope.post_commit_effect is PostCommitEffect.SUPPRESS:
+        set_post_commit_effect(inbound, PostCommitEffect.SUPPRESS)
+    return TurnRequest(
+        request.thread_id,
+        request.input,
+        {**request.metadata, "inboundMetadata": inbound},
+    )
 
 
 def _control_client_message_id(metadata: dict[str, object]) -> str:
@@ -341,6 +377,10 @@ class ConversationRuntime:
                     effective_request.input,
                     metadata,
                 )
+            effective_request = _persist_execution_scope(
+                effective_request,
+                execution_scope,
+            )
             request_bytes = _encoded_turn_bytes(effective_request)
             admission_token = self._reserve_admission(request_bytes)
 

@@ -22,6 +22,8 @@ from agent.control.models import (
 )
 from agent.control.ports import ControlExecutionResult
 from agent.control.runtime import ConversationRuntime
+from agent.control.turn_scope import TurnExecutionScope
+from agent.turn_effects import PostCommitEffect
 from session.store import SessionStore
 
 
@@ -53,6 +55,51 @@ async def test_runtime_persists_events_and_terminal_result(tmp_path: Path) -> No
     assert result.final_response == "reply:hello"
     assert store.read_turn(handle.id) is not None
     _assert_single_terminal(runtime, handle.id)
+    await runtime.shutdown()
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_runtime_persists_execution_scope_before_locking_input(
+    tmp_path: Path,
+) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    observed_inputs: list[dict[str, object]] = []
+
+    async def execute(request: TurnRequest) -> str:
+        source = request.metadata["_controlTurnInputSource"]
+        observed_inputs.append(dict(source.used_inputs()[0].metadata))
+        return "ok"
+
+    runtime = ConversationRuntime(store, execute)
+    handle = await runtime.start_turn(
+        TurnRequest(
+            "programmatic:plugin-job",
+            "background work",
+            {
+                "inboundMetadata": {
+                    "disabled_prompt_sections": ["context"],
+                    "keep": "value",
+                }
+            },
+        ),
+        execution_scope=TurnExecutionScope(
+            disabled_prompt_sections=frozenset({"memory", "context"}),
+            post_commit_effect=PostCommitEffect.SUPPRESS,
+        ),
+    )
+    _ = await handle.result()
+
+    expected = {
+        "disabled_prompt_sections": ["context", "memory"],
+        "effects": {"post_commit": "suppress"},
+        "keep": "value",
+    }
+    record = store.read_turn(handle.id)
+    assert record is not None
+    assert record.metadata["inboundMetadata"] == expected
+    assert record.items[0].data["metadata"] == expected
+    assert observed_inputs == [expected]
     await runtime.shutdown()
     store.close()
 
