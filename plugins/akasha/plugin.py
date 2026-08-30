@@ -79,6 +79,12 @@ inject = (COMMANDS, TOOL_CATALOG, UI_SLOTS, EMBEDDINGS, INTERACTION_UNDO)
 workspace_roots = ("memory",)
 workspace_files = ("sessions.db",)
 dashboard_module = "dashboard.py"
+web_module = "web_module.js"
+web_requires = ("workbench.panels.v2",)
+web_provides = ()
+web_contract_digests = {
+    "workbench.panels.v2": "fb6417c9bf532c1fdb344767d06065d5d3293da85deb64eff1e8088889a33bcb",
+}
 
 MEMORY_RECALL = ServiceKey[object]("memory.recall.v1")
 
