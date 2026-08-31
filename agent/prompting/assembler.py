@@ -102,7 +102,7 @@ class PromptAssembler:
     ) -> AssembledTurnInput:
         # assembler 负责把“主 prompt + turn injection + message envelope”
         # 收束成一份统一输入，避免调用方各自手拼消息顺序。
-        built = self._context_builder._build_system_prompt_result(
+        built_sections = self._context_builder._build_system_prompt_sections(
             skill_names=skill_names,
             channel=channel,
             chat_id=chat_id,
@@ -122,7 +122,7 @@ class PromptAssembler:
         ]
         ordered = [
             section
-            for section in [*built.system_sections, *bottom_sections]
+            for section in [*built_sections, *bottom_sections]
             if section.order is not None
         ]
         ordered.sort(key=lambda section: cast(int, section.order))
@@ -141,7 +141,7 @@ class PromptAssembler:
             if section.name in _CONTEXT_FRAME_SECTIONS
         ]
         for name, content in injection_context.items():
-            text = str(content or "").strip()
+            text = content.strip()
             if text:
                 frame_sections.append(
                     PromptSectionRender(
@@ -169,7 +169,7 @@ class PromptAssembler:
             messages=messages,
             debug_breakdown=[
                 *_section_meta(top_sections),
-                *built.debug_breakdown,
+                *_section_meta(built_sections),
                 *_section_meta(bottom_sections),
             ],
         )

@@ -590,10 +590,6 @@ def build_registered_tools(
     session_store=None,
     tools: ToolRegistry | None = None,
     event_publisher=None,
-    agent_loop_provider: Callable[[], Any] | None = None,
-    tool_context_provider: Callable[
-        [], ToolExecutionContext | None
-    ] = get_current_tool_context,
     restart_coordinator: "RestartCoordinator | None" = None,
 ) -> tuple[ToolRegistry, MessagePushTool]:
     """按配置顺序构造并注册核心工具资源。"""
@@ -602,12 +598,10 @@ def build_registered_tools(
 
     # 1. 构造共享服务；外部传入的 session_store 和 http_resources 不转移 ownership。
     wiring = config.wiring
-    _ = agent_loop_provider
     tools = tools if tools is not None else ToolRegistry()
     readonly_tools = build_readonly_tools(
         http_resources,
         workspace=workspace,
-        context_provider=tool_context_provider,
     )
     store = (
         session_store
@@ -728,7 +722,6 @@ def build_core_runtime(
         disabled_builtin_plugins=config.disabled_builtin_plugins,
     )
     # 2. 记忆与其他 Core 工具只持有通用 runtime snapshot store。
-    loop_ref: dict[str, AgentLoop] = {}
     tools, push_tool = build_registered_tools(
         config,
         workspace,
@@ -738,7 +731,6 @@ def build_core_runtime(
         tools=tools,
         session_store=session_manager._store,
         event_publisher=event_bus,
-        agent_loop_provider=lambda: loop_ref.get("loop"),
         restart_coordinator=restart_coordinator,
     )
     presence = PresenceStore(session_manager._store)
@@ -764,7 +756,6 @@ def build_core_runtime(
             ),
         ),
     )
-    loop_ref["loop"] = loop
     wire_turn_lifecycle(
         lifecycle=TurnLifecycle(event_bus),
         active_turn_states=loop.active_turn_states,

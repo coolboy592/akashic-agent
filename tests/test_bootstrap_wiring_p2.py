@@ -13,7 +13,7 @@ from agent.config import Config, DEFAULT_SOCKET
 from agent.config_models import Config as ConfigModel, WiringConfig
 from agent.lifecycle.facade import TurnLifecycle
 from agent.lifecycle.types import AfterStepCtx
-from agent.looping.interrupt import TurnInterruptState
+from agent.looping.interrupt import ActiveTurnState
 from agent.tools.registry import ToolRegistry
 from bootstrap.tools import _build_loop_deps, build_registered_tools
 from bootstrap.wiring import (
@@ -451,7 +451,6 @@ def test_build_registered_tools_respects_toolset_order_and_subset(
         session_store=object(),
         tools=ToolRegistry(),
         event_publisher=EventBus(),
-        agent_loop_provider=lambda: None,
     )
 
     assert calls == ["fixture", "mcp"]
@@ -551,11 +550,8 @@ def test_wiring_error_messages_list_available_choices():
 @pytest.mark.asyncio
 async def test_wire_turn_lifecycle_registers_afterstep_progress_handler():
     bus = EventBus()
-    states: dict[str, TurnInterruptState] = {
-        "telegram:1": TurnInterruptState(
-            session_key="telegram:1",
-            original_user_message="hello",
-        )
+    states: dict[str, ActiveTurnState] = {
+        "telegram:1": ActiveTurnState(session_key="telegram:1")
     }
     wire_turn_lifecycle(
         lifecycle=TurnLifecycle(bus),
@@ -608,7 +604,6 @@ def test_build_registered_tools_without_mcp_toolset_still_returns_empty_registry
         session_store=object(),
         tools=ToolRegistry(),
         event_publisher=EventBus(),
-        agent_loop_provider=lambda: None,
     )
 
     assert tools.get_registered_names() == set()

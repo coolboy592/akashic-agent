@@ -19,6 +19,7 @@ import infra.mobile_realtime.gateway as gateway_module
 from agent.config_models import MobileRealtimeConfig
 from agent.control.errors import ControlExecutionError
 from agent.control.models import TurnRecord, TurnRequest, TurnStatus
+from agent.control.ports import ControlExecutionResult
 from agent.control.runtime import ConversationRuntime
 from agent.plugin_composition import (
     CapabilitySources,
@@ -484,7 +485,7 @@ async def test_mobile_message_send_accepts_only_explicit_latest_failed_retry(
     )
     source_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 
-    async def fail(_request: TurnRequest) -> str:
+    async def fail(_request: TurnRequest) -> ControlExecutionResult:
         raise ControlExecutionError("provider_offline", "offline", retryable=True)
 
     control_runtime = ConversationRuntime(manager.control_store, fail)

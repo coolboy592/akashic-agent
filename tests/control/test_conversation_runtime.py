@@ -42,8 +42,8 @@ def _assert_single_terminal(runtime: ConversationRuntime, turn_id: str) -> None:
 async def test_runtime_persists_events_and_terminal_result(tmp_path: Path) -> None:
     store = SessionStore(tmp_path / "sessions.db")
 
-    async def execute(request: TurnRequest) -> str:
-        return f"reply:{request.input}"
+    async def execute(request: TurnRequest) -> ControlExecutionResult:
+        return ControlExecutionResult(response=f"reply:{request.input}")
 
     runtime = ConversationRuntime(store, execute)
     handle = await runtime.start_turn(TurnRequest("programmatic:test", "hello"))
@@ -70,10 +70,10 @@ async def test_runtime_persists_execution_scope_before_locking_input(
     store = SessionStore(tmp_path / "sessions.db")
     observed_inputs: list[dict[str, object]] = []
 
-    async def execute(request: TurnRequest) -> str:
+    async def execute(request: TurnRequest) -> ControlExecutionResult:
         source = request.metadata["_controlTurnInputSource"]
         observed_inputs.append(dict(source.used_inputs()[0].metadata))
-        return "ok"
+        return ControlExecutionResult(response="ok")
 
     runtime = ConversationRuntime(store, execute)
     handle = await runtime.start_turn(
@@ -115,9 +115,9 @@ async def test_runtime_keeps_live_attachment_paths_out_of_durable_turn(
     store = SessionStore(tmp_path / "sessions.db")
     seen_media: list[str] = []
 
-    async def execute(request: TurnRequest) -> str:
+    async def execute(request: TurnRequest) -> ControlExecutionResult:
         seen_media.extend(cast(list[str], request.metadata["media"]))
-        return "ok"
+        return ControlExecutionResult(response="ok")
 
     runtime = ConversationRuntime(store, execute)
     handle = await runtime.start_turn(
@@ -151,7 +151,7 @@ async def test_runtime_rejects_same_thread_input_and_interrupts_exact_turn(
     store = SessionStore(tmp_path / "sessions.db")
     reached = asyncio.Event()
 
-    async def execute(_request: TurnRequest) -> str:
+    async def execute(_request: TurnRequest) -> ControlExecutionResult:
         reached.set()
         await asyncio.Event().wait()
         raise AssertionError("unreachable")
@@ -218,8 +218,8 @@ async def test_runtime_startup_interrupts_crash_stale_in_progress_turn(
         thread_id=stale.thread_id,
     )
 
-    async def execute(_request: TurnRequest) -> str:
-        return "continued"
+    async def execute(_request: TurnRequest) -> ControlExecutionResult:
+        return ControlExecutionResult(response="continued")
 
     runtime = ConversationRuntime(store, execute)
 
@@ -244,7 +244,7 @@ async def test_runtime_replays_two_interrupted_attempts_into_one_interaction(
     captured_final: TurnRequest | None = None
     captured_inputs: list[str] = []
 
-    async def execute(request: TurnRequest) -> str:
+    async def execute(request: TurnRequest) -> ControlExecutionResult:
         nonlocal captured_final, captured_inputs
         attempt = cast(int, request.metadata["attemptOrdinal"])
         if attempt < 2:
@@ -269,7 +269,7 @@ async def test_runtime_replays_two_interrupted_attempts_into_one_interaction(
         captured_final = request
         source = request.metadata["_controlTurnInputSource"]
         captured_inputs = [item.content for item in source.used_inputs()]
-        return "final"
+        return ControlExecutionResult(response="final")
 
     runtime = ConversationRuntime(store, execute)
     first = await runtime.start_turn(
@@ -332,7 +332,7 @@ async def test_retry_reuses_latest_input_without_appending_user_message(
     captured: TurnRequest | None = None
     captured_inputs: tuple[TurnUserInput, ...] = ()
 
-    async def execute(request: TurnRequest) -> str:
+    async def execute(request: TurnRequest) -> ControlExecutionResult:
         nonlocal captured, captured_inputs
         if request.metadata["attemptOrdinal"] < 2:
             raise ControlExecutionError(
@@ -341,7 +341,7 @@ async def test_retry_reuses_latest_input_without_appending_user_message(
         captured = request
         source = request.metadata["_controlTurnInputSource"]
         captured_inputs = source.used_inputs()
-        return "answer"
+        return ControlExecutionResult(response="answer")
 
     runtime = ConversationRuntime(store, execute)
     first = await runtime.start_turn(
@@ -404,12 +404,12 @@ async def test_runtime_seal_rejects_late_input_until_terminal(tmp_path: Path) ->
     sealed = asyncio.Event()
     release = asyncio.Event()
 
-    async def execute(request: TurnRequest) -> str:
+    async def execute(request: TurnRequest) -> ControlExecutionResult:
         source = request.metadata["_controlTurnInputSource"]
         await source.lock()
         sealed.set()
         await release.wait()
-        return "done"
+        return ControlExecutionResult(response="done")
 
     runtime = ConversationRuntime(store, execute)
     first = await runtime.start_turn(TurnRequest("programmatic:seal", "first"))
@@ -432,8 +432,8 @@ async def test_invalid_initial_input_releases_admission_capacity(
 ) -> None:
     store = SessionStore(tmp_path / "sessions.db")
 
-    async def execute(_request: TurnRequest) -> str:
-        return "unused"
+    async def execute(_request: TurnRequest) -> ControlExecutionResult:
+        return ControlExecutionResult(response="unused")
 
     runtime = ConversationRuntime(store, execute)
     with pytest.raises(ValueError, match="必须包含时区"):
@@ -458,8 +458,8 @@ async def test_post_persist_start_failure_terminalizes_turn_and_releases_owner(
 ) -> None:
     store = SessionStore(tmp_path / "sessions.db")
 
-    async def execute(_request: TurnRequest) -> str:
-        return "unused"
+    async def execute(_request: TurnRequest) -> ControlExecutionResult:
+        return ControlExecutionResult(response="unused")
 
     runtime = ConversationRuntime(store, execute)
 
@@ -482,8 +482,8 @@ async def test_post_persist_start_failure_terminalizes_turn_and_releases_owner(
 async def test_queued_interrupt_becomes_cancelled(tmp_path: Path) -> None:
     store = SessionStore(tmp_path / "sessions.db")
 
-    async def execute(_request: TurnRequest) -> str:
-        return "done"
+    async def execute(_request: TurnRequest) -> ControlExecutionResult:
+        return ControlExecutionResult(response="done")
 
     runtime = ConversationRuntime(store, execute)
     queued = await runtime.start_turn(TurnRequest("programmatic:two", "queued"))
@@ -502,7 +502,7 @@ async def test_runtime_executes_different_threads_concurrently(tmp_path: Path) -
     active = 0
     max_active = 0
 
-    async def execute(_request: TurnRequest) -> str:
+    async def execute(_request: TurnRequest) -> ControlExecutionResult:
         nonlocal active, max_active
         active += 1
         max_active = max(max_active, active)
@@ -510,7 +510,7 @@ async def test_runtime_executes_different_threads_concurrently(tmp_path: Path) -
             both_started.set()
         try:
             await release.wait()
-            return "done"
+            return ControlExecutionResult(response="done")
         finally:
             active -= 1
 
@@ -629,7 +629,7 @@ async def _executor_with_open_tool(
     started: asyncio.Event,
     *,
     fail: bool = False,
-) -> str:
+) -> ControlExecutionResult:
     emit = request.metadata["_controlItemEvent"]
     assert callable(emit)
     emit(
@@ -679,7 +679,7 @@ async def test_interrupt_closes_and_persists_open_tool_item(tmp_path: Path) -> N
     store = SessionStore(tmp_path / "sessions.db")
     started = asyncio.Event()
 
-    async def execute(request: TurnRequest) -> str:
+    async def execute(request: TurnRequest) -> ControlExecutionResult:
         return await _executor_with_open_tool(request, started)
 
     runtime = ConversationRuntime(store, execute)
@@ -705,7 +705,7 @@ async def test_shutdown_cancel_closes_and_persists_open_tool_item(
     store = SessionStore(tmp_path / "sessions.db")
     started = asyncio.Event()
 
-    async def execute(request: TurnRequest) -> str:
+    async def execute(request: TurnRequest) -> ControlExecutionResult:
         return await _executor_with_open_tool(request, started)
 
     runtime = ConversationRuntime(store, execute)
@@ -727,7 +727,7 @@ async def test_exception_closes_and_persists_open_tool_item(tmp_path: Path) -> N
     store = SessionStore(tmp_path / "sessions.db")
     started = asyncio.Event()
 
-    async def execute(request: TurnRequest) -> str:
+    async def execute(request: TurnRequest) -> ControlExecutionResult:
         return await _executor_with_open_tool(request, started, fail=True)
 
     runtime = ConversationRuntime(store, execute)
@@ -749,7 +749,7 @@ async def test_late_executor_exception_reuses_existing_terminal_turn(
 ) -> None:
     store = SessionStore(tmp_path / "sessions.db")
 
-    async def execute(request: TurnRequest) -> str:
+    async def execute(request: TurnRequest) -> ControlExecutionResult:
         turn_id = cast(str, request.metadata["turnId"])
         store.transition_turn(
             turn_id,
@@ -783,8 +783,8 @@ async def test_fatal_runtime_failure_is_delivered_to_subscriber_once(
 ) -> None:
     store = SessionStore(tmp_path / "sessions.db")
 
-    async def execute(_request: TurnRequest) -> str:
-        return "unreachable"
+    async def execute(_request: TurnRequest) -> ControlExecutionResult:
+        return ControlExecutionResult(response="unreachable")
 
     runtime = ConversationRuntime(store, execute)
     handle = await runtime.start_turn(TurnRequest("programmatic:fatal", "hello"))
