@@ -445,9 +445,13 @@ orphan recovery 可以清除 prepare。
 
 同一 session 没有 active execution attempt 时，普通 user input 创建 attempt；最新 logical interaction 尚未产生 terminal assistant 时，新 attempt 必须沿用同一 interaction identity，并看到此前全部有序 user input 和已经闭合的工具调用/结果。active attempt 期间普通 `turn/start` 明确返回 busy，Mobile 普通发送不可用；channel 消息先通过 `/stop` 或等价中止结束 attempt，再由下一条普通输入续接。控制协议不提供 steer/follow-up 输入模式。
 
+Mobile 对 failed 终态使用更窄的入口：携带 `retry_of_client_message_id` 的显式重试才沿用原 interaction；不携带该字段的普通发送必须创建新的 interaction，并以 `supersedesInteractionId` 记录它替代的未完成 interaction。interrupted 后的普通输入仍按上一段续接。容量等待、永久拒绝与真正启动必须使用同一份有效请求及同一组 retry/fresh 参数，不能在拒绝路径补写第二条 user message。
+
 ### SES-008 Completed Interaction 显式拥有全部输入和唯一最终回复
 
 一个 logical interaction 可以拥有多个 execution attempt 和多个有序 user input。每个 attempt 的输入、工具 started/completed 和中止终态先写入 `turns`；下一 attempt 从这些事实构造 prompt replay，不恢复隐藏思维，也不重放未闭合工具。只有最终 assistant 成功提交时 interaction 才 completed。completed transcript 在一个事务中按 ordinal 追加全部 user message 和唯一 terminal assistant，并携带共同 interaction identity；不得为中止 attempt 生成 Akasha 学习样本或用角色邻接推断归属。
+
+客户端对最新 retryable failed attempt 执行显式重试时，必须复用该 interaction 的最后一个 user input，只新建 execution attempt，不追加第二条 user message。重试请求用稳定的原 user message identity 指明来源，并用新的命令 identity 保证本次传输幂等；普通发送即使正文相同也始终是新 user input，不得按正文猜测重试关系。failed、cancelled 与 interrupted 终态必须原样投影，不能合并成同一个展示状态。
 
 ## 8. 记忆系统
 
