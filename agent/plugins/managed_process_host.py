@@ -75,10 +75,6 @@ class ManagedProcessLogView:
 
     stdout: tuple[str, ...]
     stderr: tuple[str, ...]
-    stdout_bytes: int
-    stderr_bytes: int
-    dropped_stdout_lines: int
-    dropped_stderr_lines: int
 
     @property
     def lines(self) -> tuple[str, ...]:
@@ -103,7 +99,7 @@ FailureCallback = Callable[[GenerationCleanupTombstone], None]
 
 
 class _LogRing:
-    """Keep a bounded line ring while retaining byte and drop diagnostics."""
+    """Keep a bounded line ring."""
 
     def __init__(self, *, max_bytes: int, max_lines: int) -> None:
         if max_bytes <= 0 or max_lines <= 0:
@@ -112,7 +108,6 @@ class _LogRing:
         self._max_lines = max_lines
         self._lines: deque[str] = deque()
         self._bytes = 0
-        self._dropped = 0
 
     def append(self, chunk: bytes) -> None:
         text = chunk.decode("utf-8", errors="replace")
@@ -132,12 +127,11 @@ class _LogRing:
         ):
             removed = self._lines.popleft()
             self._bytes -= len(removed.encode("utf-8", errors="replace"))
-            self._dropped += 1
         self._lines.append(line)
         self._bytes += encoded_size
 
-    def snapshot(self) -> tuple[tuple[str, ...], int, int]:
-        return tuple(self._lines), self._bytes, self._dropped
+    def snapshot(self) -> tuple[str, ...]:
+        return tuple(self._lines)
 
 
 @dataclass
@@ -173,20 +167,12 @@ class _Generation:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
-class ManagedProcessGeneration(Mapping[str, ManagedProcessEndpoint]):
+class ManagedProcessGeneration:
     """Read-only endpoint facade returned after a generation becomes ready."""
 
-    def __init__(self, host: ManagedProcessHost, generation_id: str) -> None:
+    def __init__(self, host: ManagedProcessGenerationHost, generation_id: str) -> None:
         self._host = host
         self.generation_id = generation_id
-
-    @property
-    def mode(self) -> ProcessMode:
-        return self._host.mode(self.generation_id)
-
-    @property
-    def state(self) -> GenerationState:
-        return self._host.generation_state(self.generation_id)
 
     @property
     def endpoints(self) -> Mapping[str, ManagedProcessEndpoint]:
@@ -197,15 +183,6 @@ class ManagedProcessGeneration(Mapping[str, ManagedProcessEndpoint]):
 
     def logs(self, process_name: str) -> ManagedProcessLogView:
         return self._host.logs(self.generation_id, process_name)
-
-    def __getitem__(self, process_name: str) -> ManagedProcessEndpoint:
-        return self.endpoint(process_name)
-
-    def __iter__(self) -> Iterator[str]:
-        return iter(self.endpoints)
-
-    def __len__(self) -> int:
-        return len(self.endpoints)
 
 
 class ManagedProcessGenerationHost:
@@ -304,38 +281,6 @@ class ManagedProcessGenerationHost:
                 _ = self._generations.pop(generation_id, None)
             raise
 
-    async def start_candidate(
-        self,
-        generation_id: str,
-        definitions: Mapping[str, ManagedProcessDefinition],
-        *,
-        artifact_root: Path | None = None,
-    ) -> ManagedProcessGeneration:
-        """Start a candidate generation on temporary loopback ports."""
-
-        return await self.start_generation(
-            generation_id,
-            definitions,
-            mode="candidate",
-            artifact_root=artifact_root,
-        )
-
-    async def start_formal(
-        self,
-        generation_id: str,
-        definitions: Mapping[str, ManagedProcessDefinition],
-        *,
-        artifact_root: Path | None = None,
-    ) -> ManagedProcessGeneration:
-        """Start a formal generation on its declared fixed loopback ports."""
-
-        return await self.start_generation(
-            generation_id,
-            definitions,
-            mode="formal",
-            artifact_root=artifact_root,
-        )
-
     async def stop_generation(self, generation_id: str) -> None:
         """Stop a generation; retain a cleanup tombstone if any owner remains."""
 
@@ -370,18 +315,6 @@ class ManagedProcessGenerationHost:
                 raise
             _ = self._generations.pop(generation_id, None)
             _ = self._tombstones.pop(generation_id, None)
-
-    async def stop_candidate(self, generation_id: str) -> None:
-        """Stop one candidate generation without affecting formal generations."""
-
-        self._assert_mode(generation_id, "candidate")
-        await self.stop_generation(generation_id)
-
-    async def stop_formal(self, generation_id: str) -> None:
-        """Stop one formal generation without affecting candidate generations."""
-
-        self._assert_mode(generation_id, "formal")
-        await self.stop_generation(generation_id)
 
     async def retry_generation_cleanup(self, generation_id: str) -> None:
         """Retry retained process ownership and remove its tombstone only on success."""
@@ -461,12 +394,6 @@ class ManagedProcessGenerationHost:
             return cast(GenerationState, tombstone.state)
         raise KeyError(f"unknown managed process generation: {generation_id}")
 
-    def mode(self, generation_id: str) -> ProcessMode:
-        generation = self._generations.get(generation_id)
-        if generation is None:
-            raise KeyError(f"unknown managed process generation: {generation_id}")
-        return generation.mode
-
     def endpoints(self, generation_id: str) -> dict[str, ManagedProcessEndpoint]:
         generation = self._require_generation(generation_id)
         return {
@@ -489,24 +416,17 @@ class ManagedProcessGenerationHost:
         entry = generation.entries.get(process_name)
         if entry is None:
             raise KeyError(f"unknown managed process: {generation_id}:{process_name}")
-        stdout, stdout_bytes, dropped_stdout = (
+        stdout = (
             entry.stdout_ring.snapshot()
             if entry.stdout_ring is not None
-            else ((), 0, 0)
+            else ()
         )
-        stderr, stderr_bytes, dropped_stderr = (
+        stderr = (
             entry.stderr_ring.snapshot()
             if entry.stderr_ring is not None
-            else ((), 0, 0)
+            else ()
         )
-        return ManagedProcessLogView(
-            stdout=stdout,
-            stderr=stderr,
-            stdout_bytes=stdout_bytes,
-            stderr_bytes=stderr_bytes,
-            dropped_stdout_lines=dropped_stdout,
-            dropped_stderr_lines=dropped_stderr,
-        )
+        return ManagedProcessLogView(stdout=stdout, stderr=stderr)
 
     def health(self, generation_id: str, process_name: str) -> bool:
         generation = self._require_generation(generation_id)
@@ -1084,18 +1004,6 @@ class ManagedProcessGenerationHost:
         if generation is None:
             raise KeyError(f"unknown managed process generation: {generation_id}")
         return generation
-
-    def _assert_mode(self, generation_id: str, expected: ProcessMode) -> None:
-        generation = self._require_generation(generation_id)
-        if generation.mode != expected:
-            raise RuntimeError(
-                f"managed process generation mode mismatch: {generation_id}={generation.mode}, expected={expected}"
-            )
-
-
-# Short alias for callers that do not need to distinguish the host from the
-# returned generation facade.
-ManagedProcessHost = ManagedProcessGenerationHost
 
 
 async def _await_task_after_cancellation(task: asyncio.Task[Any]) -> Any:

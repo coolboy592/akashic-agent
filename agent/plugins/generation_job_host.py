@@ -13,12 +13,12 @@ import hashlib
 import inspect
 import math
 import secrets
-from contextvars import ContextVar, Token
+from contextvars import ContextVar
 from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from types import MappingProxyType
-from typing import Any, TYPE_CHECKING, cast
+from typing import Any, cast
 
 from agent.control.models import TurnRequest
 from agent.control.scoped_turn import (
@@ -62,10 +62,6 @@ from agent.plugins.snapshot import (
     bind_runtime_snapshot,
     reset_runtime_snapshot,
 )
-
-if TYPE_CHECKING:
-    from agent.plugins.generation_activity_host import ActivityCatalog
-
 
 _JOB_LIFECYCLE_REVISION = "background-job-v3"
 _JOB_API_REVISION = "plugin-api-v3"
@@ -605,16 +601,8 @@ class BackgroundJobActivityAdapter:
             )
 
     @property
-    def ledger(self) -> JobOutcomeLedger | None:
-        return self._ledger
-
-    @property
     def active_binding(self) -> BackgroundJobRuntimeBinding | None:
         return self._active
-
-    @property
-    def conversation_runtime(self) -> ScopedTurnRuntime | None:
-        return self._conversation_runtime
 
     def bind_conversation_runtime(
         self,
@@ -1724,9 +1712,6 @@ class BackgroundJobActivityAdapter:
             await request.snapshot_lease.release()
 
 
-GenerationJobHost = BackgroundJobActivityAdapter
-
-
 def _background_catalog(value: object) -> BackgroundJobCatalog | None:
     catalog = getattr(value, "background_jobs", value)
     if catalog is None:
@@ -1889,7 +1874,6 @@ __all__ = [
     "BackgroundJobContext",
     "BackgroundJobPlan",
     "BackgroundJobRuntimeBinding",
-    "GenerationJobHost",
     "ProgrammaticTurnPort",
     "ProgrammaticTurnReceipt",
 ]

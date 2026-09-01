@@ -29,6 +29,7 @@ from agent.plugins.dashboard_host import (
 from agent.plugins.manager import PluginManager, _source_revision
 from agent.plugins.manifest import write_plugin_manifest
 from agent.plugins.skill_host import SkillSnapshot
+from agent.plugins.skill_links import PluginSkillLinker
 from agent.plugins.snapshot import (
     RuntimeSnapshot,
     RuntimeSnapshotCompiler,
@@ -497,7 +498,7 @@ async def test_skill_catalog_cleanup_failure_is_reported(
     await manager.load_all()
     generation = manager.generation("skill_cleanup")
     assert generation is not None and generation.skill_catalog is not None
-    snapshot_root = generation.skill_catalog.snapshot_root
+    snapshot_root = generation.skill_catalog.snapshot.root
     real_rmtree = shutil.rmtree
 
     def fail_snapshot_cleanup(path: Path, *args: Any, **kwargs: Any) -> None:
@@ -522,21 +523,6 @@ def _installed_snapshot_source(
 ) -> str:
     exports = "skill_roots = ('skills',)\n" if skills else ""
     return _v3_source("installed_snapshot", version=version, exports=exports)
-
-
-def _installed_command_source(description: str, version: str) -> str:
-    return (
-        "from agent.plugin_composition import COMMANDS, CommandDefinition, CommandResult\n"
-        "api_version = 3\n"
-        "name = 'installed_commands'\n"
-        f"version = {version!r}\n"
-        "inject = (COMMANDS,)\n"
-        "async def apply(ctx, config):\n"
-        "    async def handler(invocation):\n"
-        "        return CommandResult('success', invocation.raw_input or 'ok')\n"
-        "    await ctx.require(COMMANDS).register(ctx, CommandDefinition(\n"
-        f"        name='hello', description={description!r}, handler=handler))\n"
-    )
 
 
 @pytest.mark.asyncio
@@ -634,7 +620,10 @@ async def test_installed_candidate_promotion_syncs_stable_skill_projection(
         installed_cache_root=tmp_path / "home" / "cache",
     )
     await manager.load_all()
-    manager.sync_skill_links()
+    PluginSkillLinker(
+        workspace=workspace,
+        plugin_roots=manager.skill_projection_roots,
+    ).sync(manager.active_plugins())
     loader = SkillsLoader(workspace, builtin_skills_dir=tmp_path / "builtin")
     stable_link = workspace / "skills" / "stable-skill"
     assert stable_link.resolve() == stable_root / "skills" / "stable-skill"
@@ -1232,7 +1221,10 @@ async def test_plugin_watcher_updates_skill_links_when_plugin_is_toggled(
     write_plugin_manifest({"computer": True}, plugins_home=tmp_path / "home")
     manager = _manager(tmp_path)
     await manager.load_all()
-    manager.sync_skill_links()
+    PluginSkillLinker(
+        workspace=tmp_path / "workspace",
+        plugin_roots=manager.skill_projection_roots,
+    ).sync(manager.active_plugins())
     link = tmp_path / "workspace" / "skills" / "opencli"
     assert link.resolve() == skill_dir.resolve()
 

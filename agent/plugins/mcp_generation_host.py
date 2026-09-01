@@ -75,11 +75,6 @@ class McpMaterializedCommand:
     cwd: str
     env: Mapping[str, str] = field(default_factory=dict)
 
-
-# Keep both spellings available while callers migrate to the explicit name.
-MaterializedMcpCommand = McpMaterializedCommand
-
-
 @dataclass(frozen=True, slots=True)
 class McpToolView:
     """Immutable tool metadata exposed by a generation facade."""
@@ -112,22 +107,6 @@ class McpLogView:
     stdout: tuple[str, ...]
     stderr: tuple[str, ...]
 
-    @property
-    def stdout_bytes(self) -> int:
-        return sum(len(line.encode("utf-8", errors="replace")) for line in self.stdout)
-
-    @property
-    def stderr_bytes(self) -> int:
-        return sum(len(line.encode("utf-8", errors="replace")) for line in self.stderr)
-
-    @property
-    def dropped_stdout_lines(self) -> int:
-        return 0
-
-    @property
-    def dropped_stderr_lines(self) -> int:
-        return 0
-
 
 @dataclass(frozen=True, slots=True)
 class McpCleanupTombstone:
@@ -142,17 +121,6 @@ class McpCleanupTombstone:
 
 
 FailureCallback = Callable[[McpCleanupTombstone], None]
-
-
-@dataclass(frozen=True, slots=True)
-class McpObservationDiagnostic:
-    """Structured callback failure retained independently from resource cleanup."""
-
-    generation_id: str
-    server_name: str
-    callback: Literal["health", "incident"]
-    reason: str
-    error: str
 
 
 @dataclass
@@ -201,40 +169,6 @@ class McpRoute:
         self._generation_token = generation_token
         self._entry = entry
         self._closed = False
-
-    @property
-    def mode(self) -> McpMode:
-        self._assert_open()
-        self._host._resolve_route(
-            self.generation_id,
-            self._generation_token,
-            self._entry,
-        )
-        return self._entry.mode
-
-    @property
-    def epoch(self) -> int:
-        self._assert_open()
-        self._host._resolve_route(
-            self.generation_id,
-            self._generation_token,
-            self._entry,
-        )
-        return self._entry.epoch
-
-    @property
-    def tools(self) -> Mapping[str, McpToolView]:
-        self._assert_open()
-        self._host._resolve_route(
-            self.generation_id,
-            self._generation_token,
-            self._entry,
-        )
-        return self._entry.tools
-
-    @property
-    def tool_names(self) -> tuple[str, ...]:
-        return tuple(self.tools)
 
     async def call(
         self,
@@ -301,15 +235,6 @@ class McpServerView:
         self._entry = entry
 
     @property
-    def mode(self) -> McpMode:
-        self._host._resolve_route(
-            self.generation_id,
-            self._generation_token,
-            self._entry,
-        )
-        return self._entry.mode
-
-    @property
     def epoch(self) -> int:
         self._host._resolve_route(
             self.generation_id,
@@ -326,17 +251,6 @@ class McpServerView:
             self._entry,
         )
         return self._entry.tools
-
-    @property
-    def catalog_digest(self) -> str:
-        """Return the protected full tools/list identity for Core inspection."""
-
-        self._host._resolve_route(
-            self.generation_id,
-            self._generation_token,
-            self._entry,
-        )
-        return self._entry.catalog_digest
 
     @property
     def tool_names(self) -> tuple[str, ...]:
@@ -376,27 +290,15 @@ class McpGeneration(Mapping[str, McpServerView]):
         )
 
     @property
-    def mode(self) -> McpMode:
-        return self._host.mode(self.generation_id, self._token)
-
-    @property
     def state(self) -> McpGenerationState:
         return self._host.generation_state(self.generation_id, self._token)
 
-    @property
-    def servers(self) -> Mapping[str, McpServerView]:
-        return self._servers
-
-    @property
-    def tool_names(self) -> tuple[str, ...]:
-        return tuple(
-            f"mcp_{server.name}__{tool_name}"
-            for server in self._servers.values()
-            for tool_name in server.tool_names
-        )
-
     def catalog_digest(self, server_name: str) -> str:
-        return self.server(server_name).catalog_digest
+        return self._host.catalog_digest(
+            self.generation_id,
+            server_name,
+            self._token,
+        )
 
     def server(self, server_name: str) -> McpServerView:
         return self._servers[server_name]
@@ -443,50 +345,7 @@ class McpGenerationHost:
         self._readiness_timeout_seconds = readiness_timeout_seconds
         self._generations: dict[str, _Generation] = {}
         self._tombstones: dict[str, McpCleanupTombstone] = {}
-        self._diagnostics: dict[str, tuple[McpObservationDiagnostic, ...]] = {}
         self._next_epoch = 0
-
-    async def start_candidate(
-        self,
-        generation_id: str,
-        registry: McpServerRegistry,
-        materialized_commands: Mapping[str, McpMaterializedCommand],
-        *,
-        endpoint_ports: Mapping[str, int] | None = None,
-        workload_endpoints: Mapping[tuple[str, str], str] | None = None,
-    ) -> McpGeneration:
-        """Materialize a candidate with only declared read-only routes."""
-
-        return await self.start_generation(
-            generation_id,
-            registry,
-            materialized_commands,
-            mode="candidate",
-            endpoint_ports=endpoint_ports,
-            workload_endpoints=workload_endpoints,
-        )
-
-    async def start_formal(
-        self,
-        generation_id: str,
-        registry: McpServerRegistry,
-        materialized_commands: Mapping[str, McpMaterializedCommand],
-        *,
-        endpoint_ports: Mapping[str, int] | None = None,
-        workload_endpoints: Mapping[tuple[str, str], str] | None = None,
-        expected_catalog_digests: Mapping[str, str] | None = None,
-    ) -> McpGeneration:
-        """Materialize a formal generation with its complete tool catalog."""
-
-        return await self.start_generation(
-            generation_id,
-            registry,
-            materialized_commands,
-            mode="formal",
-            endpoint_ports=endpoint_ports,
-            workload_endpoints=workload_endpoints,
-            expected_catalog_digests=expected_catalog_digests,
-        )
 
     async def start_generation(
         self,
@@ -524,7 +383,6 @@ class McpGenerationHost:
             registry=registry,
             entries={},
         )
-        self._diagnostics.pop(generation_id, None)
         self._generations[generation_id] = generation
         try:
             # 1. Build each Core-owned client and complete its handshake/tools-list.
@@ -645,11 +503,6 @@ class McpGenerationHost:
     def tombstone(self, generation_id: str) -> McpCleanupTombstone | None:
         return self._tombstones.get(generation_id)
 
-    def diagnostics(self, generation_id: str) -> tuple[McpObservationDiagnostic, ...]:
-        """Return retained observation failures without implying resource failure."""
-
-        return self._diagnostics.get(generation_id, ())
-
     def generation_state(
         self,
         generation_id: str,
@@ -665,11 +518,6 @@ class McpGenerationHost:
         raise RuntimeError(
             f"MCP generation belongs to a stale or unavailable host: {generation_id}"
         )
-
-    def mode(self, generation_id: str, token: object | None = None) -> McpMode:
-        generation = self._require_generation(generation_id)
-        self._assert_token(generation, token)
-        return generation.mode
 
     def health(
         self,
@@ -732,8 +580,6 @@ class McpGenerationHost:
             raise KeyError(f"unknown MCP server: {generation_id}:{server_name}")
         self._resolve_route(generation_id, generation.token, entry)
         return McpRoute(self, generation_id, generation.token, entry)
-
-    route = route_for
 
     def assert_healthy(self, generation_id: str, token: object | None = None) -> None:
         """Reject promotion while any client is recovering, failed or disconnected."""
@@ -1003,10 +849,13 @@ class McpGenerationHost:
             ) from error
         try:
             await self._emit_health(entry.generation_id, entry.name, False, "stopped")
-        except asyncio.CancelledError as error:
-            self._record_diagnostic(entry, "health", "stopped", error)
-        except Exception as error:
-            self._record_diagnostic(entry, "health", "stopped", error)
+        except (asyncio.CancelledError, Exception) as error:
+            logger.error(
+                "[mcp] observation callback failed for %s:%s: %s",
+                entry.generation_id,
+                entry.name,
+                _error_text(error),
+            )
 
     def _retain_tombstone(
         self,
@@ -1033,29 +882,6 @@ class McpGenerationHost:
         self._tombstones[generation.generation_id] = tombstone
         if self._on_failure is not None:
             self._on_failure(tombstone)
-
-    def _record_diagnostic(
-        self,
-        entry: _McpEntry,
-        callback: Literal["health", "incident"],
-        reason: str,
-        error: BaseException,
-    ) -> None:
-        diagnostic = McpObservationDiagnostic(
-            generation_id=entry.generation_id,
-            server_name=entry.name,
-            callback=callback,
-            reason=reason,
-            error=_error_text(error),
-        )
-        existing = self._diagnostics.get(entry.generation_id, ())
-        self._diagnostics[entry.generation_id] = (*existing, diagnostic)[-16:]
-        logger.error(
-            "[mcp] observation callback failed for %s:%s: %s",
-            entry.generation_id,
-            entry.name,
-            diagnostic.error,
-        )
 
     def _watch_stop_requested(
         self,
@@ -1321,10 +1147,6 @@ class McpGenerationHost:
     def _assert_token(generation: _Generation, token: object | None) -> None:
         if token is not None and token is not generation.token:
             raise RuntimeError("MCP generation belongs to another host Root")
-
-
-# Short alias for callers that do not need the longer class name.
-McpHost = McpGenerationHost
 
 
 def _descriptor_fields(descriptor: McpServerDescriptor) -> tuple[object, ...]:

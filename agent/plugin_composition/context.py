@@ -470,11 +470,6 @@ class FiberHandle:
         self._fiber = fiber
 
     @property
-    def fiber_id(self) -> int:
-        reject_executor_context_access()
-        return self._fiber.fiber_id
-
-    @property
     def name(self) -> str:
         reject_executor_context_access()
         return self._fiber.name
@@ -508,11 +503,6 @@ class HealthHandle:
     def __init__(self, root: CompositionRoot, entry: _HealthEntry) -> None:
         self._root = root
         self._entry = entry
-
-    @property
-    def name(self) -> str:
-        reject_executor_context_access()
-        return self._entry.name
 
     @property
     def healthy(self) -> bool:

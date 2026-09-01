@@ -122,10 +122,6 @@ class CommandRegistry:
         return self._descriptors
 
     @property
-    def claims(self) -> Mapping[str, str]:
-        return self._owners
-
-    @property
     def catalog_digest(self) -> str:
         return self._catalog_digest
 
@@ -176,6 +172,19 @@ class CommandRegistry:
                     result = await result
                 settled = _validate_result(definition.name, result)
         return CommandExecution(name=definition.name, result=settled)
+
+
+def command_discovery_catalog(
+    registry: CommandRegistry | None,
+) -> tuple[tuple[str, str], ...]:
+    """Project the universal channel discovery catalog from one v3 registry."""
+
+    if registry is None:
+        return ()
+    return tuple(
+        (descriptor.name, descriptor.description)
+        for descriptor in registry.descriptors
+    )
 
 
 class PluginCommands:

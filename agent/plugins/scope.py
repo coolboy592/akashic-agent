@@ -3,11 +3,10 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
-import subprocess
 from collections.abc import Awaitable, Callable, Coroutine
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Any, Generic, TypeVar, cast
+from typing import Any, TypeVar
 
 from agent.plugin_composition.diagnostics import plugin_entrypoint
 from bus.event_bus import EventBus, EventSubscription, Handler
@@ -24,7 +23,7 @@ class CleanupFailure:
     error: str
 
 
-# 插件资源接口：现有插件通过 context 或直接使用 scope 登记订阅、任务和进程。
+# 插件资源接口：现有插件通过 context 或直接使用 scope 登记订阅、任务和 cleanup。
 # 迁移插件前不得绕过逆序清理、聚合失败和清理完成后再恢复取消的语义。
 class PluginScope:
     def __init__(
@@ -105,73 +104,6 @@ class PluginScope:
         self.defer(f"task:{name or task.get_name()}", cancel)
         return task
 
-    def track_async_process(
-        self,
-        process: asyncio.subprocess.Process,
-        *,
-        name: str,
-        timeout: float = 5,
-    ) -> None:
-        async def terminate() -> None:
-            """终止异步进程并在竞态或超时时完成有限等待。"""
-
-            # 1. 进程已退出时仍 wait 一次完成 transport 收尾
-            if process.returncode is None:
-                try:
-                    process.terminate()
-                except ProcessLookupError:
-                    _ = await asyncio.wait_for(process.wait(), timeout=timeout)
-                    return
-            else:
-                _ = await asyncio.wait_for(process.wait(), timeout=timeout)
-                return
-
-            # 2. 先等待优雅退出
-            try:
-                _ = await asyncio.wait_for(process.wait(), timeout=timeout)
-            except TimeoutError:
-                # 3. 超时后强杀，并保持二次等待有界
-                try:
-                    process.kill()
-                except ProcessLookupError:
-                    pass
-                _ = await asyncio.wait_for(process.wait(), timeout=timeout)
-
-        self.defer(f"process:{name}", terminate)
-
-    def track_process(
-        self,
-        process: subprocess.Popen[Any],
-        *,
-        name: str,
-        timeout: float = 5,
-    ) -> None:
-        async def terminate() -> None:
-            """终止同步进程并在竞态或超时时完成有限等待。"""
-
-            # 1. 进程已退出时 poll 已完成回收
-            if process.poll() is not None:
-                return
-            try:
-                process.terminate()
-            except ProcessLookupError:
-                if process.poll() is None:
-                    raise
-
-            # 2. 先等待优雅退出
-            try:
-                _ = await asyncio.to_thread(process.wait, timeout)
-            except subprocess.TimeoutExpired:
-                # 3. 超时后强杀，并保持二次等待有界
-                try:
-                    process.kill()
-                except ProcessLookupError:
-                    if process.poll() is None:
-                        raise
-                _ = await asyncio.to_thread(process.wait, timeout)
-
-        self.defer(f"process:{name}", terminate)
-
     async def aclose(self) -> list[CleanupFailure]:
         """按逆序完成全部资源清理，并在末尾恢复外部取消。"""
 
@@ -240,121 +172,3 @@ class PluginScope:
     def _ensure_open(self) -> None:
         if self._closed:
             raise RuntimeError(f"插件作用域已关闭: {self.plugin_id}")
-
-
-class ScopedEventBus:
-    def __init__(
-        self,
-        event_bus: EventBus,
-        scope: PluginScope,
-        *,
-        staged: bool = False,
-    ) -> None:
-        self._event_bus = event_bus
-        self._scope = scope
-        self._active = not staged
-        self._snapshot_managed = staged
-        self._pending: list[_StagedEventSubscription[Any]] = []
-
-    def on(
-        self,
-        event_type: type[T],
-        handler: Handler[T],
-    ) -> EventSubscription | _StagedEventSubscription[T]:
-        if self._snapshot_managed:
-            if self._active:
-                raise RuntimeError("插件事件订阅必须在 generation 开放前注册")
-            subscription = _StagedEventSubscription(
-                self._event_bus,
-                event_type,
-                handler,
-            )
-            self._pending.append(subscription)
-            self._scope.defer(
-                f"event:{event_type.__name__}",
-                subscription.close,
-            )
-            return subscription
-        return self._scope.subscribe(self._event_bus, event_type, handler)
-
-    def publish(self) -> None:
-        if not self._snapshot_managed:
-            return
-        self._active = True
-
-    def staged_handlers(self) -> tuple[tuple[type[object], Handler[object]], ...]:
-        return tuple(
-            (subscription.event_type, subscription.dispatch)
-            for subscription in self._pending
-            if subscription.active
-        )
-
-    def activate(self) -> None:
-        if self._active:
-            return
-        self._active = True
-        for subscription in self._pending:
-            subscription.activate()
-        self._pending.clear()
-
-    async def emit(self, event: T) -> T:
-        self._ensure_active()
-        return await self._event_bus.emit(event)
-
-    async def observe(self, event: object) -> None:
-        self._ensure_active()
-        await self._event_bus.observe(event)
-
-    async def fanout(self, event: object) -> None:
-        self._ensure_active()
-        await self._event_bus.fanout(event)
-
-    def enqueue(self, event: object) -> None:
-        self._ensure_active()
-        self._event_bus.enqueue(event)
-
-    def _ensure_active(self) -> None:
-        if not self._active:
-            raise RuntimeError("候选插件尚未发布，不能发送事件")
-
-
-class _StagedEventSubscription(Generic[T]):
-    def __init__(
-        self,
-        event_bus: EventBus,
-        event_type: type[T],
-        handler: Handler[T],
-    ) -> None:
-        self._event_bus = event_bus
-        self._event_type = event_type
-        self._handler = handler
-        self._subscription: EventSubscription | None = None
-        self._active = True
-
-    @property
-    def active(self) -> bool:
-        return self._active
-
-    @property
-    def event_type(self) -> type[object]:
-        return self._event_type
-
-    async def dispatch(self, event: object) -> object | None:
-        if not self._active:
-            return None
-        result = self._handler(cast(T, event))
-        if inspect.isawaitable(result):
-            return await result
-        return result
-
-    def activate(self) -> None:
-        if not self._active or self._subscription is not None:
-            return
-        self._subscription = self._event_bus.on(self._event_type, self._handler)
-
-    def close(self) -> None:
-        if not self._active:
-            return
-        self._active = False
-        if self._subscription is not None:
-            self._subscription.close()

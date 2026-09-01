@@ -27,6 +27,7 @@ from agent.plugins.mcp_generation_host import (
     McpGeneration,
     McpGenerationHost,
     McpMaterializedCommand,
+    McpMode,
 )
 from utils.process_group import OwnedProcessGroup
 
@@ -178,7 +179,7 @@ async def test_candidate_filters_tools_and_projects_controlled_env(tmp_path: Pat
     root, registry = await _registry(tmp_path, script)
     host = McpGenerationHost()
     try:
-        generation = await host.start_candidate(
+        generation = await host.start_generation(
             "candidate-a",
             registry,
             _command(script, env={"GEN": "candidate-a"}),
@@ -201,16 +202,44 @@ async def test_candidate_filters_tools_and_projects_controlled_env(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+async def test_duplicate_generation_is_rejected_before_second_process(tmp_path: Path) -> None:
+    script = tmp_path / "server.py"
+    _write_server(script)
+    root, registry = await _registry(tmp_path, script)
+    host = McpGenerationHost()
+    try:
+        endpoint_ports = {"calendar_api": _free_port()}
+        await host.start_generation(
+            "same",
+            registry,
+            _command(script),
+            endpoint_ports=endpoint_ports,
+        )
+        with pytest.raises(RuntimeError, match="already exists"):
+            await host.start_generation(
+                "same",
+                registry,
+                _command(script),
+                endpoint_ports=endpoint_ports,
+            )
+        assert (script.parent / "counter").read_text(encoding="utf-8") == "1"
+    finally:
+        await host.close()
+        await root.dispose()
+
+
+@pytest.mark.asyncio
 async def test_formal_exposes_all_tools_and_does_not_apply_candidate_env(tmp_path: Path) -> None:
     script = tmp_path / "server.py"
     _write_server(script)
     root, registry = await _registry(tmp_path, script)
     host = McpGenerationHost()
     try:
-        generation = await host.start_formal(
+        generation = await host.start_generation(
             "formal-a",
             registry,
             _command(script, env={"GEN": "formal-a"}),
+            mode="formal",
             endpoint_ports={"calendar_api": _free_port()},
         )
         assert generation.server("calendar").tool_names == ("read_tool", "write_tool")
@@ -231,17 +260,18 @@ async def test_child_env_scrubs_ambient_candidate_value(monkeypatch, tmp_path: P
     monkeypatch.setenv("ROLE", "candidate")
     host = McpGenerationHost()
     try:
-        formal = await host.start_formal(
+        formal = await host.start_generation(
             "formal-ambient-env",
             registry,
             _command(script),
+            mode="formal",
             endpoint_ports={"calendar_api": _free_port()},
         )
         formal_result = await formal.route("calendar").call("read_tool", {})
         assert formal_result.output.split("|", 1)[0] == "none"
         await host.stop_generation("formal-ambient-env")
 
-        candidate = await host.start_candidate(
+        candidate = await host.start_generation(
             "candidate-ambient-env",
             registry,
             _command(script),
@@ -286,7 +316,7 @@ async def test_formal_rejects_catalog_drift_from_candidate_identity(tmp_path: Pa
     root, registry = await _registry(tmp_path, script)
     host = McpGenerationHost()
     try:
-        candidate = await host.start_candidate(
+        candidate = await host.start_generation(
             "candidate-catalog",
             registry,
             _command(script),
@@ -295,10 +325,11 @@ async def test_formal_rejects_catalog_drift_from_candidate_identity(tmp_path: Pa
         expected_digest = candidate.catalog_digest("calendar")
         _write_server(script, mode="catalog_drift")
         with pytest.raises(RuntimeError, match="catalog drift"):
-            await host.start_formal(
+            await host.start_generation(
                 "formal-catalog-drift",
                 registry,
                 _command(script),
+                mode="formal",
                 endpoint_ports={"calendar_api": _free_port()},
                 expected_catalog_digests={"calendar": expected_digest},
             )
@@ -320,15 +351,17 @@ async def test_materialized_candidate_env_is_rejected_for_candidate_and_formal(
     root, registry = await _registry(tmp_path, script)
     host = McpGenerationHost()
     try:
-        for generation_id, start in (
-            ("candidate-base-env", host.start_candidate),
-            ("formal-base-env", host.start_formal),
-        ):
+        cases: tuple[tuple[str, McpMode], ...] = (
+            ("candidate-base-env", "candidate"),
+            ("formal-base-env", "formal"),
+        )
+        for generation_id, mode in cases:
             with pytest.raises(ValueError, match="candidate-only"):
-                await start(
+                await host.start_generation(
                     generation_id,
                     registry,
                     _command(script, env={"ROLE": "candidate"}),
+                    mode=mode,
                     endpoint_ports={"calendar_api": _free_port()},
                 )
             assert host.get(generation_id) is None
@@ -350,10 +383,11 @@ async def test_declaration_rejects_overlapping_candidate_env(tmp_path: Path) -> 
     host = McpGenerationHost()
     try:
         with pytest.raises(ValueError, match="不得重叠"):
-            await host.start_formal(
+            await host.start_generation(
                 "formal-overlap",
                 registry,
                 _command(script),
+                mode="formal",
                 endpoint_ports={"calendar_api": _free_port()},
             )
         assert host.get("formal-overlap") is None
@@ -373,7 +407,7 @@ async def test_materialized_argv0_must_be_pinned_absolute_executable(
     host = McpGenerationHost()
     try:
         with pytest.raises(ValueError, match=r"argv\[0\].*absolute executable"):
-            await host.start_candidate(
+            await host.start_generation(
                 "candidate-path-hostile",
                 registry,
                 {
@@ -405,7 +439,7 @@ async def test_readiness_rejects_missing_required_tool_and_cleans_process(tmp_pa
     host = McpGenerationHost()
     try:
         with pytest.raises(RuntimeError, match="required tool 缺失"):
-            await host.start_candidate(
+            await host.start_generation(
                 "candidate-missing",
                 registry,
                 _command(script),
@@ -425,7 +459,7 @@ async def test_start_cancellation_drains_client_and_restores_cancelled_error(tmp
     root, registry = await _registry(tmp_path, script)
     host = McpGenerationHost(readiness_timeout_seconds=30)
     task = asyncio.create_task(
-        host.start_candidate(
+        host.start_generation(
             "candidate-cancel",
             registry,
             _command(script),
@@ -468,7 +502,7 @@ async def test_start_health_bridge_cancellation_drains_client(tmp_path: Path) ->
     host = McpGenerationHost(on_health=cancel_start)
     try:
         with pytest.raises(asyncio.CancelledError):
-            await host.start_candidate(
+            await host.start_generation(
                 "candidate-health-cancel",
                 registry,
                 _command(script),
@@ -495,7 +529,7 @@ async def test_client_epoch_recovery_is_fenced_and_bounded(tmp_path: Path, monke
     root, registry = await _registry(tmp_path, script)
     host = McpGenerationHost()
     try:
-        generation = await host.start_candidate(
+        generation = await host.start_generation(
             "candidate-recover",
             registry,
             _command(script),
@@ -536,7 +570,7 @@ async def test_recovery_health_bridge_cancellation_retains_degraded_tombstone(
 
     host = McpGenerationHost(on_incident=cancel_epoch_incident)
     try:
-        generation = await host.start_candidate(
+        generation = await host.start_generation(
             "candidate-recovery-health-cancel",
             registry,
             _command(script),
@@ -565,7 +599,7 @@ async def test_cleanup_failure_retains_tombstone_until_retry(tmp_path: Path, mon
     _write_server(script)
     root, registry = await _registry(tmp_path, script)
     host = McpGenerationHost()
-    await host.start_candidate(
+    await host.start_generation(
         "candidate-cleanup",
         registry,
         _command(script),
@@ -598,7 +632,10 @@ async def test_cleanup_failure_retains_tombstone_until_retry(tmp_path: Path, mon
 
 
 @pytest.mark.asyncio
-async def test_stopped_health_failure_is_diagnostic_not_cleanup_failure(tmp_path: Path) -> None:
+async def test_stopped_health_failure_is_logged_not_cleanup_failure(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     script = tmp_path / "server.py"
     _write_server(script)
     root, registry = await _registry(tmp_path, script)
@@ -614,7 +651,7 @@ async def test_stopped_health_failure_is_diagnostic_not_cleanup_failure(tmp_path
 
     host = McpGenerationHost(on_health=fail_stopped)
     try:
-        await host.start_candidate(
+        await host.start_generation(
             "candidate-observation-failure",
             registry,
             _command(script),
@@ -623,10 +660,10 @@ async def test_stopped_health_failure_is_diagnostic_not_cleanup_failure(tmp_path
         await host.stop_generation("candidate-observation-failure")
         assert host.get("candidate-observation-failure") is None
         assert host.tombstone("candidate-observation-failure") is None
-        diagnostics = host.diagnostics("candidate-observation-failure")
-        assert len(diagnostics) == 1
-        assert diagnostics[0].reason == "stopped"
-        assert "health sink disposed" in diagnostics[0].error
+        assert any(
+            "health sink disposed" in record.getMessage()
+            for record in caplog.records
+        )
     finally:
         await host.close()
         await root.dispose()
@@ -640,7 +677,7 @@ async def test_degraded_recovery_tombstone_is_actionable(tmp_path: Path, monkeyp
     root, registry = await _registry(tmp_path, script)
     host = McpGenerationHost()
     try:
-        _ = await host.start_candidate(
+        _ = await host.start_generation(
             "candidate-degraded",
             registry,
             _command(script),
@@ -669,13 +706,13 @@ async def test_same_server_name_isolated_across_generations(tmp_path: Path) -> N
     root, registry = await _registry(tmp_path, script)
     host = McpGenerationHost()
     try:
-        first = await host.start_candidate(
+        first = await host.start_generation(
             "generation-a",
             registry,
             _command(script, env={"GEN": "a"}),
             endpoint_ports={"calendar_api": _free_port()},
         )
-        second = await host.start_candidate(
+        second = await host.start_generation(
             "generation-b",
             registry,
             _command(script, env={"GEN": "b"}),
@@ -713,7 +750,7 @@ async def test_health_bridge_failure_prevents_ready_publication(tmp_path: Path) 
     host = McpGenerationHost(on_health=fail_ready)
     try:
         with pytest.raises(RuntimeError, match="health bridge failed"):
-            await host.start_candidate(
+            await host.start_generation(
                 "candidate-health-failure",
                 registry,
                 _command(script),

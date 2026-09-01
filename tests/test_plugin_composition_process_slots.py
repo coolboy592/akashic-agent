@@ -91,7 +91,6 @@ async def test_process_registry_freezes_health_identity_and_cleanup(
     assert binding.descriptor.owner == "calendar"
     assert binding.definition.env["MODE"] == "calendar"
     assert binding.is_live()
-    assert registry.identity == registry.catalog_digest
     assert not hasattr(processes, "freeze")
     incident = binding.incident_reporter(
         "process_readiness_failed",
@@ -301,7 +300,7 @@ def _write_plugin_version(plugin_dir: Path, version: str) -> None:
         'entrypoint = "plugin.py"\n\n'
         "[[python]]\n"
         'requirements = "requirements.txt"\n\n'
-        "[[process]]\n"
+        "[[processes]]\n"
         'name = "calendar_api"\n'
         'command = ["python", "api.py"]\n'
         f'env = {{VERSION = "{version}"}}\n'

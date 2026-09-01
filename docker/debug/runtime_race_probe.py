@@ -41,23 +41,10 @@ from agent.plugin_composition.channels import (
 from bus.events import (
     ChannelMessage,
     InboundMessage,
-    OutboundMessage,
 )
 from bus.event_bus import EventBus
 from bus.processing import ProcessingState
 from bus.queue import MessageBus
-from core.memory.engine import (
-    EngineProfile,
-    MemoryCapability,
-    MemoryEngineDescriptor,
-    MemoryIngestRequest,
-    MemoryIngestResult,
-    MemoryMutation,
-    MemoryMutationResult,
-    MemoryQuery,
-    MemoryQueryResult,
-    MemoryToolProfile,
-)
 from tests.model_plugin_fakes import build_test_model_store
 from core.net.http import (
     SharedHttpResources,
@@ -87,48 +74,6 @@ class ScenarioResult:
     name: str
     ok: bool
     records: list[dict[str, object]]
-
-
-class _ProbeMemoryEngine:
-    def describe(self) -> MemoryEngineDescriptor:
-        return MemoryEngineDescriptor(
-            name="race_probe",
-            profile=EngineProfile.CLASSIC_MEMORY_SERVICE,
-            capabilities=frozenset({MemoryCapability.RETRIEVE_CONTEXT_BLOCK}),
-        )
-
-    def tool_profile(self) -> MemoryToolProfile:
-        return MemoryToolProfile()
-
-    async def query(self, request: MemoryQuery) -> MemoryQueryResult:
-        return MemoryQueryResult(text_block="")
-
-    async def mutate(self, request: MemoryMutation) -> MemoryMutationResult:
-        return MemoryMutationResult(accepted=True, item_id="race-memory")
-
-    def reinforce_items_batch(self, ids: list[str]) -> None:
-        return None
-
-    async def ingest(self, request: MemoryIngestRequest) -> MemoryIngestResult:
-        return MemoryIngestResult(accepted=True)
-
-    def read_long_term(self) -> str:
-        return ""
-
-    def read_self(self) -> str:
-        return ""
-
-    def get_memory_context(self) -> str:
-        return ""
-
-    def read_history(self, max_chars: int = 0) -> str:
-        return ""
-
-    def read_recent_history(self, *, max_chars: int = 0) -> str:
-        return ""
-
-    def has_long_term_memory(self) -> bool:
-        return False
 
 
 class _BlockingReasoner(Reasoner):
@@ -239,9 +184,6 @@ class RaceHarness:
                         'system_prompt = "race probe"',
                         "max_iterations = 3",
                         "",
-                        "[agent.context.compaction]",
-                        "keep_recent_tokens = 20000",
-                        "",
                         "[app_server]",
                         'listen = "/tmp/akashic-race.sock"',
                         "",
@@ -327,10 +269,7 @@ class RaceHarness:
                 workspace=self.workspace,
                 event_bus=EventBus(),
                 processing_state=ProcessingState(),
-                context=ContextBuilder(
-                    self.workspace,
-                    cast(Any, _ProbeMemoryEngine()),
-                ),
+                context=ContextBuilder(self.workspace),
                 reasoner=reasoner,
                 outbound_port=self.passive_port,
             ),
@@ -340,7 +279,6 @@ class RaceHarness:
                     max_tokens=0,
                     tool_search_enabled=config.tool_search_enabled,
                 ),
-                context_compaction=config.context_compaction,
             ),
         )
         loop.bind_runtime_snapshot_store(
@@ -407,15 +345,6 @@ class RaceHarness:
             _ = await asyncio.wait_for(release.wait(), timeout=self.timeout)
         await self._record("end", channel, chat_id, message)
         _ = self._ended.setdefault(message, asyncio.Event()).set()
-
-    async def _send_outbound(self, msg: OutboundMessage) -> None:
-        await self._record("start", msg.channel, msg.chat_id, msg.content)
-        _ = self._started.setdefault(msg.content, asyncio.Event()).set()
-        release = self._blocked.get(msg.content)
-        if release is not None:
-            _ = await asyncio.wait_for(release.wait(), timeout=self.timeout)
-        await self._record("end", msg.channel, msg.chat_id, msg.content)
-        _ = self._ended.setdefault(msg.content, asyncio.Event()).set()
 
     async def _record(
         self,

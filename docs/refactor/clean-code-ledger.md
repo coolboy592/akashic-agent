@@ -2631,3 +2631,219 @@ SLOC 是有内容的源码行：Python 使用 AST 标出完整 docstring 表达�
 - SLOC：PR64 base python `110973`（files `505`，digest `653609adf8f2fd39a51c05c7b6f49446322141d723486b9e223090d677a47aab`）；candidate python `110934`（files `505`，digest `3f1020137a54c57f3a4913300d6aea3c5c9ff6eaff4b5736ea781837a38a6777`）；生产 SLOC 减少 `39`。
 - 回滚：按独立提交 revert；重基前代码恢复分支为 `backup/less-is-more-pr65-before-integration-20260813`。
 - 后续边界：proactive、scheduler、spawn、`message_push` 语义不动；owner/写入链调查结论（attempt 持久语义真实可达，见本轮 explore 证据）已并入本条目，turns 表与 `recover_in_progress_turns` 不改。
+
+## 2026-08-31 less-is-more PR525：退役 core memory 死链
+
+### `PR525` `refactor: retire obsolete core memory helpers`
+
+- base：`d7302584`；提交：`50c75f94`；`change_type=refactor`，active memory engine 与 observe consumer 的 `semantic_delta=none`。
+- 删除依据：`core/memory/utils.py` 的三个 scope/source-ref helper 在当前 default engine、测试、文档 API、动态入口和 `/home/huashen/.akashic-plugin` cache 中均无 consumer；ledger 中 PR21 的“保持不变”结论属于旧 engine 阶段，已被当前 source owner 覆盖。`core/memory/events.py:TurnIngested` 也无 current consumer；当前 observe 合同只使用 `RetrievalCompleted` 与 `MemoryWritten`，现有文档明确 TurnIngested 不再入队。
+- 保护边界：未改 `MemoryQuery`、`MemoryScope`、`EvidenceRef`、SessionDB、migration、写入 owner、observe 顺序或外部插件实际导入的两个事件；没有新增 absence test、fallback 或兼容壳。
+- 范围：删除 40 行 production dead code；不改变正常 memory query/write、scope 校验、event payload、持久化和错误传播。
+- 验证：memory/lifecycle/companion 定向回归 `36 passed`；`core/memory/events.py` basedpyright `0 errors, 0 warnings, 0 notes`；compile、精确 source/cache scan、`git diff --check` 和 Gate audit（`20260831-232234-0ad48677`）通过。
+- 回滚：revert `50c75f94`；修改前备份：`/mnt/data/akasic-agent-backups/pr525-core-memory-dead-chain-before-clean-20260831/`。
+
+## 2026-08-31 less-is-more PR525：删除未接入的 PluginScope 进程 API
+
+### `PR525` `refactor: remove unused PluginScope process tracking`
+
+- base：`7db05f47`；`change_type=refactor`，现行 MCP/process 生命周期 owner 不变。
+- 删除依据：`PluginScope.track_async_process()` 与 `track_process()` 在生产代码、文档合同和外部插件源码中均无调用；当前 MCP/process 合同由 `McpGenerationHost` 持有 process handle，并由 scope 登记 generation cleanup。原有两个测试只覆盖这两个未接入 API，不是现行回归边界。
+- 范围：删除两个 process tracking 方法、`subprocess` 依赖和对应测试；保留 `PluginScope` 的订阅、task、通用 cleanup 逆序执行、失败聚合和取消恢复语义。
+- 保护边界：未修改 managed-process readiness、generation drain、process cleanup owner、插件作用域错误传播或持久化；未新增 absence test。
+- 验证：`agent/plugins/scope.py` 与 `tests/test_plugin_manager.py` 编译、pyright error/unused-import 检查、精确残留扫描和 Gate audit（`20260831-235540-52174822`）通过；完整 pytest 未执行，当前环境缺少 `apscheduler`，测试收集阶段失败。
+- 回滚：revert 本批提交；修改前备份：`/mnt/data/akasic-agent-backups/pr525-plugin-scope-process-api-before-clean-20260831/`。
+
+## 2026-09-01 less-is-more PR525：收敛 generation 启动/停止入口
+
+### `PR525` `refactor: remove generation lifecycle wrappers`
+
+- base：`31e1d8b9`；`change_type=refactor`，candidate/formal 的 generation 生命周期语义不变。
+- 删除依据：`McpGenerationHost.start_candidate()`、`start_formal()` 与 `ManagedProcessGenerationHost.start_candidate()`、`start_formal()` 只有宿主测试调用；正式生产路径已直接调用统一的 `start_generation(..., mode=...)`，当前外部插件源码和文档没有这些别名的调用。两个 `stop_candidate()`/`stop_formal()` 同样没有消费者，停止路径统一走 `stop_generation()`。
+- 范围：删除四个只转发调用的启动/停止 wrapper；测试直接调用现行 generation API，formal 场景显式传 `mode="formal"`。未新增 wrapper 缺失测试，因 API 不存在本身不是可观察合同。
+- 保护边界：未改变 candidate/formal 校验、MCP catalog/readiness、managed-process 端口隔离、generation cleanup、tombstone、重试或外部进程 owner；`redirect_request()` 保留为 readiness redirect 安全边界。
+- 验证：四个文件 `py_compile` 与 `git diff --check` 通过；两宿主 pyright `0 errors`（保留既有 43 条 warning）；精确残留扫描无目标 wrapper。`pytest -q tests/test_plugin_mcp_generation_host.py` 未进入收集，环境缺少 `apscheduler`，未声称测试通过。
+- 回滚：revert 本批提交；修改前备份：`/mnt/data/akasic-agent-backups/pr525-generation-wrapper-before-clean-20260901/`。
+
+## 2026-09-01 less-is-more PR525：删除 Wake 测试专用 admission wrapper
+
+### `PR525` `refactor: remove unused wake admission wrapper`
+
+- base：`4c5770e2`；`change_type=refactor`，Wake admission 的 owner 选择与拒绝语义不变。
+- 删除依据：`WakeRuntime._admit_owner()` 在生产代码、文档和外部插件源码中均无调用；生产 `start()` 直接消费完整的 `_admit_attempt()`，该 wrapper 只返回其中的 `turn_owner`，仅由 9 个测试直接断言。
+- 范围：删除 5 行转发 helper 及 9 个只验证该 helper 返回值的测试断言；保留并继续覆盖 `_admit_attempt()` 的 alert/content/drift、拒绝、重复 admission 和幂等相关回归。
+- 保护边界：未改变 Wake pool 维护、owner 优先级、selection、delivery、持久化、恢复或调度；没有新增 absence test。
+- 验证：`plugins/wake/plugin.py` 与 `tests/test_wake_v3.py` 编译、`git diff --check` 和精确残留扫描通过。`pytest -q tests/test_wake_v3.py` 未进入收集，环境缺少 `apscheduler`，未声称测试通过。
+- 回滚：revert 本批提交；修改前备份：`/mnt/data/akasic-agent-backups/pr525-wake-admit-owner-before-clean-20260901/`。
+
+## 2026-09-01 less-is-more PR525：删除 generation 旧命名别名
+
+### `PR525` `refactor: remove obsolete generation host aliases`
+
+- base：`e1a3ce3d`；`change_type=refactor`，generation host 行为与生命周期 owner 不变。
+- 删除依据：`McpHost` 与 `ManagedProcessHost` 仅在各自模块定义（后者另有一个同文件类型注解），当前生产、测试、文档、外部插件源码和安装 cache 均无导入或字符串引用；真实类名已是 `McpGenerationHost` 与 `ManagedProcessGenerationHost`。
+- 范围：删除两个未接入的旧命名别名，把 managed-process generation facade 的类型注解改为真实 host 类名；没有兼容壳或 absence test。
+- 保护边界：未改变 MCP/process generation 的启动、readiness、端口隔离、cleanup、tombstone、恢复和安全 redirect 逻辑。
+- 验证：两个宿主 `py_compile`、pyright `0 errors`、精确残留扫描和 `git diff --check` 通过；相关 pytest 仍受环境缺少 `apscheduler` 阻塞，未声称通过。
+- 回滚：revert 本批提交；修改前备份：`/mnt/data/akasic-agent-backups/pr525-generation-alias-before-clean-20260901/`。
+
+## 2026-09-01 less-is-more PR525：清除 stop wrapper 遗留的 mode guard
+
+### `PR525` `refactor: remove orphaned managed process mode guard`
+
+- base：`82b2b743`；`change_type=refactor`，managed-process generation 的 mode 校验入口不变。
+- 删除依据：删除 `stop_candidate()`/`stop_formal()` 后，`ManagedProcessGenerationHost._assert_mode()` 已无调用；`_require_generation()` 仍由多个真实 generation 查询和操作使用，因此只清除孤立 guard，不合并或削弱通用查询。
+- 范围：删除 7 行只服务于已退役 stop wrapper 的私有方法；保留 `start_generation(mode=...)` 的输入校验和 generation 内部 mode 状态。
+- 保护边界：未改变 readiness、端口分配、进程组清理、tombstone、恢复或 mode 记录；没有新增 absence test。
+- 验证：修改文件 `py_compile`、精确残留扫描和 `git diff --check` 通过；相关 pytest 未运行，当前环境缺少 `apscheduler`，不能收集。
+- 回滚：revert 本批提交；修改前备份：`/mnt/data/akasic-agent-backups/pr525-managed-assert-mode-before-clean-20260901/`。
+
+## 2026-09-01 less-is-more PR525：删除旧 MCP generation owner
+
+### `PR525` `refactor: remove legacy mcp host owner`
+
+- base：`ec73e1e6`；`change_type=refactor`，MCP client 的恢复/协议行为不变，generation owner 统一到 v3。
+- 删除依据：`agent/mcp/host.py` 的 `McpGenerationHost`、`PreparedMcpCatalog` 与 `PreparedMcpServer` 在生产代码、`agent/mcp/__init__.py`、外部插件源码和安装 cache 中均无消费者；当前生产路径由 `agent/plugins/composition_generation_host.py` 直接持有 `agent/plugins/mcp_generation_host.py` 的 v3 host。旧模块只剩一份混合测试中的 3 个旧 owner 测试。
+- 范围：删除旧 `agent/mcp/host.py`（第二套 catalog/state/failure owner）；从 `tests/test_mcp_process_recovery.py` 删除只测试旧 owner 的 fake-client 测试，保留 6 个 `McpClient` 恢复与工具合同测试；移除 INDEX 和合同中的旧类型名；把 duplicate-generation 回归迁到当前 v3 host，并验证第二次启动不会增加实际进程 epoch。
+- 保护边界：未删除 `agent/mcp/client.py`、process recovery、tool contract、v3 candidate/formal catalog fence、readiness、tombstone、cleanup 或 route owner；没有修改 MCP 数据库或 workspace 状态。
+- 验证：client/相关测试文件编译、pyright `0 errors`（保留 `agent/mcp/client.py` 既有 1 条 warning）、精确旧 owner 残留扫描和 `git diff --check` 通过。`pytest -q tests/test_mcp_process_recovery.py tests/test_plugin_mcp_generation_host.py` 受环境缺少 `apscheduler` 阻塞在收集阶段，未声称通过。
+- 回滚：revert 本批提交；修改前备份：`/mnt/data/akasic-agent-backups/pr525-legacy-mcp-host-before-clean-20260901/`。
+
+## 2026-09-01 less-is-more PR525：删除过时的 skill 同步 wrapper
+
+### `PR525` `refactor: remove obsolete skill sync wrapper`
+
+- base：`14e9dc6c`；提交：`195a0668`；`change_type=refactor`，skill 投影 owner 与写入顺序不变。
+- 删除依据：`PluginManager.sync_skill_links()` 在生产代码、外部插件源码、文档和动态入口中均无消费者；启动 owner 已在 `bootstrap/tools.py` 直接构造 `PluginSkillLinker`。剩余 3 个调用只是测试启动后的 setup，不是独立 API 合同。
+- 范围：删除 manager 的 10 行转发方法；3 个测试直接复用 `PluginSkillLinker`，并使用 `skill_projection_roots` 覆盖 source 与 installed cache 两类根。没有删除 linker、workspace skill 软链接、active generation 或 promotion/recovery 同步。
+- 保护边界：未改变普通/Drift skill 的创建、修复、冲突、stale cleanup、candidate promotion、rollback 或 plugin-data；没有新增 absence test，删除的不是可观察功能。
+- 回归修复：验证时发现 `a3d3b7a1` 曾误删 `agent/lifecycle/composition.py` 的模块 re-export，导致 `before_turn.py` 收集失败；`14e9dc6c` 恢复 `BeforeTurnCtx` 与 `CONTEXT_PREPARED_EVENT`，不改变运行逻辑。
+- 验证：两个直接相关文件 `.venv/bin/pytest -q -x tests/test_plugin_hot_reload.py tests/test_plugin_composition_loader.py` 为 `147 passed in 42.15s`；目标文件 Pyright `0 errors, 0 warnings`；编译、精确残留扫描和 `git diff --check` 通过。全量测试与 Docker Gate 本批未运行。
+- 回滚：revert `195a0668` 恢复 wrapper；若需恢复声明侧导出，revert `14e9dc6c` 会重新引入已确认的导入回归，不应单独执行。
+- 备份：`/mnt/data/akasic-agent-backups/pr525-manager-skill-wrapper-before-clean-20260901/`、`/mnt/data/akasic-agent-backups/pr525-lifecycle-reexport-regression-before-fix-20260901/`。
+
+## 2026-09-01 less-is-more PR525：删除无消费者的 skill catalog accessor
+
+### `PR525` `refactor: remove dead skill catalog accessor`
+
+- base：`a8d1865e`；提交：`6d03475c`；`change_type=refactor`，Skill catalog 的 generation owner 不变。
+- 删除依据：`PluginManager.skill_catalog()` 在生产代码、测试、Gate、文档、外部插件源码和安装 cache 中均无消费者；`PluginSkillHost.get()` 仍由 manager 内部 invariant、生命周期清理和 loader 测试直接使用。
+- 范围：删除 manager 的 3 行转发 accessor 及其唯一 `PreparedSkillCatalog` 注解 import。未删除 `PluginSkillHost`、`PreparedSkillCatalog`、snapshot skill index、catalog readiness 或 cleanup。
+- 保护边界：没有改变 generation catalog 的构造、冻结、校验、读取、释放、workspace skill 投影或错误传播；没有新增 absence test，孤立 accessor 不属于可观察合同。
+- 验证：`tests/test_plugin_composition_loader.py` 为 `107 passed in 28.96s`；manager Pyright `0 errors, 0 warnings`；编译、精确残留扫描和 `git diff --check` 通过。
+- 回滚：revert `6d03475c`；修改前备份：`/mnt/data/akasic-agent-backups/pr525-manager-skill-catalog-wrapper-before-clean-20260901/`。
+
+## 2026-09-01 less-is-more PR525：删除 recovery action 的无消费者别名
+
+### `PR525` `refactor: remove unused reload action aliases`
+
+- base：`602cbed1`；提交：`3485d328`；`change_type=refactor`，reload journal 的 canonical 持久化字段和恢复状态机不变。
+- 删除依据：`ReloadRecoveryAction` 的 `old_snapshot_id`、`new_snapshot_id`、`old_generation_id`、`attempt_generation_id`、`new_generation_id`、`resource`、`attempt` 在 manager、Gate、测试、文档、外部插件和安装 cache 中均无属性读取；调用方使用 `base_*`、`candidate_*`、`generation_id`、`failure_resource`、`attempt_count`。
+- 范围：删除 recovery action 的 7 个只读 alias；同时删除 `ReloadTransactionRecord.new_generation_id` 的零消费者 alias。保留 record 其余被现有回归读取的兼容属性和事件 detail 字符串。
+- 保护边界：未修改 SQLite schema/查询、reload event JSON、attempt 单调性、recovery action 选择、retry receipt、错误传播或 bootstrap/Gate 观测；没有新增 absence test，删除的属性不是当前可观察合同。
+- 验证：`tests/test_plugin_reload_journal.py` 为 `10 passed in 0.12s`；reload journal Pyright `0 errors, 0 warnings`；编译、精确残留检查和 `git diff --check` 通过。
+- 回滚：revert `3485d328`；修改前备份：`/mnt/data/akasic-agent-backups/pr525-reload-action-aliases-before-clean-20260901/`。
+
+## 2026-09-01 less-is-more PR525：按 hua-home 真实 v3 artifact 复核插件依赖
+
+- `hua-home` 健康检查通过；active Core commit 为 `51f50ad58be41106def8fb30662f1ceb6ecc563d`，服务器 manifest 启用 16 个 GitHub 外部插件。工作站原 `/home/huashen/.akashic-plugin/cache/github` 只有 12 个 `plugin.py api_version=2` 旧缓存；已用服务器 stable pointer 指向的精确 artifact 和 manifest 替换，当前 16 个外部 manifest 均为 `api_version=3`。
+- 复核结果：16 个 manifest 和入口 AST 均可解析；已删除的生产符号与旧 ABI 在 v3 artifact 生产文件中无引用。真实 Manager smoke 已走到 v3 MCP runtime，随后因本机临时环境没有服务器的 Steam MCP 配置/依赖而停止，不能记为全量插件通过。
+- 兼容分类：`workbench.panels.v2` 是当前 `workbench-ui` 持有的 UI slot 合同（decision 0051），不是 v2 插件 ABI；Calendar、Feed、Fitbit、Proactive Feedback、Steam 等 `v2` 文件是离线数据迁移/历史桥，不是运行时入口。它们在迁移完成合同明确前保留并标注为“v3 runtime + v2 data bridge”，不能按名称盲删。
+- 旧本机 v2 cache 已移到 `/mnt/data/akasic-agent-backups/pr525-local-v2-plugin-home-20260901/` 作为回退点；`plugin-data`、workspace、凭据和服务器状态未改。完成 v3 依赖验证后才可物理清除该回退点。
+
+## 2026-09-01 less-is-more PR525：恢复 compaction identity 的模块导出合同
+
+- `a3d3b7a1` 删除 `plugins/compaction/engine.py` 中 `compaction_scope_id` 与 `normalize_session_created_at` 的导入时，误把实现文件未直接使用理解成模块无消费者；`compaction/plugin.py`、`compaction/runtime.py`、测试和 `context_compaction.py` 仍从 `plugins.compaction.engine` 导入它们。
+- `599d82cc` 只恢复这两个 identity helper 的模块导出路径，实际实现仍由 `compaction_migration_v1` 持有，没有恢复任何死逻辑。此前真实 Manager smoke 已以 ImportError 证明该边界可达。
+- 验证：compaction/session/store 相关测试 `101 passed in 5.03s`；目标 Pyright `0 errors, 0 warnings, 0 informations`；`git diff --check` 通过。
+- 回滚：若未来正式废除该模块导出合同，应先迁移全部调用方，再 revert `599d82cc`；修改前备份：`/mnt/data/akasic-agent-backups/pr525-compaction-reexports-before-fix-20260901/`。
+
+## 2026-09-01 less-is-more PR525：删除 Channel generation 旧别名
+
+- `ChannelGenerationHost.start()` 只转发到 `start_generation()`，且正式 manager 路径已统一调用 `start_formal()`；`stop_generation()` 只转发到 `stop()`，仓库、外部插件源码和 hua-home v3 cache 均无消费者。没有动态入口、v2 兼容壳或已接受的文档合同引用它们。
+- 范围：删除两个 host alias；宿主测试改用已有的 `start_formal()`，不改变 formal snapshot 校验、binding admission、drain、cleanup、tombstone 或 retry 行为；没有增加实现细节测试。
+- 验证：`tests/test_plugin_channel_generation_host.py` 为 `53 passed in 0.51s`；目标 Pyright `0 errors, 0 warnings, 0 informations`；编译、精确残留扫描和 `git diff --check` 通过。
+- 回滚：revert `3bae3d74`；修改前备份：`/mnt/data/akasic-agent-backups/pr525-channel-host-aliases-before-clean-20260901/`。
+
+## 2026-09-01 less-is-more PR525：收敛 Channel host 为 formal-only
+
+- `ChannelGenerationHost` 的 channel catalog 只有 formal target；原 `start_generation(target=...)` 对非 `formal` 直接拒绝，唯一调用者是同文件的 `start_formal()`。将实现直接收敛到 `start_formal()`，删除伪通用 target 参数，仍把 `target="formal"` 写入 start/failure durable record。
+- 范围：删除 24 行不可达的转发/校验层，不改变 snapshot/catalog provenance、binding lifecycle、admission、drain、cleanup、tombstone、retry 或恢复记录。
+- 验证：`tests/test_plugin_channel_generation_host.py` 为 `53 passed in 0.40s`；目标 Pyright `0 errors, 0 warnings, 0 informations`；编译、残留扫描和 `git diff --check` 通过。
+- 回滚：revert `cb0dfb9e`；修改前备份：`/mnt/data/akasic-agent-backups/pr525-channel-formal-only-before-clean-20260901/`。
+
+## 2026-09-01 less-is-more PR525：内联 manager 的 plugin roots accessor
+
+- `PluginManager.plugin_dirs` 没有生产、测试、Gate、文档、外部插件或 hua-home v3 cache 消费者，只被 `skill_projection_roots` 自身读取一次；保留真实的 `skill_projection_roots` 边界，将 `_dirs` 拷贝直接内联。
+- 范围：删除 5 行无合同 accessor，不改变 source/cache root 顺序、skill link 校验、promotion 或 workspace 投影。
+- 验证：manager 编译、Pyright `0 errors, 0 warnings, 0 informations`、`tests/test_plugin_hot_reload.py` `40 passed in 14.20s`、精确残留扫描和 `git diff --check` 通过。
+- 回滚：revert `cab22401`；修改前备份：`/mnt/data/akasic-agent-backups/pr525-manager-plugin-dirs-before-clean-20260901/`。
+
+## 2026-09-01 less-is-more PR525：删除 background catalog 的重复 digest 别名
+
+- `BackgroundJobCatalog.catalog_digest` 只返回 canonical `identity`，生产、Gate、外部插件和文档没有读取；唯一测试只验证两个属性相等，属于实现细节而非行为合同。`BackgroundJobBinding.handler_export` 仍由 v3 job 合同要求，未删除。
+- 范围：删除 4 行别名及 1 条 alias-only 断言；保留 catalog identity、immutable mapping、job lookup、generation/health ownership 和 snapshot digest。
+- 验证：background-job composition/generation tests `45 passed in 0.80s`；目标 Pyright `0 errors, 0 warnings, 0 informations`；编译、残留扫描和 `git diff --check` 通过。
+- 回滚：revert `391ddccf`；修改前备份：`/mnt/data/akasic-agent-backups/pr525-background-catalog-digest-before-clean-20260901/`。
+
+## 2026-09-01 less-is-more PR525：删除 MCP/process registry 的重复 digest 别名
+
+- `McpServerRegistry.catalog_digest` 与 `ManagedProcessRegistry.catalog_digest` 都只返回 canonical `identity`，没有生产、Gate、外部插件或 hua-home v3 cache 消费者；各自唯一测试断言也只是 alias 相等性。MCP runtime handshake 的 server digest 和 process readiness 证据不依赖这两个 registry 属性。
+- 范围：删除两个 registry alias 及两条 alias-only 断言；保留 descriptors、identity、root token、immutable mapping、snapshot identity 和运行时 catalog digest。
+- 验证：MCP/process composition tests `42 passed in 25.58s`；目标 Pyright `0 errors, 0 warnings, 0 informations`；编译、残留扫描和 `git diff --check` 通过。
+- 回滚：revert `3a9f137b`；修改前备份：`/mnt/data/akasic-agent-backups/pr525-process-mcp-catalog-digests-before-clean-20260901/`。
+
+## 2026-09-01 less-is-more PR525：删除 background binding 的 owner 别名
+
+- `BackgroundJobBinding.owner` 只返回 `plugin_id`，无任何 `binding.owner` 生产、测试、Gate、外部插件或 hua-home v3 cache 消费者；v3 合同使用 `plugin_id`，descriptor 的 `owner` 字段仍保留。
+- 范围：删除 4 行无合同属性，不改变 handler export、Fiber/Health ownership、冻结 catalog 或 generation job 执行。
+- 验证：background-job composition/generation tests `45 passed in 0.79s`；目标 Pyright `0 errors, 0 warnings, 0 informations`；编译、精确残留扫描和 `git diff --check` 通过。
+- 回滚：revert `cf5cbac0`；修改前备份：`/mnt/data/akasic-agent-backups/pr525-background-binding-owner-before-clean-20260901/`。
+
+## 2026-09-01 PR525：完成 pure v3 consumer 迁移并合入最新 main
+
+- 恢复点：`backup/pr525-pre-v3-fix-20260901` 固定修复前 PR head `81a11c2d`；本轮通过普通 merge 合入 `origin/main@e4ba0427`，没有改写已发布历史。
+- 分类结论：没有恢复 v2 lifecycle、固定贡献方法或 Manager 兼容壳。`active_channel_generation` 是重复的 v3 inspection 门面，Feishu/QQBot 测试迁到 `current_snapshot.snapshot_id → channel_generation_host.get()`；`stable_telegram_command_catalog()` 与 `stable_mobile_command_catalog()` 是重复渠道投影，Core 改为一份 universal v3 command discovery projection。
+- main 对账：保留 Computer managed workload 的 v3 owner、controller、MCP workload binding 与测试；新 manifest 从双写法 `[[workloads]]`/`[[mcp_servers]]` 收敛到唯一 `[[workload]]`/`[[mcp]]`。MCP generation 的 candidate/formal forwarding wrapper、`PluginManager.skill_catalog()` 和公开 `sync_skill_links()` 不因 merge 复活；热重载内部使用私有 `_sync_skill_links()` 完成真实 v3 projection 生命周期。
+- 回归修复：bootstrap 只接收一个 universal command catalog provider；Wake 行为测试通过完整 `_admit_attempt()` 建立 admitted pool/alert expiry，不恢复 `_admit_owner()`；duplicate-generation 测试补齐必需的 endpoint materialization 后再验证第二次启动被拒绝。
+- 跨仓 consumer：Feishu `dcde5a5`（PR #4）在同一 Core candidate 上 `35 passed`；QQBot `489c693`（PR #4）为 `37 passed`。两者只修改合同测试，插件生产代码与 installed cache 未改。
+- 验证：已知失败与 Computer 回归 `37 passed`；Core 全量 `3217 passed, 6 skipped`；Basedpyright `0 errors`、compileall、`git diff --check` 与 change-impact audit 通过。完整 change Gate 与冻结 head 独立概念 Review 在最终提交后记录。
+- 受保护状态：没有写 hua-home、正式 workspace、plugin-data、Session、数据库、凭据或运行服务；代码变化只删除 v2/重复入口并把消费者迁到现有 v3 owner。
+
+## 2026-09-01 less-is-more PR525：继续清理 v3 已收敛后的旧兼容表面
+
+### `PR525` `refactor: reclaim v2 compatibility surfaces`
+
+- 提交范围：`43f8b917` 至 `d81526cf`（中间 cleanup commits 均已推送到 PR #525）；`49fab44f` 是本轮发现误删后的独立恢复提交，`aba6fc80`、`c6f66eee`、`dc99f562`、`d81526cf` 为本轮新增清理提交。
+- v3 依赖依据：重新读取 hua-home active Core 的 16 个 enabled external plugin stable artifact；均为 `api_version=3`，active cache 无被删生产符号、旧 ABI 或本轮删除名称的引用。未把外部源码仓库中未发布的 v2 分支当作当前消费者，也没有直接改 cache。
+- 删除范围：
+  - `McpGenerationHost` 删除只用于停止 callback 失败缓存的 `McpObservationDiagnostic`、`diagnostics()` 和 `_diagnostics`；保留资源清理、不生成 cleanup tombstone 以及错误日志合同（`aba6fc80`）。
+  - 删除 `MaterializedMcpCommand` 旧拼写别名；`McpMaterializedCommand` 是唯一真实类型（同提交）。
+  - 删除 `ToolRegistry.get_context()` compatibility view；保留当前 v3 的 `set_context()` 与 `get_execution_context()`（`c6f66eee`）。
+  - 删除 `BackgroundJobRetryPolicy = RetryPolicy` 及顶层导出；`RetryPolicy`、job catalog、generation host 不变（`dc99f562`）。
+  - compaction 的运行时实现和身份 owner 已迁到 `plugins/compaction/` 与 `compaction_migration_v1.py`；已注册 Yoyo migration 的旧 import path 是 append-only 执行 ABI，后续修复中保留 11 行转发模块，不属于 v2 插件 ABI。
+- 删除依据：上述表面分别只有定义/自递归/导出或一个测试读取；Core、Gate、外部插件源码和 active v3 artifact 没有真实消费者。`ModelCatalogUnavailable` 虽为同对象别名，但仍被 bootstrap、mobile、web 的可观察错误边界使用，保留；命令 aliases 是现行命令输入合同，也保留。
+- 误删回退：混合回归发现 `1d478f2d` 曾移除 `agent/supervisor.py` 对 `_cleanup_boot_processes`、`_pid_exists` 的必要模块导入，导致 5 个 Guardian/重启回归失败；恢复两个 import 后 `tests/test_agent_restart.py` 精确 5 passed（`49fab44f`）。本轮没有用 skip 掩盖失败；失败测试留下的两个临时 `guardian_gateway.py` 子进程已按精确 PID 清理，正常服务未触碰。
+- 保护边界：保留 active v3 插件中的 v2 data bridge/migration（Calendar、Feed、Fitbit、Proactive Feedback、Steam、Emotion）、`workbench.panels.v2` 当前 UI slot、Akasha v2 算法命名、持久化旧字段别名、Wake 私有历史迁移和 readiness redirect 安全边界；它们不是 v2 plugin ABI，删除条件另由数据迁移/合同拥有。
+- 验证：MCP host `19 passed, 1 deselected`（跳过既有缺少 `endpoint_ports` 的 duplicate-generation fixture）；`tests/test_plugin_composition_tool_catalog.py tests/test_subagent_v3_runtime.py` `25 passed`；background job/generation `45 passed`；compaction/migration `37 passed`；Guardian/restart 精确回归 `5 passed`；`compileall` 和 `git diff --check` 通过。已删除 Gate 文件无当前 CI/Gate 悬挂引用。
+- 未完成验证：全 Docker/大 Gate 未运行以保护本机资源；all-plugin Manager smoke 已进入 v3 MCP runtime，但因本机临时环境缺少 hua-home Steam MCP 配置/依赖而失败，不能记作全插件通过；MCP duplicate fixture 的原始失败与固定 formal port 的既有环境问题仍单独记录，不归因于本轮删除。
+- 回滚：按独立提交 revert；本轮 source/test/doc 修改前备份分别位于 `/mnt/data/akasic-agent-backups/pr525-mcp-observation-diagnostics-before-20260901/`、`/mnt/data/akasic-agent-backups/pr525-materialized-mcp-alias-before-20260901/`、`/mnt/data/akasic-agent-backups/pr525-tool-registry-context-facade-before-20260901/`、`/mnt/data/akasic-agent-backups/pr525-background-retry-alias-before-20260901/`、`/mnt/data/akasic-agent-backups/pr525-context-compaction-compat-before-20260901/` 和 `/mnt/data/akasic-agent-backups/pr525-supervisor-imports-before-20260901/`。
+
+## 2026-09-01 PR525：保留 pure v3 Wake/H5 Gate 合同
+
+- 独立概念 Review 发现，PR 删除旧大测试时也移除了仍受 `docker/debug` runner、manifest 和操作文档承诺的 v3 行为 oracle；这不是 v2 兼容壳，必须保留可观察覆盖。
+- 新增一份小型无外网合同测试，直接运行现有 v3 Wake provider runner，经 loopback Chat Completions 覆盖 200、400、503，验证 v3 request/tool shape、成功交付、失败终态、重试语义以及 endpoint、credential、provider body 的报告脱敏。
+- 同一测试覆盖 H5 manifest 保持 `real_provider=PENDING`、suite case 存在，以及受保护 workspace 必需文件、SQLite 表和非空行约束；不恢复已删除的 v2 ABI、旧 facade 或约 800 行重复 Gate/Probe 测试。
+- `content_wake_delivery_contract` 现直接执行该测试，timeout 从 60 秒调整为 90 秒以容纳 503 的生产重试时序；coverage catalog digest 同步更新。精确场景为 `56 passed in 43.06s`，新测试单独为 `4 passed in 42.20s`。
+- 恢复点：`backup/pr525-before-gate-oracle-fix-20260901` 固定修复前 head `c047c923`。完整 Core 回归、change Gate 与新 head 独立 Review 在冻结提交后重新记录。
+
+## 2026-09-01 PR525：恢复 append-only Yoyo import ABI
+
+- GitHub `change-impact-gate` 正确发现 `20260826_03_unify_akashic_channel_identity.py` 被改写。已注册 migration 是不可改写的持久化执行合同；把 import 改到新 owner 即使行为等价也不安全。
+- 恢复 migration 原文及其 11 行 `context_compaction` import path。该模块只把两个 identity helper 转发到冻结的 `compaction_migration_v1` owner，没有恢复 compaction runtime、v2 插件入口或第二套状态模型。
+- 恢复点：`backup/pr525-before-yoyo-ci-fix-20260901` 固定远端失败 head `31da9841`。修复后以 `scripts/check_yoyo_migrations.py --base origin/main`、迁移/compaction 回归和远端 CI 验证。
+
+## 2026-09-01 PR525：补齐 unified MCP v3 测试类型
+
+- 删除 `start_candidate()` / `start_formal()` wrapper 后，测试已统一调用 `start_generation(mode=...)`；一处循环把 `candidate` / `formal` literal 推断成普通 `str`，GitHub test Pyright 正确拒绝。
+- 只为该 fixture 的两组 case 标注 `McpMode`，不改变生产签名、mode 校验或运行行为。恢复点：`backup/pr525-before-test-pyright-fix-20260901` 固定修复前 head `dfa1d3b0`。

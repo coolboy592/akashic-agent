@@ -85,52 +85,6 @@ class FeaturePool:
         )
         self.term_order, self.postings = _build_postings(turns)
 
-    def infer_seed(
-        self,
-        index: int,
-        context: ContextState,
-        capture_channels: bool,
-    ) -> SeedEvidence:
-        """Infer a sparse seed from strictly historical content."""
-
-        # 1. Score the current user cue and the completed previous context.
-        query = self.turns[index]
-        query_terms = _normalize_pairs(query.user_terms)
-        query_dense = self.dense_scores(query.user_dense, index)
-        query_bm25 = self.bm25_scores(query_terms, index)
-        context_dense = self.dense_scores(context.dense, index)
-        context_terms = dict(context.terms)
-        context_bm25 = self.bm25_scores(context_terms, index)
-        surprise = self.query_surprise(
-            query,
-            index,
-            query_dense,
-            query_bm25,
-        )
-
-        # 2. Infer whether the previous event continues.
-        time_prior = self.time_prior(query.inter_gap_seconds, index)
-        continuation = self.continuation_belief(
-            query,
-            context,
-            index,
-            time_prior,
-            query_dense,
-            query_bm25,
-        )
-
-        # 3. Project calibrated channel evidence onto one sparse simplex.
-        evidence = {
-            "query_dense": _tail_surprisal(query_dense),
-            "query_bm25": _tail_surprisal(query_bm25),
-            "context_dense": _tail_surprisal(context_dense),
-            "context_bm25": _tail_surprisal(context_bm25),
-        }
-        seed = _causal_seed(evidence, continuation)
-        seed_nodes = None if capture_channels else tuple(node for node, _ in seed)
-        channels = _channel_support(evidence, seed_nodes)
-        return SeedEvidence(seed, channels, time_prior, continuation, surprise)
-
     def query_surprise(
         self,
         query: Turn,
@@ -806,24 +760,6 @@ def _log_evidence(observed: float, background: np.ndarray) -> float:
         background.size + 1.0
     )
     return math.log((1.0 - math.log(probability)) / 2.0)
-
-
-def _causal_seed(
-    evidence: dict[str, np.ndarray],
-    continuation: float,
-) -> tuple[tuple[int, float], ...]:
-    if not any(np.any(values > 0.0) for values in evidence.values()):
-        return ()
-    current = evidence["query_dense"] + evidence["query_bm25"]
-    same_event = current + evidence["context_dense"] + evidence["context_bm25"]
-    current_seed = _sparsemax(current)
-    event_seed = _sparsemax(same_event)
-    mixed: dict[int, float] = defaultdict(float)
-    for node_id, value in current_seed:
-        mixed[node_id] += (1.0 - continuation) * value
-    for node_id, value in event_seed:
-        mixed[node_id] += continuation * value
-    return _normalize_pairs_by_id(tuple(mixed.items()))
 
 
 def _sparsemax(logits: np.ndarray) -> tuple[tuple[int, float], ...]:

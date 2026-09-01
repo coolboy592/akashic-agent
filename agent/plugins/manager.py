@@ -13,7 +13,7 @@ import shutil
 import sys
 import tomllib
 from dataclasses import dataclass, replace
-from pathlib import Path, PurePosixPath, PureWindowsPath
+from pathlib import Path, PurePosixPath
 from types import MappingProxyType, ModuleType, UnionType
 from collections.abc import Awaitable, Callable, Mapping
 from typing import Any, Literal, TypeVar, Union, cast, get_args, get_origin
@@ -59,7 +59,6 @@ from agent.plugin_composition import (
     PluginDeliveries,
     PluginDurableDeliveries,
     PluginTimers,
-    ServiceKey,
     ServiceView,
     RUNTIME_STARTED,
     RUNTIME_STOPPING,
@@ -69,7 +68,6 @@ from agent.plugin_composition import (
     SnapshotSealing,
 )
 from agent.plugin_composition.channels import (
-    CommittedChannelCatalog,
     CoreChannelDefinition,
     ChannelRegistrySnapshot,
     CredentialRef,
@@ -79,6 +77,7 @@ from agent.plugin_composition.channels import (
 from agent.plugin_composition.mcp_slots import PluginMcpServers
 from agent.plugin_composition.process_slots import PluginManagedProcesses
 from agent.plugin_composition.workload_slots import PluginWorkloads
+from agent.plugin_composition.commands import command_discovery_catalog
 from agent.plugin_composition.model import (
     resolve_declared_workspace_file,
     resolve_declared_workspace_root,
@@ -160,7 +159,7 @@ from agent.plugins.reload_journal import (
     ReloadPhase,
     ReloadRecoveryAction,
 )
-from agent.plugins.skill_host import PluginSkillHost, PreparedSkillCatalog
+from agent.plugins.skill_host import PluginSkillHost
 from agent.plugins.web_ui import resolve_web_module
 from agent.workloads.client import UnixWorkloadController, WorkloadController
 from agent.plugins.generation_activity_host import (
@@ -181,6 +180,13 @@ from infra.persistence.json_store import atomic_save_json
 
 logger = logging.getLogger(__name__)
 U = TypeVar("U")
+
+
+def _snapshot_command_catalog(
+    snapshot: RuntimeSnapshot | None,
+) -> tuple[tuple[str, str], ...]:
+    registry = None if snapshot is None else snapshot.command_registry
+    return command_discovery_catalog(registry)
 
 
 class _NoopProviderClient:
@@ -515,18 +521,14 @@ class PluginManager:
             raise asyncio.CancelledError
 
     @property
-    def plugin_dirs(self) -> list[Path]:
-        return list(self._dirs)
-
-    @property
     def skill_projection_roots(self) -> list[Path]:
-        roots = self.plugin_dirs
+        roots = list(self._dirs)
         if self._installed_cache_root is not None:
             roots.append(self._installed_cache_root)
         return roots
 
-    def sync_skill_links(self):
-        """Rebuild workspace links from the active stable plugin generations."""
+    def _sync_skill_links(self):
+        """Rebuild workspace links from the active v3 generations."""
 
         from agent.plugins.skill_links import PluginSkillLinker
 
@@ -586,9 +588,6 @@ class PluginManager:
 
     def prepared_generation(self, plugin_id: str) -> PluginGeneration | None:
         return self._prepared_generations.get(plugin_id)
-
-    def skill_catalog(self, generation_id: str) -> PreparedSkillCatalog | None:
-        return self._skill_host.get(generation_id)
 
     def workload_urls(self, generation_id: str) -> Mapping[tuple[str, str], str]:
         """Return ready workload URLs for one exact plugin generation."""
@@ -729,16 +728,6 @@ class PluginManager:
     @property
     def composition_generation_host(self) -> CompositionGenerationHost:
         return self._composition_generation_host
-
-    @property
-    def activity_host(self) -> ActivityHost | None:
-        return self._activity_host
-
-    @property
-    def active_channel_generation(self) -> ChannelGeneration | None:
-        """Return the exact committed channel runtime owned by this Manager."""
-
-        return self._active_channel_generation
 
     @staticmethod
     def _channel_catalog_identity(snapshot: RuntimeSnapshot | None) -> str | None:
@@ -1203,16 +1192,6 @@ class PluginManager:
             for generation in self.current_snapshot.active_generations()
         )
 
-    def stable_telegram_command_catalog(self) -> tuple[tuple[str, str], ...]:
-        """Return discovery commands from the exact committed stable snapshot."""
-
-        return self._snapshot_bot_commands(self.current_snapshot)
-
-    def stable_mobile_command_catalog(self) -> tuple[tuple[str, str], ...]:
-        """Return mobile commands from the exact committed stable snapshot."""
-
-        return self._snapshot_bot_commands(self.current_snapshot)
-
     def stable_channel_catalog(self) -> ChannelRegistrySnapshot | None:
         """Return the exact committed stable merged channel declaration catalog."""
 
@@ -1221,12 +1200,6 @@ class PluginManager:
             return None
         catalog = snapshot.channel_catalog
         return catalog.registry if catalog is not None else snapshot.channel_registry
-
-    def stable_committed_channel_catalog(self) -> CommittedChannelCatalog | None:
-        """Return the Core-owned merged catalog for the exact stable snapshot."""
-
-        snapshot = self.current_snapshot
-        return None if snapshot is None else snapshot.channel_catalog
 
     async def bind_core_channel_definitions(
         self,
@@ -1252,22 +1225,6 @@ class PluginManager:
             if self.current_snapshot is not snapshot:
                 self._core_channel_definitions = ()
             raise
-
-    @staticmethod
-    def _snapshot_bot_commands(
-        snapshot: RuntimeSnapshot | None,
-    ) -> tuple[tuple[str, str], ...]:
-        """Project one immutable channel catalog from a snapshot."""
-
-        if snapshot is None:
-            return ()
-        registry = snapshot.command_registry
-        if registry is None:
-            return ()
-        return tuple(
-            (descriptor.name, descriptor.description)
-            for descriptor in registry.descriptors
-        )
 
     # 扫描所有 plugin_dirs，返回可加载的插件描述列表
     def discover(
@@ -2216,20 +2173,10 @@ class PluginManager:
             self._forget_drained_generation(generation)
         self._finish_drained_reload(snapshot.snapshot_id)
 
-    async def prepare_changed(self) -> list[dict[str, object]]:
-        async with self._candidate_prepare_lock:
-            if self._ready_candidate is not None:
-                return [self._ready_candidate_status()]
-            discovered = {
-                _resolve_plugin_id(mod): mod
-                for mod in self.discover(installed_selector="latest")
-            }
-            return await self._prepare_changed(discovered=discovered)
-
     async def reconcile_changed(self) -> list[dict[str, object]]:
         async with self._candidate_prepare_lock:
             results = await self._reconcile_changed_locked()
-            _ = self.sync_skill_links()
+            _ = self._sync_skill_links()
             return results
 
     async def install_candidate(
@@ -2394,7 +2341,7 @@ class PluginManager:
                 if not generation.scope.closed:
                     raise RuntimeError(f"插件旧代资源尚未关闭: {plugin_id}")
             _ = self._draining_generations.pop(plugin_id, None)
-            _ = self.sync_skill_links()
+            _ = self._sync_skill_links()
 
     async def _deactivate_plugin(self, plugin_id: str) -> dict[str, object]:
         active = self._active_generations[plugin_id]
@@ -2412,8 +2359,8 @@ class PluginManager:
             await self._dispose_unreferenced_composition_root(snapshot)
             raise
 
-        old_commands = self.stable_telegram_command_catalog()
-        new_commands = self._snapshot_bot_commands(snapshot)
+        old_commands = _snapshot_command_catalog(self.current_snapshot)
+        new_commands = _snapshot_command_catalog(snapshot)
         current_snapshot = self.current_snapshot
         exclusive_endpoint_changed = (
             current_snapshot is not None
@@ -2810,8 +2757,8 @@ class PluginManager:
             if self._reload_journal.get(tx_id).phase != "latest_ready":
                 raise RuntimeError("latest candidate 已被 runtime recovery 撤销准入")
 
-            old_commands = self.stable_telegram_command_catalog()
-            new_commands = self._snapshot_bot_commands(ready.snapshot)
+            old_commands = _snapshot_command_catalog(self.current_snapshot)
+            new_commands = _snapshot_command_catalog(ready.snapshot)
             stable_snapshot = self.current_snapshot
             shared_handoff = _requires_shared_candidate_handoff(
                 ready.previous,
@@ -2908,7 +2855,7 @@ class PluginManager:
                     finally:
                         stable_root_stopped = generation.formal_root_stopped
                     generation = ready.candidate
-                    new_commands = self._snapshot_bot_commands(ready.snapshot)
+                    new_commands = _snapshot_command_catalog(ready.snapshot)
                 except BaseException:
                     gated_runtime_error: BaseException | None = None
                     if stable_root_stopped:
@@ -3791,8 +3738,8 @@ class PluginManager:
             )
             return result
 
-        old_commands = self.stable_telegram_command_catalog()
-        new_commands = self._snapshot_bot_commands(snapshot)
+        old_commands = _snapshot_command_catalog(self.current_snapshot)
+        new_commands = _snapshot_command_catalog(snapshot)
         current = self.current_snapshot
         v3_runtime_handoff = self._composition_runtime_declared(
             snapshot,
@@ -5936,21 +5883,6 @@ class PluginManager:
             None,
         )
 
-    async def _stop_replaced_composition_runtime(
-        self,
-        generation: PluginGeneration,
-    ) -> None:
-        """Stop the old stable runtime after admission and leases are drained."""
-
-        previous = self._active_generations.get(generation.plugin_id)
-        if (
-            previous is None
-            or self._composition_generation_host.get(previous.generation_id) is None
-        ):
-            return
-        await self._stop_composition_generation_runtime(previous)
-        generation.replaced_composition_runtime_generation = previous
-
     async def _stop_stable_root(
         self,
         generation: PluginGeneration,
@@ -6731,14 +6663,6 @@ def _with_gate_check(
         checks=checks,
         failure_reason="; ".join(failed),
     )
-
-
-def _load_plugin_config(
-    data_dir: Path,
-    config_model: type[BaseModel] | None = None,
-) -> Any:
-    projection = _read_plugin_config_projection(data_dir)
-    return _validate_plugin_config_projection(projection, config_model)
 
 
 def _read_plugin_config_projection(
@@ -7573,62 +7497,11 @@ def _validate_static_manifest_runtime(
         )
 
 
-def _resolve_command_item(
-    plugin_dir: Path,
-    item: str,
-    *,
-    executable: bool,
-) -> str:
-    path = Path(item)
-    if path.is_absolute() or PureWindowsPath(item).is_absolute():
-        if executable and path.is_file() and os.access(path, os.X_OK):
-            return item
-        raise RuntimeError(f"插件 MCP command 绝对路径不允许越过 artifact: {item}")
-    if "/" not in item and "\\" not in item and not item.startswith("."):
-        return item
-    resolved = (
-        path.resolve(strict=False)
-        if path.is_absolute()
-        else (plugin_dir / path).resolve(strict=False)
-    )
-    _require_plugin_path(plugin_dir, resolved, "MCP command")
-    if not resolved.is_file():
-        raise RuntimeError(f"插件 MCP command 文件不存在: {item}")
-    return str(resolved)
-
-
 def _require_plugin_path(plugin_dir: Path, path: Path, label: str) -> None:
     try:
         _ = path.relative_to(plugin_dir)
     except ValueError as error:
         raise RuntimeError(f"插件 {label} 越界: {path}") from error
-
-
-def _is_python_command(value: str) -> bool:
-    return Path(value).name.lower() in {"python", "python3", "python.exe"}
-
-
-def _resolve_mcp_runtime_root(
-    plugin_dir: Path,
-    cwd: str,
-    command: list[str],
-) -> Path | None:
-    candidates: list[Path] = []
-    if len(command) >= 2:
-        script_path = Path(command[1])
-        if script_path.is_absolute():
-            candidates.append(script_path.parent)
-    candidates.extend([Path(cwd), plugin_dir])
-    for candidate in candidates:
-        if (candidate / "requirements.txt").exists():
-            return candidate
-    return None
-
-
-def _venv_python(venv_dir: Path) -> Path:
-    if os.name == "nt":
-        return venv_dir / "Scripts" / "python.exe"
-    return venv_dir / "bin" / "python"
 
 
 def _build_v3_plugin_tool(
@@ -7731,24 +7604,6 @@ def _build_v3_plugin_tool(
     return tool_class()
 
 
-def _make_execute(bound: Any) -> Any:
-    # 预先提取插件函数接受的参数名（排除 self/event），用于过滤 Registry 注入的 context 字段
-    sig = inspect.signature(bound)
-    accepted = frozenset(
-        name for name in sig.parameters if name not in ("self", "event")
-    )
-
-    # 工厂函数把 bound 和 accepted 锁进闭包，避免动态 type() 时 self 顶掉 bound
-    async def execute(self: Any, **kwargs: Any) -> str:
-        filtered = {k: v for k, v in kwargs.items() if k in accepted}
-        result = bound(**filtered)
-        if inspect.isawaitable(result):
-            result = await result
-        return str(result)
-
-    return execute
-
-
 def _file_revision(path: Path) -> str:
     digest = hashlib.sha256()
     digest.update(str(path.resolve(strict=False)).encode())
@@ -7831,16 +7686,6 @@ def _path_metadata(path: Path) -> bytes:
     return f"{path}:{stat.st_mtime_ns}:{stat.st_size}".encode()
 
 
-def _duplicates(values: list[str]) -> list[str]:
-    seen: set[str] = set()
-    duplicates: set[str] = set()
-    for value in values:
-        if value in seen:
-            duplicates.add(value)
-        seen.add(value)
-    return sorted(duplicates)
-
-
 def _skill_descriptions(generation: PluginGeneration) -> dict[str, str]:
     catalog = generation.skill_catalog
     if catalog is None:
@@ -7912,13 +7757,3 @@ def _log_candidate_status(result: dict[str, object]) -> None:
         "plugin_candidate_status_detail %s",
         json.dumps(result, ensure_ascii=False, sort_keys=True),
     )
-
-
-def _gate_check_evidence(
-    generation: PluginGeneration,
-    check_id: str,
-) -> object:
-    for check in reversed(generation.gate_result.checks):
-        if check.check_id == check_id:
-            return check.evidence
-    return []

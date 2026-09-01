@@ -6,7 +6,7 @@ import os
 from collections.abc import Awaitable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, cast
+from typing import TYPE_CHECKING, cast
 from uuid import uuid4
 
 if TYPE_CHECKING:
@@ -39,7 +39,6 @@ from agent.looping.ports import (
     LLMConfig,
     SessionServices,
 )
-from agent.tools.base import ToolExecutionContext, get_current_tool_context
 from agent.tools.message_push import MessagePushTool
 from agent.tools.registry import ToolRegistry
 from agent.turns.outbound import OutboundPort, PushToolOutboundPort
@@ -426,7 +425,7 @@ class CoreRuntime:
 
                 link_result = PluginSkillLinker(
                     workspace=self.workspace,
-                    plugin_roots=self.plugin_manager.plugin_dirs,
+                    plugin_roots=self.plugin_manager.skill_projection_roots,
                 ).sync(self.plugin_manager.active_plugins())
                 logger.info(
                     "插件 skill 同步完成: expected=%d created=%d repaired=%d removed=%d skipped=%d",

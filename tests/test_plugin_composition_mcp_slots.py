@@ -107,7 +107,6 @@ async def test_mcp_registry_freezes_descriptor_health_and_cleanup(
     )
     assert binding.health.healthy
     assert binding.is_live()
-    assert registry.identity == registry.catalog_digest
     incident = binding.incident_reporter(
         "mcp_handshake_failed",
         "calendar initialize failed",
@@ -385,39 +384,6 @@ def _plugin_source(version: str, *, python_command: str = "python") -> str:
     )
 
 
-def _write_manager_plugin(tmp_path: Path, version: str) -> Path:
-    plugin_dir = _plugin_dir(tmp_path / "plugins")
-    (plugin_dir / "plugin.py").write_text(
-        _plugin_source(version, python_command=sys.executable),
-        encoding="utf-8",
-    )
-    (plugin_dir / "api.py").write_text(
-        "import os\n"
-        "from http.server import BaseHTTPRequestHandler, HTTPServer\n"
-        "class Handler(BaseHTTPRequestHandler):\n"
-        "    def do_GET(self):\n"
-        "        self.send_response(200); self.end_headers(); self.wfile.write(b'ready')\n"
-        "    def log_message(self, *_args): pass\n"
-        "HTTPServer(('127.0.0.1', int(os.environ['PORT'])), Handler).serve_forever()\n",
-        encoding="utf-8",
-    )
-    (plugin_dir / "mcp.py").write_text(
-        "import json, os, sys\n"
-        "for raw in sys.stdin:\n"
-        "    msg = json.loads(raw); method = msg.get('method')\n"
-        "    if method == 'initialize': result = {'protocolVersion': '2025-11-25'}\n"
-        "    elif method == 'tools/list': result = {'tools': [{'name': 'get_events', "
-        "'description': 'read events', 'inputSchema': {'type': 'object'}}]}\n"
-        "    elif method == 'tools/call': result = {'content': [{'type': 'text', "
-        "'text': '|'.join((os.environ.get('VERSION', 'formal'), "
-        "os.environ['PORT'], os.environ['AKA_PLUGIN_DATA_DIR']))}]}\n"
-        "    else: continue\n"
-        "    print(json.dumps({'jsonrpc': '2.0', 'id': msg['id'], 'result': result}), flush=True)\n",
-        encoding="utf-8",
-    )
-    return plugin_dir
-
-
 def _write_static_manager_plugin(tmp_path: Path, version: str) -> Path:
     plugin_dir = _plugin_dir(tmp_path / "plugins")
     (plugin_dir / "entry.py").write_text(
@@ -471,7 +437,7 @@ def _write_static_manager_plugin(tmp_path: Path, version: str) -> Path:
         "candidate_read_only_tools = [\"get_events\"]\n"
         "endpoint_env = [{env = \"PORT\", process = \"calendar_api\"}]\n"
         f"candidate_env = {{VERSION = \"{version}\"}}\n\n"
-        "[[process]]\n"
+        "[[processes]]\n"
         "name = \"calendar_api\"\n"
         "command = [\"python\", \"api.py\"]\n"
         "port_env = \"PORT\"\n"

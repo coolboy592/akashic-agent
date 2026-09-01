@@ -101,9 +101,6 @@ class RetryPolicy:
             raise ValueError("retry max_delay_seconds 不能小于 base_delay_seconds")
 
 
-BackgroundJobRetryPolicy = RetryPolicy
-
-
 @dataclass(frozen=True, slots=True)
 class ProgrammaticTurnReceipt:
     """Identify a Turn admitted through one invocation-scoped port."""
@@ -231,10 +228,6 @@ class BackgroundJobBinding:
     required_health: HealthHandle
 
     @property
-    def owner(self) -> str:
-        return self.plugin_id
-
-    @property
     def handler_export(self) -> str:
         return self.descriptor.handler_export
 
@@ -287,21 +280,6 @@ class BackgroundJobCatalog(Mapping[str, BackgroundJobBinding]):
     @property
     def identity(self) -> str:
         return self._identity
-
-    @property
-    def catalog_digest(self) -> str:
-        return self._identity
-
-    def job(self, name: str) -> BackgroundJobBinding | None:
-        """Resolve a canonical owner/name key or a unique semantic name."""
-
-        binding = self._bindings.get(name)
-        if binding is not None:
-            return binding
-        matches = tuple(item for item in self._bindings.values() if item.name == name)
-        if len(matches) == 1:
-            return matches[0]
-        return None
 
     def __getitem__(self, key: str) -> BackgroundJobBinding:
         return self._bindings[key]
@@ -567,7 +545,6 @@ __all__ = [
     "BackgroundJobCatalog",
     "BackgroundJobDefinition",
     "BackgroundJobDescriptor",
-    "BackgroundJobRetryPolicy",
     "BackgroundJobTrigger",
     "IntervalTrigger",
     "PluginBackgroundJobs",

@@ -14,37 +14,37 @@ version = "1.0.0"
 api_version = 3
 entrypoint = "plugin.py"
 
-[[workloads]]
+[[workload]]
 name = "worker"
 image = "example.invalid/worker@sha256:{image_digest}"
 command = ["serve"]
 
-[[workloads.ports]]
+[[workload.ports]]
 name = "gateway"
 number = 8080
 
-[[workloads.data]]
+[[workload.data]]
 name = "state"
 target = "/data"
 writable = true
 
-[workloads.health]
+[workload.health]
 port = "gateway"
 path = "/health"
 timeout_seconds = 30
 
-[workloads.limits]
+[workload.limits]
 memory_mb = 128
 cpu_count = 1.0
 pids = 64
 
-[[mcp_servers]]
+[[mcp]]
 name = "fixture"
 command = ["mcp.py"]
 required_tools = ["read"]
 candidate_read_only_tools = ["read"]
 
-[[mcp_servers.workload_env]]
+[[mcp.workload_env]]
 env = "WORKER_URL"
 workload = "{workload_ref}"
 port = "gateway"

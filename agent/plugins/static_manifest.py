@@ -38,12 +38,8 @@ _TOP_LEVEL_KEYS = frozenset(
         "python",
         "validation",
         "mcp",
-        "mcp_servers",
-        "process",
         "processes",
-        "managed_processes",
         "workload",
-        "workloads",
         "channel_credentials",
     }
 )
@@ -127,12 +123,6 @@ class StaticPluginManifest:
         """Return all declared requirements paths in manifest order."""
 
         return tuple(runtime.requirements for runtime in self.python)
-
-    @property
-    def runtime(self) -> tuple[StaticPythonRuntime, ...]:
-        """Return the immutable Python runtime declarations."""
-
-        return self.python
 
 
 def load_static_plugin_manifest(plugin_root: Path) -> StaticPluginManifest:
@@ -436,7 +426,10 @@ def _mcp_declarations(
     raw: Mapping[str, object],
     python: tuple[StaticPythonRuntime, ...],
 ) -> tuple[StaticMcpDeclaration, ...]:
-    items = _alias_array(raw, ("mcp", "mcp_servers"), "MCP")
+    raw_items = raw.get("mcp", [])
+    if not isinstance(raw_items, list):
+        raise ValueError("MCP 声明必须是表数组")
+    items = cast(list[object], raw_items)
     result: list[StaticMcpDeclaration] = []
     seen: set[str] = set()
     for index, item in enumerate(items):
@@ -519,11 +512,10 @@ def _process_declarations(
     raw: Mapping[str, object],
     python: tuple[StaticPythonRuntime, ...],
 ) -> tuple[StaticManagedProcessDeclaration, ...]:
-    items = _alias_array(
-        raw,
-        ("process", "processes", "managed_processes"),
-        "managed process",
-    )
+    raw_items = raw.get("processes", [])
+    if not isinstance(raw_items, list):
+        raise ValueError("managed process 声明必须是表数组")
+    items = cast(list[object], raw_items)
     result: list[StaticManagedProcessDeclaration] = []
     seen: set[str] = set()
     for index, item in enumerate(items):
@@ -639,7 +631,10 @@ def _workload_declarations(
 ) -> tuple[StaticWorkloadDeclaration, ...]:
     """Validate fixed Workload data without importing plugin code."""
 
-    items = _alias_array(raw, ("workload", "workloads"), "Workload")
+    raw_items = raw.get("workload", [])
+    if not isinstance(raw_items, list):
+        raise ValueError("Workload 声明必须是表数组")
+    items = cast(list[object], raw_items)
     result: list[StaticWorkloadDeclaration] = []
     seen: set[str] = set()
     image_pattern = re.compile(r"^[^\s@]+@sha256:[0-9a-f]{64}$")
@@ -708,20 +703,6 @@ def _validate_endpoint_workload_refs(
                     "MCP workload_env 引用了未声明的 Workload 端口: "
                     f"{workload}:{port}"
                 )
-
-
-def _alias_array(
-    raw: Mapping[str, object], aliases: tuple[str, ...], label: str
-) -> list[object]:
-    present = [name for name in aliases if name in raw]
-    if len(present) > 1:
-        raise ValueError(f"{label} 声明不能同时使用: {present}")
-    if not present:
-        return []
-    value = raw[present[0]]
-    if not isinstance(value, list):
-        raise ValueError(f"{label} 声明必须是表数组")
-    return cast(list[object], value)
 
 
 def _command(root: Path, raw: object, label: str) -> tuple[str, ...]:

@@ -6,8 +6,7 @@ import logging
 import math
 from copy import deepcopy
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any, Callable, Literal, Mapping, Sequence, cast
+from typing import Any, Callable, Literal, Mapping, Sequence, cast
 
 from agent.model_runtime.execution_history import active_shell_execution_origins
 from agent.model_runtime.compaction_migration_v1 import (
@@ -300,10 +299,6 @@ class ContextCompactor:
     @property
     def compaction(self) -> ContextCompaction | None:
         return self._compaction
-
-    @property
-    def has_compactable_prefix(self) -> bool:
-        return bool(self._candidate_units())
 
     def checkpoint_payload(self) -> dict[str, object] | None:
         return self._compaction.to_payload() if self._compaction is not None else None

@@ -252,6 +252,27 @@ candidate_env = {CALENDAR_BACKEND = "recording"}
     assert manifest.managed_processes[0].python_runtime == "mcp"
 
 
+@pytest.mark.parametrize(
+    "removed_field",
+    ("mcp_servers", "process", "managed_processes", "workloads"),
+)
+def test_static_manifest_rejects_removed_v2_declaration_alias(
+    tmp_path: Path,
+    removed_field: str,
+) -> None:
+    root = tmp_path / "calendar"
+    root.mkdir()
+    (root / "plugin.py").write_text("", encoding="utf-8")
+    (root / "akashic.plugin.toml").write_text(
+        _manifest()
+        + f"\n[[{removed_field}]]\nname = 'legacy'\ncommand = ['run.py']\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="未知字段"):
+        load_static_plugin_manifest(root)
+
+
 def test_static_manifest_validates_relative_command_head_inside_artifact(
     tmp_path: Path,
 ) -> None:
@@ -314,35 +335,6 @@ def test_static_manifest_rejects_escaped_relative_command_head(
 
     with pytest.raises(ValueError, match="artifact 内的相对路径"):
         load_static_plugin_manifest(root)
-
-
-def test_manager_command_containment_preserves_staged_interpreter(
-    tmp_path: Path,
-) -> None:
-    plugin_root = tmp_path / "calendar"
-    plugin_root.mkdir()
-    script = plugin_root / "run.py"
-    script.write_text("", encoding="utf-8")
-
-    assert manager_module._resolve_command_item(  # pyright: ignore[reportPrivateUsage]
-        plugin_root,
-        sys.executable,
-        executable=True,
-    ) == sys.executable
-    assert manager_module._resolve_command_item(  # pyright: ignore[reportPrivateUsage]
-        plugin_root,
-        "./run.py",
-        executable=False,
-    ) == str(script.resolve())
-
-    outside = tmp_path / "not-executable"
-    outside.write_text("", encoding="utf-8")
-    with pytest.raises(RuntimeError, match="绝对路径不允许越过 artifact"):
-        manager_module._resolve_command_item(  # pyright: ignore[reportPrivateUsage]
-            plugin_root,
-            str(outside),
-            executable=True,
-        )
 
 
 def test_candidate_data_inventory_excludes_manifest_paths(tmp_path: Path) -> None:
@@ -420,7 +412,7 @@ def test_static_process_declaration_must_match_c13_root_registry(
         "version = '3.0.0'\n"
         "api_version = 3\n"
         "entrypoint = 'plugin.py'\n\n"
-        "[[process]]\n"
+        "[[processes]]\n"
         "name = 'calendar_api'\n"
         "command = ['run_server.py']\n"
         "port_env = 'PORT'\n"
@@ -484,7 +476,7 @@ def test_static_artifact_command_uses_absolute_executable(tmp_path: Path) -> Non
         "version = '1.0.0'\n"
         "api_version = 3\n"
         "entrypoint = 'plugin.py'\n\n"
-        "[[mcp_servers]]\n"
+        "[[mcp]]\n"
         "name = 'computer'\n"
         "command = ['mcp_server.py']\n",
         encoding="utf-8",
@@ -566,14 +558,14 @@ def test_static_manifest_rejects_manifest_symlink(tmp_path: Path) -> None:
     "declaration",
     (
         "[validation]\nexclude_data_paths = ['.']\n",
-        "[[process]]\nname = 'api'\ncommand = ['run.py']\n"
+        "[[processes]]\nname = 'api'\ncommand = ['run.py']\n"
         "port_env = 'AKASHIC_WORKSPACE'\nformal_port = 18000\n",
-        "[[process]]\nname = 'api'\ncommand = ['run.py']\n"
+        "[[processes]]\nname = 'api'\ncommand = ['run.py']\n"
         "port_env = 'PORT'\nformal_port = 18000\nreadiness_path = '//evil'\n",
-        "[[process]]\nname = 'api'\ncommand = ['run.py']\n"
+        "[[processes]]\nname = 'api'\ncommand = ['run.py']\n"
         "port_env = 'PORT'\nformal_port = 18000\nstartup_timeout_seconds = nan\n",
-        "[[process]]\nname = 'api'\ncommand = ['run.py']\n",
-        "[[process]]\nname = 'api'\ncommand = ['run.py']\n"
+        "[[processes]]\nname = 'api'\ncommand = ['run.py']\n",
+        "[[processes]]\nname = 'api'\ncommand = ['run.py']\n"
         "port_env = 'PORT'\nformal_port = 18000\n\n"
         "[[mcp]]\nname = 'calendar'\ncommand = ['run.py']\n"
         "endpoint_env = [{env = 'AKASHIC_WORKSPACE', process = 'api'}]\n",

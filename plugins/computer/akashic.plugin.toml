@@ -14,47 +14,47 @@ exclude_data_paths = [
   "state/profile/SingletonSocket",
 ]
 
-[[workloads]]
+[[workload]]
 name = "computer"
 image = "ghcr.io/kachofugetsu09/akashic-computer@sha256:6fd3c605380a3daef5ddebb34f2905ee992d2b4e1490fbfb78dcce9f06a3dadb"
 command = ["/opt/computer/start.sh"]
 user_namespaces = true
 
-[[workloads.ports]]
+[[workload.ports]]
 name = "gateway"
 number = 8080
 
-[[workloads.ports]]
+[[workload.ports]]
 name = "display"
 number = 6080
 
-[[workloads.ports]]
+[[workload.ports]]
 name = "opencli"
 number = 19826
 loopback = 19825
 
-[[workloads.data]]
+[[workload.data]]
 name = "state"
 target = "/data"
 writable = true
 
-[workloads.health]
+[workload.health]
 port = "gateway"
 path = "/health"
 timeout_seconds = 90
 
-[workloads.limits]
+[workload.limits]
 memory_mb = 0
 cpu_count = 0.0
 pids = 0
 
-[[mcp_servers]]
+[[mcp]]
 name = "computer"
 command = ["mcp_server.py"]
 required_tools = ["browser_observe", "browser_action", "computer_observe", "computer_action"]
 candidate_read_only_tools = ["browser_observe", "computer_observe"]
 
-[[mcp_servers.workload_env]]
+[[mcp.workload_env]]
 env = "COMPUTER_URL"
 workload = "computer"
 port = "gateway"

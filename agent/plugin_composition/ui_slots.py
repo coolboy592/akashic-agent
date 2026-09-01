@@ -13,7 +13,6 @@ from agent.plugin_composition.context import Context, FiberHandle
 from agent.plugin_composition.model import (
     CompositionError,
     FiberState,
-    PluginRuntime,
     ServiceKey,
 )
 from agent.plugins.generation import MobileUiAsset
@@ -77,11 +76,6 @@ class MobileUiDescriptor:
     navigation_label: str | None
     navigation_description: str | None
     slots: tuple[str, ...]
-
-    @property
-    def plugin_id(self) -> str:
-        return self.owner
-
 
 @dataclass(frozen=True, slots=True)
 class MobileUiBinding:
@@ -150,10 +144,6 @@ class MobileUiRegistry(Mapping[str, MobileUiBinding]):
     @property
     def identity(self) -> str:
         return self._identity
-
-    @property
-    def bindings(self) -> Mapping[str, MobileUiBinding]:
-        return self._bindings
 
     def binding(self, plugin_id: str) -> MobileUiBinding | None:
         return self._bindings.get(plugin_id)
