@@ -4,6 +4,7 @@
 
 - 负责范围：组合内核的 typed event、Fiber-owned listener/task、受限同步并发执行服务、验证回执和隔离测试。
 - 当前阶段：complete
+- 证据状态：historical；2026-09-02 已删除本任务的内部 events/executor/kernel 测试。E1/E2 也因随后删除的 v2 组合 API 而失效；当前合同由保留的 plugin lifecycle 与 hot reload 行为回归承担。
 
 ## Goal
 
@@ -60,9 +61,8 @@ protected_state:
   - current RuntimeSnapshot publication semantics
 allowed_paths:
   - agent/plugin_composition/**
-  - tests/test_plugin_composition_events.py
-  - tests/test_plugin_composition_executor.py
-  - tests/test_plugin_composition_kernel.py
+  - tests/test_plugin_composition_lifecycle.py
+  - tests/test_plugin_hot_reload.py
   - tests_scenarios/contracts/impact.toml
   - tests_scenarios/contracts/coverage-baseline.json
   - docs/projectneed.md

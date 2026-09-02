@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import ast
 import hashlib
+import importlib
 import json
 import re
 import subprocess
@@ -16,6 +17,8 @@ from pathlib import Path
 from typing import cast
 
 ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 DEFAULT_LOCK = ROOT / "docker" / "debug" / "plugin-v3-fleet.lock.json"
 DEFAULT_REPORT = ROOT / "docker" / "debug" / "reports" / "plugin-v3-fleet" / "gate.json"
 GATE_VERSION = 1
@@ -98,9 +101,6 @@ FORBIDDEN_V2_FIXED_METHODS = frozenset(
         "mobile_ui_query",
     }
 )
-E2E_NOT_RUN_REASON = (
-    "static Gate 第一阶段不执行 runtime E2E；需最终 Core/plugin 组合与受控环境"
-)
 GIT_COMMAND_TIMEOUT_SECONDS = 30
 
 
@@ -111,89 +111,6 @@ class PluginLock:
     requested_ref: str
     resolved_sha: str
     change_source_pr_head: str
-
-
-@dataclass(frozen=True, slots=True)
-class E2ECase:
-    id: str
-    title: str
-    required_plugins: tuple[str, ...]
-    oracle: tuple[str, ...]
-
-
-E2E_CATALOG = (
-    E2ECase(
-        "E1",
-        "Passive/Data/Mobile",
-        (
-            "akasha",
-            "citation",
-            "meme",
-            "emotion",
-            "observe",
-            "proactive_feedback",
-            "plugin_undo",
-        ),
-        (
-            "prompt/recall/metadata/media",
-            "bounded mobile query and lease",
-            "append-only SessionDB write set",
-        ),
-    ),
-    E2ECase(
-        "E2",
-        "Tool/MCP/Process",
-        (
-            "shell_restore",
-            "shell_safety",
-            "calendar-mcp",
-            "feed-mcp",
-            "fitbit-mcp",
-            "steam-mcp",
-        ),
-        (
-            "transform/authorize/invoke",
-            "MCP and process readiness",
-            "cancel and process cleanup",
-            "controlled external read-only calls",
-        ),
-    ),
-    E2ECase(
-        "E3",
-        "Fleet/Channel/Proactive",
-        (
-            "setup_helper",
-            "status_commands",
-            "feishu",
-            "qqbot",
-            "emotion",
-            "calendar-mcp",
-            "feed-mcp",
-            "fitbit-mcp",
-            "steam-mcp",
-            "huayue-skills",
-            "github_watch",
-        ),
-        (
-            "full boot and catalog",
-            "candidate discard and promotion",
-            "loopback channel recording",
-            "fixed-clock background-job restart",
-            "controlled repository probe",
-        ),
-    ),
-    E2ECase(
-        "E4",
-        "Production Rehearsal",
-        ("E1", "E2", "E3"),
-        (
-            "copied-workspace database integrity",
-            "complete write set",
-            "artifact/pointer and restart",
-            "stop cleanup and restore evidence",
-        ),
-    ),
-)
 
 
 class GateError(RuntimeError):
@@ -422,7 +339,7 @@ def _matching_refs(output: str, sha: str) -> tuple[str, ...]:
 
 
 def _inspect_static_plugin(root: Path, plugin_id: str) -> dict[str, object]:
-    """Inspect manifest, v3 namespace, and generic v2 imports without importing code."""
+    """Inspect manifest, v3 namespace, and declared Core imports."""
 
     # 1. Parse the import-free manifest and choose its declared entrypoint.
     manifest, manifest_errors = _inspect_manifest(root)
@@ -435,6 +352,7 @@ def _inspect_static_plugin(root: Path, plugin_id: str) -> dict[str, object]:
     # 3. Scan production Python sources for generic v2 import and class edges.
     forbidden = _find_forbidden_v2_imports(root)
     forbidden_classes = _find_forbidden_v2_classes(root)
+    missing_core_imports = _find_missing_core_imports(root)
     errors = [*manifest_errors, *cast(list[str], namespace["errors"])]
     manifest_name = manifest.get("name")
     namespace_name = namespace.get("name")
@@ -452,6 +370,8 @@ def _inspect_static_plugin(root: Path, plugin_id: str) -> dict[str, object]:
         errors.append("发现 generic v2 import")
     if forbidden_classes:
         errors.append("发现 legacy v2 Plugin class/fixed methods")
+    if missing_core_imports:
+        errors.append("发现当前 Core 不再导出的导入符号")
     return {
         "status": "passed" if not errors else "failed",
         "plugin_id": plugin_id,
@@ -459,8 +379,63 @@ def _inspect_static_plugin(root: Path, plugin_id: str) -> dict[str, object]:
         "namespace": namespace,
         "forbidden_v2_imports": forbidden,
         "forbidden_v2_classes": forbidden_classes,
+        "missing_core_imports": missing_core_imports,
         "errors": errors,
     }
+
+
+def _find_missing_core_imports(root: Path) -> list[dict[str, object]]:
+    """Reject plugin imports that the current Core cannot satisfy."""
+
+    violations: list[dict[str, object]] = []
+    modules: dict[str, object] = {}
+    for source in sorted(root.rglob("*.py")):
+        if any(
+            part in {".git", ".venv", "__pycache__", "scripts", "tests"}
+            for part in source.parts
+        ):
+            continue
+        try:
+            tree = ast.parse(source.read_text(encoding="utf-8"), filename=str(source))
+        except (OSError, SyntaxError):
+            continue
+        for node in ast.walk(tree):
+            if (
+                not isinstance(node, ast.ImportFrom)
+                or node.level
+                or node.module is None
+                or not node.module.startswith("agent.")
+            ):
+                continue
+            try:
+                if node.module not in modules:
+                    modules[node.module] = importlib.import_module(node.module)
+                module = modules[node.module]
+            except (ImportError, ModuleNotFoundError) as error:
+                violations.append(
+                    {
+                        "path": _relative_or_name(source, root),
+                        "line": node.lineno,
+                        "module": node.module,
+                        "error": f"{type(error).__name__}: {error}",
+                    }
+                )
+                continue
+            missing = sorted(
+                alias.name
+                for alias in node.names
+                if alias.name != "*" and not hasattr(module, alias.name)
+            )
+            if missing:
+                violations.append(
+                    {
+                        "path": _relative_or_name(source, root),
+                        "line": node.lineno,
+                        "module": node.module,
+                        "names": missing,
+                    }
+                )
+    return violations
 
 
 def _inspect_manifest(root: Path) -> tuple[dict[str, object], list[str]]:
@@ -721,9 +696,7 @@ def _build_report(
     plugins: tuple[dict[str, object], ...] | list[dict[str, object]],
     errors: list[str],
 ) -> dict[str, object]:
-    """Build one report whose runtime E2E entries cannot claim execution."""
-
-    e2e = _e2e_report()
+    """Build one report for the locked fleet's static contract."""
     return {
         "status": "passed" if not errors else "failed",
         "phase": "static",
@@ -740,28 +713,7 @@ def _build_report(
             "status": "passed" if not errors else "failed",
             "error_count": len(errors),
         },
-        "e2e": e2e,
         "errors": list(errors),
-    }
-
-
-def _e2e_report() -> dict[str, object]:
-    catalog = [
-        {
-            **asdict(case),
-            "required_plugins": list(case.required_plugins),
-            "oracle": list(case.oracle),
-            "status": "not_run",
-            "executed": False,
-            "reason": E2E_NOT_RUN_REASON,
-        }
-        for case in E2E_CATALOG
-    ]
-    return {
-        "status": "not_run",
-        "catalog_sha256": _json_sha256(catalog),
-        "catalog": catalog,
-        "reason": E2E_NOT_RUN_REASON,
     }
 
 
