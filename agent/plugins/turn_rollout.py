@@ -29,7 +29,7 @@ class PendingPluginOperation:
     generation_id: str = ""
     source_revision: str = ""
     reload_tx_id: str = ""
-    validation_evidence: tuple[str, ...] = ()
+    child_checked: bool = False
     sealed: bool = False
 
 
@@ -48,7 +48,6 @@ class TurnPluginRollout:
         self._fact_path = Path(workspace) / "runtime" / "plugin-rollout-fact.json"
         self._pending: PendingPluginOperation | None = None
         self._lock = asyncio.Lock()
-        self._tasks: set[asyncio.Task[None]] = set()
         self._resolution_task: asyncio.Task[None] | None = None
         self._child_capabilities: dict[str, str] = {}
         self._reserved_child_capabilities: dict[str, str] = {}
@@ -208,14 +207,18 @@ class TurnPluginRollout:
         turn_id: str,
         status: TurnStatus,
         metadata: dict[str, object],
-        items: tuple[object, ...],
     ) -> None:
         """Record child evidence or seal a parent operation after lease release."""
 
         # 1. A causally bound child can validate only its frozen generation.
         owner_turn_id = str(metadata.get("_pluginRolloutOwnerTurnId") or "")
         if owner_turn_id:
-            self._record_child_terminal(owner_turn_id, status, metadata, items)
+            self._record_child_terminal(
+                turn_id,
+                owner_turn_id,
+                status,
+                metadata,
+            )
             return
 
         # 2. The parent terminal seals once and hands slow work to a background task.
@@ -234,8 +237,6 @@ class TurnPluginRollout:
             name=f"plugin-turn-rollout:{turn_id}",
         )
         self._resolution_task = task
-        self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
 
     async def wait_for_turn_boundary(self) -> None:
         """Keep the next admitted turn behind a sealed rollout resolution."""
@@ -245,7 +246,7 @@ class TurnPluginRollout:
             await asyncio.shield(task)
 
     async def shutdown(self) -> None:
-        """Finish or cancel owned background resolutions during runtime shutdown."""
+        """Finish sealed background work before runtime shutdown returns."""
 
         pending = self._pending
         if pending is not None:
@@ -255,11 +256,9 @@ class TurnPluginRollout:
             )
         self._child_capabilities.clear()
         self._reserved_child_capabilities.clear()
-        for task in self._tasks:
-            task.cancel()
-        if self._tasks:
-            await asyncio.gather(*self._tasks, return_exceptions=True)
-        self._tasks.clear()
+        task = self._resolution_task
+        if task is not None:
+            await asyncio.shield(task)
 
     def consume_fact(self) -> str:
         """Consume one runtime-owned rollout fact for the next user turn."""
@@ -279,10 +278,10 @@ class TurnPluginRollout:
 
     def _record_child_terminal(
         self,
+        child_turn_id: str,
         owner_turn_id: str,
         status: TurnStatus,
         metadata: dict[str, object],
-        items: tuple[object, ...],
     ) -> None:
         pending = self._pending
         if (
@@ -307,27 +306,17 @@ class TurnPluginRollout:
                 source_revision,
             )
             return
-        evidence = (
-            self._manager.candidate_child_evidence(
-                pending.plugin_id,
-                generation_id,
-                items,
-            )
-            if status is TurnStatus.COMPLETED
-            else ()
-        )
-        pending.validation_evidence = tuple(
-            sorted({*pending.validation_evidence, *evidence})
-        )
+        if status is TurnStatus.COMPLETED:
+            pending.child_checked = True
         self._manager.annotate_reload(
             pending.reload_tx_id,
             {
                 "event": "candidate_child_terminal",
                 "owner_turn_id": owner_turn_id,
-                "child_turn_id": str(metadata.get("turnId") or ""),
+                "child_turn_id": child_turn_id,
                 "status": status.value,
                 "identity_match": True,
-                "candidate_evidence": list(evidence),
+                "candidate_checked": status is TurnStatus.COMPLETED,
             },
         )
 
@@ -339,10 +328,10 @@ class TurnPluginRollout:
         try:
             if status is not TurnStatus.COMPLETED:
                 await self._cancel(pending, f"parent turn {status.value}")
-            elif pending.kind == "install" and not pending.validation_evidence:
+            elif pending.kind == "install" and not pending.child_checked:
                 await self._cancel(
                     pending,
-                    "attached programmatic child 没有成功使用 candidate-owned Tool/Skill",
+                    "attached programmatic child 没有完成 exact candidate 检查",
                 )
             elif pending.kind == "install":
                 await self._manager.switch_ready(pending.plugin_id)

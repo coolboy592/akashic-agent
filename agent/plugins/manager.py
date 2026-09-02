@@ -2392,10 +2392,7 @@ class PluginManager:
                 if exclusive_endpoint_changed or v3_channel_catalog_changed:
                     await self._snapshot_store.wait_for_no_leases(quiesced)
             self._snapshot_skill_catalogs[snapshot.snapshot_id] = catalog_id
-            transaction = self._snapshot_store.begin_publish(
-                snapshot,
-                admission_gated=quiesced is not None,
-            )
+            transaction = self._snapshot_store.begin_publish(snapshot)
             await self._post_snapshot_invariants(snapshot)
         except BaseException:
             if transaction is not None:
@@ -3569,81 +3566,6 @@ class PluginManager:
             "candidate_error": None if transaction is None else transaction.error,
         }
 
-    def candidate_child_evidence(
-        self,
-        plugin_id: str,
-        generation_id: str,
-        items: tuple[object, ...],
-    ) -> tuple[str, ...]:
-        """返回 child 真实成功使用的候选 Tool 或 Skill 证据。"""
-
-        # 1. 从冻结的 latest snapshot 判定 owner，不信任 child 自报。
-        ready = self._require_ready_candidate(plugin_id)
-        generation = ready.candidate
-        if generation.generation_id != generation_id:
-            raise RuntimeError(
-                "candidate child generation 身份不一致: "
-                f"expected={generation.generation_id} actual={generation_id}"
-            )
-        registry = ready.snapshot.tool_registry
-        if registry is None:
-            raise RuntimeError("candidate RuntimeSnapshot 缺少 ToolRegistry")
-        owned_tools = registry.get_source_tool_names(
-            "plugin", plugin_id, risk="read-only"
-        )
-        mcp_registry = ready.snapshot.mcp_server_registry
-        server_names = (
-            ()
-            if mcp_registry is None
-            else (
-                descriptor.name
-                for descriptor in mcp_registry.descriptors
-                if descriptor.owner == plugin_id
-            )
-        )
-        for server_name in server_names:
-            owned_tools.update(
-                registry.get_source_tool_names("mcp", server_name, risk="read-only")
-            )
-        owned_skills = {
-            skill_dir.name
-            for root in generation.contributions.skill_roots
-            for skill_dir in root.iterdir()
-            if skill_dir.is_dir() and (skill_dir / "SKILL.md").is_file()
-        }
-        skill_catalog_generation_id = (
-            generation.skill_catalog.generation_id
-            if generation.skill_catalog is not None
-            else None
-        )
-
-        # 2. 只接受成功工具 item 或本轮真实注入的候选 Skill。
-        evidence: set[str] = set()
-        for item in items:
-            kind = getattr(getattr(item, "kind", None), "value", None)
-            data = getattr(item, "data", None)
-            if not isinstance(data, dict):
-                continue
-            if kind == "toolCall":
-                name = data.get("name")
-                if data.get("status") == "success" and name in owned_tools:
-                    evidence.add(f"tool:{name}")
-                provenance = data.get("runtimeProvenance")
-                if (
-                    data.get("status") == "success"
-                    and name == "load_skill"
-                    and isinstance(provenance, dict)
-                    and provenance.get("kind") == "plugin-skill"
-                    and provenance.get("pluginId") == plugin_id
-                    and provenance.get("skillName") in owned_skills
-                    and provenance.get("skillCatalogGenerationId")
-                    == skill_catalog_generation_id
-                    and provenance.get("runtimeSnapshotId")
-                    == ready.snapshot.snapshot_id
-                ):
-                    evidence.add(f"skill:{provenance['skillName']}")
-        return tuple(sorted(evidence))
-
     def _ready_candidate_status(self) -> dict[str, object]:
         ready = self._ready_candidate
         if ready is None:
@@ -3831,10 +3753,7 @@ class PluginManager:
                     error=f"endpoint_quiesce: {error_text}",
                 )
                 raise
-        transaction = self._snapshot_store.begin_publish(
-            snapshot,
-            admission_gated=quiesced_snapshot is not None,
-        )
+        transaction = self._snapshot_store.begin_publish(snapshot)
         self._advance_reload(
             generation,
             "validating",
