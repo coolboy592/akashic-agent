@@ -7,6 +7,7 @@ import shutil
 import sqlite3
 import stat
 import tomllib
+from contextlib import closing
 from pathlib import Path
 
 import pytest
@@ -16,6 +17,9 @@ from agent.migrations.runner import MigrationRunner
 from agent.model_runtime.auth.store import Credential, CredentialStore
 from agent.model_runtime.store import ModelRegistryStore
 from bootstrap.workspace_lock import WorkspaceInstanceLock
+from bootstrap.init_workspace import init_workspace
+from session.log import MessageLog, SessionAttributes
+from session.message import Input
 
 _PROJECT_ROOT = Path(__file__).parents[1]
 _ORIGIN_ID = "20260802_01_yoyo_origin"
@@ -46,6 +50,24 @@ _PROGRAMMATIC_EFFECTS_ID = "20260829_01_backfill_plugin_programmatic_effects"
 _EXPLICIT_PROGRAMMATIC_EFFECTS_ID = "20260829_02_backfill_explicit_programmatic_effects"
 _RETIRE_CORE_MODEL_CONFIG_ID = "20260829_03_retire_core_model_config"
 _COMPACTION_PLUGIN_CONFIG_ID = "20260831_01_migrate_compaction_plugin_config"
+_MESSAGE_LOG_ID = "20260905_01_message_log"
+_OWNER_RECORDS_ID = "20260905_02_owner_records"
+_MODEL_CALLS_ID = "20260905_03_model_calls"
+_AKASHA_CONSUMPTION_ID = "20260905_04_akasha_consumption"
+_MESSAGE_EMBEDDINGS_ID = "20260905_05_message_embeddings"
+_MESSAGE_ARTIFACTS_ID = "20260905_06_message_artifacts"
+_TURN_MESSAGES_ID = "20260906_01_turn_messages"
+_SCHEDULER_MESSAGES_ID = "20260906_01_scheduler_messages"
+_SESSION_ATTRIBUTES_ID = "20260906_02_session_attributes"
+_PLUGIN_UPDATE_ROLLBACK_ID = "20260906_03_plugin_update_rollback"
+_CHANNEL_IDENTITIES_ID = "20260906_04_channel_identities"
+_MOBILE_INPUT_REJECTIONS_ID = "20260906_05_mobile_input_rejections"
+_MODEL_CALL_TIMING_ID = "20260906_06_model_call_timing"
+_CONTEXT_MATERIAL_GRANTS_ID = "20260907_01_context_material_grants"
+_LEGACY_AGENT_CONFIG_ID = "20260907_02_retire_legacy_agent_config"
+_MESSAGE_METADATA_ID = "20260907_03_message_metadata"
+_SKILL_PROMPT_GRANT_ID = "20260907_03_skill_prompt_grant"
+_LEGACY_SUMMARIES_ID = "20260908_01_legacy_summaries"
 _CURRENT_IDS = (
     _ORIGIN_ID,
     _AKASHA_V9_ID,
@@ -75,6 +97,24 @@ _CURRENT_IDS = (
     _EXPLICIT_PROGRAMMATIC_EFFECTS_ID,
     _RETIRE_CORE_MODEL_CONFIG_ID,
     _COMPACTION_PLUGIN_CONFIG_ID,
+    _MESSAGE_LOG_ID,
+    _OWNER_RECORDS_ID,
+    _MODEL_CALLS_ID,
+    _AKASHA_CONSUMPTION_ID,
+    _MESSAGE_EMBEDDINGS_ID,
+    _MESSAGE_ARTIFACTS_ID,
+    _TURN_MESSAGES_ID,
+    _SCHEDULER_MESSAGES_ID,
+    _SESSION_ATTRIBUTES_ID,
+    _PLUGIN_UPDATE_ROLLBACK_ID,
+    _CHANNEL_IDENTITIES_ID,
+    _MOBILE_INPUT_REJECTIONS_ID,
+    _MODEL_CALL_TIMING_ID,
+    _CONTEXT_MATERIAL_GRANTS_ID,
+    _LEGACY_AGENT_CONFIG_ID,
+    _MESSAGE_METADATA_ID,
+    _SKILL_PROMPT_GRANT_ID,
+    _LEGACY_SUMMARIES_ID,
 )
 _CURRENT_LEDGER_IDS = tuple(sorted(_CURRENT_IDS))
 
@@ -112,15 +152,24 @@ def _applied_ids(ledger: Path) -> list[str]:
 def _create_sessions(path: Path) -> None:
     connection = sqlite3.connect(path)
     try:
+        connection.executescript("""
+            CREATE TABLE sessions (
+                key TEXT PRIMARY KEY, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                last_consolidated INTEGER NOT NULL DEFAULT 0, metadata TEXT,
+                last_user_at TEXT, last_proactive_at TEXT, next_seq INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE messages (
+                id TEXT PRIMARY KEY, session_key TEXT NOT NULL, seq INTEGER NOT NULL,
+                role TEXT NOT NULL, content TEXT, tool_chain TEXT, extra TEXT,
+                ts TEXT NOT NULL, UNIQUE(session_key, seq)
+            );
+        """)
         connection.execute(
-            "CREATE TABLE sessions ("
-            "key TEXT PRIMARY KEY, last_consolidated INTEGER NOT NULL)"
+            "INSERT INTO sessions (key,created_at,updated_at,last_consolidated,next_seq) VALUES ('chat','2026-09-01T00:00:00+00:00','2026-09-01T00:00:00+00:00',4,1)"
         )
         connection.execute(
-            "CREATE TABLE messages (id TEXT PRIMARY KEY, body TEXT NOT NULL)"
+            "INSERT INTO messages VALUES ('m1','chat',0,'user','session-bytes',NULL,NULL,'2026-09-01T00:00:00+00:00')"
         )
-        connection.execute("INSERT INTO sessions VALUES ('chat', 4)")
-        connection.execute("INSERT INTO messages VALUES ('m1', 'session-bytes')")
         connection.commit()
     finally:
         connection.close()
@@ -165,9 +214,11 @@ def test_origin_removes_legacy_state_without_touching_business_data(
         assert migrated.execute(
             "SELECT last_consolidated FROM sessions WHERE key = 'chat'"
         ).fetchone() == (0,)
-        assert migrated.execute("SELECT body FROM messages").fetchall() == [
-            ("session-bytes",)
-        ]
+        body = json.loads(
+            migrated.execute("SELECT body FROM messages WHERE id='m1'").fetchone()[0]
+        )
+        assert body["kind"] == "input"
+        assert body["parts"][0] == {"kind": "text", "value": "session-bytes"}
         assert {
             row[0]
             for row in migrated.execute(
@@ -205,6 +256,24 @@ def test_origin_is_a_noop_when_legacy_state_is_absent(tmp_path: Path) -> None:
     assert first.migrations == _CURRENT_IDS
     assert second.state == "current"
     assert second.migrations == ()
+
+
+def test_fresh_migration_then_log_writes_then_restart_uses_recorded_ledger(tmp_path):
+    from session.log import MessageLog
+    from session.message import Input
+
+    root = tmp_path / "state"
+    runner = _runner(root)
+    assert _MESSAGE_LOG_ID in runner.run().migrations
+    log = MessageLog(root / "workspace/sessions.db")
+    try:
+        writer = log.writer(
+            "s", author="user", source="conversation", body_types=(Input,), content={}
+        )
+        writer.append("first", Input(()))
+    finally:
+        log.close()
+    assert runner.run().state == "current"
 
 
 def test_runner_supplies_yoyo_identity_without_os_username(
@@ -322,7 +391,7 @@ def test_staged_catalog_upgrade_preserves_legacy_inputs_until_final_cutover(
 
     current_without_model_cleanup = _catalog(
         tmp_path / "current-without-model-cleanup",
-        _CURRENT_IDS[:-2],
+        _CURRENT_IDS[: _CURRENT_IDS.index(_RETIRE_CORE_MODEL_CONFIG_ID)],
     )
     second = _runner(root, repo_root=current_without_model_cleanup).run()
     assert _DIGEST_ID in second.migrations
@@ -362,8 +431,13 @@ def test_toolset_wiring_migration_retires_only_the_exact_legacy_default(
     )
     config.chmod(0o640)
 
-    legacy_repo = _catalog(tmp_path / "legacy-repo", _CURRENT_IDS[:-14])
-    assert _runner(root, repo_root=legacy_repo).run().migrations == _CURRENT_IDS[:-14]
+    legacy_repo = _catalog(
+        tmp_path / "legacy-repo", _CURRENT_IDS[: _CURRENT_IDS.index(_TOOLSET_WIRING_ID)]
+    )
+    assert (
+        _runner(root, repo_root=legacy_repo).run().migrations
+        == _CURRENT_IDS[: _CURRENT_IDS.index(_TOOLSET_WIRING_ID)]
+    )
     before = config.read_bytes()
 
     outcome = _runner(root).run()
@@ -383,9 +457,27 @@ def test_toolset_wiring_migration_retires_only_the_exact_legacy_default(
         _EXPLICIT_PROGRAMMATIC_EFFECTS_ID,
         _RETIRE_CORE_MODEL_CONFIG_ID,
         _COMPACTION_PLUGIN_CONFIG_ID,
+        _MESSAGE_LOG_ID,
+        _OWNER_RECORDS_ID,
+        _MODEL_CALLS_ID,
+        _AKASHA_CONSUMPTION_ID,
+        _MESSAGE_EMBEDDINGS_ID,
+        _MESSAGE_ARTIFACTS_ID,
+        _TURN_MESSAGES_ID,
+        _SCHEDULER_MESSAGES_ID,
+        _SESSION_ATTRIBUTES_ID,
+        _PLUGIN_UPDATE_ROLLBACK_ID,
+        _CHANNEL_IDENTITIES_ID,
+    _MOBILE_INPUT_REJECTIONS_ID,
+    _MODEL_CALL_TIMING_ID,
+        _CONTEXT_MATERIAL_GRANTS_ID,
+        _LEGACY_AGENT_CONFIG_ID,
+        _MESSAGE_METADATA_ID,
+        _SKILL_PROMPT_GRANT_ID,
+        _LEGACY_SUMMARIES_ID,
     )
     migrated = tomllib.loads(config.read_text(encoding="utf-8"))
-    assert migrated["agent"]["wiring"]["toolsets"] == ["meta_common"]
+    assert "agent" not in migrated
     assert migrated["custom"] == {"value": "protected"}
     assert stat.S_IMODE(config.stat().st_mode) == 0o640
     backups = sorted(
@@ -403,11 +495,8 @@ def test_toolset_wiring_migration_retires_only_the_exact_legacy_default(
     assert len(list(backups[0].parent.iterdir())) == 1
 
 
-@pytest.mark.parametrize(
-    "toolsets",
-    (["meta_common"], ["meta_common", "spawn"], ["schedule"]),
-)
-def test_toolset_wiring_migration_leaves_nonlegacy_values_untouched(
+@pytest.mark.parametrize("toolsets", (["meta_common", "spawn"], ["schedule"]))
+def test_legacy_agent_migration_rejects_custom_wiring_without_writing(
     tmp_path: Path,
     toolsets: list[str],
 ) -> None:
@@ -419,33 +508,18 @@ def test_toolset_wiring_migration_leaves_nonlegacy_values_untouched(
         encoding="utf-8",
     )
 
-    legacy_repo = _catalog(tmp_path / "legacy-repo", _CURRENT_IDS[:-14])
+    legacy_repo = _catalog(tmp_path / "legacy-repo", _CURRENT_IDS[:_CURRENT_IDS.index(_LEGACY_AGENT_CONFIG_ID)])
     _ = _runner(root, repo_root=legacy_repo).run()
     before = config.read_bytes()
 
-    outcome = _runner(root).run()
+    with pytest.raises(RuntimeError, match=r"agent\.wiring"):
+        _runner(root).run()
 
-    assert outcome.migrations == (
-        _TOOLSET_WIRING_ID,
-        _PROACTIVE_DELIVERY_TARGET_ID,
-        _TURN_EFFECTS_ID,
-        _AKASHA_PLUGIN_SELECTION_ID,
-        _AKASHA_EMBEDDING_BACKFILL_ID,
-        _AKASHIC_CHANNEL_IDENTITY_ID,
-        _SESSION_TIMESTAMP_ID,
-        _MOBILE_CLIENT_ID_ID,
-        _EVENTMAIL_STATE_ID,
-        _WAKE_CONTENT_SCORES_ID,
-        _PROGRAMMATIC_EFFECTS_ID,
-        _EXPLICIT_PROGRAMMATIC_EFFECTS_ID,
-        _RETIRE_CORE_MODEL_CONFIG_ID,
-        _COMPACTION_PLUGIN_CONFIG_ID,
-    )
-    migrated = tomllib.loads(config.read_text())
-    assert migrated["agent"]["wiring"]["toolsets"] == toolsets
-    assert "context" not in migrated["agent"]
+    assert config.read_bytes() == before
     assert tomllib.loads(
-        (root / "workspace/plugin-data/compaction-builtin/config.local.toml").read_text()
+        (
+            root / "workspace/plugin-data/compaction-builtin/config.local.toml"
+        ).read_text()
     ) == {"keep_recent_tokens": 20_000}
     assert not (root / "workspace/backups/retire-legacy-toolset-wiring").exists()
 
@@ -463,32 +537,18 @@ def test_toolset_wiring_migration_preserves_config_symlink_identity(
     config = root / "config.toml"
     config.symlink_to(source.name)
 
-    legacy_repo = _catalog(tmp_path / "legacy-repo", _CURRENT_IDS[:-14])
+    legacy_repo = _catalog(tmp_path / "legacy-repo", _CURRENT_IDS[:_CURRENT_IDS.index(_LEGACY_AGENT_CONFIG_ID)])
     _ = _runner(root, repo_root=legacy_repo).run()
+    before = source.read_bytes()
 
     outcome = _runner(root).run()
 
-    assert outcome.migrations == (
-        _TOOLSET_WIRING_ID,
-        _PROACTIVE_DELIVERY_TARGET_ID,
-        _TURN_EFFECTS_ID,
-        _AKASHA_PLUGIN_SELECTION_ID,
-        _AKASHA_EMBEDDING_BACKFILL_ID,
-        _AKASHIC_CHANNEL_IDENTITY_ID,
-        _SESSION_TIMESTAMP_ID,
-        _MOBILE_CLIENT_ID_ID,
-        _EVENTMAIL_STATE_ID,
-        _WAKE_CONTENT_SCORES_ID,
-        _PROGRAMMATIC_EFFECTS_ID,
-        _EXPLICIT_PROGRAMMATIC_EFFECTS_ID,
-        _RETIRE_CORE_MODEL_CONFIG_ID,
-        _COMPACTION_PLUGIN_CONFIG_ID,
-    )
+    assert outcome.migrations == (_LEGACY_AGENT_CONFIG_ID, _MESSAGE_METADATA_ID, _SKILL_PROMPT_GRANT_ID, _LEGACY_SUMMARIES_ID)
+
     assert config.is_symlink()
     assert os.readlink(config) == source.name
-    assert tomllib.loads(source.read_text(encoding="utf-8"))["agent"]["wiring"][
-        "toolsets"
-    ] == ["meta_common"]
+    assert source.read_bytes() != before
+    assert "agent" not in tomllib.loads(source.read_text(encoding="utf-8"))
 
 
 def test_new_branch_migration_is_applied_even_after_sibling_ran(
@@ -533,9 +593,15 @@ def test_embedding_backfill_runs_after_selection_is_already_recorded(
 
     # 1. Recreate a workspace that already ran every migration through selection.
     root = tmp_path / "state"
-    prior_repo = _catalog(tmp_path / "prior-repo", _CURRENT_IDS[:-10])
+    prior_repo = _catalog(
+        tmp_path / "prior-repo",
+        _CURRENT_IDS[: _CURRENT_IDS.index(_AKASHA_PLUGIN_SELECTION_ID) + 1],
+    )
     first = _runner(root, repo_root=prior_repo).run()
-    assert first.migrations == _CURRENT_IDS[:-10]
+    assert (
+        first.migrations
+        == _CURRENT_IDS[: _CURRENT_IDS.index(_AKASHA_PLUGIN_SELECTION_ID) + 1]
+    )
     assert _AKASHA_PLUGIN_SELECTION_ID in _applied_ids(
         root / "workspace/migrations.sqlite3"
     )
@@ -553,6 +619,24 @@ def test_embedding_backfill_runs_after_selection_is_already_recorded(
         _EXPLICIT_PROGRAMMATIC_EFFECTS_ID,
         _RETIRE_CORE_MODEL_CONFIG_ID,
         _COMPACTION_PLUGIN_CONFIG_ID,
+        _MESSAGE_LOG_ID,
+        _OWNER_RECORDS_ID,
+        _MODEL_CALLS_ID,
+        _AKASHA_CONSUMPTION_ID,
+        _MESSAGE_EMBEDDINGS_ID,
+        _MESSAGE_ARTIFACTS_ID,
+        _TURN_MESSAGES_ID,
+        _SCHEDULER_MESSAGES_ID,
+        _SESSION_ATTRIBUTES_ID,
+        _PLUGIN_UPDATE_ROLLBACK_ID,
+        _CHANNEL_IDENTITIES_ID,
+    _MOBILE_INPUT_REJECTIONS_ID,
+    _MODEL_CALL_TIMING_ID,
+        _CONTEXT_MATERIAL_GRANTS_ID,
+        _LEGACY_AGENT_CONFIG_ID,
+        _MESSAGE_METADATA_ID,
+        _SKILL_PROMPT_GRANT_ID,
+        _LEGACY_SUMMARIES_ID,
     )
 
 
@@ -736,7 +820,6 @@ def test_model_registry_migration_accepts_toml_rewritten_nested_tables(
                         }
                     },
                 },
-                "agent": {"system_prompt": "plugin gate"},
                 "app_server": {"listen": "/sandbox/akashic.sock"},
             }
         ),
@@ -748,9 +831,11 @@ def test_model_registry_migration_accepts_toml_rewritten_nested_tables(
     assert outcome.migrations == _CURRENT_IDS
     migrated = tomllib.loads(config.read_text(encoding="utf-8"))
     assert "llm" not in migrated
-    assert migrated["agent"] == {"system_prompt": "plugin gate"}
+    assert "agent" not in migrated
     assert tomllib.loads(
-        (root / "workspace/plugin-data/compaction-builtin/config.local.toml").read_text()
+        (
+            root / "workspace/plugin-data/compaction-builtin/config.local.toml"
+        ).read_text()
     ) == {"keep_recent_tokens": 20_000}
     assert migrated["app_server"] == {"listen": "/sandbox/akashic.sock"}
 
@@ -777,8 +862,6 @@ base_url = "https://api.deepseek.com/v1"
 api_key = "secret-value"
 input_modalities = ["text"]
 
-[agent]
-system_prompt = "test"
 """,
         encoding="utf-8",
     )
@@ -899,8 +982,81 @@ api_key = "secret"
         _EXPLICIT_PROGRAMMATIC_EFFECTS_ID,
         _RETIRE_CORE_MODEL_CONFIG_ID,
         _COMPACTION_PLUGIN_CONFIG_ID,
+        _MESSAGE_LOG_ID,
+        _OWNER_RECORDS_ID,
+        _MODEL_CALLS_ID,
+        _AKASHA_CONSUMPTION_ID,
+        _MESSAGE_EMBEDDINGS_ID,
+        _MESSAGE_ARTIFACTS_ID,
+        _TURN_MESSAGES_ID,
+        _SCHEDULER_MESSAGES_ID,
+        _SESSION_ATTRIBUTES_ID,
+        _PLUGIN_UPDATE_ROLLBACK_ID,
+        _CHANNEL_IDENTITIES_ID,
+    _MOBILE_INPUT_REJECTIONS_ID,
+    _MODEL_CALL_TIMING_ID,
+        _CONTEXT_MATERIAL_GRANTS_ID,
+        _LEGACY_AGENT_CONFIG_ID,
+        _MESSAGE_METADATA_ID,
+        _SKILL_PROMPT_GRANT_ID,
+        _LEGACY_SUMMARIES_ID,
     )
     assert (
         CredentialStore.for_workspace(root / "workspace").api_key("model_deepseek_main")
         == "secret"
     )
+
+
+def test_fresh_init_runs_migrations_before_message_log_owner_creates_schema(
+    tmp_path: Path,
+) -> None:
+    """新 workspace 先完成 Yoyo，再由 MessageLog owner 创建当前 schema。"""
+
+    root = tmp_path / "fresh"
+    root.mkdir()
+    config = root / "config.toml"
+    workspace = root / "workspace"
+
+    init_workspace(config_path=config, workspace=workspace)
+    sessions = workspace / "sessions.db"
+    assert not sessions.exists()
+
+    first = _runner(root).run()
+    assert first.migrations == _CURRENT_IDS
+    assert not sessions.exists()
+
+    message_log = MessageLog(sessions)
+    message_log.ensure_session("fresh", SessionAttributes())
+    message = message_log.writer(
+        "fresh",
+        author="user",
+        source="test",
+        body_types=(Input,),
+        content={},
+    ).append("input-1", Input(()))
+    message_log.close()
+    before_init = sessions.read_bytes()
+    init_workspace(config_path=config, workspace=workspace, force=True)
+    assert sessions.read_bytes() == before_init
+    with closing(sqlite3.connect(sessions)) as connection:
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(sessions)")
+        }
+        assert columns == {
+            "key",
+            "created_at",
+            "updated_at",
+            "metadata",
+            "attributes",
+            "next_seq",
+        }
+
+    reopened = MessageLog(sessions)
+    try:
+        assert reopened.reader("fresh").snapshot() == (message,)
+    finally:
+        reopened.close()
+
+    second = _runner(root).run()
+    assert second.state == "current"
+    assert second.migrations == ()

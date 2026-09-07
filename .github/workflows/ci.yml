@@ -9,7 +9,7 @@ on:
 jobs:
   check-and-test:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -36,6 +36,9 @@ jobs:
           .venv/bin/python -m pip install -r requirements-dev.txt
           .venv/bin/python -m pip install -e sdk/python
 
+      - name: Add project virtualenv to PATH
+        run: echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
+
       - name: Check Host Bridge generated protocol
         run: |
           python -m venv /tmp/akashic-protoc
@@ -54,8 +57,11 @@ jobs:
           ../../.venv/bin/pyright src tests --level error
           ../../.venv/bin/pytest -q tests
 
+      - name: Install Node dependencies
+        run: npm ci
+
       - name: Run Python regressions
-        timeout-minutes: 15
+        timeout-minutes: 25
         env:
           PYTHONWARNINGS: "ignore:.*AbstractEventLoopPolicy.*:DeprecationWarning"
         run: |
@@ -63,7 +69,6 @@ jobs:
 
       - name: Run Web regressions
         run: |
-          npm ci
           npm run test:web
           npm run typecheck
 

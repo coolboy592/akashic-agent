@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import os
+import json
 import re
 import shutil
 import subprocess
-import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
+
+from agent.plugins.python_environment import ENVIRONMENT_FILE, PythonEnvironments
+from agent.plugins.reload_journal import ReloadJournal
+from agent.plugins.archive import sync_directory
 
 from agent.plugins.artifacts import (
     ArtifactPointer,
@@ -44,6 +48,7 @@ class PluginInstallResult:
     data_path: Path
     source_revision: str
     staged_candidate: bool
+    update_id: str = ""
 
 
 @dataclass
@@ -54,12 +59,13 @@ class _CacheActivation:
     created_artifact: bool
     created_data_dir: bool
     superseded_artifact: Path | None
+    journal: ReloadJournal
 
     def rollback(self) -> None:
         """撤销已发布 cache，并恢复发布前的可运行版本。"""
 
         # 1. 恢复发布前完整 pointer state；缺失状态也精确恢复。
-        _restore_pointers(self.plugin_base, self.previous_pointers)
+        self.journal.rollback_updates(self.plugin_base.parents[2], update_id=self.result.update_id, error="install failed")
 
         # 2. 只删除本事务新建、且尚未被任何旧 pointer 引用的 artifact。
         target_root = self.result.installed_path
@@ -132,8 +138,11 @@ def install_git_plugin(
     plugins_home: Path | None = None,
     stage_candidate: bool = False,
     refresh_existing_artifact: bool = False,
+    update_id: str | None = None,
 ) -> PluginInstallResult:
     home = (plugins_home or plugins_root()).resolve(strict=False)
+    journal = ReloadJournal(workspace)
+    update_id = uuid4().hex if update_id is None else update_id
     _ = _validate_path_segment(marketplace, "marketplace")
     if not isinstance(source, str) or not source or source != source.strip():
         raise ValueError("插件 source 必须是非空且不含首尾空白的字符串")
@@ -175,6 +184,7 @@ def install_git_plugin(
             static_manifest.version,
             "插件 version",
         )
+        previous_enabled = load_plugin_manifest(home).get(f"{plugin_name}@{marketplace}")
         activation = _activate_plugin_version(
             plugin_name=plugin_name,
             plugin_version=plugin_version,
@@ -187,6 +197,8 @@ def install_git_plugin(
             source_revision=source_revision,
             stage_candidate=stage_candidate,
             refresh_existing_artifact=refresh_existing_artifact,
+            journal=journal, update_id=update_id,
+            previous_enabled=previous_enabled,
         )
         plugin_id = f"{plugin_name}@{marketplace}"
         try:
@@ -199,7 +211,9 @@ def install_git_plugin(
         except BaseException:
             activation.rollback()
             raise
-        activation.finalize()
+        if not stage_candidate or (not activation.result.staged_candidate and previous_enabled is True):
+            journal.commit_update(update_id)
+            activation.finalize()
     return activation.result
 
 
@@ -278,6 +292,7 @@ def _activate_plugin_version(
     source_revision: str,
     stage_candidate: bool,
     refresh_existing_artifact: bool,
+    journal: ReloadJournal, update_id: str, previous_enabled: bool | None,
 ) -> _CacheActivation:
     """Prepare one immutable artifact and publish it as latest."""
 
@@ -329,10 +344,13 @@ def _activate_plugin_version(
     )
     created_artifact = False
     created_data_dir = False
+    armed = False
     try:
         # 2. 在不可发现的 staging 目录复制代码并准备依赖，旧版本保持可见
         _ = shutil.copytree(clone_root, staging_root, dirs_exist_ok=True)
-        _prepare_static_python_runtimes(staging_root, static_manifest)
+        _prepare_static_python_runtimes(
+            staging_root, static_manifest, workspace=workspace
+        )
 
         # 3. 先落完整 artifact，再原子切换 stable/latest 指针对。
         if target_root.exists():
@@ -347,7 +365,21 @@ def _activate_plugin_version(
             existing_revision = _run_git(["rev-parse", "HEAD"], cwd=target_root)
             if existing_revision != source_revision:
                 raise RuntimeError(f"插件 artifact 身份冲突: {target_root}")
-            _remove_path(staging_root)
+            environment_ref = staging_root / ENVIRONMENT_FILE
+            previous_ref = target_root / ENVIRONMENT_FILE
+            if environment_ref.exists() and (
+                not previous_ref.is_file()
+                or previous_ref.is_symlink()
+                or previous_ref.read_bytes() != environment_ref.read_bytes()
+            ):
+                # 显式重装旧环境时发布新 artifact，失败仍可恢复完整旧 pointer。
+                target_root = (
+                    artifacts_root / f"{artifact_id}-runtime-{uuid4().hex[:16]}"
+                )
+                os.replace(staging_root, target_root)
+                created_artifact = True
+            else:
+                _remove_path(staging_root)
         else:
             os.replace(staging_root, target_root)
             created_artifact = True
@@ -355,13 +387,23 @@ def _activate_plugin_version(
         ensure_workspace_plugin_data_dir(data_path, workspace)
         latest = relative_artifact_pointer(plugin_base, target_root)
         candidate_staged = stage_latest and stable != latest
+        # 新指针可见之前，先让代码目录与旧状态的恢复点耐久。
+        _sync_artifact_tree(target_root)
+        sync_directory(artifacts_root)
+        sync_directory(plugin_base)
+        journal.arm_update(
+            update_id=update_id, plugin_id=f"{plugin_name}@{marketplace}", plugin_base=plugin_base,
+            previous=previous_pointers, candidate=latest, previous_enabled=previous_enabled,
+        )
+        armed = True
         _ = write_pointers(
             plugin_base,
             stable=stable if stage_latest else latest,
             latest=latest,
         )
     except BaseException:
-        _restore_pointers(plugin_base, previous_pointers)
+        if armed:
+            journal.rollback_updates(plugin_base.parents[2], update_id=update_id, error="install failed")
         if created_artifact and (target_root.exists() or target_root.is_symlink()):
             _remove_path(target_root)
         if staging_root.exists() or staging_root.is_symlink():
@@ -378,6 +420,7 @@ def _activate_plugin_version(
         data_path=data_path,
         source_revision=source_revision,
         staged_candidate=candidate_staged,
+        update_id=update_id,
     )
     return _CacheActivation(
         result=result,
@@ -386,7 +429,20 @@ def _activate_plugin_version(
         created_artifact=created_artifact,
         created_data_dir=created_data_dir,
         superseded_artifact=superseded_artifact,
+        journal=journal,
     )
+
+
+def _sync_artifact_tree(root: Path) -> None:
+    """先同步实际源码文件与目录，再允许指针指向它。"""
+    for directory, _, files in os.walk(root, followlinks=False, topdown=False):
+        current = Path(directory)
+        for name in files:
+            path = current / name
+            if not path.is_symlink():
+                with path.open("rb") as stream:
+                    os.fsync(stream.fileno())
+        sync_directory(current)
 
 
 def _remove_created_data_dir(path: Path) -> None:
@@ -508,47 +564,20 @@ def _validate_source_tree(
 def _prepare_static_python_runtimes(
     plugin_root: Path,
     manifest: StaticPluginManifest,
+    *,
+    workspace: Path,
 ) -> None:
-    """Stage all manifest-declared Python runtimes before publishing an artifact."""
-
-    # 1. Each requirements parent owns its own immutable .venv.
-    for index, runtime in enumerate(manifest.python):
-        requirements = plugin_root / runtime.requirements
-        runtime_root = requirements.parent
-        _ = _ensure_python_runtime(
-            runtime_root,
-            requirements,
-            f"{manifest.name} python[{index}]",
-        )
-
-
-def _ensure_python_runtime(
-    runtime_root: Path,
-    requirements: Path,
-    server_name: str,
-) -> Path:
-    venv_dir = runtime_root / ".venv"
-    venv_python = _venv_python_path(venv_dir)
-    if not venv_python.exists():
-        _run_command(
-            [sys.executable, "-m", "venv", str(venv_dir)],
-            cwd=runtime_root,
-            label=f"{server_name} venv",
-        )
-    _run_command(
-        [str(venv_python), "-m", "pip", "install", "-r", str(requirements)],
-        cwd=runtime_root,
-        label=f"{server_name} pip install",
-    )
-    return venv_python
-
-
-def _venv_python_path(venv_dir: Path) -> Path:
-    return (
-        venv_dir / "Scripts" / "python.exe"
-        if os.name == "nt"
-        else venv_dir / "bin" / "python"
-    )
+    """在最终耐久路径准备环境；安装 cache 只保存不可变引用。"""
+    if manifest.python:
+        environments = PythonEnvironments(workspace)
+        refs = {
+            runtime.runtime_root: environments.prepare(plugin_root, runtime)
+            for runtime in manifest.python
+        }
+        with (plugin_root / ENVIRONMENT_FILE).open("w") as stream:
+            _ = stream.write(json.dumps(refs, sort_keys=True))
+            stream.flush()
+            os.fsync(stream.fileno())
 
 
 def _run_git(args: list[str], cwd: Path | None = None) -> str:
@@ -565,27 +594,5 @@ def _run_git(args: list[str], cwd: Path | None = None) -> str:
     raise RuntimeError(
         "git 命令失败: "
         + " ".join(args)
-        + f"\nstdout:\n{result.stdout.strip()}\nstderr:\n{result.stderr.strip()}"
-    )
-
-
-def _run_command(
-    args: list[str],
-    *,
-    cwd: Path,
-    label: str,
-) -> None:
-    result = subprocess.run(
-        args,
-        cwd=cwd,
-        capture_output=True,
-        text=True,
-        check=False,
-        env=os.environ.copy(),
-    )
-    if result.returncode == 0:
-        return
-    raise RuntimeError(
-        f"{label} 失败: {' '.join(args)}"
         + f"\nstdout:\n{result.stdout.strip()}\nstderr:\n{result.stderr.strip()}"
     )

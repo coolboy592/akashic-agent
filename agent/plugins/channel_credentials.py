@@ -1,19 +1,20 @@
 from __future__ import annotations
 
-import hashlib
 import tomllib
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 
 from agent.plugin_composition.channels import CredentialRef, ProviderClient
+from agent.plugins.config import read_config_source
 
 
 class CoreProviderClient:
-    """Expose only the credential values leased for one formal channel start."""
+    """只暴露本次租约取得的凭据；关闭后清空并释放 factory 记录。"""
 
-    def __init__(self, values: Mapping[tuple[str, ...], str]) -> None:
+    def __init__(self, values: Mapping[tuple[str, ...], str], on_close: Callable[[CoreProviderClient], None]) -> None:
         self._values = dict(values)
         self._closed = False
+        self._on_close = on_close
 
     def credential(self, ref: CredentialRef) -> str:
         if self._closed:
@@ -26,10 +27,11 @@ class CoreProviderClient:
     async def aclose(self) -> None:
         self._values.clear()
         self._closed = True
+        self._on_close(self)
 
 
 class CoreProviderClientFactory:
-    """Resolve frozen refs from the exact formal config and own every lease."""
+    """按已冻结配置读取声明的凭据，统一拥有 Channel 与普通插件的租约。"""
 
     def __init__(
         self,
@@ -51,20 +53,21 @@ class CoreProviderClientFactory:
 
         if self._closed:
             raise RuntimeError("provider client factory 已关闭")
-        if _file_revision(self._config_path) != self._raw_config_revision:
-            raise RuntimeError("channel credential config revision 已漂移")
-        raw = _read_raw_config(self._config_path)
+        content, revision = read_config_source(self._config_path)
+        if revision != self._raw_config_revision:
+            raise RuntimeError("plugin credential config revision 已漂移")
+        raw = {} if content is None else tomllib.loads(content.decode("utf-8"))
         values: dict[tuple[str, ...], str] = {}
         for name, ref in credentials.items():
             if not isinstance(name, str) or not isinstance(ref, CredentialRef):
                 raise TypeError("credentials 必须映射到 CredentialRef")
             if ref.path not in self._allowed or tuple(name.split(".")) != ref.path:
-                raise RuntimeError("CredentialRef 不属于 frozen channel 声明")
+                raise RuntimeError("CredentialRef 不属于 frozen plugin 声明")
             value = _resolve_path(raw, ref.path)
             if not isinstance(value, str) or not value:
-                raise RuntimeError(f"channel credential 必须是非空字符串: {name}")
+                raise RuntimeError(f"plugin credential 必须是非空字符串: {name}")
             values[ref.path] = value
-        client = CoreProviderClient(values)
+        client = CoreProviderClient(values, self._clients.discard)
         self._clients.add(client)
         return client
 
@@ -77,26 +80,13 @@ class CoreProviderClientFactory:
         self._closed = True
 
 
-def _read_raw_config(path: Path) -> Mapping[str, object]:
-    if not path.is_file():
-        return {}
-    return tomllib.loads(path.read_text(encoding="utf-8"))
-
-
 def _resolve_path(value: object, path: tuple[str, ...]) -> object:
     current = value
     for segment in path:
         if not isinstance(current, Mapping) or segment not in current:
-            raise RuntimeError(f"channel credential 不存在: {'.'.join(path)}")
+            raise RuntimeError(f"plugin credential 不存在: {'.'.join(path)}")
         current = current[segment]
     return current
-
-
-def _file_revision(path: Path) -> str:
-    digest = hashlib.sha256()
-    digest.update(str(path.resolve(strict=False)).encode())
-    digest.update(path.read_bytes() if path.is_file() else b"<missing>")
-    return digest.hexdigest()
 
 
 __all__ = ["CoreProviderClientFactory"]

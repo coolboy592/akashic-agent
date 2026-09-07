@@ -2,6 +2,25 @@
 
 本账本记录测试与 Gate 的永久收敛。数量只是历史观察指标，不是删除依据；取舍按用户可观察失败、持久化与安全边界、并发 finality、恢复能力和插件 v3 生命周期排序。
 
+## 2026-09-06：Message 输入接纳替换旧回复队列
+
+本项属于已批准的 Message/plugins 栈第 08 层：Channel 在 Input 提交后返回，回复由独立消费者运行。`publish_channel_inbound` 的 BUS → LANE → LOOP 接纳已被删除；不为中间 PR 恢复兼容队列。原测试备份：`/tmp/message-plugins-pr08-inbound-recovery-backup-20260906/tests/test_message_bus_admission.py`，Git 相邻基线 `79fcc358` 也可恢复旧测试。
+
+以下对应旧 `tests/test_message_bus_admission.py` 的 19 项用例。新边界均在 `tests/test_channel_input.py`；独立回复在 `tests/test_default_reply.py`。删除不依据测试数量或失败本身。
+
+| 旧测试范围（共同前缀 `test_v3_`） | 处置与继续保护的行为 |
+| --- | --- |
+| `channel_inbound_transfers_bus_lane_loop_and_closes_once`、`channel_inbound_bus_close_releases_queued_exact_lease`、`channel_inbound_blocked_at_lane_is_closed_by_concurrent_bus_close`、`channel_bus_close_cancellation_drains_every_queued_lease`、`channel_inbound_release_cancellation_clears_lane_before_return` | 删除已移除队列/lane 的实现合同；新边界证明 Input 无排队、无模型或发送，取消关闭 exact lease，关闭后的 lock waiter 不能提交。 |
+| `channel_worker_preserves_exact_binding_through_terminal_delivery`、`channel_worker_holds_session_admission_until_terminal`、`channel_worker_cancel_closes_running_and_lane_queued_leases` | 删除旧 worker 持有到最终回复的合同。新接纳只持有到 Input ACK；重启仍取 current exact binding，独立回复取消与 drain 由 Task 和默认回复测试保护。 |
+| `mobile_inbound_reserves_before_bus_queue_and_deletes_after_terminal`、`mobile_delete_retry_retains_exact_and_session_owners` | 替换为 Input 提交前耐久预留、提交后清理失败不推翻接纳；交接行成功删除前保留 exact lease 与 Session admission。 |
+| `mobile_handoff_recovers_through_current_exact_binding`、`mobile_recovery_redelivers_existing_turn_without_duplicate` | 重启对尚未/已经提交的 Input 都走实际 Channel ingress；原 Message 身份/seq 不变，只收束传输，不重跑模型或发送。 |
+| `mobile_restart_missing_session_keeps_visible_handoff`、`mobile_same_process_recovery_does_not_duplicate_live_owner` | 缺失 Session 不复活、不删除原行；分页越过 live owner 后继续处理，失败不遗留阻止重试的 claim。 |
+| `mobile_bus_close_retains_durable_handoff_for_next_boot`、`mobile_mark_pending_race_with_close_cannot_queue_after_shutdown` | 提交前取消/关闭保留附件与交接行，释放进程资源；durable lock 等待者不能在关闭后提交 Input。 |
+| `mobile_delete_failure_then_bus_close_keeps_durable_row`、`mobile_completion_cancellation_waits_for_exact_cleanup` | 已提交 Input 不撤销；取消等待收束，失败后关闭仍保留下一次启动的恢复证据。 |
+| `channel_worker_projects_and_closes_attachment_lease` | 新用例使用真实 ArtifactStore 导入与 Message yoyo，经过实际 Channel ingress 核对 artifact_ref、数据库引用、文件保留与 read lease 关闭。 |
+
+保留的 Session override 拒绝测试改走 `prepare_channel_input`；仍保护 durable handoff 与 envelope 的 Session 一致性。公开 `companion_mobile_receipt_contract` 保留原 Mobile storage/channel、有效 bus 测试和 mutant，再加入新输入与独立回复测试，没有缩减公开场景。完整生产启动、实时客户端和 Delivery 由后续层累计验收。
+
 ## 2026-09-04：移除固定测试预算门槛
 
 1080 项 Python、62 项 Web 和 72 个 Python 测试文件是 2026-09-02 清理的历史快照，不再是当前合同。删除固定数量检查、Python 保留清单和 Web 数量断言；CI 继续运行仓库实际存在的 Python 测试，Web runner 自动发现源目录下的 `.test.mjs` 文件。后续测试只按用户可观察回归、非平凡不变量、边界或具体 bug 保留，新增或删除不因数量本身失败。
@@ -72,3 +91,33 @@
 清理前恢复点：`/mnt/data/akasic-agent-backups/test-gate-one-third-20260902-before-clean/pre-hard-budget-71b27f5b.bundle`，SHA-256 `78c213310dc94c8ee5a16da65f8dd25c4dc0078aab7bb965cb772b91001ed7f5`。更早的完整测试归档为同目录 `test-and-gate-surface.tar.gz`。
 
 本地验证：预算检查为 `python_files=72 python_tests=1080 node_files=4`；最终等额交换后的 Python 全量为 `1075 passed, 5 skipped`（155.87 秒），Node 为 `62 passed`。Python/测试/SDK Pyright、TypeScript、control schema、Yoyo append-only、SDK 11 项测试、workflow YAML、Gate audit 和 `git diff --check` 均通过；受保护合同变化触发的 27 个公开场景也通过。Terra xhigh 独立复审提出的 fleet coverage、pairing/credential swap、full-process lifecycle owner 和活跃文档悬空引用均已修正，代码与文档 P0/P1 清零。提交后仍需远端 CI 对精确 head 验证。
+
+## 2026-09-07：旧执行图与插件文档清理
+
+### 清理范围与保留结果
+
+本批次只清理当前候选中已无生产消费者的旧执行图和与其绑定的文档入口：
+
+| 删除或退役的图 | 原因 | 当前承接 |
+|---|---|---|
+| `agent/core/passive_turn.py`、`agent/core/passive_support.py`、`agent/core/prompt_block.py`、`agent/core/response_parser.py`、`agent/core/runtime_support.py` | 被 Message → source → reply/react 的插件链替代，旧固定 Passive Turn 编排已无当前调用入口 | `plugins/sources/`、`plugins/conversation/`、`plugins/reply/`、`plugins/react/`、`plugins/context/`、`plugins/content/` |
+| `agent/lifecycle/` composition/facade/phase/types 及 `agent/plugin_composition/turn_lifecycle.py` | 删除固定 Before/After lifecycle 与 Turn 业务身份，避免第二套执行控制流 | `agent/plugin_composition/` 的 Context/Fiber/Task/Effect 与插件自身 Service |
+| `agent/retrieval/events.py`、`agent/retrieval/protocol.py`、旧 `agent/turn_events/observe.py` 接入 | retrieval/observe 旧事件不是当前 Message/Turn owner，也没有新 Core 发布证据 | `plugins/turn_projection/`、`plugins/akasha/` 及各自 typed signal |
+| Mobile 旧 stop/interrupt 注入、生产 `_Bus` 假设及其过渡辅助 | 真实 ChannelRuntimePorts、MessageCatalog 和 recoverer 已承接输入与恢复；旧队列模型会误导新入口 | `infra/mobile_realtime/`、`session/`、Channel/来源插件 |
+| 旧 Memory2/runtime helper 路由 | 退役能力不再进入当前插件组合；其历史数据仍按状态地图和恢复合同保留 | `plugins/compaction/`、`plugins/markdown_memory/`、`plugins/akasha/` |
+
+`core.tool_catalog` 不是兼容残留：`agent/plugin_composition/tool_catalog.py` 的 `TOOL_CATALOG` 仍由 manager 提供，并在 snapshot generation、freeze、activation 和 lease 路径消费；它是 Core 内部组合服务。插件公开工具合同是 `plugins.tools` 的 `TOOLS`（`tools.v1`），不是这个内部 key。当前普通出站 owner 是 `plugins.delivery`，提供 `DELIVERY_SENDERS`、`DELIVERY`、`FINAL_OUTPUT_DELIVERY` 和 `DELIVERY_READ`；`agent/plugin_composition` 的 `DELIVERIES` / `DURABLE_DELIVERIES` 仍由 manager/static candidate view 提供，但当前生产插件不再 import，只有 manager、导出和测试保留它们。`AFTER_TURN_COMMITTED` 仍有当前定义与测试残留，外部 Observe/Proactive Feedback stable artifact 的迁移仍待完成；这些旧事件和兼容导出不能证明新 Core 会发布对应业务事实。
+
+### 写入集与恢复
+
+本次文档修正未修改数据库、yoyo、workspace、plugin-data、Android 源码、外部插件 checkout、安装 cache 或生成 bundle。此前 stacked code commits 可能包含各自 owner 的 yoyo 迁移；本句只描述本次文档写入集。删除代码不减少既有 Message、学习、附件、receipt 或 plugin-data。第 10 层已有分范围的 programmatic smoke、MC01 和 G5 证据；完整 MessageLog 启动与每周 lifecycle/restart probe 已由下方 clean run 验收，Android 配套、外部插件迁移和正式切换仍未验收。
+
+代码清理的实际历史是：`1492ce5f` 为 `7340e5a0` 的父提交，`7340e5a0` 删除旧 lifecycle/passive graph，随后 `576e8add` 删除旧 event/retrieval leaves。`5e1b1b93` 是 Message 行为与 Gate 元数据的候选基线，不是这些代码删除的恢复点；如需回放文档/行为候选，可将其作为参考提交，不能据此恢复已删除代码。文档修改前的逐文件恢复副本位于 `/tmp/akasic-agent-backups/docs-cleanup-20260907-before-edit/`，包含本批次涉及的六份文档。恢复时先停用候选运行时，再按 Git worktree 和文档副本逐项回放，不能触碰正式 workspace。验证至少包括 `git diff --check`、相对链接检查、旧入口搜索，以及与当前实现直接相关的文档/API路径核对。
+
+## 2026-09-07：MessageLog 第 10 层 Gate 分层
+
+- 当前候选已分别完成 programmatic control smoke、MC01 memory-context 和 G5 programmatic Message soak。它们各自验证来源接纳、MessageLog 追加/投影和受控失败边界；随后 clean run 又完成了完整 MessageLog 启动与 lifecycle/restart probe 验收。
+- MC01 在 admission 时显式传 `persist_memory=true`，并核对 `learning=eligible`；G5 soak 使用默认 `persist_memory=false`，并核对 `learning=excluded`。两种 Session 资格是有意分开的合同，不能把 G5 的默认排除写成 MC01 结果。
+- `agent/plugin_composition/tool_catalog.py` 的 `core.tool_catalog` 仍被 manager、snapshot generation、freeze、activation 和 lease 消费；active `content-source-interop.lock` 的 `emotion` revision `2bb332b7` 仍以该边界验收，公开插件/工具合同是 `tools.v1`，因此该 leaf 不能按名称相似或局部无调用就删除。
+- FrameBook 断线时移除 active route，将原始 `ConnectionError` 留给 live claim；RestartWatcher 先 `gate.prepare`，等待 Turn complete 后在 claim drain 与普通 delivery 之间分支，`gate.commit` 成功后才消费 programmatic claim。详细 owner 合同见 [消息日志设计](../design/0902-reviewed-v4.md) 与 [Linux 自重启设计](../design/linux-supervisor-safe-self-restart.md)。
+- clean Core `7189f19fb7ba385e37932e2d08c4c9a56c86942e` 的 run `20260907-182121-3efdcba6` 已通过完整启动与每周 lifecycle/restart probe：primary `103/103`（20 轮）、`unsupervised=true`、5 个 failure mode 全通过，`inside`/`unsupervised`/`failures`/`cleanup` 均为 0，残留 containers/networks/volumes 为空，`repositoriesUnchanged=true`。报告位于 `/mnt/data/coding/akasic-agent-worktrees/message-plugins-10-restart-probe/docker/debug/reports/restart/20260907-182121-3efdcba6/`，其中 `sourceDigest=sandboxAppDigest=a6de60971668fdabc0efc8a732050335f774d8e65c61177ab128f38330c44fbd`、`fileCount=1395`；完整 change-impact Gate 的最终提交与源码摘要由对应报告和 PR 记录。Android 原生配套、外部插件源码迁移、旧 workspace/历史效果转换和正式 workspace 演练仍是正式切换前提。

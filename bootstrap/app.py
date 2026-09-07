@@ -9,19 +9,15 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from agent.config import resolve_app_server_endpoint
-from agent.control.models import TurnRequest
-from agent.control.runtime import ConversationRuntime
 from agent.control.service import ControlService
 from agent.host_bridge.monitor import build_host_bridge_monitor
 from agent.host_bridge.monitor import claim_host_bridge_boot
-from agent.restart import RestartCoordinator
+from agent.restart import RestartGate
 from agent.config_models import Config
 from bootstrap.channel_host import ChannelHost
-from bootstrap.channel_presentation import ChannelTurnPresentationBridge
 from bootstrap.channels import start_channels
 from bootstrap.chat_api import build_chat_server
 from bootstrap.cleanup import run_cleanup_steps
-from bootstrap.control_execution import execute_control_turn
 from bootstrap.dashboard_api import build_dashboard_server
 from bootstrap.web_runtime import (
     chat_socket_path,
@@ -29,7 +25,6 @@ from bootstrap.web_runtime import (
     prepare_runtime_socket,
 )
 from bootstrap.runtime_readiness import RuntimeReadiness
-from bootstrap.passive_worker import PassiveMessageWorker
 from bootstrap.tools import CoreRuntime, build_core_runtime
 from bootstrap.workspace_lock import WorkspaceInstanceLock
 from bootstrap.workspace_token import ensure_workspace_token
@@ -176,29 +171,21 @@ class AppRuntime:
         config: Config,
         workspace: Path,
         *,
-        restart_coordinator: RestartCoordinator | None = None,
+        restart_gate: RestartGate | None = None,
         readiness: RuntimeReadiness | None = None,
     ) -> None:
         self.config = config
         self.workspace = workspace
-        self.restart_coordinator = restart_coordinator
+        self.restart_gate = restart_gate
         self.readiness = readiness
         self.http_resources = SharedHttpResources()
         self.app_server: SocketAppServer | None = None
-        self.conversation_runtime: ConversationRuntime | None = None
         self.control_service: ControlService | None = None
         self.plugin_turn_rollout: TurnPluginRollout | None = None
-        self.passive_worker: PassiveMessageWorker | None = None
         self.channel_host: ChannelHost | None = None
-        self.channel_presentation: ChannelTurnPresentationBridge | None = None
         self.core: CoreRuntime | None = None
-        self.agent_loop = None
         self.bus = None
         self.event_bus: EventBus | None = None
-        self.tools = None
-        self.push_tool = None
-        self.session_manager = None
-        self.presence = None
         self.dashboard_server = None
         self.dashboard_task: asyncio.Task[None] | None = None
         self.chat_server = None
@@ -229,11 +216,7 @@ class AppRuntime:
             if claim is not None and self.readiness is not None:
                 self.readiness.mark_stage("host_bridge.owner")
             configure_default_shared_http_resources(self.http_resources)
-            core_kwargs = (
-                {"restart_coordinator": self.restart_coordinator}
-                if self.restart_coordinator is not None
-                else {}
-            )
+            core_kwargs = {"restart_gate": self.restart_gate} if self.restart_gate is not None else {}
             self.core = build_core_runtime(
                 self.config,
                 self.workspace,
@@ -241,129 +224,31 @@ class AppRuntime:
                 **core_kwargs,
                 clear_stale_session_admissions=True,
             )
-            self.agent_loop = self.core.loop
             self.bus = self.core.bus
             event_bus = self.core.event_bus
             self.event_bus = event_bus
-            self.channel_presentation = ChannelTurnPresentationBridge(event_bus)
-            self.tools = self.core.tools
-            self.push_tool = self.core.push_tool
-            self.session_manager = self.core.session_manager
-            self.presence = self.core.presence
-
-            async def _execute_control_request(request: TurnRequest):
-                assert self.agent_loop is not None
-                return await execute_control_turn(
-                    self.agent_loop,
-                    event_bus,
-                    request,
-                )
-
-            manager = getattr(self.core, "plugin_manager", None)
-            if manager is None:
-                await self.core.start()
-                raise RuntimeError("插件 Runtime 不可用")
-            self.plugin_turn_rollout = TurnPluginRollout(
-                manager,
-                workspace=self.workspace,
-                uninstall=self._uninstall_plugin,
-            )
-            assert self.agent_loop is not None
-            self.agent_loop.bind_plugin_rollout_fact_provider(
-                self.plugin_turn_rollout.consume_fact
-            )
-            self.conversation_runtime = ConversationRuntime(
-                self.session_manager.control_store,
-                _execute_control_request,
-                restart_coordinator=self.restart_coordinator,
-                turn_terminal=self.plugin_turn_rollout.turn_terminal,
-            )
-            if self.restart_coordinator is not None:
-                self.restart_coordinator.bind_admission(
-                    quiesce=self.conversation_runtime.quiesce_for_restart,
-                    resume=self.conversation_runtime.resume_after_restart_cancel,
-                )
-            self.core.bind_conversation_runtime(self.conversation_runtime)
+            manager = self.core.plugin_manager
             await self.core.start()
             if self.readiness is not None:
                 self.readiness.mark_stage("core.ready")
             app_server_endpoint: str | None = None
             workspace_token: str | None = None
             if self.config.app_server.enabled:
-                app_server_endpoint = resolve_app_server_endpoint(
-                    self.config.app_server.listen,
-                    self.workspace,
-                )
+                app_server_endpoint = resolve_app_server_endpoint(self.config.app_server.listen, self.workspace)
                 if is_tcp_endpoint(app_server_endpoint):
                     workspace_token = ensure_workspace_token(self.workspace)
-            self.control_service = ControlService(
-                self.conversation_runtime,
-                self.session_manager,
-                self.workspace,
-                plugin_drain=self._disable_and_drain_plugin,
-                plugin_uninstall=self._uninstall_plugin,
-                plugin_uninstall_register=self._register_plugin_uninstall,
-                plugin_install=self._install_plugin,
-                plugin_revert=self._revert_plugin_operation,
-                plugin_turn_barrier=self.plugin_turn_rollout.wait_for_turn_boundary,
-                plugin_child_binding=lambda capability, consume: (
-                    self.plugin_turn_rollout.child_binding(
-                        capability,
-                        consume,
-                    )
-                    if self.plugin_turn_rollout is not None
-                    else None
-                ),
-                plugin_status=self._plugin_status,
-                plugin_promote=self._promote_plugin,
-                plugin_discard=self._discard_plugin,
-                workspace_token=workspace_token,
-                restart_coordinator=self.restart_coordinator,
+            from bootstrap.app_server import build_control_service
+            from bootstrap.reply_status import RuntimeReplyStatus
+            from session.log import MessageCatalog
+
+            self.control_service = build_control_service(
+                self.core, workspace_token=workspace_token,
                 boot_id=self.readiness.boot_id if self.readiness else None,
                 ready=(lambda: self.readiness.ready) if self.readiness else None,
             )
             channel_attachment_store = self.core.channel_attachment_store
-            if channel_attachment_store is None:
-                raise RuntimeError("Core channel attachment store 未初始化")
-            self.passive_worker = PassiveMessageWorker(
-                self.bus,
-                self.conversation_runtime,
-                self.agent_loop,
-                attachment_store=channel_attachment_store,
-                channel_dispatcher=(
-                    lambda message, passive: self.push_tool.dispatch(
-                        message,
-                        commit_role="passive" if passive else "",
-                    )
-                ),
-            )
-
-            # 1. v3 control 始终通过 exact Channel binding 中断并回送收据。
-            async def interrupt_v3_channel(raw: Any) -> str:
-                assert self.conversation_runtime is not None
-                result = self.conversation_runtime.request_interrupt(
-                    raw.session_key,
-                    sender=raw.message.sender,
-                    command=raw.message.content,
-                )
-                return result.status
-
-            async def dispatch_v3_control_response(
-                envelope: Any,
-                binding: Any,
-            ) -> Any:
-                return await self.bus.publish_channel_outbound_awaited(
-                    envelope,
-                    binding,
-                    passive=True,
-                )
-
-            manager.channel_generation_host.bind_control_interrupter(
-                interrupt_v3_channel
-            )
-            manager.channel_generation_host.bind_control_response_dispatcher(
-                dispatch_v3_control_response
-            )
+            messages = MessageCatalog(self.core.message_log)
+            reply_status = RuntimeReplyStatus(manager.snapshot_store).follow
             if self.config.app_server.enabled:
                 assert app_server_endpoint is not None
                 self.app_server = SocketAppServer(
@@ -413,7 +298,7 @@ class AppRuntime:
                     self.config.mobile_realtime,
                     self.workspace,
                 )
-                self.bus.bind_durable_inbound_store(self.session_manager.control_store)
+                self.mobile_gateway_runtime.channel.bind_messages(messages, reply_status)
                 self.mobile_gateway_runtime.channel.bind_runtime_inspection(
                     runtime_inspection
                 )
@@ -425,6 +310,9 @@ class AppRuntime:
                 self.mobile_gateway_runtime.channel.bind_model_catalog(
                     model_catalog_reader
                 )
+                if model_control is None:
+                    raise RuntimeError("Mobile Gateway 启动需要模型调用统计")
+                self.mobile_gateway_runtime.channel.bind_model_stats(model_control.call_stats)
                 if plugin_ui_provider is not None:
                     self.mobile_gateway_runtime.channel.bind_mobile_ui_provider(
                         plugin_ui_provider
@@ -441,6 +329,7 @@ class AppRuntime:
 
                     self.web_chat_channel = WebChatChannel()
                     self.web_chat_channel.bind_artifact_store(channel_attachment_store)
+                    self.web_chat_channel.bind_message_readers(messages, reply_status)
                 extra_channels.append(
                     AkashicChannel(
                         web=self.web_chat_channel,
@@ -465,12 +354,11 @@ class AppRuntime:
             self.channel_host = await start_channels(
                 self.config,
                 bus=self.bus,
-                session_manager=self.session_manager,
-                push_tool=self.push_tool,
+                workspace=self.workspace,
+                identities=self.core.identities,
                 http_resources=self.http_resources,
                 event_bus=event_bus,
                 command_catalog_provider=command_catalog_provider,
-                interrupt_controller=self.conversation_runtime,
                 extra_channels=extra_channels,
             )
             if plugin_manager is not None:
@@ -482,15 +370,28 @@ class AppRuntime:
                         for channel in self.channel_host.channels
                     )
                 )
+            # 对账只读取 exact 注册名；缺少出站时不能先启动外部收件。
+            if self.channel_host.required_delivery_senders:
+                from agent.plugins.snapshot import lease_runtime_snapshot
+                from plugins.delivery.senders import DELIVERY_SENDERS
+
+                async with lease_runtime_snapshot(manager.snapshot_store) as snapshot:
+                    available = snapshot.composition_root.context.require(DELIVERY_SENDERS).registered_names()
+                    missing = set(self.channel_host.required_delivery_senders) - set(available)
+                if missing:
+                    raise RuntimeError("收件渠道缺少已启用的同名 Sender：" + ", ".join(sorted(missing)))
             await self.channel_host.start_all()
+            # 渠道已打开 exact ingress 后恢复 Input；不依赖回复 worker。
+            await self.bus.recover_durable_inbounds()
             if self.readiness is not None:
                 self.readiness.mark_stage("channels.ready")
             if plugin_manager is None:
                 raise RuntimeError("插件 Runtime 不可用")
             plugin_manager.bind_endpoint_switcher(self._swap_plugin_endpoints)
+            # 正式 lifecycle 完成后才公布 runtime ready；一次调度机会不等于启动完成。
+            await plugin_manager.start_runtime()
 
             self.tasks = [
-                self.passive_worker.run(),
                 self.bus.dispatch_outbound(),
                 plugin_manager.run_runtime_services(),
             ]
@@ -536,6 +437,8 @@ class AppRuntime:
                     web_ui_provider=web_ui_provider,
                     model_catalog_reader=model_catalog_reader,
                     model_control=model_control,
+                    messages=messages,
+                    reply_status=reply_status,
                 )
                 self.chat_task = asyncio.create_task(
                     self.chat_server.serve(),
@@ -746,22 +649,6 @@ class AppRuntime:
                     (
                         self.control_service.shutdown
                         if self.control_service
-                        else _noop_async
-                    ),
-                ),
-                (
-                    "conversation_runtime.shutdown",
-                    (
-                        self.conversation_runtime.shutdown
-                        if self.conversation_runtime
-                        else _noop_async
-                    ),
-                ),
-                (
-                    "channel_presentation.aclose",
-                    (
-                        self.channel_presentation.aclose
-                        if self.channel_presentation
                         else _noop_async
                     ),
                 ),
@@ -1010,12 +897,12 @@ def build_app_runtime(
     config: Config,
     workspace: Path,
     *,
-    restart_coordinator: RestartCoordinator | None = None,
+    restart_gate: RestartGate | None = None,
     readiness: RuntimeReadiness | None = None,
 ) -> AppRuntime:
     return AppRuntime(
         config,
         workspace,
-        restart_coordinator=restart_coordinator,
+        restart_gate=restart_gate,
         readiness=readiness,
     )

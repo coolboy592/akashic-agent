@@ -4,186 +4,27 @@ import asyncio
 import hashlib
 import json
 import subprocess
-import sys
 import threading
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
-import certifi
 import pytest
+from akashic_sdk import ConnectionClosedError
 
-from agent.control.context import mint_plugin_child_capability
-from agent.control.models import TurnRequest
-from agent.control.ports import ControlExecutionResult
-from agent.control.runtime import ConversationRuntime
-from agent.control.service import ControlService
 from agent.plugins.artifacts import read_pointers, resolve_pointer
+from agent.plugins.generation import PluginGeneration
 from agent.plugins.manager import PluginManager
 from agent.plugins.install import PluginInstallResult, install_git_plugin
+from agent.plugins.install import finalize_uninstall_plugin, set_installed_plugin_enabled
 from agent.plugins.reload_journal import ReloadJournal
-from agent.plugins.turn_rollout import TurnPluginRollout
 from agent.tools.registry import ToolRegistry
+from agent.control.client import ControlClient
+from agent.control.service import ControlService
 from bootstrap.app import AppRuntime
 from bus.event_bus import EventBus
-from session.manager import SessionManager
-
-
-@pytest.mark.asyncio
-async def test_turn_owned_candidate_promotes_after_exact_child(
-    tmp_path: Path,
-) -> None:
-    """Run the real parent-child rollout through snapshot, journal, and pointer owners."""
-
-    # 1. Build one stable Root and one immutable candidate with Tool and Skill assets.
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
-    builtin = tmp_path / "builtin" / "baseline"
-    _write_v3_plugin(builtin, name="baseline")
-    source = tmp_path / "candidate"
-    _write_tool_skill_plugin(source)
-    _commit(source)
-    event_bus = EventBus()
-    sessions = SessionManager(workspace)
-    manager = PluginManager(
-        plugin_dirs=[builtin.parent],
-        event_bus=event_bus,
-        tool_registry=ToolRegistry(),
-        session_manager=sessions,
-        workspace=workspace,
-        installed_cache_root=tmp_path / "plugins-home" / "cache",
-    )
-    await manager.load_all()
-    stable = manager.current_snapshot
-    assert stable is not None and stable.composition_root is not None
-
-    async def uninstall(_plugin_id: str) -> dict[str, object]:
-        raise AssertionError("install promotion must not call uninstall")
-
-    rollout = TurnPluginRollout(manager, workspace=workspace, uninstall=uninstall)
-    parent_release = asyncio.Event()
-    installed = asyncio.Event()
-    install_result: PluginInstallResult | None = None
-    install_status: dict[str, object] | None = None
-    seen_snapshots: dict[str, object] = {}
-
-    async def execute(request: TurnRequest) -> ControlExecutionResult:
-        nonlocal install_result, install_status
-        selector = cast(Any, request.metadata.get("runtime", "stable"))
-        lease = manager.snapshot_store.lease(selector=selector)
-        async with lease as snapshot:
-            assert snapshot.composition_root is not None
-            seen_snapshots[request.input] = snapshot
-            if request.input == "install candidate":
-                turn_id = str(request.metadata["turnId"])
-                install_result, install_status = await rollout.install(
-                    turn_id,
-                    source=str(source),
-                    marketplace="lab",
-                    ref_name="",
-                    sparse_paths=[],
-                )
-                installed.set()
-                await parent_release.wait()
-            return ControlExecutionResult(response="ok")
-
-    runtime = ConversationRuntime(
-        sessions.control_store,
-        execute,
-        turn_terminal=rollout.turn_terminal,
-    )
-    service = ControlService(
-        runtime,
-        sessions,
-        workspace,
-        plugin_child_binding=rollout.child_binding,
-        plugin_turn_barrier=rollout.wait_for_turn_boundary,
-    )
-    parent_handle = None
-    child_handle = None
-    try:
-        # 2. The real parent Turn owns install while retaining its stable lease.
-        parent_thread = service.start_thread({})
-        parent_thread_id = str(parent_thread["id"])
-        parent_handle = await service.start_turn(
-            parent_thread_id,
-            "install candidate",
-            {},
-        )
-        await asyncio.wait_for(installed.wait(), timeout=10)
-        assert install_result is not None and install_status is not None
-        candidate = manager.latest_snapshot
-        assert candidate is not None and candidate is not stable
-        assert seen_snapshots["install candidate"] is stable
-
-        # 3. Reserve and consume the registered one-shot capability through Control.
-        capability = mint_plugin_child_capability(parent_handle.id)
-        assert capability
-        child_thread = service.start_thread(
-            {},
-            plugin_rollout_capability=capability,
-        )
-        child_thread_id = str(child_thread["id"])
-        child_handle = await service.start_turn(
-            child_thread_id,
-            "check candidate",
-            {},
-            attached=True,
-        )
-        child_result = await child_handle.result()
-        assert child_result.status.value == "completed"
-        await runtime.wait_thread_available(child_thread_id)
-        assert seen_snapshots["check candidate"] is candidate
-
-        # 4. No revert plus a normal parent terminal is the sole commit grant.
-        parent_release.set()
-        parent_result = await parent_handle.result()
-        assert parent_result.status.value == "completed"
-        await runtime.wait_thread_available(parent_thread_id)
-        await rollout.wait_for_turn_boundary()
-        await manager.snapshot_store.retry_drains()
-
-        assert manager.current_snapshot is candidate
-        assert manager.latest_snapshot is candidate
-        assert manager.ready_candidate is None
-        assert "已经成功提交" in rollout.consume_fact()
-
-        # 5. Verify durable recovery facts, not only in-memory publication state.
-        tx_id = str(install_status["candidate_reload_tx_id"])
-        journal = ReloadJournal(workspace)
-        record = journal.get(tx_id)
-        assert record.phase == "complete"
-        events = journal.events(tx_id)
-        details = [event.details for event in events]
-        assert any(item.get("event") == "turn_operation_registered" for item in details)
-        assert any(
-            item.get("event") == "candidate_child_terminal"
-            and item.get("identity_match") is True
-            and item.get("candidate_checked") is True
-            for item in details
-        )
-        assert "promoting" in [event.phase for event in events]
-        assert "committed" in [event.phase for event in events]
-
-        plugin_base = install_result.installed_path.parents[1]
-        pointers = read_pointers(plugin_base)
-        assert pointers is not None and pointers.stable == pointers.latest
-        active = manager.generation("candidate@lab")
-        assert active is not None
-        assert resolve_pointer(plugin_base, pointers.stable) == active.plugin_dir
-    finally:
-        parent_release.set()
-        for handle in (child_handle, parent_handle):
-            if handle is not None and handle.record()["status"] == "in_progress":
-                _ = await handle.result()
-        await service.shutdown()
-        await rollout.shutdown()
-        await runtime.shutdown()
-        if manager.ready_candidate is not None:
-            await manager.drop_candidate("candidate@lab")
-        await manager.terminate_all()
-        sessions.close()
-        await event_bus.aclose()
+from infra.control.socket import SocketAppServer
+from session.log import MessageCatalog, MessageLog
 
 
 @pytest.mark.asyncio
@@ -256,6 +97,7 @@ async def test_installed_mcp_update_keeps_old_artifact_until_lease_drains(
     old_generation = old_lease.snapshot.generations[plugin_id]
     old_runtime = _composition_runtime(manager, old_generation)
     old_server = _mcp_server(old_runtime)
+    old_ca_bundle = _runtime_ca_bundle(old_generation)
 
     try:
         # 1. 同版本提交新 revision，并等待真实 latest MCP 可租用。
@@ -287,8 +129,8 @@ async def test_installed_mcp_update_keeps_old_artifact_until_lease_drains(
                 "workspace",
             )
         } == {
-            "artifact": str(old_artifact),
-            "ca_bundle": str(_runtime_ca_bundle(old_artifact)),
+            "artifact": str(old_generation.code_dir),
+            "ca_bundle": str(old_ca_bundle),
             "ca_certificates": old_probe["ca_certificates"],
             "data_dir": str(
                 tmp_path / "workspace" / "plugin-data" / "runtime_mcp-lab"
@@ -298,10 +140,11 @@ async def test_installed_mcp_update_keeps_old_artifact_until_lease_drains(
         }
         assert int(old_probe["ca_certificates"]) > 0
         assert isinstance(old_probe["pid"], int)
-        assert latest_probe["artifact"] == str(new_artifact)
+        assert latest_probe["artifact"] == str(latest_generation.code_dir)
         assert "runtime/plugin-validation" in str(latest_probe["data_dir"])
         assert latest_probe["pid"] != old_probe["pid"]
         assert latest_probe["runtime_version"] == "v2"
+        assert latest_probe["ca_bundle"] != str(old_ca_bundle)
 
         # 3. 候选 lease 排空后，promotion 必须等待旧 stable lease 排空。
         candidate_snapshot = latest_lease.snapshot
@@ -333,6 +176,7 @@ async def test_installed_mcp_update_keeps_old_artifact_until_lease_drains(
         data_path = Path(str(updated["dataPath"]))
         _ = await app._uninstall_plugin(plugin_id)
         assert not plugin_base.exists()
+        assert old_ca_bundle.is_file()
         assert data_path.is_dir()
     finally:
         for lease in (latest_lease, promoted_lease, old_lease):
@@ -340,6 +184,99 @@ async def test_installed_mcp_update_keeps_old_artifact_until_lease_drains(
                 await lease.release()
         if manager.ready_candidate is not None:
             await manager.drop_candidate(plugin_id)
+        await manager.terminate_all()
+        await bus.aclose()
+
+
+@pytest.mark.asyncio
+async def test_socket_uninstall_waits_for_old_lease_after_client_disconnects(
+    tmp_path: Path,
+) -> None:
+    """真实控制 socket 的卸载操作由服务 owner 持续到旧代排空。"""
+
+    _source, manager, _app, bus, old_artifact = await _start_runtime_mcp(tmp_path)
+    plugin_id = "runtime_mcp@lab"
+    production_data = tmp_path / "workspace" / "plugin-data" / "runtime_mcp-lab"
+    production_marker = production_data / "retained.json"
+    production_marker.write_text('{"keep": true}\n', encoding="utf-8")
+    old_lease = manager.snapshot_store.lease()
+    started = asyncio.Event()
+    finished = asyncio.Event()
+    outcome: dict[str, object] = {}
+
+    async def uninstall(plugin: str) -> dict[str, object]:
+        assert plugin == plugin_id
+        _ = set_installed_plugin_enabled(
+            plugin, enabled=False, plugins_home=manager.installed_plugins_home,
+        )
+        started.set()
+        try:
+            await manager.reconcile_disabled_and_drain(plugin)
+            cache_path, data_path = finalize_uninstall_plugin(
+                plugin,
+                workspace=tmp_path / "workspace",
+                plugins_home=manager.installed_plugins_home,
+            )
+            outcome.update({
+                "plugin_id": plugin,
+                "cache_path": str(cache_path),
+                "data_path": str(data_path),
+            })
+            return outcome
+        finally:
+            finished.set()
+
+    message_log = MessageLog(tmp_path / "workspace" / "sessions.db")
+
+    async def reject_accept(_session, _message_id, _incoming):
+        raise AssertionError("卸载测试不应接纳消息")
+
+    async def no_reply_status(_session):
+        if False:
+            yield {}
+
+    service = ControlService(
+        MessageCatalog(message_log),
+        tmp_path / "workspace",
+        accept=reject_accept,
+        reply_status=no_reply_status,
+        attachments=lambda _ids: (),
+        plugin_uninstall=uninstall,
+    )
+    server = SocketAppServer(tmp_path / "control.sock", service)
+    await server.start()
+    request_task: asyncio.Task[object] | None = None
+    try:
+        client = await ControlClient.connect(str(server.endpoint))
+        request_task = asyncio.create_task(
+            client.request("plugin/uninstall", {"plugin_id": plugin_id})
+        )
+        await asyncio.wait_for(started.wait(), 5)
+        await asyncio.sleep(0)
+        assert not request_task.done()
+        assert old_artifact.is_dir()
+
+        await client.close()
+        await asyncio.sleep(0)
+        assert not finished.is_set()
+        assert request_task.done()
+        with pytest.raises(ConnectionClosedError, match="server closed connection"):
+            request_task.result()
+
+        await old_lease.release()
+        await asyncio.wait_for(finished.wait(), 10)
+        assert outcome["plugin_id"] == plugin_id
+        assert not old_artifact.exists()
+        assert production_marker.read_text(encoding="utf-8") == '{"keep": true}\n'
+    finally:
+        if request_task is not None and not request_task.done():
+            request_task.cancel()
+            await asyncio.gather(request_task, return_exceptions=True)
+        if old_lease.active:
+            await old_lease.release()
+        await server.stop()
+        await service.shutdown()
+        message_log.close()
         await manager.terminate_all()
         await bus.aclose()
 
@@ -432,14 +369,15 @@ async def test_mcp_hot_reload_oracle_rejects_deleted_old_ca_bundle(
     old_generation = old_lease.snapshot.generations[plugin_id]
     old_runtime = _composition_runtime(manager, old_generation)
     old_server = _mcp_server(old_runtime)
+    old_ca_bundle = _runtime_ca_bundle(old_generation)
 
     try:
-        # 1. 建立新 latest 后模拟旧安装器提前删除 CA bundle。
+        # 1. 建立新 latest 后模拟旧环境材料丢失。
         _write_runtime_mcp_source(source, runtime_version="v2")
         _commit_all(source, "runtime-v2")
         _ = await app._install_plugin(str(source), "lab", "", [])
         latest_lease = manager.snapshot_store.lease(selector="latest")
-        _runtime_ca_bundle(old_artifact).unlink()
+        old_ca_bundle.unlink()
 
         # 2. 旧 MCP 在调用时才读取路径，oracle 必须命中原事故而不是静默切新代。
         error_result = await old_server.route().call("probe", {})
@@ -450,6 +388,7 @@ async def test_mcp_hot_reload_oracle_rejects_deleted_old_ca_bundle(
         latest_runtime = _composition_runtime(manager, latest_generation)
         latest_probe = await _call_runtime_probe(_mcp_server(latest_runtime))
         assert latest_probe["runtime_version"] == "v2"
+        assert latest_probe["ca_bundle"] != str(old_ca_bundle)
     finally:
         if latest_lease is not None and latest_lease.active:
             await latest_lease.release()
@@ -575,7 +514,7 @@ async def _start_runtime_mcp(
 
 
 def _write_runtime_mcp_source(source: Path, *, runtime_version: str) -> None:
-    """写入在每次工具调用时解析 artifact 内 CA bundle 的 MCP 插件。"""
+    """写入每次调用都读取实际 Python 环境 CA 的 MCP 插件。"""
 
     # 1. 插件版本保持不变，用 server 内容变化制造同版本新 revision。
     source.mkdir(parents=True, exist_ok=True)
@@ -614,7 +553,7 @@ def _write_runtime_mcp_source(source: Path, *, runtime_version: str) -> None:
 
     # 2. server 不缓存文件内容，确保更新后的调用会触发旧绝对路径读取。
     _ = (source / "mcp" / "server.py").write_text(
-        "import json, os, ssl, sys\n"
+        "import certifi, json, os, ssl, sys\n"
         "from pathlib import Path\n"
         f"RUNTIME_VERSION = {runtime_version!r}\n"
         "ARTIFACT = Path(__file__).resolve().parent.parent\n"
@@ -640,9 +579,7 @@ def _write_runtime_mcp_source(source: Path, *, runtime_version: str) -> None:
         "        elif method == 'tools/list':\n"
         "            result = {'tools': TOOLS}\n"
         "        elif method == 'tools/call':\n"
-        "            py_version = f'python{sys.version_info.major}.{sys.version_info.minor}'\n"
-        "            ca_bundle = ARTIFACT / 'mcp' / '.venv' / 'lib' / py_version / "
-        "'site-packages' / 'certifi' / 'cacert.pem'\n"
+        "            ca_bundle = Path(certifi.where())\n"
         "            context = ssl.create_default_context(cafile=str(ca_bundle))\n"
         "            probe = {'artifact': str(ARTIFACT), 'ca_bundle': str(ca_bundle), "
         "'data_dir': os.environ.get('AKA_PLUGIN_DATA_DIR', ''), "
@@ -657,9 +594,6 @@ def _write_runtime_mcp_source(source: Path, *, runtime_version: str) -> None:
         "    print(json.dumps(response), flush=True)\n",
         encoding="utf-8",
     )
-    ca_bundle = _runtime_ca_bundle(source)
-    ca_bundle.parent.mkdir(parents=True, exist_ok=True)
-    _ = ca_bundle.write_bytes(Path(certifi.where()).read_bytes())
     _ = (source / "akashic.plugin.toml").write_text(
         "schema_version = 1\n"
         "name = \"runtime_mcp\"\n"
@@ -677,20 +611,16 @@ def _write_runtime_mcp_source(source: Path, *, runtime_version: str) -> None:
     )
 
 
-def _runtime_ca_bundle(root: Path) -> Path:
-    """返回与 PATH 实际启动的 MCP Python 版本一致的 certifi 路径。"""
-
-    python_dir = f"python{sys.version_info.major}.{sys.version_info.minor}"
-    return (
-        root
-        / "mcp"
-        / ".venv"
-        / "lib"
-        / python_dir
-        / "site-packages"
-        / "certifi"
-        / "cacert.pem"
+def _runtime_ca_bundle(generation: PluginGeneration) -> Path:
+    """从启动命令固定的 interpreter 取得真实环境 CA，不猜测安装目录。"""
+    interpreter = dict(generation.static_runtime_commands)["mcp:runtime_probe"][0]
+    result = subprocess.run(
+        [interpreter, "-I", "-B", "-c", "import certifi; print(certifi.where())"],
+        capture_output=True,
+        text=True,
+        check=True,
     )
+    return Path(result.stdout.strip())
 
 
 def _directory_digest(root: Path) -> str:

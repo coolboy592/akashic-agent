@@ -61,6 +61,12 @@
 | [0053](0053-plugins-declare-managed-workloads.md) | accepted / implementing | 插件声明受管 Workload | RUN-016、PLG-017、WEBUI-008、WSP-006 |
 | [0054](0054-model-sync-refreshes-public-capabilities.md) | accepted / implementing | 模型同步刷新公共能力目录 | RUN-011、ONB-001、WSP-001 |
 | [0055](0055-host-bridge-uses-typed-protobuf.md) | accepted | Host Bridge 使用 typed Protobuf V2 | RUN-013～RUN-015、SH-001～SH-003 |
+| [0056](0056-plugin-update-crashes-return-to-stable.md) | accepted / implementing | 插件更新中进程死亡时恢复旧指针，不续跑候选 | PLG-010、PLG-013、RUN-007 |
+| [0057](0057-internal-source-messages.md) | accepted | Subagent 与 Wake 保留完整内部消息 | SES-003～SES-005、MEM-001～MEM-002 |
+| [0058](0058-scheduler-keeps-internal-messages.md) | accepted | Scheduler 保留可恢复的内部消息 | SCH-001～SCH-003、SES-003～SES-005、MEM-001～MEM-002 |
+| [0059](0059-abandon-settles-tool-calls.md) | accepted | 明确放弃结算工具调用，不等待物理清理 | RUN-003、RUN-008、SES-003～SES-005、SH-002 |
+| [0060](0060-message-plugin-metadata.md) | accepted | 插件附加信息使用普通 Message metadata | SES-001、SES-003～SES-006、SES-009 |
+| [0061](0061-archive-stopped-legacy-executions.md) | accepted | 已停止旧执行完整归档，不自动续跑 | SES-001、SES-003、WSP-001、BAK-001 |
 
 ## 新增规则
 
@@ -68,3 +74,5 @@
 2. 写明状态、日期、背景、决定、理由、影响、验收和关联条款。
 3. 旧决定被推翻时保留原文件，新记录声明 `supersedes`，旧记录补 `superseded by`。
 4. 没有形成选择的讨论不进入这里；未完成动作写入 `NOW.md`。
+
+- [0057 · Subagent 与 Wake 保留完整内部消息](0057-internal-source-messages.md)：独立内部 Session 的保存、展示、投递和学习边界。

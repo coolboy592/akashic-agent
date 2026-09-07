@@ -5,28 +5,29 @@ import hashlib
 import os
 import threading
 from pathlib import Path
+from dataclasses import asdict
 
 import pytest
 from PIL import Image
 
 from agent.plugin_composition.channels import AttachmentKind, AttachmentRef
-from bootstrap.channel_attachment_import import import_channel_attachments
+from infra.channels.attachment_import import import_channel_attachments
 from bus.events import (
     AttachmentKind as LegacyAttachmentKind,
     ChannelAttachment,
 )
 from infra.channels.artifacts import ChannelAttachmentArtifactStore
-from session.store import SessionStore
+from session.artifact_store import ArtifactStore
 
 
 @pytest.fixture
 def stores(tmp_path: Path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    session_store = SessionStore(workspace / "sessions.db")
+    session_store = ArtifactStore(workspace / "sessions.db")
     artifact_store = ChannelAttachmentArtifactStore(
         workspace=workspace,
-        session_store=session_store,
+        metadata_store=session_store,
     )
     try:
         yield session_store, artifact_store
@@ -48,7 +49,7 @@ async def test_import_publishes_ready_metadata_and_verified_read_lease(stores) -
     record = session_store.get_attachment(ref.artifact_id)
     assert record is not None
     assert record.storage_key == f"uploads/artifacts/{ref.artifact_id}.bin"
-    assert record.state == "ready"
+    assert record.ref == ref
     assert not Path(record.storage_key).is_absolute()
 
     lease = await artifact_store.acquire(ref)
@@ -161,10 +162,10 @@ async def test_import_rejects_symlinked_artifact_parent_before_write(
     workspace.mkdir()
     outside.mkdir()
     os.symlink(outside, workspace / "uploads")
-    session_store = SessionStore(workspace / "sessions.db")
+    session_store = ArtifactStore(workspace / "sessions.db")
     artifact_store = ChannelAttachmentArtifactStore(
         workspace=workspace,
-        session_store=session_store,
+        metadata_store=session_store,
     )
     try:
         with pytest.raises(ValueError, match="符号链接"):
@@ -556,3 +557,90 @@ async def test_adopt_rejects_source_path_replacement_after_fd_open(
     report = session_store.validate_attachment_metadata_integrity()
     assert report.artifact_count == 0
     assert len(report.incomplete_import_ids) == 1
+
+
+@pytest.mark.asyncio
+async def test_model_artifact_projection_reads_verified_bytes_without_changing_original(
+    stores,
+):
+    import io
+    from plugins.models.content import load_artifacts, render_content
+    from session.message import ContentPart
+
+    session_store, artifact_store = stores
+    buffer = io.BytesIO()
+    Image.new("RGBA", (16, 12), (10, 20, 30, 150)).save(buffer, format="PNG")
+    original = buffer.getvalue()
+    ref = await artifact_store.import_bytes(
+        original,
+        kind=AttachmentKind.IMAGE,
+        filename="photo.png",
+        media_type="image/png",
+    )
+    before = session_store.get_attachment(ref.artifact_id)
+    loaded = await load_artifacts(artifact_store, (ref,), accepts_images=True)
+    rendered = render_content(
+        ContentPart("artifact_ref", ref.artifact_id), artifacts=loaded
+    )
+    assert ref.artifact_id in rendered[0]["text"]
+    assert rendered[1]["image_url"]["url"].startswith("data:image/png;base64,")
+    with pytest.raises(TypeError):
+        loaded[ref.artifact_id][1]["image_url"]["url"] = "changed"
+    text_only = await load_artifacts(artifact_store, (ref,), accepts_images=False)
+    assert len(text_only[ref.artifact_id]) == 1
+    assert "不接收图片" in text_only[ref.artifact_id][0]["text"]
+    assert ref.artifact_id in text_only[ref.artifact_id][0]["text"]
+    lease = await artifact_store.acquire(ref)
+    try:
+        assert await lease.read_bytes(max_bytes=len(original)) == original
+    finally:
+        await lease.aclose()
+    assert session_store.get_attachment(ref.artifact_id) == before
+    report = await artifact_store.validate_filesystem_integrity()
+    assert report.ready_count == 1
+    assert report.verified_bytes == len(original)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("sizes", "match"),
+    [
+        ([1] * 5, "每条消息最多可以添加 4 张图片"),
+        ([20 * 1024 * 1024 + 1], "单张图片不能超过 20MB"),
+        (
+            [10 * 1024 * 1024] * 3 + [10 * 1024 * 1024 + 1],
+            "每条消息的图片合计不能超过 40MB",
+        ),
+    ],
+)
+async def test_model_image_budget_rejects_before_acquiring_any_lease(
+    sizes: list[int],
+    match: str,
+) -> None:
+    from plugins.models.content import load_artifacts
+    from session.artifacts import AttachmentReadLease
+
+    refs = tuple(
+        AttachmentRef(
+            artifact_id=f"image-{index}",
+            kind=AttachmentKind.IMAGE,
+            filename=f"{index}.png",
+            media_type="image/png",
+            size_bytes=size,
+            sha256="a" * 64,
+        )
+        for index, size in enumerate(sizes)
+    )
+
+    class Reader:
+        def __init__(self) -> None:
+            self.acquire_calls = 0
+
+        async def acquire(self, ref: AttachmentRef) -> AttachmentReadLease:
+            self.acquire_calls += 1
+            raise AssertionError("image budget must be checked before acquire")
+
+    reader = Reader()
+    with pytest.raises(ValueError, match=match):
+        await load_artifacts(reader, refs, accepts_images=True)
+    assert reader.acquire_calls == 0

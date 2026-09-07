@@ -28,7 +28,6 @@ from pathlib import Path
 from typing import Any, cast
 
 from agent.config_models import QQGroupConfig
-from agent.looping.interrupt import InterruptController
 from agent.plugin_composition.channels import (
     AttachmentKind,
     AttachmentRef,
@@ -53,7 +52,6 @@ from bus.events_lifecycle import (
     TurnStarted,
 )
 from bus.queue import MessageBus
-from infra.channels.base import SessionIdentityIndex
 from infra.channels.contract import ChannelContext
 from infra.channels.delivery import deliver_message_parts
 from infra.channels.group_filter import (
@@ -63,7 +61,6 @@ from infra.channels.group_filter import (
 )
 from infra.channels.native_delivery import NativeChannelDeliveryAdapter
 from core.net.http import HttpRequester, RequestBudget, get_default_http_requester
-from session.manager import SessionManager
 
 # NcatBot 运行时产物（plugins、logs）放到用户目录，不污染项目目录
 _NCATBOT_DIR = Path.home() / ".akashic" / "ncatbot"
@@ -437,33 +434,24 @@ class QQChannel:
         self,
         bot_uin: str,
         bus: MessageBus,
-        session_manager: SessionManager,
+        workspace: Path,
         allow_from: list[str] | None = None,
         groups: list[QQGroupConfig] | None = None,
         websocket_open_timeout_seconds: float = 5.0,
         group_filter: GroupMessageFilter | None = None,
         http_requester: HttpRequester | None = None,
         event_bus: EventBus | None = None,
-        interrupt_controller: InterruptController | None = None,
     ) -> None:
         from ncatbot.core import BotClient
         from ncatbot.utils import ncatbot_config
 
         self._bus = bus
-        self._session_manager = session_manager
         self._bot_uin = bot_uin
         allowed_users = [str(user_id) for user_id in (allow_from or [])]
         self._allow_from: set[str] = set(allowed_users)
         self._websocket_open_timeout_seconds = float(websocket_open_timeout_seconds)
-        self._interrupt_controller = interrupt_controller
-        self._workspace = session_manager.workspace
+        self._workspace = workspace
         self._trace_actor_name_cache: str | None = None
-        self._identity_index = SessionIdentityIndex(
-            session_manager,
-            channel=_CHANNEL,
-            metadata_key="user_id",
-        )
-
         # group_id → QQGroupConfig
         self._groups: dict[str, QQGroupConfig] = {g.group_id: g for g in (groups or [])}
 
@@ -499,8 +487,6 @@ class QQChannel:
         (_NCATBOT_DIR / "plugins").mkdir(exist_ok=True)
         ncatbot_config.plugin.plugins_dir = str(_NCATBOT_DIR / "plugins")
 
-        # username（QQ 号字符串）→ chat_id 映射，供主动推送工具使用
-        self.user_map = self._identity_index.mapping
 
     def _is_allowed(self, user_id: str) -> bool:
         if not self._allow_from:
@@ -511,9 +497,7 @@ class QQChannel:
         if ctx is not None:
             self._bus = ctx.bus
             self._event_bus = ctx.event_bus
-            self._interrupt_controller = ctx.interrupt_controller
         self._main_loop = asyncio.get_running_loop()
-        self._identity_index.rebuild()
         self._bind_events()
 
         @cast(Any, self._bot.on_private_message())
@@ -528,15 +512,11 @@ class QQChannel:
 
             raw: str = event.raw_message
             text, img_urls = _extract_cq_images(raw)
-            if text.strip() == "/stop":
-                self._submit_to_main_loop(self._handle_stop_private(user_id), track=False)
-                return
             preview = text[:60] + "..." if len(text) > 60 else text
             logger.info(
                 f"[qq] 私聊消息  user_id={user_id}  内容: {preview!r}  图片: {len(img_urls)}"
             )
 
-            self.user_map[user_id] = user_id
 
             self._submit_to_main_loop(
                 self._handle_private(
@@ -572,12 +552,6 @@ class QQChannel:
 
             raw = strip_at_segments(event.raw_message)
             text, img_urls = _extract_cq_images(raw)
-            if text.strip() == "/stop":
-                self._submit_to_main_loop(
-                    self._handle_stop_group(group_id, user_id),
-                    track=False,
-                )
-                return
             preview = text[:60] + "..." if len(text) > 60 else text
             logger.info(
                 f"[qq] 群聊消息  group_id={group_id}  user_id={user_id}  内容: {preview!r}  图片: {len(img_urls)}"
@@ -834,17 +808,6 @@ class QQChannel:
             ports=ports,
         )
 
-    async def _handle_stop_private(self, user_id: str) -> None:
-        if self._interrupt_controller is None:
-            await self.send(user_id, "当前未启用中断功能。")
-            return
-        result = self._interrupt_controller.request_interrupt(
-            session_key=f"{_CHANNEL}:{user_id}",
-            sender=user_id,
-            command="/stop",
-        )
-        await self.send(user_id, result.message)
-
     async def _handle_group(
         self,
         group_id: str,
@@ -864,18 +827,6 @@ class QQChannel:
             message_id=message_id,
             event=event,
         )
-
-    async def _handle_stop_group(self, group_id: str, user_id: str) -> None:
-        chat_id = f"{_GROUP_PREFIX}{group_id}"
-        if self._interrupt_controller is None:
-            await self.send(chat_id, "当前未启用中断功能。")
-            return
-        result = self._interrupt_controller.request_interrupt(
-            session_key=f"{_CHANNEL}:{chat_id}",
-            sender=user_id,
-            command="/stop",
-        )
-        await self.send(chat_id, result.message)
 
     async def _send_private_trace(
         self,

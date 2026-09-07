@@ -46,13 +46,13 @@ class _FakeChatServer:
             await asyncio.sleep(0)
 
 
-def test_plugin_uninstall_passes_active_turn_owner(
+def test_plugin_uninstall_uses_runtime_control_request(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config_path = tmp_path / "config.toml"
     config_path.write_text("[runtime]\nworkspace='workspace'\n", encoding="utf-8")
-    calls: list[str] = []
+    calls: list[tuple[str, str, Path]] = []
 
     monkeypatch.setattr(
         main.Config,
@@ -68,33 +68,25 @@ def test_plugin_uninstall_passes_active_turn_owner(
     async def request(
         _endpoint: str,
         plugin_id: str,
-        _workspace: Path,
-        *,
-        owner_turn_id: str,
+        workspace: Path,
     ) -> dict[str, object]:
-        calls.append(owner_turn_id)
+        calls.append((_endpoint, plugin_id, workspace))
         return {
             "pluginId": plugin_id,
             "publicationState": "pending_turn_end",
         }
 
     monkeypatch.setattr(main, "_request_plugin_uninstall", request)
-    monkeypatch.delenv("AKASHIC_PLUGIN_ROLLOUT_OWNER_TURN", raising=False)
-    outside = main._uninstall_via_runtime(
-        str(config_path),
-        "context_pressure@github",
-        tmp_path / "workspace",
-    )
-    monkeypatch.setenv("AKASHIC_PLUGIN_ROLLOUT_OWNER_TURN", "turn:owner")
-    inside = main._uninstall_via_runtime(
+    result = main._uninstall_via_runtime(
         str(config_path),
         "context_pressure@github",
         tmp_path / "workspace",
     )
 
-    assert calls == ["", "turn:owner"]
-    assert outside["publicationState"] == "pending_turn_end"
-    assert inside["publicationState"] == "pending_turn_end"
+    assert calls == [
+        ("runtime.sock", "context_pressure@github", tmp_path / "workspace")
+    ]
+    assert result["publicationState"] == "pending_turn_end"
 
 
 def test_agent_turn_rejects_internal_plugin_commands(
@@ -148,8 +140,6 @@ def _dump_toml(data: dict, prefix: tuple[str, ...] = ()) -> list[str]:
 def _write_config(path: Path, socket_path: Path) -> None:
     payload = {
         "agent": {
-            "system_prompt": "test system prompt",
-            "max_iterations": 2,
             "plugins": {"disabled_builtin": ["akasha", "wake"]},
         },
         "app_server": {
@@ -157,21 +147,43 @@ def _write_config(path: Path, socket_path: Path) -> None:
         },
     }
     path.write_text("\n".join(_dump_toml(payload)).strip() + "\n", encoding="utf-8")
+    _ = workspace_init.init_workspace(config_path=path, workspace=path.parent)
 
 
-def test_load_config_keeps_internal_max_iterations_default(tmp_path: Path):
+def test_load_config_has_no_legacy_agent_fields(tmp_path: Path):
     config_path = tmp_path / "config.toml"
     config_path.write_text(
         """
 [agent]
-system_prompt = "test"
 """.strip() + "\n",
         encoding="utf-8",
     )
 
     cfg = load_config(config_path, workspace=tmp_path)
 
-    assert cfg.max_iterations == 10
+    assert not hasattr(cfg, "max_iterations")
+
+
+@pytest.mark.parametrize(
+    ("snippet", "owner"),
+    [
+        ('[agent]\nsystem_prompt = "old"', "prompt plugin"),
+        ("[agent]\nmax_iterations = 1", "reply max_steps"),
+        ("[agent.tools]\nsearch_enabled = true", "tool discovery"),
+        ("[agent]\ndev_mode = false", "no runtime owner"),
+        ('[agent.wiring]\ntoolsets = ["meta_common"]', "no runtime owner"),
+    ],
+)
+def test_load_config_rejects_retired_agent_fields(
+    tmp_path: Path,
+    snippet: str,
+    owner: str,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(snippet + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match=owner):
+        load_config(config_path, workspace=tmp_path)
 
 
 def test_load_config_has_no_pending_optimizer_config(tmp_path: Path):
@@ -179,7 +191,6 @@ def test_load_config_has_no_pending_optimizer_config(tmp_path: Path):
     config_path.write_text(
         """
 [agent]
-system_prompt = "test"
 """.strip() + "\n",
         encoding="utf-8",
     )
@@ -195,7 +206,6 @@ system_prompt = "test"
 def test_load_config_rejects_retired_pending_optimizer_keys(tmp_path: Path):
     config_path = tmp_path / "config.toml"
     config_path.write_text(
-        '[agent]\nsystem_prompt = "test"\n\n'
         "[agent.maintenance]\nmemory_optimizer_enabled = false\n",
         encoding="utf-8",
     )
@@ -208,9 +218,6 @@ def test_load_config_projects_generic_disabled_builtin_plugins(tmp_path: Path) -
     config_path = tmp_path / "config.toml"
     config_path.write_text(
         """
-[agent]
-system_prompt = "test"
-
 [agent.plugins]
 disabled_builtin = ["subagent", "scheduler"]
 """.strip() + "\n",
@@ -275,9 +282,6 @@ def test_config_load_resolves_channel_secret_from_explicit_workspace(
         (memory / "TG_TOKEN").write_text(token, encoding="utf-8")
     config_path.write_text(
         """
-[agent]
-system_prompt = "test"
-
 [channels.telegram]
 token = "${TG_TOKEN}"
 """.strip() + "\n",
@@ -461,24 +465,17 @@ async def test_serve_smoke_loads_config_and_runs_shutdown(monkeypatch, tmp_path)
         runtime = original_build_core_runtime(
             config, workspace, http_resources, **kwargs
         )
-        agent_loop = runtime.loop
         bus = runtime.bus
 
-        async def _agent_loop_run():
+        async def _runtime_task():
             return None
 
-        agent_loop.run = _agent_loop_run  # type: ignore[assignment]
-        monkeypatch.setattr(
-            bootstrap_app,
-            "PassiveMessageWorker",
-            lambda *args, **kwargs: types.SimpleNamespace(run=_agent_loop_run),
-        )
-        monkeypatch.setattr(bus, "dispatch_outbound", _agent_loop_run)
+        monkeypatch.setattr(bus, "dispatch_outbound", _runtime_task)
         assert runtime.plugin_manager is not None
         monkeypatch.setattr(
             runtime.plugin_manager,
             "run_runtime_services",
-            _agent_loop_run,
+            _runtime_task,
         )
         observed["bus"] = bus
         observed["http_resources"] = http_resources
@@ -556,10 +553,6 @@ async def test_shutdown_stops_mobile_channel_before_closing_gateway_storage(tmp_
 
     gateway = Gateway()
 
-    class ConversationRuntime:
-        async def shutdown(self) -> None:
-            events.append("conversation.shutdown")
-
     class ChannelHost:
         async def stop_all(self) -> None:
             assert gateway.closed is False
@@ -567,12 +560,11 @@ async def test_shutdown_stops_mobile_channel_before_closing_gateway_storage(tmp_
 
     runtime = bootstrap_app.AppRuntime(cast(Any, object()), tmp_path)
     runtime.mobile_gateway_runtime = gateway
-    runtime.conversation_runtime = cast(Any, ConversationRuntime())
     runtime.channel_host = cast(Any, ChannelHost())
 
     await runtime.shutdown()
 
-    assert events == ["conversation.shutdown", "channels.stop", "gateway.close"]
+    assert events == ["channels.stop", "gateway.close"]
 
 
 @pytest.mark.asyncio
@@ -900,7 +892,8 @@ def test_init_workspace_creates_expected_assets(tmp_path):
     assert any("embedding 模型" in step for step in summary.next_steps)
     assert not any("llm.main" in step for step in summary.next_steps)
     assert not any("memory.embedding" in step for step in summary.next_steps)
-    assert (workspace / "sessions.db").exists()
+    # 启动迁移完成后由 MessageLog owner 创建 canonical schema。
+    assert not (workspace / "sessions.db").exists()
     assert (workspace / "observe").is_dir()
     assert not (workspace / "memory" / "consolidation_writes.db").exists()
     assert not (workspace / "memory" / "journal").exists()
@@ -1055,11 +1048,7 @@ async def test_start_channels_wires_telegram_qq_and_extra_channel(
     monkeypatch.setitem(sys.modules, "infra.channels.telegram_channel", fake_telegram)
     monkeypatch.setitem(sys.modules, "infra.channels.qq_channel", fake_qq)
 
-    class _PushTool:
-        pass
-
     config = Config(
-        system_prompt="s",
         channels=ChannelsConfig(
             telegram=TelegramChannelConfig(token="tg-token", allow_from=["1"]),
             qq=QQChannelConfig(
@@ -1071,16 +1060,14 @@ async def test_start_channels_wires_telegram_qq_and_extra_channel(
     )
     resources = SharedHttpResources()
     event_bus = EventBus()
-    controller = object()
     host = await start_channels(
         config,
         bus=cast(Any, object()),
-        session_manager=cast(Any, types.SimpleNamespace(workspace=tmp_path)),
-        push_tool=cast(Any, _PushTool()),
+        workspace=tmp_path,
+        identities=cast(Any, object()),
         http_resources=resources,
         event_bus=event_bus,
         command_catalog_provider=lambda: (("shared", "统一目录"),),
-        interrupt_controller=cast(Any, controller),
         extra_channels=[cast(Any, _PluginChannel())],
     )
     try:
@@ -1089,11 +1076,11 @@ async def test_start_channels_wires_telegram_qq_and_extra_channel(
         telegram, qq, plugin = host.channels
         assert starts == ["telegram", "qq", "plugin"]
         assert telegram.kwargs["event_bus"] is event_bus
-        assert telegram.kwargs["interrupt_controller"] is controller
+        assert "interrupt_controller" not in telegram.kwargs
         assert telegram.kwargs["command_catalog_provider"]() == (
             ("shared", "统一目录"),
         )
-        assert qq.kwargs["interrupt_controller"] is controller
+        assert "interrupt_controller" not in qq.kwargs
         assert plugin.name == "plugin"
         assert attachment_roots == [tmp_path / "uploads"]
         assert mobile_catalogs == [[("shared", "统一目录")]]
@@ -1105,7 +1092,6 @@ async def test_start_channels_wires_telegram_qq_and_extra_channel(
 @pytest.mark.asyncio
 async def test_start_channels_skips_unfilled_optional_channels(tmp_path: Path) -> None:
     config = Config(
-        system_prompt="s",
         channels=ChannelsConfig(telegram=None, qq=None),
     )
     resources = SharedHttpResources()
@@ -1113,8 +1099,8 @@ async def test_start_channels_skips_unfilled_optional_channels(tmp_path: Path) -
         host = await start_channels(
             config,
             bus=cast(Any, object()),
-            session_manager=cast(Any, types.SimpleNamespace(workspace=tmp_path)),
-            push_tool=cast(Any, object()),
+            workspace=tmp_path,
+            identities=cast(Any, object()),
             http_resources=resources,
             event_bus=EventBus(),
         )

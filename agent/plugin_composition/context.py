@@ -13,7 +13,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
-from typing import Any, AsyncGenerator, TypeVar, cast
+from typing import TYPE_CHECKING, Any, AsyncGenerator, TypeVar, cast
 
 from agent.plugin_composition.effect import Effect, EffectSetup
 from agent.plugin_composition.diagnostics import (
@@ -46,6 +46,10 @@ from agent.plugin_composition.model import (
     TopologyFiberView,
     TopologyView,
 )
+
+if TYPE_CHECKING:
+    from agent.plugin_composition.overlay import CompositionSnapshotRoot
+
 
 T = TypeVar("T")
 R = TypeVar("R")
@@ -97,6 +101,7 @@ class _Provider:
     value: object
     owner: Fiber
     revision: int
+    binding_contributors: Callable[[], tuple[Context, ...]] | None = None
 
 
 @dataclass(slots=True)
@@ -156,12 +161,28 @@ class Context:
         lease = (
             current.fork()
             if current is not None
-            and current.snapshot.composition_root is self._root
+            and self._belongs_to_scope(current.snapshot.composition_root)
             else await self._root._acquire_runtime_scope()
         )
 
         async with RuntimeScope(lease):
             yield
+
+    def require_runtime_owner(self, key: ServiceKey[object], service: object) -> str:
+        """验证当前 scope 的实际服务与 Context，返回 Core 分配的插件 owner。"""
+        reject_executor_context_access()
+        from agent.plugins.snapshot import get_current_runtime_lease
+
+        lease = get_current_runtime_lease()
+        if lease is None or lease.snapshot.composition_root is None:
+            raise RuntimeError("授权需要实际 runtime scope")
+        root = lease.snapshot.composition_root
+        if root.context.require(key) is not service:
+            raise RuntimeError("授权服务不属于当前 runtime scope")
+        owner = root.context_owner(self)
+        if owner is None:
+            raise PermissionError("Context 不属于当前 runtime scope")
+        return owner
 
     def capture_runtime_scope(self) -> RuntimeScope:
         """Fork the exact scope bound to this callback for one detached operation."""
@@ -170,9 +191,15 @@ class Context:
         from agent.plugins.snapshot import get_current_runtime_lease
 
         current = get_current_runtime_lease()
-        if current is None or current.snapshot.composition_root is not self._root:
+        if current is None or not self._belongs_to_scope(current.snapshot.composition_root):
             raise RuntimeError("当前 task 未绑定此插件 Root 的 runtime scope")
         return RuntimeScope(current.fork())
+
+    def _belongs_to_scope(self, root: CompositionSnapshotRoot | None) -> bool:
+        """Overlay 按实际 Context 选择 generation，不能退回其底层旧 Root。"""
+        return root is self._root or (
+            root is not None and root.context_owner(self) is not None
+        )
 
     @property
     def runtime(self) -> PluginRuntime:
@@ -263,7 +290,9 @@ class Context:
             required_for_readiness=False,
         )
 
-    async def provide(self, key: ServiceKey[T], value: T) -> Effect:
+    async def provide(self, key: ServiceKey[T], value: T, *,
+                      binding_contributors: Callable[[], tuple[Context, ...]] | None = None) -> Effect:
+        """服务 owner 可声明归档时实际需要的动态注册 Context，生命周期随同一 Effect。"""
         reject_executor_context_access()
 
         async def setup() -> Callable[[], Awaitable[None]]:
@@ -271,6 +300,7 @@ class Context:
                 cast(ServiceKey[object], key),
                 value,
                 self._fiber,
+                binding_contributors=binding_contributors,
             )
 
             async def cleanup() -> None:
@@ -1163,6 +1193,30 @@ class CompositionRoot:
             if (runtime := provider.owner.runtime) is not None
         }
 
+    def binding_contributors(self, key: ServiceKey[object]) -> tuple[Context, ...]:
+        """归档依赖来自当前服务 provider，不另存动态注册状态。"""
+        provider = self._active_provider(key)
+        if provider is None:
+            raise RuntimeError(f"归档服务已失效: {key.name}")
+        return () if provider.binding_contributors is None else provider.binding_contributors()
+
+    def context_owner(self, context: Context) -> str | None:
+        """只识别本 Root 实际存活的插件 Context，不接受重建的身份字段。"""
+        for fiber in self._fibers.values():
+            if fiber.context is context:
+                if fiber.state != FiberState.ACTIVE or fiber.runtime is None:
+                    raise RuntimeError("注册 Context 已失效或没有插件 owner")
+                return fiber.runtime.plugin_id
+        return None
+
+    def plugin_dependencies(self) -> Mapping[str, frozenset[ServiceKey[object]]]:
+        """收集各插件及子 Fiber 声明的服务依赖。"""
+        dependencies: dict[str, set[ServiceKey[object]]] = {}
+        for fiber in self._fibers.values():
+            if fiber.runtime is not None:
+                dependencies.setdefault(fiber.runtime.plugin_id, set()).update(fiber.dependencies)
+        return {owner: frozenset(keys) for owner, keys in dependencies.items()}
+
     def validation_identity(self) -> str:
         """Bind the Core-observed topology and audit receipt at validation close."""
 
@@ -1279,6 +1333,7 @@ class CompositionRoot:
         key: ServiceKey[object],
         value: object,
         owner: Fiber,
+        *, binding_contributors: Callable[[], tuple[Context, ...]] | None = None,
     ) -> None:
         existing = self._providers.get(key)
         if existing is not None:
@@ -1291,6 +1346,7 @@ class CompositionRoot:
             value=value,
             owner=owner,
             revision=self._next_provider_revision,
+            binding_contributors=binding_contributors,
         )
         self._next_provider_revision += 1
         self._bump_composition_revision()

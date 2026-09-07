@@ -3,11 +3,18 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+from collections.abc import Callable
 from contextlib import closing
 from pathlib import Path
 from typing import Any, cast
 
 from infra.persistence.json_store import atomic_write_text
+from agent.plugin_composition import ServiceKey
+
+
+MEMORY_WRITES = ServiceKey[
+    Callable[[tuple[str, str] | None, int], tuple[dict[str, object], ...]]
+]("markdown-memory.writes.v1")
 
 
 DEFAULT_SELF_MD = """# Akashic 的自我认知
@@ -48,6 +55,30 @@ class MarkdownProfileStore:
     def read_self(self) -> str:
         return self.self_path.read_text(encoding="utf-8")
 
+    def read_writes(
+        self, after: tuple[str, str] | None, limit: int,
+    ) -> tuple[dict[str, object], ...]:
+        """读取独立的 receipt 副本；分页位置只用于本轮扫描，不代表写入顺序。"""
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise ValueError("Markdown 写入分页大小无效")
+        if after is not None and (
+            not isinstance(after, tuple) or len(after) != 2
+            or any(not isinstance(value, str) for value in after)
+        ):
+            raise ValueError("Markdown 写入分页位置无效")
+        with closing(sqlite3.connect(self.receipts_path.resolve().as_uri() + "?mode=ro", uri=True)) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT source_ref,kind,payload,done_at FROM consolidation_writes "
+                "WHERE (source_ref,kind)>(?,?) ORDER BY source_ref,kind LIMIT ?",
+                (*(after or ("", "")), limit),
+            ).fetchall()
+        return tuple({
+            "source_ref": row["source_ref"], "kind": row["kind"],
+            "payload": None if row["payload"] is None else json.loads(row["payload"]),
+            "done_at": row["done_at"],
+        } for row in rows)
+
     def read_draft(self, source_ref: str) -> dict[str, object] | None:
         return self._read_receipt(source_ref, "markdown_profile_model_v1")
 
@@ -74,6 +105,32 @@ class MarkdownProfileStore:
             is not None
             for document in ("memory", "self")
         )
+
+    def latest_applied(self, session_key: str) -> tuple[str, int] | None:
+        """从已有顺序与双文件 receipt 读取进度，不建立第二份消费 ledger。"""
+        with closing(sqlite3.connect(str(self.receipts_path), timeout=30.0)) as conn:
+            rows = conn.execute("SELECT source_ref, payload FROM consolidation_writes WHERE kind=?",
+                                ("markdown_projection_order_v1",)).fetchall()
+        latest: tuple[str, int] | None = None
+        seen: set[int] = set()
+        for source_ref, payload in rows:
+            raw: object = json.loads(payload)
+            if not isinstance(raw, dict):
+                raise ValueError("Markdown 顺序 receipt schema 无效")
+            order = cast(dict[str, object], raw)
+            if set(order) != {"session_key", "generation"}:
+                raise ValueError("Markdown 顺序 receipt schema 无效")
+            key, generation = order["session_key"], order["generation"]
+            if not isinstance(key, str) or type(generation) is not int or generation < 0:
+                raise ValueError("Markdown 顺序 receipt 身份无效")
+            if key != session_key or not self.is_applied(source_ref):
+                continue
+            if generation in seen:
+                raise ValueError("同一 Session generation 出现多条已应用档案")
+            seen.add(generation)
+            if latest is None or generation > latest[1]:
+                latest = (source_ref, generation)
+        return latest
 
     def pending_source_refs(self) -> tuple[str, ...]:
         """List drafts whose two document receipts have not both committed."""
@@ -165,7 +222,11 @@ class MarkdownProfileStore:
 
     def apply_pending(self, source_ref: str) -> None:
         """Converge each document from its own immutable draft and receipt."""
-
+        draft = self.read_draft(source_ref)
+        if draft is None:
+            raise RuntimeError(f"Markdown 已准备文档缺少完整 model draft: {source_ref}")
+        # model draft 先落盘；中途退出可能只留下其中一份文档 draft。
+        self._write_document_drafts(source_ref, draft)
         self._apply_document(source_ref, "memory", self.memory_path)
         self._apply_document(source_ref, "self", self.self_path)
 

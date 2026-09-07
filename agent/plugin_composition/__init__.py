@@ -1,3 +1,4 @@
+from agent.plugin_composition.credentials import CREDENTIALS, CredentialClients
 from agent.plugin_composition.context import (
     CompositionRoot,
     Context,
@@ -12,11 +13,7 @@ from agent.plugin_composition.overlay import (
 )
 from agent.control.turn_scope import ToolGrant, TurnExecutionScope
 from agent.control.models import TurnItem, TurnItemKind, TurnStatus
-from agent.control.scoped_turn import (
-    DurableTurnView,
-    ScopedTurnHandle,
-    TurnAcceptedReceipt,
-)
+from agent.control.scoped_turn import TurnAcceptedReceipt
 from agent.control.timer import TimerHandle, TimerStatus
 from agent.tools.base import ToolExecutionContext
 from agent.turn_effects import PostCommitEffect, TurnStorage
@@ -47,10 +44,6 @@ from agent.plugin_composition.events import (
     SerialEventKey,
     TransformEventKey,
 )
-from agent.plugin_composition.turn_lifecycle import (
-    BeforeTurnCtx,
-    CONTEXT_PREPARED_EVENT,
-)
 from agent.plugin_composition.executor import (
     EXECUTOR_SERVICE,
     ExecutorService,
@@ -80,31 +73,9 @@ from agent.plugin_composition.session_compaction import (
     SESSION_COMPACTION_STORAGE,
     SessionCompactionStorage,
 )
-from agent.plugin_composition.request_projection import (
-    CONTEXT_PROJECTION_COMMITTED,
-    CONTEXT_PROJECTION_FACTS,
-    PROVIDER_REQUEST_PROJECTION,
-    ContextProjectionCommitted,
-    ContextProjectionFact,
-    ContextProjectionFacts,
-    PreparedProviderRequest,
-    ProviderRequestBinding,
-    ProviderRequestGate,
-    ProviderRequestProjection,
-    ProviderProjectionError,
-    ProviderTurnInput,
-    ProviderTurnProjection,
-    RequestHistoryUnit,
-    SessionHistoryUnit,
-)
 from agent.plugin_composition.semantic_interest import (
     CONVERSATION_SEMANTIC_INTEREST,
     ConversationSemanticInterest,
-)
-from agent.plugin_composition.scoped_turns import PluginScopedTurns, SCOPED_TURNS
-from agent.plugin_composition.continuations import (
-    CONTINUATIONS,
-    PluginContinuations,
 )
 from agent.plugin_composition.deliveries import DELIVERIES, PluginDeliveries
 from agent.plugin_composition.durable_deliveries import (
@@ -116,9 +87,11 @@ from agent.plugin_composition.durable_deliveries import (
 )
 from agent.plugin_composition.timers import TIMERS, PluginTimers
 from agent.plugin_composition.runtime_lifecycle import (
+    RUNTIME_STARTING,
     RUNTIME_STARTED,
     RUNTIME_STOPPING,
     SNAPSHOT_SEALING,
+    RuntimeStarting,
     RuntimeStarted,
     RuntimeStopping,
     SnapshotSealing,
@@ -149,12 +122,17 @@ from agent.plugin_composition.models import (
     DriverUnavailableError,
     EMBEDDINGS,
     EmbeddingResult,
+    SavedEmbedding,
+    read_embedding_binding,
+    open_embedding,
     Embeddings,
     EmbeddingSpaceDescriptor,
     FinishConnectionAuth,
     LLMResponse,
     InvalidRequestError,
     MODEL_CATALOG,
+    MODEL_CALL_STATS,
+    ModelCallStats,
     MODEL_DRIVERS,
     MODEL_SETTINGS,
     ModelAvailability,
@@ -212,21 +190,6 @@ from agent.plugin_composition.workload_slots import (
     WorkloadHealth,
     WorkloadLimits,
     WorkloadPort,
-)
-from agent.plugin_composition.background_jobs import (
-    BACKGROUND_JOBS,
-    BackgroundJobBinding,
-    BackgroundJobCatalog,
-    BackgroundJobDefinition,
-    BackgroundJobDescriptor,
-    BackgroundJobTrigger,
-    IntervalTrigger,
-    PluginBackgroundJobs,
-    ProgrammaticTurnPort,
-    ProgrammaticTurnPreAdmissionError,
-    ProgrammaticTurnReceipt,
-    ProgrammaticTurnUncertainError,
-    RetryPolicy,
 )
 from agent.plugin_composition.tool_catalog import (
     TOOL_CATALOG,
@@ -291,8 +254,12 @@ from agent.plugin_composition.ui_slots import (
     resolve_mobile_ui_asset,
 )
 
+from agent.plugin_composition.processes import PROCESSES, PluginProcesses, ProcessCleanupError
+
 __all__ = [
-    "BeforeTurnCtx",
+    "PROCESSES",
+    "PluginProcesses",
+    "ProcessCleanupError",
     "AddConnection",
     "AddModel",
     "AuthenticationError",
@@ -318,12 +285,17 @@ __all__ = [
     "DriverUnavailableError",
     "EMBEDDINGS",
     "EmbeddingResult",
+    "SavedEmbedding",
+    "read_embedding_binding",
+    "open_embedding",
     "Embeddings",
     "EmbeddingSpaceDescriptor",
     "FinishConnectionAuth",
     "LLMResponse",
     "InvalidRequestError",
     "MODEL_CATALOG",
+    "MODEL_CALL_STATS",
+    "ModelCallStats",
     "MODEL_DRIVERS",
     "MODEL_SETTINGS",
     "ModelAvailability",
@@ -356,7 +328,6 @@ __all__ = [
     "TransportError",
     "UpdateConnection",
     "UsageCoverage",
-    "CONTEXT_PREPARED_EVENT",
     "CONVERSATION_SEMANTIC_INTEREST",
     "ConversationSemanticInterest",
     "CompositionError",
@@ -396,6 +367,8 @@ __all__ = [
     "AttachmentReadLease",
     "AttachmentRef",
     "CredentialRef",
+    "CREDENTIALS",
+    "CredentialClients",
     "DeliveryStatus",
     "EmitEventKey",
     "Effect",
@@ -422,7 +395,6 @@ __all__ = [
     "WORKLOADS",
     "EMBEDDING_MEMORY_PLUGIN",
     "MCP_SERVERS",
-    "BACKGROUND_JOBS",
     "TOOL_CATALOG",
     "EndpointEnv",
     "WorkloadEnv",
@@ -444,11 +416,6 @@ __all__ = [
     "ObserveEventKey",
     "PluginChannels",
     "PluginCommands",
-    "PluginBackgroundJobs",
-    "ProgrammaticTurnPort",
-    "ProgrammaticTurnPreAdmissionError",
-    "ProgrammaticTurnReceipt",
-    "ProgrammaticTurnUncertainError",
     "PluginToolBinding",
     "PluginToolCatalog",
     "PluginToolDefinition",
@@ -465,13 +432,6 @@ __all__ = [
     "ProviderClientFactory",
     "ProviderDeliveryReceipt",
     "ProviderDeliveryRequest",
-    "BackgroundJobBinding",
-    "BackgroundJobCatalog",
-    "BackgroundJobDefinition",
-    "BackgroundJobDescriptor",
-    "BackgroundJobTrigger",
-    "IntervalTrigger",
-    "RetryPolicy",
     "ToolRisk",
     "PushToolRequest",
     "ParallelEventKey",
@@ -482,43 +442,25 @@ __all__ = [
     "SessionReadSnapshot",
     "SESSION_COMPACTION_STORAGE",
     "SessionCompactionStorage",
-    "CONTEXT_PROJECTION_COMMITTED",
-    "CONTEXT_PROJECTION_FACTS",
-    "PROVIDER_REQUEST_PROJECTION",
-    "ContextProjectionCommitted",
-    "ContextProjectionFact",
-    "ContextProjectionFacts",
-    "PreparedProviderRequest",
-    "ProviderRequestBinding",
-    "ProviderRequestGate",
-    "ProviderRequestProjection",
-    "ProviderProjectionError",
-    "ProviderTurnInput",
-    "ProviderTurnProjection",
-    "RequestHistoryUnit",
-    "SessionHistoryUnit",
     "ServiceKey",
     "ServiceView",
-    "PluginScopedTurns",
-    "SCOPED_TURNS",
-    "CONTINUATIONS",
-    "PluginContinuations",
     "DELIVERIES",
     "PluginDeliveries",
     "DURABLE_DELIVERIES",
     "DurableBindingAttempt",
     "DurableDeliveryRequest",
     "DurableDeliveryView",
-    "DurableTurnView",
     "PluginDurableDeliveries",
     "PostCommitEffect",
     "TIMERS",
     "TimerHandle",
     "TimerStatus",
     "PluginTimers",
+    "RUNTIME_STARTING",
     "RUNTIME_STARTED",
     "RUNTIME_STOPPING",
     "SNAPSHOT_SEALING",
+    "RuntimeStarting",
     "RuntimeStarted",
     "RuntimeStopping",
     "RuntimeScope",
@@ -530,7 +472,6 @@ __all__ = [
     "TopologyView",
     "ToolGrant",
     "ToolExecutionContext",
-    "ScopedTurnHandle",
     "TurnAcceptedReceipt",
     "TurnExecutionScope",
     "TurnItem",

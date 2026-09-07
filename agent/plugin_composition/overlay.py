@@ -5,7 +5,7 @@ import json
 from dataclasses import replace
 from typing import TypeVar
 
-from agent.plugin_composition.context import CompositionRoot, Fiber
+from agent.plugin_composition.context import CompositionRoot, Context, Fiber
 from agent.plugin_composition.events import (
     Bail,
     EmitEventKey,
@@ -168,26 +168,33 @@ class CompositionOverlay:
         effects = tuple(
             sorted(effect for topology in selected for effect in topology.effects)
         )
-        candidate_listener_groups = self.candidate._events.registration_groups(  # pyright: ignore[reportPrivateUsage]
-            plugin_ids=self.replaced_plugin_ids
-        )
-        if not candidate_listener_groups:
-            listeners = self.stable._events.registrations(  # pyright: ignore[reportPrivateUsage]
+        stable_listener_groups = dict(
+            self.stable._events.registration_groups(  # pyright: ignore[reportPrivateUsage]
                 plugin_ids=self.stable_plugin_ids
             )
-        else:
-            listener_groups: dict[str, list[str]] = {}
-            for root, plugin_id in self.dispatch_order:
-                groups = root._events.registration_groups(  # pyright: ignore[reportPrivateUsage]
-                    plugin_ids=(plugin_id,)
+        )
+        candidate_listener_groups = dict(
+            self.candidate._events.registration_groups(  # pyright: ignore[reportPrivateUsage]
+                plugin_ids=self.replaced_plugin_ids
+            )
+        )
+        listeners: list[str] = []
+        for descriptor in sorted(
+            set(stable_listener_groups) | set(candidate_listener_groups)
+        ):
+            stable_owners = stable_listener_groups.get(descriptor, ())
+            candidate_owners = candidate_listener_groups.get(descriptor, ())
+            if stable_owners and candidate_owners:
+                raise CompositionError(
+                    "OVERLAY_EVENT_SPLIT",
+                    f"事件 {descriptor} 同时属于 stable 与 candidate Root",
                 )
-                for descriptor, owners in groups:
-                    listener_groups.setdefault(descriptor, []).extend(owners)
-            listeners = tuple(
+            owners = candidate_owners or stable_owners
+            listeners.extend(
                 f"{descriptor}:{owner}"
-                for descriptor, owners in listener_groups.items()
                 for owner in owners
             )
+        listener_tuple = tuple(listeners)
         payload: dict[str, object] = {
             "fibers": [
                 {
@@ -200,7 +207,7 @@ class CompositionOverlay:
                 for item in fibers
             ],
             "services": services,
-            "listeners": listeners,
+            "listeners": listener_tuple,
         }
         identity = hashlib.sha256(
             json.dumps(
@@ -219,7 +226,7 @@ class CompositionOverlay:
             fibers=fibers,
             services=services,
             effects=effects,
-            listeners=listeners,
+            listeners=listener_tuple,
         )
 
     def topology_identity(self) -> str:
@@ -240,6 +247,29 @@ class CompositionOverlay:
     def plugin_runtime(self, plugin_id: str) -> PluginRuntime:
         root = self.candidate if plugin_id in self.replaced_plugin_ids else self.stable
         return root.plugin_runtime(plugin_id)
+
+    def context_owner(self, context: Context) -> str | None:
+        """只接受 Overlay 实际选择的插件 Context。"""
+        for root, selected in self.dispatch_order:
+            owner = root.context_owner(context)
+            if owner == selected:
+                return owner
+        return None
+
+    def binding_contributors(self, key: ServiceKey[object]) -> tuple[Context, ...]:
+        """与服务取值共用 stable/candidate 的精确 owner 选择。"""
+        owner = self.plugin_service_owners()[key]
+        root = self.candidate if owner in self.replaced_plugin_ids else self.stable
+        return root.binding_contributors(key)
+
+    def plugin_dependencies(self) -> dict[str, frozenset[ServiceKey[object]]]:
+        """使用与 Overlay provider 相同的 generation 选择。"""
+        return {
+            owner: dependencies
+            for root, selected in self.dispatch_order
+            for owner, dependencies in root.plugin_dependencies().items()
+            if owner == selected
+        }
 
     def plugin_service_owners(self) -> dict[ServiceKey[object], str]:
         """Return service owners from the exact stable/candidate selection."""

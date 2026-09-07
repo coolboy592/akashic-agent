@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 
 import react from "@vitejs/plugin-react";
 import autoprefixer from "autoprefixer";
-import { transform } from "esbuild";
+import { build as bundle, transform } from "esbuild";
 import tailwindcss from "tailwindcss";
 import { build } from "vite";
 import webUiPreset from "../packages/akashic-web-ui-v1/tailwind-preset.mjs";
@@ -15,15 +15,18 @@ const pluginNames = (await readdir(pluginsRoot, { withFileTypes: true }))
   .filter((entry) => entry.isDirectory())
   .map((entry) => entry.name)
   .sort();
+const sourceRoots = new Map();
 const modules = (await Promise.all(pluginNames.map(async (plugin) => {
-  const entry = resolve(pluginsRoot, plugin, "web", "index.tsx");
-  try {
-    await access(entry);
-    return plugin;
-  } catch (error) {
-    if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") return null;
-    throw error;
+  for (const sourceRoot of [resolve(repoRoot, "frontend/plugins", plugin, "src"), resolve(pluginsRoot, plugin, "web")]) {
+    try {
+      await access(resolve(sourceRoot, "index.tsx"));
+      sourceRoots.set(plugin, sourceRoot);
+      return plugin;
+    } catch (error) {
+      if (!(error && typeof error === "object" && "code" in error && error.code === "ENOENT")) throw error;
+    }
   }
+  return null;
 }))).filter((plugin) => plugin !== null);
 
 const compactGeneratedModules = {
@@ -45,7 +48,7 @@ const compactGeneratedModules = {
 };
 
 for (const plugin of modules) {
-  const sourceRoot = resolve(pluginsRoot, plugin, "web");
+  const sourceRoot = sourceRoots.get(plugin);
   await build({
     configFile: false,
     root: repoRoot,
@@ -86,3 +89,13 @@ for (const plugin of modules) {
     },
   });
 }
+
+// 新 Message Inspector 的源文件与其他前端一样保存在 frontend 下。
+await bundle({
+  entryPoints: [resolve(repoRoot, "frontend/plugins/akasha/src/mobile.js")],
+  bundle: true,
+  format: "esm",
+  target: "es2022",
+  minify: true,
+  outfile: resolve(pluginsRoot, "akasha/message_ui.js"),
+});

@@ -2,15 +2,20 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import closing
+import array
+import fcntl
 import hashlib
 import json
 import os
 import shutil
+import select
 import socket
 import sqlite3
 import subprocess
 import sys
 import tempfile
+import termios
 import threading
 import time
 import uuid
@@ -25,7 +30,7 @@ if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
 from docker.debug.model_plugin_fixture import add_openai_models
-PROTOCOL_VERSION = "1.0"
+PROTOCOL_VERSION = "2.0"
 READINESS_DEADLINE_S = 30.0
 SCENARIO_DEADLINE_S = 15.0
 _PC09_COMPACTION_SUMMARY = """## Goal
@@ -66,7 +71,7 @@ _MEMORY_CONTEXT_PROFILE_RESPONSE = json.dumps(
     {"memory": "", "self": _DEFAULT_SELF_MD},
     ensure_ascii=False,
 )
-_MEMORY_CONTEXT_TOKEN_REPEAT = 5_000
+_MEMORY_CONTEXT_TOKEN_REPEAT = 4_500
 
 
 @dataclass(frozen=True)
@@ -109,6 +114,75 @@ class JsonRpcSocketClient:
         if "error" in response:
             raise GateFailure(f"{method} 返回 JSON-RPC error：{response['error']}")
         return response
+
+    def request_result(
+        self,
+        method: str,
+        params: dict[str, object],
+        *,
+        timeout: float = SCENARIO_DEADLINE_S,
+    ) -> dict[str, Any]:
+        """返回 v2 result，并保留旧场景需要的原始响应。"""
+
+        response = self.request(method, params, timeout=timeout)
+        result = response.get("result")
+        if not isinstance(result, dict):
+            raise GateFailure(f"{method} result 不是 object：{response!r}")
+        return cast(dict[str, Any], result)
+
+    def admit_programmatic(
+        self, session_id: str, *, persist_memory: bool = False
+    ) -> dict[str, Any]:
+        """接纳一个属性不可变的程序 Session。"""
+
+        return self.request_result(
+            "programmatic/session/admit",
+            {"session_id": session_id, "persist_memory": persist_memory},
+        )
+
+    def send_programmatic(
+        self, session_id: str, message_id: str, text: str
+    ) -> dict[str, Any]:
+        """追加一个程序 Input，并返回持久 ACK。"""
+
+        return self.request_result(
+            "programmatic/message/send",
+            {"session_id": session_id, "message_id": message_id, "text": text},
+        )
+
+    def read_messages(
+        self, session_id: str, *, after_seq: int = -1, limit: int = 200
+    ) -> dict[str, Any]:
+        """读取 Session 的追加式 Message 页面。"""
+
+        return self.request_result(
+            "message/read",
+            {"session_id": session_id, "after_seq": after_seq, "limit": limit},
+        )
+
+    def programmatic_result(
+        self, session_id: str, input_id: str
+    ) -> dict[str, Any]:
+        """读取一个程序 Input 的结果投影。"""
+
+        return self.request_result(
+            "programmatic/message/result",
+            {"session_id": session_id, "input_id": input_id},
+        )
+
+    def follow_session(
+        self, session_id: str, subscription_id: str, *, after_seq: int = -1
+    ) -> dict[str, Any]:
+        """注册有界 v2 Session 订阅，并返回 ACK。"""
+
+        return self.request_result(
+            "session/follow",
+            {
+                "session_id": session_id,
+                "subscription_id": subscription_id,
+                "after_seq": after_seq,
+            },
+        )
 
     def request_raw(
         self,
@@ -170,6 +244,38 @@ class JsonRpcSocketClient:
                     return self._pending_notifications.pop(index)
             event = self._receive(deadline)
             if _matches_event(event, method, turn_id):
+                return event
+            if "method" in event:
+                self._pending_notifications.append(event)
+
+    def wait_session_event(
+        self,
+        event_type: str,
+        *,
+        subscription_id: str | None = None,
+        timeout: float = SCENARIO_DEADLINE_S,
+    ) -> dict[str, Any]:
+        """等待 v2 Session 事件，同时保留无关通知。"""
+
+        deadline = time.monotonic() + timeout
+
+        def matches(event: dict[str, Any]) -> bool:
+            if event.get("method") != "session/event":
+                return False
+            params = event.get("params")
+            if not isinstance(params, dict):
+                return False
+            if subscription_id is not None and params.get("subscription_id") != subscription_id:
+                return False
+            payload = params.get("event")
+            return isinstance(payload, dict) and payload.get("type") == event_type
+
+        while True:
+            for index, event in enumerate(self._pending_notifications):
+                if matches(event):
+                    return self._pending_notifications.pop(index)
+            event = self._receive(deadline)
+            if matches(event):
                 return event
             if "method" in event:
                 self._pending_notifications.append(event)
@@ -364,147 +470,96 @@ def _turn_projection(turn: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _wait_database_turn(
-    database: Path,
-    thread_id: str,
-    input_text: str,
+def _receive_web_follow_rows(
+    web: Any,
+    session_id: str,
+    complete: Any,
     *,
     timeout: float = SCENARIO_DEADLINE_S,
-) -> dict[str, Any]:
-    """等待 channel adapter 写入指定输入的领域终态并返回 wire 投影。"""
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """从真实 session.follow 读取消息页和 reply.status，直到 predicate 成立。"""
 
     deadline = time.monotonic() + timeout
-    last_status = "missing"
+    rows_by_id: dict[str, dict[str, Any]] = {}
+    statuses: list[dict[str, Any]] = []
+    while time.monotonic() < deadline:
+        frame = json.loads(web.recv(timeout=deadline - time.monotonic()))
+        frame_type = frame.get("type")
+        if frame_type == "messages.appended":
+            if frame.get("session_id") != session_id:
+                raise GateFailure(f"Web 消息页 Session 不匹配：{frame!r}")
+            items = frame.get("items")
+            if not isinstance(items, list):
+                raise GateFailure(f"Web messages.appended 缺少 items：{frame!r}")
+            for item in items:
+                if not isinstance(item, dict) or not isinstance(item.get("id"), str):
+                    raise GateFailure(f"Web 消息页 item 非法：{frame!r}")
+                rows_by_id[item["id"]] = item
+        elif frame_type == "reply.status":
+            if frame.get("session_id") != session_id:
+                raise GateFailure(f"Web reply.status Session 不匹配：{frame!r}")
+            statuses.append(frame)
+        elif frame_type == "session.following":
+            continue
+        elif frame_type == "error":
+            raise GateFailure(f"Web session.follow 返回 error：{frame!r}")
+        else:
+            raise GateFailure(f"Web session.follow 收到未知 frame：{frame!r}")
+        rows = sorted(rows_by_id.values(), key=lambda item: int(item["seq"]))
+        if complete(rows, statuses):
+            return rows, statuses
+    raise GateFailure(
+        f"Web session.follow 未在 deadline 内达到条件：session={session_id} "
+        f"rows={list(rows_by_id.values())!r} statuses={statuses!r}"
+    )
+
+
+def _wait_message_log_rows(
+    database: Path,
+    session_id: str,
+    *,
+    minimum: int = 1,
+    required_ids: set[str] | frozenset[str] = frozenset(),
+    timeout: float = SCENARIO_DEADLINE_S,
+) -> list[dict[str, Any]]:
+    """等待真实 Message 日志前缀，保留身份、seq、来源和完整 body。"""
+
+    deadline = time.monotonic() + timeout
+    last_rows: list[dict[str, Any]] = []
     while time.monotonic() < deadline:
         with sqlite3.connect(database) as connection:
             connection.row_factory = sqlite3.Row
             rows = connection.execute(
-                """
-                SELECT id, session_key, status, input_json, items_json,
-                       usage_json, error_json, final_response
-                FROM turns WHERE session_key = ? ORDER BY created_at DESC
-                """,
-                (thread_id,),
+                "SELECT id, session_key, seq, ts, author, source, body "
+                "FROM messages WHERE session_key = ? ORDER BY seq",
+                (session_id,),
             ).fetchall()
-        for row in rows:
-            input_payload = json.loads(row["input_json"])
-            if input_payload.get("input") != input_text:
-                continue
-            last_status = str(row["status"])
-            if last_status not in {"completed", "failed", "interrupted", "cancelled"}:
-                break
-            return {
-                "id": row["id"],
-                "threadId": row["session_key"],
-                "status": row["status"],
-                "finalResponse": row["final_response"],
-                "items": json.loads(row["items_json"]),
-                "usage": json.loads(row["usage_json"]) if row["usage_json"] else None,
-                "error": json.loads(row["error_json"]) if row["error_json"] else None,
-            }
-        threading.Event().wait(0.02)
-    raise GateFailure(
-        f"等待 channel turn 终态超时：thread={thread_id} input={input_text!r} status={last_status}"
-    )
-
-
-def _wait_database_turn_status(
-    database: Path,
-    thread_id: str,
-    input_text: str,
-    expected: set[str],
-    *,
-    timeout: float = SCENARIO_DEADLINE_S,
-) -> dict[str, Any]:
-    """等待 channel turn 进入指定状态并返回最小可审计证据。"""
-
-    deadline = time.monotonic() + timeout
-    last_status = "missing"
-    while time.monotonic() < deadline:
-        with sqlite3.connect(database) as connection:
-            connection.row_factory = sqlite3.Row
-            row = connection.execute(
-                """
-                SELECT id, status, final_response, error_json
-                FROM turns
-                WHERE session_key = ? AND json_extract(input_json, '$.input') = ?
-                ORDER BY created_at DESC LIMIT 1
-                """,
-                (thread_id, input_text),
-            ).fetchone()
-        if row is not None:
-            last_status = str(row["status"])
-            if last_status in expected:
-                return {
+        try:
+            last_rows = [
+                {
                     "id": row["id"],
-                    "status": last_status,
-                    "finalResponse": row["final_response"],
-                    "error": (
-                        json.loads(row["error_json"]) if row["error_json"] else None
-                    ),
+                    "session_id": row["session_key"],
+                    "seq": row["seq"],
+                    "timestamp": row["ts"],
+                    "author": row["author"],
+                    "source": row["source"],
+                    "body": json.loads(row["body"]),
                 }
-        threading.Event().wait(0.02)
-    raise GateFailure(
-        f"等待 channel turn 状态超时：thread={thread_id} input={input_text!r} "
-        f"expected={sorted(expected)} actual={last_status}"
-    )
-
-
-def _wait_database_turn_inputs(
-    database: Path,
-    thread_id: str,
-    input_text: str,
-    expected_count: int,
-    *,
-    timeout: float = SCENARIO_DEADLINE_S,
-) -> dict[str, object]:
-    """等待 active channel turn 持久化指定数量的有序 user item。"""
-
-    deadline = time.monotonic() + timeout
-    last_inputs: list[object] = []
-    while time.monotonic() < deadline:
-        with sqlite3.connect(database) as connection:
-            connection.row_factory = sqlite3.Row
-            row = connection.execute(
-                """
-                SELECT id, status, items_json
-                FROM turns
-                WHERE session_key = ? AND json_extract(input_json, '$.input') = ?
-                ORDER BY created_at DESC LIMIT 1
-                """,
-                (thread_id, input_text),
-            ).fetchone()
-        if row is not None:
-            items = json.loads(row["items_json"])
-            last_inputs = [
-                item.get("data", {}).get("content")
-                for item in items
-                if isinstance(item, dict) and item.get("type") == "userMessage"
+                for row in rows
             ]
-            if len(last_inputs) == expected_count:
-                return {
-                    "id": row["id"],
-                    "status": row["status"],
-                    "userInputs": last_inputs,
-                }
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            raise GateFailure(
+                f"Message 日志 body 不是有效 JSON：session={session_id}"
+            ) from error
+        if len(last_rows) >= minimum and required_ids <= {
+            str(row["id"]) for row in last_rows
+        }:
+            return last_rows
         threading.Event().wait(0.02)
     raise GateFailure(
-        f"等待 channel turn 输入超时：thread={thread_id} input={input_text!r} "
-        f"expected_count={expected_count} actual={last_inputs!r}"
+        f"Message 日志未在 deadline 内达到前缀：session={session_id} "
+        f"minimum={minimum} required={sorted(required_ids)} rows={last_rows!r}"
     )
-
-
-def _receive_web_final(
-    web: Any, *, timeout: float = SCENARIO_DEADLINE_S
-) -> dict[str, Any]:
-    """忽略流式帧并返回下一条 Web channel 最终帧。"""
-
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        frame = json.loads(web.recv(timeout=deadline - time.monotonic()))
-        if frame.get("type") == "message.final":
-            return cast(dict[str, Any], frame)
-    raise GateFailure("Web channel 未在 deadline 内返回 message.final")
 
 
 def _extract_id(response: dict[str, Any], resource: str) -> str:
@@ -542,6 +597,40 @@ def _model_requests(payload: object) -> list[object]:
     return list(requests)
 
 
+def _model_call_records(database: Path, call_ids: Sequence[str]) -> list[dict[str, Any]]:
+    """从 Models owner 读取指定调用的结算事实。"""
+
+    if not call_ids:
+        return []
+    placeholders = ",".join("?" for _ in call_ids)
+    uri = f"file:{database}?mode=ro"
+    try:
+        with closing(sqlite3.connect(uri, uri=True)) as connection:
+            connection.row_factory = sqlite3.Row
+            rows = connection.execute(
+                "SELECT id, state, binding_json, usage_json FROM model_calls "
+                f"WHERE id IN ({placeholders}) ORDER BY rowid",
+                tuple(call_ids),
+            ).fetchall()
+    except sqlite3.Error as error:
+        raise GateFailure(f"读取 Models 调用账失败：{database}") from error
+    records: list[dict[str, Any]] = []
+    for row in rows:
+        records.append(
+            {
+                "id": row["id"],
+                "state": row["state"],
+                "binding": json.loads(row["binding_json"]),
+                "usage": (
+                    None
+                    if row["usage_json"] is None
+                    else json.loads(row["usage_json"])
+                ),
+            }
+        )
+    return records
+
+
 def _memory_context_seed_content(role: str, index: int) -> str:
     """Return one deterministic large seed message for the ledger gate."""
 
@@ -550,43 +639,44 @@ def _memory_context_seed_content(role: str, index: int) -> str:
     return (f"seed {role} {index} " + "token " * _MEMORY_CONTEXT_TOKEN_REPEAT).strip()
 
 
-def _memory_context_seed_rows(session_key: str) -> list[tuple[str, str, str]]:
-    """Return expected seed IDs, roles, and bodies in durable seq order."""
+def _memory_context_seed_rows() -> list[tuple[str, str]]:
+    """Return the expected historical role and text pairs in durable order."""
 
-    rows: list[tuple[str, str, str]] = []
+    rows: list[tuple[str, str]] = []
     for index in range(4):
         for role in ("user", "assistant"):
-            seq = len(rows)
-            rows.append(
-                (
-                    f"{session_key}:{seq}",
-                    role,
-                    _memory_context_seed_content(role, index),
-                )
-            )
+            rows.append((role, _memory_context_seed_content(role, index)))
     return rows
 
 
-def _memory_context_source_plan_digest(session_key: str) -> str:
-    """Hash the three selected complete units exactly as ContextCompactor does."""
+def _memory_context_source_plan_digest(
+    rows: Sequence[sqlite3.Row], source_ids: Sequence[str]
+) -> str:
+    """Hash selected Message identity and complete encoded body facts."""
 
+    by_id = {str(row["id"]): row for row in rows}
+    if not source_ids:
+        raise GateFailure("memory-context source digest 缺少 source IDs")
+    try:
+        selected_rows = [by_id[message_id] for message_id in source_ids]
+    except KeyError as error:
+        raise GateFailure(f"memory-context source digest 缺少 Message：{error}") from error
     selected: list[dict[str, object]] = []
-    for unit_index in range(3):
-        source_from_seq = unit_index * 2
-        through_seq = source_from_seq + 1
-        for offset, role in enumerate(("user", "assistant")):
-            seq = source_from_seq + offset
-            selected.append(
-                {
-                    "id": f"{session_key}:{seq}",
-                    "seq": seq,
-                    "unit_ref": f"{source_from_seq}:{through_seq}:{unit_index}",
-                    "message": {
-                        "role": role,
-                        "content": _memory_context_seed_content(role, unit_index),
-                    },
-                }
-            )
+    for row in selected_rows:
+        body = json.loads(str(row["body"]))
+        if not isinstance(body, dict):
+            raise GateFailure("memory-context source body 不是 object")
+        selected.append(
+            {
+                "id": str(row["id"]),
+                "session_key": str(row["session_key"]),
+                "seq": int(row["seq"]),
+                "ts": str(row["ts"]),
+                "author": str(row["author"]),
+                "source": str(row["source"]),
+                "body": body,
+            }
+        )
     encoded = json.dumps(
         selected,
         ensure_ascii=False,
@@ -596,10 +686,100 @@ def _memory_context_source_plan_digest(session_key: str) -> str:
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
-def _memory_context_request_kinds(requests: Sequence[object]) -> list[str]:
-    """Classify the exact three model requests and reject tool-boundary drift."""
+def _memory_context_summary_source(requests: Sequence[object]) -> list[dict[str, object]]:
+    """Extract the exact source rows submitted to the summary provider."""
 
-    if len(requests) != 3:
+    for raw_request in requests:
+        if not isinstance(raw_request, dict):
+            continue
+        payload = raw_request.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        messages = payload.get("messages")
+        if not isinstance(messages, list) or len(messages) != 1:
+            continue
+        content = messages[0].get("content") if isinstance(messages[0], dict) else None
+        if not isinstance(content, str) or "\n[Source messages]\n" not in content:
+            continue
+        source_text = content.split("\n[Source messages]\n", 1)[1]
+        source_rows = json.loads(source_text)
+        if not isinstance(source_rows, list) or not all(
+            isinstance(row, dict) for row in source_rows
+        ):
+            raise GateFailure("摘要 provider source rows 不是 object 列表")
+        return source_rows
+    raise GateFailure("缺少摘要 provider 的 Source messages 输入")
+
+
+def _memory_context_summary_body(body: object) -> object:
+    """Remove private model replay parts exactly as summary source_text does."""
+
+    if not isinstance(body, dict) or body.get("kind") == "control":
+        return body
+    normalized = dict(body)
+    parts = normalized.get("parts")
+    if isinstance(parts, list):
+        normalized["parts"] = [
+            part
+            for part in parts
+            if not isinstance(part, dict)
+            or part.get("kind") not in {
+                "model.facts", "context.summary", "model.selection", "tool.selection",
+            }
+        ]
+    return normalized
+
+
+def _memory_context_business_tail(
+    messages: object, expected_rows: Sequence[sqlite3.Row], stop_text: str
+) -> tuple[dict[str, object], list[tuple[str, str]], list[str]]:
+    """Return the summary object, projected raw tail, and source text leaks."""
+
+    if not isinstance(messages, list):
+        raise GateFailure("业务 provider payload messages 不是 list")
+    summary_object: dict[str, object] | None = None
+    tail: list[tuple[str, str]] = []
+    source_texts: list[str] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            try:
+                value = json.loads(content)
+            except json.JSONDecodeError:
+                value = None
+            if isinstance(value, dict) and "summary" in value and "reference" in value:
+                summary_object = value
+                continue
+        if summary_object is None:
+            continue
+        if not isinstance(content, list):
+            continue
+        text_values = [
+            str(part["text"])
+            for part in content
+            if isinstance(part, dict) and isinstance(part.get("text"), str)
+        ]
+        if text_values and text_values[0] == stop_text:
+            break
+        if text_values:
+            tail.append((str(message.get("role")), text_values[0]))
+    for row in expected_rows:
+        body = json.loads(str(row["body"]))
+        parts = body.get("parts", []) if isinstance(body, dict) else []
+        source_texts.extend(
+            str(part["value"])
+            for part in parts
+            if isinstance(part, dict) and part.get("kind") == "text"
+        )
+    return summary_object or {}, tail, source_texts
+
+
+def _memory_context_request_kinds(requests: Sequence[object]) -> list[str]:
+    """Classify four seed replies and the three expected memory requests."""
+
+    if len(requests) != 7:
         raise GateFailure(f"memory-context 模型请求数量异常：{len(requests)}")
     kinds: list[str] = []
     for raw_request in requests:
@@ -609,12 +789,17 @@ def _memory_context_request_kinds(requests: Sequence[object]) -> list[str]:
         if not isinstance(payload, dict):
             raise GateFailure("memory-context 模型请求缺少 payload")
         serialized = json.dumps(payload.get("messages", []), ensure_ascii=False)
-        if "Closed history to consolidate" in serialized:
+        if (
+            "更新当前长任务的上下文压缩摘要" in serialized
+            and "[Source messages]" in serialized
+        ):
             kind = "summary"
         elif "你维护两个长期 Markdown 档案" in serialized:
             kind = "markdown"
         elif _MEMORY_CONTEXT_INPUT in serialized:
             kind = "business"
+        elif "seed user" in serialized:
+            kind = "seed"
         else:
             raise GateFailure("memory-context 模型请求无法归类")
         if kind in {"summary", "markdown"} and payload.get("tools", []) not in (
@@ -624,7 +809,7 @@ def _memory_context_request_kinds(requests: Sequence[object]) -> list[str]:
             raise GateFailure(f"memory-context {kind} 请求不得携带 tools")
         kinds.append(kind)
     # Committed fact 在 business response settle 后消费，顺序固定。
-    if kinds != ["summary", "business", "markdown"]:
+    if kinds != ["seed", "seed", "seed", "seed", "summary", "business", "markdown"]:
         raise GateFailure(f"memory-context 模型请求顺序异常：{kinds!r}")
     return kinds
 
@@ -680,21 +865,22 @@ def _configure_model_gate(*, context_window: int = 64_000) -> None:
 
 
 def _connect_client(endpoint: Path, events_path: Path) -> JsonRpcSocketClient:
-    """建立连接并完成 initialize/initialized/status readiness。"""
+    """建立 v2 连接并完成 initialize/initialized/status readiness。"""
 
     client = JsonRpcSocketClient(endpoint, events_path)
     client.request(
         "initialize",
         {
             "protocolVersion": PROTOCOL_VERSION,
-            "clientInfo": {"name": "docker-control-gate", "version": "1.0"},
+            "clientInfo": {"name": "docker-control-gate", "version": "2.0"},
             "capabilities": {"reasoningEvents": False},
         },
         timeout=READINESS_DEADLINE_S,
     )
     client.notify("initialized", {})
     status = client.request("server/status", {}, timeout=READINESS_DEADLINE_S)
-    if status.get("result", {}).get("ready") is not True:
+    status_result = status.get("result")
+    if not isinstance(status_result, dict) or status_result.get("ready") is not True:
         client.close()
         raise GateFailure(f"server/status 未 ready：{status!r}")
     return client
@@ -703,6 +889,27 @@ def _connect_client(endpoint: Path, events_path: Path) -> JsonRpcSocketClient:
 def _create_barrier(model_url: str, name: str, script: dict[str, object]) -> None:
     _http_json("PUT", f"{model_url}/control/barriers/{name}")
     _http_json("PUT", f"{model_url}/control/script", {**script, "barrier": name})
+
+
+def _create_chunk_barrier(
+    model_url: str,
+    name: str,
+    scripts: list[dict[str, object]],
+    *,
+    script_index: int,
+    after_chunk: int,
+) -> None:
+    """为指定 stream script 创建可控的 chunk 后 barrier。"""
+
+    if not 0 <= script_index < len(scripts):
+        raise ValueError("chunk barrier script_index 超出脚本范围")
+    configured = [dict(script) for script in scripts]
+    configured[script_index]["chunk_barrier"] = {
+        "name": name,
+        "after_chunk": after_chunk,
+    }
+    _http_json("PUT", f"{model_url}/control/barriers/{name}")
+    _http_json("PUT", f"{model_url}/control/script", configured)
 
 
 def _wait_barrier(model_url: str, name: str) -> None:
@@ -756,8 +963,212 @@ def _terminal_status(event: dict[str, Any]) -> str:
     return status
 
 
+def _message_text(item: object) -> str:
+    """Extract text parts from one wire Message row."""
+    if not isinstance(item, dict):
+        return ""
+    body = item.get("body")
+    if not isinstance(body, dict):
+        return ""
+    parts = body.get("parts")
+    if not isinstance(parts, list):
+        return ""
+    return "".join(
+        str(part.get("value", ""))
+        for part in parts
+        if isinstance(part, dict) and part.get("kind") == "text"
+    )
+
+
+def _execution_payload(item: object) -> dict[str, Any]:
+    """Decode one standard shell ToolResult envelope."""
+
+    try:
+        payload = json.loads(_message_text(item))
+    except (TypeError, ValueError, json.JSONDecodeError) as error:
+        raise GateFailure(f"shell ToolResult payload 不是 JSON：{item!r}") from error
+    if not isinstance(payload, dict):
+        raise GateFailure(f"shell ToolResult payload 不是 object：{item!r}")
+    return payload
+
+
+def _execution_last_json(item: object) -> dict[str, Any]:
+    """Decode the last JSON line emitted by one standard shell execution."""
+
+    payload = _execution_payload(item)
+    output = payload.get("output")
+    if not isinstance(output, str):
+        raise GateFailure(f"shell ToolResult 缺少 output：{item!r}")
+    try:
+        value = json.loads(output.strip().splitlines()[-1])
+    except (IndexError, TypeError, ValueError) as error:
+        raise GateFailure(f"shell ToolResult output 不是 JSON：{item!r}") from error
+    if not isinstance(value, dict):
+        raise GateFailure(f"shell ToolResult output JSON 不是 object：{item!r}")
+    return value
+
+
+def _message_items(page: object, kind: str) -> list[dict[str, Any]]:
+    """Return wire rows of one body kind from a message page."""
+
+    if not isinstance(page, dict) or not isinstance(page.get("items"), list):
+        return []
+    return [
+        item
+        for item in page["items"]
+        if isinstance(item, dict)
+        and isinstance(item.get("body"), dict)
+        and item["body"].get("kind") == kind
+    ]
+
+
+def _wait_for_message_items(
+    client: JsonRpcSocketClient,
+    session_id: str,
+    kind: str,
+    *,
+    minimum: int = 1,
+    timeout: float = SCENARIO_DEADLINE_S,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Poll the durable page until it contains the requested body rows."""
+
+    deadline = time.monotonic() + timeout
+    page: dict[str, Any] = {}
+    while time.monotonic() < deadline:
+        page = client.read_messages(session_id)
+        rows = _message_items(page, kind)
+        if len(rows) >= minimum:
+            return page, rows
+        threading.Event().wait(0.05)
+    raise GateFailure(
+        f"{session_id} 未在 deadline 内得到 {minimum} 个 {kind}：{page!r}"
+    )
+
+
+def _socket_pending_bytes(connection: socket.socket) -> int:
+    """Read queued bytes without consuming the slow subscriber's socket."""
+
+    pending = array.array("I", [0])
+    fcntl.ioctl(connection.fileno(), termios.FIONREAD, pending, True)
+    return int(pending[0])
+
+
+def _drain_socket_until_eof(
+    connection: socket.socket, *, timeout: float = SCENARIO_DEADLINE_S
+) -> tuple[bool, int]:
+    """Drain buffered frames before checking the peer's EOF."""
+
+    connection.setblocking(False)
+    deadline = time.monotonic() + timeout
+    drained = 0
+    while time.monotonic() < deadline:
+        try:
+            chunk = connection.recv(65_536)
+        except BlockingIOError:
+            readable, _, _ = select.select(
+                [connection], [], [], min(0.1, max(0.0, deadline - time.monotonic()))
+            )
+            if not readable:
+                continue
+            continue
+        if not chunk:
+            return True, drained
+        drained += len(chunk)
+    return False, drained
+
+
+def _wait_programmatic_result(
+    client: JsonRpcSocketClient,
+    session_id: str,
+    input_id: str,
+    *,
+    timeout: float = SCENARIO_DEADLINE_S,
+) -> dict[str, Any]:
+    """轮询持久程序结果，直到状态离开 open。"""
+
+    deadline = time.monotonic() + timeout
+    result: dict[str, Any] = {}
+    while time.monotonic() < deadline:
+        result = client.programmatic_result(session_id, input_id)
+        if result.get("status") != "open":
+            return result
+        threading.Event().wait(0.05)
+    raise GateFailure(f"programmatic result 超时：{session_id}/{input_id} {result!r}")
+
+
+def _message_wire_projection(page: dict[str, Any]) -> list[dict[str, Any]]:
+    """把 Message page 收敛为 messages 表的完整列集合。"""
+
+    items = page.get("items")
+    if not isinstance(items, list):
+        raise GateFailure(f"message/read items 不是数组：{page!r}")
+    projected: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            raise GateFailure(f"message/read item 不是对象：{item!r}")
+        projected.append({
+            "id": item.get("id"),
+            "session_id": item.get("session_id"),
+            "seq": item.get("seq"),
+            "timestamp": item.get("timestamp"),
+            "author": item.get("author"),
+            "source": item.get("source"),
+            "body": item.get("body"),
+        })
+    return projected
+
+
+def _message_observable_projection(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Project wire and database rows onto the fields the Web contract exposes."""
+
+    projected: list[dict[str, Any]] = []
+    for row in rows:
+        body = row.get("body")
+        if not isinstance(body, dict):
+            raise GateFailure(f"Message row body 不是 object：{row!r}")
+        kind = body.get("kind")
+        if not isinstance(kind, str):
+            raise GateFailure(f"Message row body 缺少 kind：{row!r}")
+        parts = body.get("parts", [])
+        if not isinstance(parts, list):
+            raise GateFailure(f"Message row parts 不是数组：{row!r}")
+        item: dict[str, Any] = {
+            "id": row.get("id"),
+            "session_id": row.get("session_id"),
+            "seq": row.get("seq"),
+            "author": row.get("author"),
+            "source": row.get("source"),
+            "kind": kind,
+            "text": [
+                part.get("value")
+                for part in parts
+                if isinstance(part, dict) and part.get("kind") == "text"
+            ],
+        }
+        if kind == "output":
+            item["finish"] = body.get("finish")
+            item["modelFacts"] = [
+                {
+                    "call_record_id": value.get("call_record_id"),
+                    "thinking": value.get("thinking"),
+                }
+                for part in parts
+                if isinstance(part, dict)
+                and part.get("kind") == "model.facts"
+                and isinstance(value := part.get("value"), dict)
+            ]
+        elif kind == "control":
+            item["control"] = {
+                "action": body.get("action"),
+                "through_seq": body.get("through_seq"),
+                "reason": body.get("reason"),
+            }
+        projected.append(item)
+    return projected
+
+
 def _inside_smoke(report_dir: Path) -> int:
-    """从独立 probe 容器验证真实 gateway、provider 和持久化路径。"""
+    """从独立 probe 容器验证真实 v2 gateway、provider 和 Message 日志。"""
 
     report_dir.mkdir(parents=True, exist_ok=True)
     events_path = report_dir / "events.jsonl"
@@ -766,7 +1177,7 @@ def _inside_smoke(report_dir: Path) -> int:
     checks: list[CheckResult] = []
     client: JsonRpcSocketClient | None = None
     try:
-        # 1. readiness 必须完成协议握手与 server/status
+        # 1. readiness 必须完成 v2 握手与 server/status。
         _wait_http_ready(f"{model_url}/readyz", READINESS_DEADLINE_S)
         _configure_model_gate()
         _wait_socket(endpoint, READINESS_DEADLINE_S)
@@ -775,188 +1186,369 @@ def _inside_smoke(report_dir: Path) -> int:
             "initialize",
             {
                 "protocolVersion": PROTOCOL_VERSION,
-                "clientInfo": {"name": "docker-control-gate", "version": "1.0"},
+                "clientInfo": {"name": "docker-control-gate", "version": "2.0"},
                 "capabilities": {"reasoningEvents": False},
             },
             timeout=READINESS_DEADLINE_S,
         )
         client.notify("initialized", {})
         status = client.request("server/status", {}, timeout=READINESS_DEADLINE_S)
+        status_result = status.get("result")
         mode = endpoint.stat().st_mode & 0o777
         checks.append(
             CheckResult(
                 "PC-01",
-                mode == 0o600,
+                mode == 0o600
+                and isinstance(initialized.get("result"), dict)
+                and initialized["result"].get("protocolVersion") == "2.0"
+                and isinstance(status_result, dict)
+                and status_result.get("ready") is True
+                and status_result.get("protocolVersion") == "2.0",
                 {"initialize": initialized, "status": status, "socketMode": oct(mode)},
             )
         )
 
-        # 2. 基本 turn 必须真正穿过正式 HTTP provider wiring
+        # 2. 程序 Input 穿过 provider，并从 Message 日志读取。
+        pc03_session = "programmatic:pc03-smoke"
+        admission = client.admit_programmatic(pc03_session)
         _http_json(
             "PUT",
             f"{model_url}/control/script",
-            {
-                "mode": "stream",
-                "deltas": ["control gate"],
-                "usage": {
-                    "prompt_tokens": 11,
-                    "completion_tokens": 2,
-                    "total_tokens": 13,
-                    "prompt_tokens_details": {"cached_tokens": 0},
-                    "completion_tokens_details": {"reasoning_tokens": 0},
-                },
-            },
+            {"mode": "complete", "content": "control gate"},
         )
-        thread_response = client.request(
-            "thread/start", {"metadata": {"gate": "PC-03"}}
-        )
-        thread_id = _extract_id(thread_response, "thread")
-        turn_response = client.request(
-            "turn/start",
-            {"threadId": thread_id, "input": "run control gate", "metadata": {}},
-        )
-        turn_id = _extract_id(turn_response, "turn")
-        terminal = client.wait_terminal(turn_id)
-        turn_read = client.request(
-            "turn/read",
-            {"threadId": thread_id, "turnId": turn_id},
-        )
-        _ = client.request("server/status", {})
-        terminal_count = sum(
-            event.get("method") == "turn/completed"
-            for event in _recorded_turn_notifications(events_path, turn_id)
-        )
-        requests = _http_json("GET", f"{model_url}/control/requests")
-        model_requests = _model_requests(requests)
-        provider_called = len(model_requests) == 1
-        terminal_turn = _event_turn(terminal)
-        consistent = (
-            terminal_turn.get("status") == "completed"
-            and terminal_turn.get("finalResponse") == "control gate"
-            and turn_read.get("result") == terminal_turn
-        )
+        pc03_before = len(_model_requests(_http_json("GET", f"{model_url}/control/requests")))
+        ack = client.send_programmatic(pc03_session, "pc03-input", "run control gate")
+        result = _wait_programmatic_result(client, pc03_session, "pc03-input")
+        page = client.read_messages(pc03_session)
+        pc03_requests = _model_requests(_http_json("GET", f"{model_url}/control/requests"))[pc03_before:]
+        rows = page.get("items")
+        input_rows = [item for item in rows if isinstance(item, dict) and item.get("id") == "pc03-input"] if isinstance(rows, list) else []
+        output_rows = [item for item in rows if isinstance(item, dict) and item.get("body", {}).get("kind") == "output"] if isinstance(rows, list) else []
+        ending_id = result.get("ending_message_id")
+        ending_seq = result.get("ending_seq")
+        final_outputs = [
+            item for item in output_rows
+            if isinstance(item, dict)
+            and item.get("id") == ending_id
+            and isinstance(item.get("body"), dict)
+            and item["body"].get("finish") == "complete"
+        ]
+        final_output = final_outputs[0] if len(final_outputs) == 1 else None
         checks.append(
             CheckResult(
                 "PC-03",
-                provider_called and consistent and terminal_count == 1,
+                admission.get("session_id") == pc03_session
+                and ack.get("message_id") == "pc03-input"
+                and result.get("status") == "complete"
+                and isinstance(ending_id, str)
+                and type(ending_seq) is int
+                and final_output is not None
+                and final_output.get("seq") == ending_seq
+                and len(pc03_requests) == 1
+                and len(input_rows) == 1
+                and any(
+                    isinstance(item.get("body"), dict)
+                    and any(
+                        part.get("value") == "control gate"
+                        for part in item["body"].get("parts", [])
+                        if isinstance(part, dict)
+                    )
+                    for item in output_rows
+                ),
                 {
-                    "threadId": thread_id,
-                    "turnId": turn_id,
-                    "terminal": terminal,
-                    "turnRead": turn_read,
-                    "terminalEventCount": terminal_count,
-                    "modelRequestCount": len(model_requests or []),
+                    "admission": admission,
+                    "ack": ack,
+                    "result": result,
+                    "messagePage": page,
+                    "endingOutput": final_output,
+                    "providerRequestCount": len(pc03_requests),
                 },
             )
         )
 
-        # 3. 正式 streaming provider 的 tool/usage 必须投影到事件和同一 DB turn。
-        _http_json(
-            "PUT",
-            f"{model_url}/control/script",
-            [
-                {
-                    "mode": "stream",
-                    "deltas": [],
-                    "tool_calls": [
-                        {
-                            "id": "call_pc04",
-                            "name": "tool_search",
-                            "arguments": {"query": "no-match-pc04"},
-                        }
-                    ],
-                    "usage": {
-                        "prompt_tokens": 7,
-                        "completion_tokens": 3,
-                        "total_tokens": 10,
-                        "prompt_tokens_details": {"cached_tokens": 0},
-                        "completion_tokens_details": {"reasoning_tokens": 0},
-                    },
+        # 3. follow 与 provider stream 同时打开，先观察真实中间预览。
+        pc04_session = "programmatic:pc04-smoke"
+        client.admit_programmatic(pc04_session)
+        follow_ack = client.follow_session(pc04_session, "pc04-follow")
+        pc04_stream_barrier = f"pc04-stream-{uuid.uuid4().hex}"
+        pc04_scripts = [
+            {
+                "mode": "stream",
+                "deltas": [],
+                "tool_calls": [
+                    {
+                        "id": "call_pc04",
+                        "name": "tool_search",
+                        "arguments": {"query": "no-match-pc04"},
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 7,
+                    "completion_tokens": 3,
+                    "total_tokens": 10,
+                    "prompt_tokens_details": {"cached_tokens": 0},
+                    "completion_tokens_details": {"reasoning_tokens": 0},
                 },
-                {
-                    "mode": "stream",
-                    "deltas": ["stream ", "complete"],
-                    "usage": {
-                        "prompt_tokens": 5,
-                        "completion_tokens": 2,
-                        "total_tokens": 7,
-                        "prompt_tokens_details": {"cached_tokens": 0},
-                        "completion_tokens_details": {"reasoning_tokens": 0},
-                    },
+            },
+            {
+                "mode": "stream",
+                "deltas": ["stream ", "complete"],
+                "usage": {
+                    "prompt_tokens": 5,
+                    "completion_tokens": 2,
+                    "total_tokens": 7,
+                    "prompt_tokens_details": {"cached_tokens": 0},
+                    "completion_tokens_details": {"reasoning_tokens": 0},
                 },
-            ],
+            },
+        ]
+        _create_chunk_barrier(
+            model_url,
+            pc04_stream_barrier,
+            pc04_scripts,
+            script_index=1,
+            after_chunk=0,
         )
-        stream_thread = _start_thread(client, "PC-04")
-        stream_turn = _start_turn(client, stream_thread, "stream tool usage")
-        stream_terminal = client.wait_terminal(stream_turn)
-        stream_read = client.request(
-            "turn/read", {"threadId": stream_thread, "turnId": stream_turn}
+        pc04_before = len(_model_requests(_http_json("GET", f"{model_url}/control/requests")))
+        pc04_ack = client.send_programmatic(pc04_session, "pc04-input", "stream tool usage")
+        intermediate_reply: dict[str, Any] | None = None
+        intermediate_texts: list[str] = []
+        reply_deadline = time.monotonic() + SCENARIO_DEADLINE_S
+        while time.monotonic() < reply_deadline:
+            event = client.wait_session_event(
+                "reply.status",
+                subscription_id="pc04-follow",
+                timeout=reply_deadline - time.monotonic(),
+            )
+            payload = event.get("params", {}).get("event", {})
+            if not isinstance(payload, dict) or payload.get("available") is not True:
+                continue
+            items = payload.get("items")
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                preview = item.get("preview")
+                if isinstance(preview, dict) and isinstance(preview.get("text"), str):
+                    intermediate_texts.append(preview["text"])
+            if any(text and text != "stream complete" for text in intermediate_texts):
+                intermediate_reply = event
+                _release_barrier(model_url, pc04_stream_barrier)
+                break
+        if intermediate_reply is None:
+            raise GateFailure("未观察到 chunk barrier 之前的中间 reply.status")
+        pc04_result = _wait_programmatic_result(client, pc04_session, "pc04-input")
+        pc04_page = client.read_messages(pc04_session)
+        pc04_requests = _model_requests(_http_json("GET", f"{model_url}/control/requests"))[pc04_before:]
+        pc04_barrier_status = _http_json(
+            "GET", f"{model_url}/control/barriers/{pc04_stream_barrier}"
         )
-        stream_payload = _event_turn(stream_terminal)
-        notifications = _recorded_turn_notifications(events_path, stream_turn)
-        deltas = [
-            event["params"]
-            for event in notifications
-            if event.get("method") == "item/assistantMessage/delta"
+        pc04_rows = pc04_page.get("items")
+        tool_rows = [item for item in pc04_rows if isinstance(item, dict) and item.get("body", {}).get("kind") == "tool_result"] if isinstance(pc04_rows, list) else []
+        output_rows = [item for item in pc04_rows if isinstance(item, dict) and item.get("body", {}).get("kind") == "output"] if isinstance(pc04_rows, list) else []
+        final_id = pc04_result.get("ending_message_id")
+        final_seq = pc04_result.get("ending_seq")
+        final_output = next(
+            (
+                item for item in output_rows
+                if isinstance(item, dict)
+                and item.get("id") == final_id
+                and isinstance(item.get("body"), dict)
+                and item["body"].get("finish") == "complete"
+            ),
+            None,
+        )
+        final_text = "".join(
+            str(part.get("value", ""))
+            for part in final_output.get("body", {}).get("parts", [])
+            if isinstance(part, dict) and part.get("kind") == "text"
+        ) if isinstance(final_output, dict) else ""
+        tool_calls: list[tuple[str, int, str, str]] = []
+        for item in output_rows:
+            if not isinstance(item, dict) or not isinstance(item.get("body"), dict):
+                continue
+            for index, part in enumerate(item["body"].get("parts", [])):
+                if isinstance(part, dict) and part.get("kind") == "tool_call":
+                    binding_id = part.get("binding_id")
+                    name = part.get("name")
+                    if isinstance(binding_id, str) and isinstance(name, str):
+                        tool_calls.append((str(item.get("id")), index, binding_id, name))
+        result_refs = [
+            (
+                cast(dict[str, Any], item["body"])["call_ref"].get("message_id"),
+                cast(dict[str, Any], item["body"])["call_ref"].get("part_index"),
+            )
+            for item in tool_rows
+            if isinstance(item, dict)
+            and isinstance(item.get("body"), dict)
+            and isinstance(item["body"].get("call_ref"), dict)
         ]
-        sequences = [delta.get("sequence") for delta in deltas]
-        delta_text = "".join(str(delta.get("delta") or "") for delta in deltas)
-        tool_items = [
-            item
-            for item in stream_payload.get("items", [])
-            if isinstance(item, dict) and item.get("type") == "toolCall"
+        call_ids = [
+            cast(str, value["value"].get("call_record_id"))
+            for item in output_rows
+            if isinstance(item, dict) and isinstance(item.get("body"), dict)
+            for value in item["body"].get("parts", [])
+            if isinstance(value, dict)
+            and value.get("kind") == "model.facts"
+            and isinstance(value.get("value"), dict)
+            and isinstance(value["value"].get("call_record_id"), str)
         ]
-        started_ids = [
-            event.get("params", {}).get("item", {}).get("id")
-            for event in notifications
-            if event.get("method") == "item/started"
+        model_calls = _model_call_records(
+            Path("/sandbox/workspace/model-registry.sqlite3"), call_ids
+        )
+        model_calls_by_id = {
+            str(record.get("id")): record for record in model_calls
+        }
+        actual_usage = [
+            model_calls_by_id.get(call_id, {}).get("usage") for call_id in call_ids
         ]
-        completed_ids = [
-            event.get("params", {}).get("item", {}).get("id")
-            for event in notifications
-            if event.get("method") == "item/completed"
-        ]
-        usage = stream_payload.get("usage")
-        pc04_passed = (
-            stream_payload.get("status") == "completed"
-            and stream_payload.get("finalResponse") == "stream complete"
-            and delta_text == stream_payload.get("finalResponse")
-            and sequences == list(range(len(sequences)))
-            and started_ids == completed_ids
-            and len(tool_items) == 1
-            and tool_items[0].get("data", {}).get("callId") == "call_pc04"
-            and usage
-            == {
-                "inputTokens": 12,
-                "cachedInputTokens": 0,
-                "outputTokens": 5,
-                "reasoningOutputTokens": 0,
-                "requestCount": 2,
-                "coveredRequestCount": 2,
+        expected_usage = [
+            {
+                "cache_write_input_tokens": None,
+                "cached_input_tokens": 0,
                 "coverage": "exact",
+                "covered_request_count": 1,
+                "input_tokens": 7,
+                "output_tokens": 3,
+                "reasoning_output_tokens": 0,
+                "request_count": 1,
+            },
+            {
+                "cache_write_input_tokens": None,
+                "cached_input_tokens": 0,
+                "coverage": "exact",
+                "covered_request_count": 1,
+                "input_tokens": 5,
+                "output_tokens": 2,
+                "reasoning_output_tokens": 0,
+                "request_count": 1,
+            },
+        ]
+        usage_totals: dict[str, int | None] = {}
+        for field in (
+            "input_tokens",
+            "output_tokens",
+            "request_count",
+            "covered_request_count",
+        ):
+            values = [
+                usage.get(field)
+                for usage in actual_usage
+                if isinstance(usage, dict)
+            ]
+            usage_totals[field] = (
+                sum(cast(int, value) for value in values)
+                if len(values) == len(actual_usage)
+                and all(type(value) is int for value in values)
+                else None
+            )
+        message_events: list[dict[str, Any]] = []
+        event_rows: list[dict[str, Any]] = []
+        event_deadline = time.monotonic() + SCENARIO_DEADLINE_S
+        while time.monotonic() < event_deadline:
+            event = client.wait_session_event(
+                "messages.appended",
+                subscription_id="pc04-follow",
+                timeout=event_deadline - time.monotonic(),
+            )
+            message_events.append(event)
+            payload = event.get("params", {}).get("event", {})
+            items = payload.get("items") if isinstance(payload, dict) else None
+            if isinstance(items, list):
+                event_rows.extend(item for item in items if isinstance(item, dict))
+            if any(item.get("id") == final_id for item in event_rows):
+                break
+        page_pairs = [
+            (item.get("id"), item.get("seq"))
+            for item in pc04_rows
+            if isinstance(item, dict)
+        ] if isinstance(pc04_rows, list) else []
+        event_pairs = [(item.get("id"), item.get("seq")) for item in event_rows]
+        seqs = [seq for _, seq in page_pairs]
+        continuous_seqs = (
+            bool(seqs)
+            and all(type(seq) is int for seq in seqs)
+            and seqs
+            == list(
+                range(
+                    cast(int, seqs[0]),
+                    cast(int, seqs[-1]) + 1,
+                )
+            )
+        )
+        valid_tool_ref = (
+            len(tool_rows) == 1
+            and len(tool_calls) == 1
+            and len(result_refs) == 1
+            and result_refs[0][:2] == tool_calls[0][:2]
+            and tool_calls[0][2] != ""
+            and tool_calls[0][3] == "tool_search"
+        )
+        valid_model_calls = (
+            len(call_ids) == 2
+            and len(set(call_ids)) == 2
+            and len(model_calls) == 2
+            and all(
+                isinstance(record.get("binding"), dict)
+                and record["binding"].get("model") == "model-gate"
+                and record.get("state") == "success"
+                for record in model_calls
+            )
+            and actual_usage == expected_usage
+            and usage_totals
+            == {
+                "input_tokens": 12,
+                "output_tokens": 5,
+                "request_count": 2,
+                "covered_request_count": 2,
             }
-            and stream_read.get("result") == stream_payload
         )
         checks.append(
             CheckResult(
                 "PC-04",
-                pc04_passed,
+                follow_ack.get("subscription_id") == "pc04-follow"
+                and pc04_ack.get("message_id") == "pc04-input"
+                and pc04_result.get("status") == "complete"
+                and len(pc04_requests) == 2
+                and isinstance(final_id, str)
+                and type(final_seq) is int
+                and isinstance(final_output, dict)
+                and final_output.get("seq") == final_seq
+                and final_text == "stream complete"
+                and valid_tool_ref
+                and valid_model_calls
+                and page_pairs == event_pairs
+                and continuous_seqs
+                and isinstance(pc04_barrier_status, dict)
+                and pc04_barrier_status.get("reached") is True
+                and pc04_barrier_status.get("released") is True
+                and intermediate_reply is not None,
                 {
-                    "threadId": stream_thread,
-                    "turnId": stream_turn,
-                    "itemMethods": [event.get("method") for event in notifications],
-                    "deltaSequences": sequences,
-                    "deltaText": delta_text,
-                    "toolItems": tool_items,
-                    "usage": usage,
-                    "terminalEqualsRead": stream_read.get("result") == stream_payload,
+                    "follow": follow_ack,
+                    "ack": pc04_ack,
+                    "result": pc04_result,
+                    "messagePage": pc04_page,
+                    "messageEvents": message_events,
+                    "intermediateReply": intermediate_reply,
+                    "intermediateTexts": intermediate_texts,
+                    "chunkBarrier": {
+                        "name": pc04_stream_barrier,
+                        "status": pc04_barrier_status,
+                    },
+                    "providerRequestCount": len(pc04_requests),
+                    "outputText": final_text,
+                    "toolCalls": tool_calls,
+                    "toolResultRefs": result_refs,
+                    "modelCallIds": call_ids,
+                    "modelCalls": model_calls,
+                    "usage": actual_usage,
+                    "usageTotals": usage_totals,
                 },
             )
         )
         final_requests = _http_json("GET", f"{model_url}/control/requests")
-        _write_jsonl(
-            report_dir / "model-requests.jsonl", _model_requests(final_requests)
-        )
+        _write_jsonl(report_dir / "model-requests.jsonl", _model_requests(final_requests))
     except Exception as error:
         checks.append(
             CheckResult(
@@ -979,9 +1571,8 @@ def _inside_smoke(report_dir: Path) -> int:
     print(json.dumps(report, ensure_ascii=False, indent=2))
     return 0 if passed else 1
 
-
 def _inside_memory_context(report_dir: Path) -> int:
-    """验证真实 session compaction ledger、Markdown side effects 和 append-only 语义。"""
+    """验证显式 eligible 程序 Session 的 Message compaction 和 Markdown 投影。"""
 
     report_dir.mkdir(parents=True, exist_ok=True)
     events_path = report_dir / "events.jsonl"
@@ -990,18 +1581,17 @@ def _inside_memory_context(report_dir: Path) -> int:
     checks: list[CheckResult] = []
     client: JsonRpcSocketClient | None = None
     try:
-        # 1. 按固定顺序提供 summary、业务响应和 Markdown profile projection。
         _wait_http_ready(f"{model_url}/readyz", READINESS_DEADLINE_S)
         _configure_model_gate(context_window=100_000)
-        _wait_socket(endpoint, READINESS_DEADLINE_S)
-        _http_json(
-            "PUT",
-            f"{model_url}/control/script",
+        seed_rows = _memory_context_seed_rows()
+        scripts = [
+            {"mode": "complete", "content": content}
+            for role, content in seed_rows
+            if role == "assistant"
+        ]
+        scripts.extend(
             [
-                {
-                    "mode": "complete",
-                    "content": _PC09_COMPACTION_SUMMARY,
-                },
+                {"mode": "complete", "content": _PC09_COMPACTION_SUMMARY},
                 {
                     "mode": "complete",
                     "content": (
@@ -1009,201 +1599,557 @@ def _inside_memory_context(report_dir: Path) -> int:
                         f"{_MEMORY_CONTEXT_RESPONSE}"
                     ),
                 },
-                {
-                    "mode": "complete",
-                    "content": _MEMORY_CONTEXT_PROFILE_RESPONSE,
-                },
-            ],
+                {"mode": "complete", "content": _MEMORY_CONTEXT_PROFILE_RESPONSE},
+            ]
         )
+        _http_json("PUT", f"{model_url}/control/script", scripts)
+        _wait_socket(endpoint, READINESS_DEADLINE_S)
         client = _connect_client(endpoint, events_path)
-        turn_id = _start_turn(client, _MEMORY_CONTEXT_SESSION, _MEMORY_CONTEXT_INPUT)
-        terminal = client.wait_terminal(turn_id)
-        payload = _event_turn(terminal)
+        admission = client.admit_programmatic(
+            _MEMORY_CONTEXT_SESSION, persist_memory=True
+        )
+        if admission.get("learning") != "eligible":
+            raise GateFailure(f"memory-context Session 未取得 eligible 准入：{admission!r}")
         database = Path("/sandbox/workspace/sessions.db")
-        seed_rows = _memory_context_seed_rows(_MEMORY_CONTEXT_SESSION)
-        expected_seed_hashes = {
-            message_id: hashlib.sha256(content.encode("utf-8")).hexdigest()
-            for message_id, _, content in seed_rows
-        }
-        connection = sqlite3.connect(database)
-        try:
+        # 1. 通过正式程序来源显式声明 eligible，再追加四个已结算历史 Turn。
+        seed_results: list[dict[str, Any]] = []
+        for index in range(4):
+            user_text = seed_rows[index * 2][1]
+            assistant_text = seed_rows[index * 2 + 1][1]
+            input_id = f"mc01-seed-{index}"
+            ack = client.send_programmatic(
+                _MEMORY_CONTEXT_SESSION, input_id, user_text
+            )
+            result = _wait_programmatic_result(
+                client, _MEMORY_CONTEXT_SESSION, input_id
+            )
+            if (
+                ack.get("message_id") != input_id
+                or result.get("status") != "complete"
+            ):
+                raise GateFailure(
+                    f"memory-context seed turn {index} 未完成：ack={ack!r} result={result!r}"
+                )
+            seed_results.append({"ack": ack, "result": result, "text": assistant_text})
+
+        with sqlite3.connect(database) as connection:
             connection.row_factory = sqlite3.Row
-            session_row = connection.execute(
-                "SELECT last_consolidated FROM sessions WHERE key = ?",
-                (_MEMORY_CONTEXT_SESSION,),
-            ).fetchone()
-            message_rows = connection.execute(
-                "SELECT id, seq, role, content FROM messages "
+            seed_message_rows = connection.execute(
+                "SELECT id, session_key, seq, ts, author, source, body FROM messages "
                 "WHERE session_key = ? ORDER BY seq",
                 (_MEMORY_CONTEXT_SESSION,),
             ).fetchall()
-            compaction_row = connection.execute(
-                "SELECT * FROM session_compactions "
-                "WHERE session_key = ? AND generation = 1",
+        if len(seed_message_rows) != 8:
+            raise GateFailure(
+                f"memory-context seed Message 数量异常：{len(seed_message_rows)}"
+            )
+        # 2. 最终业务 Input 继续走同一程序来源，触发 compaction 后完成 Reply。
+        business_id = "mc01-business"
+        business_ack = client.send_programmatic(
+            _MEMORY_CONTEXT_SESSION, business_id, _MEMORY_CONTEXT_INPUT
+        )
+        business_result = _wait_programmatic_result(
+            client, _MEMORY_CONTEXT_SESSION, business_id
+        )
+        if business_ack.get("message_id") != business_id:
+            raise GateFailure(f"memory-context business ACK 异常：{business_ack!r}")
+        if business_result.get("status") != "complete":
+            raise GateFailure(
+                f"memory-context business turn 未完成：{business_result!r}"
+            )
+
+        # Markdown 投影由已提交 SummaryRecord 的普通插件任务完成；等待其
+        # 可观察的 provider 请求，避免把 programmatic result 的完成 ACK 当成
+        # 所有 post-commit side effect 已经落盘。
+        final_requests: list[object] = []
+        request_deadline = time.monotonic() + SCENARIO_DEADLINE_S
+        while time.monotonic() < request_deadline:
+            final_requests = _model_requests(
+                _http_json("GET", f"{model_url}/control/requests")
+            )
+            if len(final_requests) == len(scripts):
+                break
+            threading.Event().wait(0.05)
+        if len(final_requests) != len(scripts):
+            raise GateFailure(
+                f"memory-context Markdown 请求未完成：{len(final_requests)}/{len(scripts)}"
+            )
+
+        with sqlite3.connect(database) as connection:
+            connection.row_factory = sqlite3.Row
+            session_row = connection.execute(
+                "SELECT attributes, next_seq FROM sessions WHERE key = ?",
                 (_MEMORY_CONTEXT_SESSION,),
             ).fetchone()
-            prepare_count = int(
-                connection.execute(
-                    "SELECT COUNT(*) FROM session_compaction_prepares "
-                    "WHERE session_key = ?",
-                    (_MEMORY_CONTEXT_SESSION,),
-                ).fetchone()[0]
-            )
-        finally:
-            connection.close()
+            message_rows = connection.execute(
+                "SELECT id, session_key, seq, ts, author, source, body FROM messages "
+                "WHERE session_key = ? ORDER BY seq",
+                (_MEMORY_CONTEXT_SESSION,),
+            ).fetchall()
+            owner_rows = connection.execute(
+                "SELECT key, value FROM owner_records "
+                "WHERE owner = 'plugin:compaction' ORDER BY key"
+            ).fetchall()
+            integrity_rows = connection.execute("PRAGMA integrity_check").fetchall()
+            owner_records = {
+                str(row["key"]): json.loads(str(row["value"])) for row in owner_rows
+            }
+        integrity_ok = [tuple(row) for row in integrity_rows] == [("ok",)]
+        if session_row is None or not integrity_ok:
+            raise GateFailure("memory-context Message ledger 缺失或完整性检查失败")
+        head_record = owner_records.get(f"head:{_MEMORY_CONTEXT_SESSION}")
+        summary_reference = (
+            head_record.get("reference") if isinstance(head_record, dict) else None
+        )
+        summary_record = (
+            owner_records.get(f"summary:{summary_reference}")
+            if isinstance(summary_reference, str)
+            else None
+        )
+        if not isinstance(summary_reference, str) or not isinstance(summary_record, dict):
+            raise GateFailure("memory-context SummaryRecord/head 缺失")
 
-        if session_row is None or compaction_row is None:
-            raise GateFailure("memory-context ledger row 缺失")
-        actual_hashes = {
-            str(row["id"]): hashlib.sha256(
-                str(row["content"]).encode("utf-8")
-            ).hexdigest()
+        source_ids = summary_record.get("source_message_ids")
+        source_ids = list(source_ids) if isinstance(source_ids, (list, tuple)) else []
+        source_ids = [str(item) for item in source_ids]
+        message_ids = {str(row["id"]) for row in message_rows}
+        summary_record_valid = (
+            summary_record.get("reference") == summary_reference
+            and summary_record.get("session_id") == _MEMORY_CONTEXT_SESSION
+            and summary_record.get("generation") == 1
+            and summary_record.get("parent") is None
+            and bool(source_ids)
+            and len(source_ids) == len(set(source_ids))
+            and set(source_ids) <= message_ids
+            and summary_record.get("content") == _PC09_COMPACTION_SUMMARY.strip()
+            and isinstance(summary_record.get("model_call_ids"), list)
+            and bool(summary_record.get("model_call_ids"))
+        )
+
+        seed_pairs_match = True
+        seed_full_shape: list[dict[str, object]] = []
+        for row, (expected_role, expected_text) in zip(message_rows[:8], seed_rows):
+            body = json.loads(str(row["body"]))
+            parts = body.get("parts") if isinstance(body, dict) else None
+            text_values = [
+                part.get("value")
+                for part in parts or ()
+                if isinstance(part, dict) and part.get("kind") == "text"
+            ]
+            shape_ok = (
+                isinstance(body, dict)
+                and body.get("kind") == ("input" if expected_role == "user" else "output")
+                and int(row["seq"]) == len(seed_full_shape)
+                and str(row["author"]) == expected_role
+                and str(row["source"]) == "programmatic"
+                and text_values == [expected_text]
+            )
+            seed_pairs_match = seed_pairs_match and shape_ok
+            seed_full_shape.append({
+                "id": str(row["id"]), "session_key": str(row["session_key"]),
+                "seq": int(row["seq"]), "ts": str(row["ts"]),
+                "author": str(row["author"]), "source": str(row["source"]),
+                "body": body,
+            })
+        seed_snapshot = [
+            (str(row["id"]), str(row["session_key"]), int(row["seq"]),
+             str(row["ts"]), str(row["author"]), str(row["source"]),
+             str(row["body"]))
+            for row in seed_message_rows
+        ]
+        final_snapshot = [
+            (str(row["id"]), str(row["session_key"]), int(row["seq"]),
+             str(row["ts"]), str(row["author"]), str(row["source"]),
+             str(row["body"]))
             for row in message_rows
-            if int(row["seq"]) < 8
-        }
-        seed_hashes_unchanged = actual_hashes == expected_seed_hashes
-        source_ids = json.loads(compaction_row["source_message_ids_json"])
-        retained_tail = json.loads(compaction_row["retained_tail_json"])
-        source_digest = str(compaction_row["source_plan_digest"])
-        expected_source_ids = [message_id for message_id, _, _ in seed_rows[:6]]
-        expected_retained_ids = [message_id for message_id, _, _ in seed_rows[6:]]
-        retained_ids = [str(item.get("id")) for item in retained_tail]
+        ]
+        seed_immutable = (
+            len(seed_snapshot) == 8
+            and final_snapshot[:8] == seed_snapshot
+            and [int(row["seq"]) for row in message_rows] == list(range(10))
+        )
         final_messages_only_append = (
             len(message_rows) == 10
-            and [str(row["id"]) for row in message_rows[:8]]
-            == [message_id for message_id, _, _ in seed_rows]
-            and [str(row["role"]) for row in message_rows[8:]] == ["user", "assistant"]
-            and str(message_rows[8]["content"]) == _MEMORY_CONTEXT_INPUT
-            and str(message_rows[9]["content"]) == _MEMORY_CONTEXT_RESPONSE
+            and [str(row["author"]) for row in message_rows[8:]] == ["user", "assistant"]
+            and [str(row["source"]) for row in message_rows[8:]]
+            == ["programmatic", "programmatic"]
         )
-        retained_tail_exact = (
-            retained_ids == expected_retained_ids
-            and [str(item.get("unit_ref")) for item in retained_tail]
-            == ["6:7:0", "6:7:0"]
-            and [str(item.get("message", {}).get("content")) for item in retained_tail]
-            == [content for _, _, content in seed_rows[6:]]
+        final_texts = []
+        for row in message_rows[8:]:
+            body = json.loads(str(row["body"]))
+            final_texts.append([
+                part.get("value") for part in body.get("parts", [])
+                if isinstance(part, dict) and part.get("kind") == "text"
+            ])
+        final_messages_only_append = final_messages_only_append and (
+            final_texts == [[_MEMORY_CONTEXT_INPUT], [_MEMORY_CONTEXT_RESPONSE]]
         )
-        ledger_passed = (
-            session_row["last_consolidated"] == 1
-            and compaction_row["context_window"] == 100_000
-            and compaction_row["threshold_tokens"] == 74_000
-            and source_ids == expected_source_ids
-            and retained_tail_exact
-            and source_digest
-            == _memory_context_source_plan_digest(_MEMORY_CONTEXT_SESSION)
-            and prepare_count == 0
-            and seed_hashes_unchanged
-            and final_messages_only_append
-        )
-        receipt_connection = sqlite3.connect(
-            "/sandbox/workspace/memory/consolidation_writes.db"
-        )
-        try:
-            receipt_row = receipt_connection.execute(
-                "SELECT payload FROM consolidation_writes "
-                "WHERE source_ref = ? AND kind = 'session_compaction_receipt'",
-                (str(compaction_row["source_ref"]),),
-            ).fetchone()
-        finally:
-            receipt_connection.close()
+
+        final_output_body = json.loads(str(message_rows[9]["body"])) if len(message_rows) > 9 else {}
+        final_output_facts = [
+            part.get("value")
+            for part in final_output_body.get("parts", [])
+            if isinstance(part, dict) and part.get("kind") == "model.facts"
+        ] if isinstance(final_output_body, dict) else []
+        final_output_text = [
+            part.get("value")
+            for part in final_output_body.get("parts", [])
+            if isinstance(part, dict) and part.get("kind") == "text"
+        ] if isinstance(final_output_body, dict) else []
+
+        memory_path = Path("/sandbox/workspace/memory/MEMORY.md")
+        self_path = Path("/sandbox/workspace/memory/SELF.md")
+        receipt_payloads: dict[str, dict[str, object]] = {}
+        receipt_inventory: list[dict[str, object]] = []
+        receipt_deadline = time.monotonic() + SCENARIO_DEADLINE_S
+        while time.monotonic() < receipt_deadline:
+            with sqlite3.connect(
+                "/sandbox/workspace/memory/markdown-profile-writes.db"
+            ) as connection:
+                receipt_rows = connection.execute(
+                    "SELECT source_ref, kind, payload FROM consolidation_writes "
+                    "WHERE kind IN ('markdown_memory_applied_v1', 'markdown_self_applied_v1') "
+                    "ORDER BY source_ref, kind"
+                ).fetchall()
+            receipt_inventory = [
+                {"sourceRef": str(source_ref), "kind": str(kind)}
+                for source_ref, kind, _payload in receipt_rows
+            ]
+            candidate: dict[str, dict[str, object]] = {}
+            for source_ref, kind, payload in receipt_rows:
+                if str(source_ref) != summary_reference:
+                    continue
+                value = json.loads(str(payload))
+                if not isinstance(value, dict):
+                    raise GateFailure(f"Markdown receipt 不是 object：{kind}")
+                candidate[str(kind)] = value
+            memory_content = memory_path.read_text(encoding="utf-8") if memory_path.exists() else ""
+            self_content = self_path.read_text(encoding="utf-8") if self_path.exists() else ""
+            if (
+                set(candidate) == {
+                    "markdown_memory_applied_v1",
+                    "markdown_self_applied_v1",
+                }
+                and memory_path.exists()
+                and self_path.exists()
+                and candidate["markdown_memory_applied_v1"].get("digest")
+                == hashlib.sha256(memory_content.encode("utf-8")).hexdigest()
+                and candidate["markdown_self_applied_v1"].get("digest")
+                == hashlib.sha256(self_content.encode("utf-8")).hexdigest()
+            ):
+                receipt_payloads = candidate
+                break
+            threading.Event().wait(0.05)
+        if len(receipt_payloads) != 2:
+            raise GateFailure(
+                "Markdown receipt 或目标文件未收敛："
+                f"{sorted(receipt_payloads)} inventory={receipt_inventory!r} "
+                f"summaryReference={summary_reference!r}"
+            )
+
         pending_path = Path("/sandbox/workspace/memory/PENDING.md")
         pending_retired = (
             not pending_path.exists()
             or not pending_path.read_text(encoding="utf-8").strip()
         )
-        receipt_connection = sqlite3.connect(
+        memory_applied = receipt_payloads.get("markdown_memory_applied_v1")
+        self_applied = receipt_payloads.get("markdown_self_applied_v1")
+
+        request_kinds = _memory_context_request_kinds(final_requests)
+        source_positions = [
+            index for index, row in enumerate(message_rows)
+            if str(row["id"]) in source_ids
+        ]
+        if len(source_positions) != len(source_ids):
+            raise GateFailure("SummaryRecord 引用了不存在的 Message")
+        source_contiguous = (
+            bool(source_positions)
+            and source_positions == list(range(source_positions[0], source_positions[-1] + 1))
+            and source_positions[0] % 2 == 0
+            and (source_positions[-1] - source_positions[0] + 1) % 2 == 0
+        )
+        source_digest = _memory_context_source_plan_digest(message_rows, source_ids)
+
+        summary_source_rows = _memory_context_summary_source(final_requests)
+        expected_summary_source = []
+        for position in source_positions:
+            row = message_rows[position]
+            expected_summary_source.append(
+                {
+                    "message_id": str(row["id"]),
+                    "source": str(row["source"]),
+                    "seq": int(row["seq"]),
+                    "body": _memory_context_summary_body(
+                        json.loads(str(row["body"]))
+                    ),
+                }
+            )
+        summary_source_matches = summary_source_rows == expected_summary_source
+
+        business_request = next(
+            request for request in final_requests
+            if isinstance(request, dict)
+            and isinstance(request.get("payload"), dict)
+            and _MEMORY_CONTEXT_INPUT in json.dumps(
+                request["payload"].get("messages", []), ensure_ascii=False
+            )
+        )
+        business_serialized = json.dumps(
+            business_request["payload"].get("messages", []), ensure_ascii=False
+        )
+        summary_payload, business_tail, source_contents = _memory_context_business_tail(
+            business_request["payload"].get("messages"),
+            [message_rows[position] for position in source_positions],
+            _MEMORY_CONTEXT_INPUT,
+        )
+        source_end = source_positions[-1] + 1
+        expected_business_tail = []
+        for row in message_rows[source_end:8]:
+            body = json.loads(str(row["body"]))
+            parts = body.get("parts", []) if isinstance(body, dict) else []
+            text_values = [
+                str(part["value"])
+                for part in parts
+                if isinstance(part, dict) and part.get("kind") == "text"
+            ]
+            if len(text_values) != 1:
+                raise GateFailure("业务保留尾部 Message 缺少唯一原文 text")
+            expected_business_tail.append((str(row["author"]), text_values[0]))
+        summary_binding_ids = [
+            str(part["value"]["reference"])
+            for part in final_output_body.get("parts", [])
+            if (
+                isinstance(part, dict)
+                and part.get("kind") == "context.summary"
+                and isinstance(part.get("value"), dict)
+                and isinstance(part["value"].get("reference"), str)
+            )
+        ] if isinstance(final_output_body, dict) else []
+        if len(summary_binding_ids) != 1:
+            raise GateFailure(
+                "业务 Output 缺少唯一 context.summary binding："
+                f"{summary_binding_ids!r}"
+            )
+        summary_binding_id = summary_binding_ids[0]
+        with sqlite3.connect(database) as connection:
+            binding_row = connection.execute(
+                "SELECT descriptor FROM bindings WHERE binding_id = ?",
+                (summary_binding_id,),
+            ).fetchone()
+        binding_descriptor = (
+            json.loads(str(binding_row[0])) if binding_row is not None else None
+        )
+        binding_metadata = (
+            binding_descriptor.get("metadata")
+            if isinstance(binding_descriptor, dict)
+            else None
+        )
+        summary_binding_metadata_valid = (
+            isinstance(binding_descriptor, dict)
+            and binding_descriptor.get("version") == 1
+            and binding_descriptor.get("service") == "compaction.summaries.v1"
+            and isinstance(binding_metadata, dict)
+            and binding_metadata.get("record_ref") == summary_reference
+            and binding_metadata.get("session_id") == _MEMORY_CONTEXT_SESSION
+        )
+        business_summary_replaced = (
+            summary_payload.get("summary") == summary_record.get("content")
+            and summary_payload.get("reference") == summary_binding_id
+            and summary_binding_metadata_valid
+            and business_tail == expected_business_tail
+            and all(str(message_id) not in business_serialized for message_id in source_ids)
+            and all(content not in business_serialized for content in source_contents)
+        )
+
+        owner_snapshot = [
+            (str(row["key"]), str(row["value"])) for row in owner_rows
+        ]
+        receipts_database = Path(
             "/sandbox/workspace/memory/markdown-profile-writes.db"
         )
-        try:
-            memory_applied = receipt_connection.execute(
-                "SELECT 1 FROM consolidation_writes "
-                "WHERE source_ref = ? AND kind = 'markdown_memory_applied_v1'",
-                (str(compaction_row["source_ref"]),),
-            ).fetchone()
-            self_applied = receipt_connection.execute(
-                "SELECT 1 FROM consolidation_writes "
-                "WHERE source_ref = ? AND kind = 'markdown_self_applied_v1'",
-                (str(compaction_row["source_ref"]),),
-            ).fetchone()
-        finally:
-            receipt_connection.close()
-        final_requests = _model_requests(
+        with sqlite3.connect(receipts_database) as connection:
+            receipt_snapshot = [
+                tuple(str(value) for value in row)
+                for row in connection.execute(
+                    "SELECT source_ref, kind, payload, trailing_blank_line, done_at "
+                    "FROM consolidation_writes ORDER BY source_ref, kind"
+                ).fetchall()
+            ]
+        target_snapshot = {
+            "memory": memory_path.read_text(encoding="utf-8"),
+            "self": self_path.read_text(encoding="utf-8"),
+        }
+        pending_snapshot = (
+            pending_path.read_text(encoding="utf-8")
+            if pending_path.exists()
+            else None
+        )
+
+        # 3. 断开原连接，再用同一 message_id/text 重试持久 send/result。
+        client.close()
+        client = None
+        _wait_socket(endpoint, READINESS_DEADLINE_S)
+        client = _connect_client(endpoint, events_path)
+        retry_ack = client.send_programmatic(
+            _MEMORY_CONTEXT_SESSION, business_id, _MEMORY_CONTEXT_INPUT
+        )
+        retry_result = _wait_programmatic_result(
+            client, _MEMORY_CONTEXT_SESSION, business_id
+        )
+        retry_requests = _model_requests(
             _http_json("GET", f"{model_url}/control/requests")
         )
-        if len(final_requests) != 3:
-            capabilities = _http_json(
-                "GET",
-                "http://akashic-control-gate:2236/api/chat/runtime/capabilities",
-            )
-            markdown_incidents = next(
-                (
-                    plugin.get("composition", {}).get("recent_incidents", [])
-                    for plugin in capabilities.get("plugins", [])
-                    if plugin.get("id") == "markdown_memory"
-                ),
-                [],
-            )
-            raise GateFailure(
-                "memory-context 模型请求数量异常："
-                f"{len(final_requests)} markdownIncidents="
-                f"{json.dumps(markdown_incidents, ensure_ascii=False, sort_keys=True)}"
-            )
-        request_kinds = _memory_context_request_kinds(final_requests)
-        scripts = [
-            request.get("script")
-            for request in final_requests
-            if isinstance(request, dict)
+        with sqlite3.connect(database) as connection:
+            connection.row_factory = sqlite3.Row
+            retry_message_rows = connection.execute(
+                "SELECT id, session_key, seq, ts, author, source, body "
+                "FROM messages WHERE session_key = ? ORDER BY seq",
+                (_MEMORY_CONTEXT_SESSION,),
+            ).fetchall()
+            retry_owner_rows = connection.execute(
+                "SELECT key, value FROM owner_records "
+                "WHERE owner = 'plugin:compaction' ORDER BY key"
+            ).fetchall()
+        retry_message_snapshot = [
+            (str(row["id"]), str(row["session_key"]), int(row["seq"]),
+             str(row["ts"]), str(row["author"]), str(row["source"]),
+             str(row["body"]))
+            for row in retry_message_rows
         ]
-        scripts_boundary = (
-            scripts[0] == {"mode": "complete", "content": _PC09_COMPACTION_SUMMARY}
-            and isinstance(scripts[1], dict)
-            and "<think>" in str(scripts[1].get("content"))
-            and scripts[2] == {"mode": "complete", "content": _MEMORY_CONTEXT_PROFILE_RESPONSE}
+        retry_owner_snapshot = [
+            (str(row["key"]), str(row["value"])) for row in retry_owner_rows
+        ]
+        with sqlite3.connect(receipts_database) as connection:
+            retry_receipt_snapshot = [
+                tuple(str(value) for value in row)
+                for row in connection.execute(
+                    "SELECT source_ref, kind, payload, trailing_blank_line, done_at "
+                    "FROM consolidation_writes ORDER BY source_ref, kind"
+                ).fetchall()
+            ]
+        retry_target_snapshot = {
+            "memory": memory_path.read_text(encoding="utf-8"),
+            "self": self_path.read_text(encoding="utf-8"),
+        }
+        retry_pending_snapshot = (
+            pending_path.read_text(encoding="utf-8")
+            if pending_path.exists()
+            else None
         )
-        projected = _turn_projection(payload)
-        assistant_items = [
-            item
-            for item in projected["items"]
-            if item.get("type") == "assistantMessage"
-        ]
+        retry_ack_same = retry_ack == business_ack
+        retry_result_same = retry_result == business_result
+        retry_messages_unchanged = retry_message_snapshot == final_snapshot
+        retry_owner_unchanged = retry_owner_snapshot == owner_snapshot
+        retry_receipts_unchanged = retry_receipt_snapshot == receipt_snapshot
+        retry_targets_unchanged = retry_target_snapshot == target_snapshot
+        retry_pending_unchanged = retry_pending_snapshot == pending_snapshot
+        retry_transport_recovery = (
+            retry_ack_same
+            and retry_result_same
+            and len(retry_message_snapshot) == 10
+            and retry_messages_unchanged
+            and retry_owner_unchanged
+            and retry_receipts_unchanged
+            and retry_targets_unchanged
+            and retry_pending_unchanged
+            and len(retry_requests) == len(scripts) == 7
+        )
+        scripts_boundary = (
+            [request.get("script") for request in final_requests
+             if isinstance(request, dict)] == scripts
+        )
         thinking_boundary = (
-            len(assistant_items) == 1
-            and assistant_items[0]["data"].get("thinking") == _MEMORY_CONTEXT_THINKING
-            and not any(item.get("type") == "toolCall" for item in projected["items"])
+            len(final_output_facts) == 1
+            and isinstance(final_output_facts[0], dict)
+            and final_output_facts[0].get("thinking") == _MEMORY_CONTEXT_THINKING
+            and final_output_body.get("finish") == "complete"
+        )
+        attributes = json.loads(str(session_row["attributes"]))
+        attributes_valid = (
+            isinstance(attributes, dict)
+            and attributes.get("visibility") == "internal"
+            and attributes.get("learning") == "eligible"
         )
         checks.append(
             CheckResult(
                 "MC-01",
-                payload.get("status") == "completed"
-                and payload.get("finalResponse") == _MEMORY_CONTEXT_RESPONSE
-                and request_kinds == ["summary", "business", "markdown"]
+                business_result.get("status") == "complete"
+                and final_output_text == [_MEMORY_CONTEXT_RESPONSE]
+                and request_kinds == ["seed", "seed", "seed", "seed", "summary", "business", "markdown"]
                 and scripts_boundary
                 and thinking_boundary
-                and ledger_passed
-                and receipt_row is not None
+                and attributes_valid
+                and session_row["next_seq"] == 10
+                and seed_pairs_match
+                and seed_immutable
+                and summary_record_valid
+                and summary_source_matches
+                and source_contiguous
+                and final_messages_only_append
+                and summary_binding_metadata_valid
+                and business_summary_replaced
+                and retry_transport_recovery
                 and pending_retired
                 and memory_applied is not None
                 and self_applied is not None,
                 {
-                    "terminal": payload,
+                    "admission": admission,
+                    "seedResults": seed_results,
+                    "businessAck": business_ack,
+                    "businessResult": business_result,
                     "requestKinds": request_kinds,
                     "ledger": {
-                        "lastConsolidated": session_row["last_consolidated"],
+                        "sessionAttributes": attributes,
+                        "nextSeq": session_row["next_seq"],
+                        "summaryReference": summary_reference,
                         "sourceIds": source_ids,
-                        "retainedIds": retained_ids,
-                        "sourceDigest": source_digest,
-                        "seedHashesUnchanged": seed_hashes_unchanged,
+                        "sourcePlanDigest": source_digest,
+                        "sourcePositions": source_positions,
+                        "sourceContiguous": source_contiguous,
+                        "summarySourceMatches": summary_source_matches,
+                        "summarySourceRows": summary_source_rows,
+                        "summaryBinding": {
+                            "bindingId": summary_binding_id,
+                            "metadata": binding_metadata,
+                            "metadataValid": summary_binding_metadata_valid,
+                        },
+                        "businessSummaryReplaced": business_summary_replaced,
+                        "businessTail": business_tail,
+                        "expectedBusinessTail": expected_business_tail,
+                        "summaryRecordValid": summary_record_valid,
+                        "seedPairsMatch": seed_pairs_match,
+                        "seedImmutable": seed_immutable,
                         "finalMessagesOnlyAppend": final_messages_only_append,
-                        "prepareCount": prepare_count,
-                        "retainedTailExact": retained_tail_exact,
                     },
-                    "receiptExists": receipt_row is not None,
+                    "transportRetry": {
+                        "disconnected": True,
+                        "newConnection": True,
+                        "ack": retry_ack,
+                        "result": retry_result,
+                        "ackSameIdSeq": retry_ack_same,
+                        "resultUnchanged": retry_result_same,
+                        "messageCount": len(retry_message_snapshot),
+                        "messagesUnchanged": retry_messages_unchanged,
+                        "summaryOwnerCount": len(owner_snapshot),
+                        "summaryOwnerUnchanged": retry_owner_unchanged,
+                        "receiptCount": len(receipt_snapshot),
+                        "receiptsUnchanged": retry_receipts_unchanged,
+                        "targetsUnchanged": retry_targets_unchanged,
+                        "pendingUnchanged": retry_pending_unchanged,
+                        "providerRequestCount": len(retry_requests),
+                    },
                     "pendingRetired": pending_retired,
                     "memoryApplied": memory_applied is not None,
                     "selfApplied": self_applied is not None,
+                    "markdownTargets": {
+                        "memory": memory_path.read_text(encoding="utf-8"),
+                        "self": self_path.read_text(encoding="utf-8"),
+                    },
                     "scriptsBoundary": scripts_boundary,
                     "thinkingBoundary": thinking_boundary,
                     "modelRequestCount": len(final_requests),
+                    "seedFullShape": seed_full_shape,
+                    "finalOutputFacts": final_output_facts,
                 },
             )
         )
@@ -1230,7 +2176,6 @@ def _inside_memory_context(report_dir: Path) -> int:
     print(json.dumps(report, ensure_ascii=False, indent=2))
     return 0 if passed else 1
 
-
 def _inside_failure_matrix(report_dir: Path) -> int:
     """以真实 barrier 和多连接驱动 PR 必选故障矩阵。"""
 
@@ -1240,541 +2185,1105 @@ def _inside_failure_matrix(report_dir: Path) -> int:
     endpoint = Path("/sandbox/akashic.sock")
     checks: list[CheckResult] = []
     clients: list[JsonRpcSocketClient] = []
-    restart_state: dict[str, str] = {}
+    restart_state: dict[str, object] = {}
     try:
         _wait_http_ready(f"{model_url}/readyz", READINESS_DEADLINE_S)
-        _configure_model_gate()
+        _configure_model_gate(context_window=1_000_000)
         _wait_socket(endpoint, READINESS_DEADLINE_S)
         first = _connect_client(endpoint, events_path)
         second = _connect_client(endpoint, events_path)
         clients.extend((first, second))
 
-        # 1. 两连接两 thread：第二个 turn 保持 queued，释放后事件不串线。
-        _create_barrier(
-            model_url,
-            "isolation-first",
-            {"mode": "complete", "content": "isolation first"},
+        # 1. 两个独立 programmatic Session 必须同时进入同一 provider barrier。
+        pc05_a = "programmatic:pc05-a"
+        pc05_b = "programmatic:pc05-b"
+        first.admit_programmatic(pc05_a)
+        second.admit_programmatic(pc05_b)
+        pc05_a_barrier = "pc05-provider-a"
+        pc05_b_barrier = "pc05-provider-b"
+        _http_json(
+            "PUT", f"{model_url}/control/barriers/{pc05_a_barrier}"
         )
-        _create_barrier(
-            model_url,
-            "isolation-second",
-            {"mode": "complete", "content": "isolation second"},
+        _http_json(
+            "PUT", f"{model_url}/control/barriers/{pc05_b_barrier}"
         )
-        thread_a = _start_thread(first, "PC-05")
-        thread_b = _start_thread(second, "PC-05")
-        turn_a = _start_turn(first, thread_a, "isolation first")
-        _wait_barrier(model_url, "isolation-first")
-        turn_b = _start_turn(second, thread_b, "isolation second")
-        queued_b = second.wait_notification("turn/queued", turn_id=turn_b)
-        before_release = _http_json("GET", f"{model_url}/control/requests")
-        before_requests = _model_requests(before_release)
-        _release_barrier(model_url, "isolation-first")
-        terminal_a = first.wait_terminal(turn_a)
-        _wait_barrier(model_url, "isolation-second")
-        _release_barrier(model_url, "isolation-second")
-        terminal_b = second.wait_terminal(turn_b)
-        isolated = (
-            len(before_requests) == 1
-            and _terminal_status(terminal_a) == "completed"
-            and _terminal_status(terminal_b) == "completed"
-            and queued_b.get("params", {}).get("threadId") == thread_b
-            and terminal_a.get("params", {}).get("threadId") == thread_a
-            and terminal_b.get("params", {}).get("threadId") == thread_b
-        )
-        checks.append(
-            CheckResult(
-                "PC-05",
-                isolated,
-                {
-                    "requestsBeforeFirstRelease": len(before_requests),
-                    "threadA": thread_a,
-                    "threadB": thread_b,
-                    "turnA": turn_a,
-                    "turnB": turn_b,
-                },
-            )
-        )
-
-        # 2. 同 thread 的第二个 start 必须明确 busy，不能注入 owner turn。
-        _create_barrier(
-            model_url,
-            "thread-conflict",
-            {"mode": "complete", "content": "intermediate candidate"},
-        )
-        conflict_thread = _start_thread(first, "PC-06")
-        conflict_turn = _start_turn(first, conflict_thread, "conflict owner")
-        _wait_barrier(model_url, "thread-conflict")
-        rejected = first.request_raw(
-            "turn/start",
-            {
-                "threadId": conflict_thread,
-                "input": "must conflict",
-                "metadata": {},
-            },
-        )
-        _release_barrier(model_url, "thread-conflict")
-        conflict_terminal = first.wait_terminal(conflict_turn)
-        rejected_error = rejected.get("error")
-        terminal_turn = _event_turn(conflict_terminal)
-        user_inputs = [
-            item.get("data", {}).get("content")
-            for item in terminal_turn.get("items", [])
-            if isinstance(item, dict) and item.get("type") == "userMessage"
-        ]
-        checks.append(
-            CheckResult(
-                "PC-06",
-                isinstance(rejected_error, dict)
-                and rejected_error.get("code") == -32011
-                and rejected_error.get("data") == {"retryable": True}
-                and _terminal_status(conflict_terminal) == "completed"
-                and terminal_turn.get("finalResponse") == "intermediate candidate"
-                and user_inputs == ["conflict owner"],
-                {
-                    "rejected": rejected_error,
-                    "ownerTerminal": conflict_terminal,
-                    "userInputs": user_inputs,
-                },
-            )
-        )
-
-        # 3. 工具已 started 后精确 interrupt，owner 必须闭合同 ID item。
         _http_json(
             "PUT",
             f"{model_url}/control/script",
             [
                 {
-                    "mode": "stream",
-                    "deltas": [],
-                    "tool_calls": [
-                        {
-                            "id": "call_pc07_unlock",
-                            "name": "tool_search",
-                            "arguments": {"query": "select:shell"},
-                        }
-                    ],
+                    "mode": "complete",
+                    "content": "pc05 first complete",
+                    "barrier": pc05_a_barrier,
                 },
                 {
-                    "mode": "stream",
-                    "deltas": [],
+                    "mode": "complete",
+                    "content": "pc05 second complete",
+                    "barrier": pc05_b_barrier,
+                },
+            ],
+        )
+        pc05_a_ack = first.send_programmatic(pc05_a, "pc05-input-a", "pc05 first")
+        _wait_barrier(model_url, pc05_a_barrier)
+        pc05_b_ack = second.send_programmatic(pc05_b, "pc05-input-b", "pc05 second")
+        _wait_barrier(model_url, pc05_b_barrier)
+        pc05_requests = _model_requests(
+            _http_json("GET", f"{model_url}/control/requests")
+        )
+        pc05_blocked = [
+            request
+            for request in pc05_requests
+            if isinstance(request, dict)
+            and request.get("state") == "blocked"
+            and isinstance(request.get("payload"), dict)
+            and any(
+                text in json.dumps(request["payload"], ensure_ascii=False)
+                for text in ("pc05 first", "pc05 second")
+            )
+        ]
+        _release_barrier(model_url, pc05_a_barrier)
+        _release_barrier(model_url, pc05_b_barrier)
+        pc05_a_result = _wait_programmatic_result(first, pc05_a, "pc05-input-a")
+        pc05_b_result = _wait_programmatic_result(second, pc05_b, "pc05-input-b")
+        pc05_a_page = first.read_messages(pc05_a)
+        pc05_b_page = second.read_messages(pc05_b)
+        pc05_a_output = next(
+            (item for item in pc05_a_page.get("items", [])
+             if isinstance(item, dict) and item.get("body", {}).get("kind") == "output"),
+            None,
+        )
+        pc05_b_output = next(
+            (item for item in pc05_b_page.get("items", [])
+             if isinstance(item, dict) and item.get("body", {}).get("kind") == "output"),
+            None,
+        )
+        pc05_input_rows = [
+            item for page in (pc05_a_page, pc05_b_page)
+            for item in page.get("items", [])
+            if isinstance(item, dict) and item.get("body", {}).get("kind") == "input"
+        ]
+        pc05_passed = (
+            pc05_a_ack.get("seq") == 0
+            and pc05_b_ack.get("seq") == 0
+            and len(pc05_blocked) == 2
+            and pc05_a_result.get("status") == "complete"
+            and pc05_b_result.get("status") == "complete"
+            and pc05_a_output is not None
+            and pc05_b_output is not None
+            and _message_text(pc05_a_output) == "pc05 first complete"
+            and _message_text(pc05_b_output) == "pc05 second complete"
+            and len(pc05_input_rows) == 2
+            and {item.get("session_id") for item in pc05_input_rows}
+            == {pc05_a, pc05_b}
+            and all(item.get("source") == "programmatic" for item in pc05_input_rows)
+        )
+        checks.append(
+            CheckResult(
+                "PC-05",
+                pc05_passed,
+                {
+                    "sessions": [pc05_a, pc05_b],
+                    "acks": [pc05_a_ack, pc05_b_ack],
+                    "blockedProviderRequests": pc05_blocked,
+                    "results": [pc05_a_result, pc05_b_result],
+                    "messagePages": [pc05_a_page, pc05_b_page],
+                },
+            )
+        )
+
+        # 2. 同一来源再次提交时只追加新的 Input，并按 source head 撤掉旧回复。
+        pc06 = "programmatic:pc06-source-head"
+        first.admit_programmatic(pc06)
+        pc06_barrier = "pc06-old-provider"
+        _http_json("PUT", f"{model_url}/control/barriers/{pc06_barrier}")
+        _http_json(
+            "PUT",
+            f"{model_url}/control/script",
+            [
+                {
+                    "mode": "complete",
+                    "content": "pc06 stale response",
+                    "barrier": pc06_barrier,
+                },
+                {"mode": "complete", "content": "pc06 latest response"},
+            ],
+        )
+        pc06_first_ack = first.send_programmatic(pc06, "pc06-first", "pc06 first input")
+        _wait_barrier(model_url, pc06_barrier)
+        pc06_request_start = len(
+            _model_requests(_http_json("GET", f"{model_url}/control/requests"))
+        ) - 1
+        pc06_second_ack = first.send_programmatic(
+            pc06, "pc06-second", "pc06 same-source replacement"
+        )
+        pc06_before_release = first.read_messages(pc06)
+        pc06_inputs_before = [
+            item for item in pc06_before_release.get("items", [])
+            if isinstance(item, dict) and item.get("body", {}).get("kind") == "input"
+        ]
+        _release_barrier(model_url, pc06_barrier)
+        pc06_result = _wait_programmatic_result(first, pc06, "pc06-second")
+        pc06_page = first.read_messages(pc06)
+        pc06_inputs = [
+            item for item in pc06_page.get("items", [])
+            if isinstance(item, dict) and item.get("body", {}).get("kind") == "input"
+        ]
+        pc06_outputs = [
+            item for item in pc06_page.get("items", [])
+            if isinstance(item, dict) and item.get("body", {}).get("kind") == "output"
+        ]
+        pc06_requests = _model_requests(
+            _http_json("GET", f"{model_url}/control/requests")
+        )[max(0, pc06_request_start):]
+        pc06_second_payload = next(
+            (
+                request.get("payload")
+                for request in pc06_requests
+                if isinstance(request, dict)
+                and isinstance(request.get("payload"), dict)
+                and "pc06 same-source replacement"
+                in json.dumps(request["payload"], ensure_ascii=False)
+            ),
+            None,
+        )
+        pc06_second_messages = (
+            pc06_second_payload.get("messages", [])
+            if isinstance(pc06_second_payload, dict)
+            else []
+        )
+        pc06_second_prompt = json.dumps(pc06_second_messages, ensure_ascii=False)
+        pc06_passed = (
+            pc06_first_ack.get("seq") == 0
+            and pc06_second_ack.get("seq") == 1
+            and len(pc06_inputs_before) == 2
+            and [item.get("id") for item in pc06_inputs_before] == [
+                "pc06-first", "pc06-second"
+            ]
+            and all(item.get("session_id") == pc06 for item in pc06_inputs_before)
+            and all(item.get("source") == "programmatic" for item in pc06_inputs_before)
+            and pc06_result.get("status") == "complete"
+            and len(pc06_inputs) == 2
+            and [item.get("id") for item in pc06_inputs] == [
+                "pc06-first", "pc06-second"
+            ]
+            and len(pc06_outputs) == 1
+            and _message_text(pc06_outputs[0]) == "pc06 latest response"
+            and "pc06 first input" in pc06_second_prompt
+            and "pc06 same-source replacement" in pc06_second_prompt
+        )
+        checks.append(
+            CheckResult(
+                "PC-06",
+                pc06_passed,
+                {
+                    "firstAck": pc06_first_ack,
+                    "secondAck": pc06_second_ack,
+                    "inputsBeforeRelease": pc06_inputs_before,
+                    "result": pc06_result,
+                    "messagePage": pc06_page,
+                    "providerRequests": pc06_requests,
+                    "secondProviderPayload": pc06_second_payload,
+                },
+            )
+        )
+
+        # 3. 真实 shell 已 started 后暂停；清理物理进程，ToolResult 仍引用原 CallRef。
+        pc07 = "programmatic:pc07-control"
+        first.admit_programmatic(pc07)
+        pc07_pause_barrier = "pc07-pause-provider"
+        pc07_identity_command = (
+            "pid=$(cat /sandbox/workspace/pc07-shell.pid) || "
+            "{ printf 'PC07 identity: cannot read pid\\n' >&2; exit 43; }; "
+            "expected=$(cat /sandbox/workspace/pc07-shell.starttime) || "
+            "{ printf 'PC07 identity: cannot read expected starttime\\n' >&2; exit 43; }; "
+            "stat_path=/proc/$pid/stat; alive=false; status=42; actual=null; "
+            "if [ -e \"$stat_path\" ]; then "
+            "actual=$(awk '{print $22}' \"$stat_path\") || "
+            "{ printf 'PC07 identity: cannot read %s\\n' \"$stat_path\" >&2; exit 43; }; "
+            "if [ -z \"$actual\" ]; then "
+            "printf 'PC07 identity: empty starttime from %s\\n' \"$stat_path\" >&2; exit 43; fi; "
+            "if [ \"$actual\" = \"$expected\" ]; then "
+            "if kill -0 \"$pid\" 2>/dev/null; then alive=true; status=0; "
+            "elif [ ! -e \"$stat_path\" ]; then actual=null; "
+            "else printf 'PC07 identity: cannot verify pid %s\\n' \"$pid\" >&2; exit 43; fi; "
+            "fi; fi; "
+            "printf '{\"alive\":%s,\"pid\":%s,' \"$alive\" \"$pid\"; "
+            "printf '\"expected_starttime\":%s,\"actual_starttime\":%s}\\n' "
+            "\"$expected\" \"$actual\"; exit \"$status\""
+        )
+        _http_json("PUT", f"{model_url}/control/barriers/{pc07_pause_barrier}")
+        _http_json(
+            "PUT",
+            f"{model_url}/control/script",
+            [
+                {
+                    "mode": "complete",
                     "tool_calls": [
                         {
                             "id": "call_pc07_shell",
                             "name": "shell",
                             "arguments": {
-                                "command": "sleep 300",
-                                "description": "阻塞中断探针",
+                                "command": (
+                                    "pid_file=/sandbox/workspace/pc07-shell.pid; "
+                                    "start_file=/sandbox/workspace/pc07-shell.starttime; "
+                                    "printf '%s\\n' \"$$\" > \"$pid_file\"; "
+                                    "awk '{print $22}' /proc/$$/stat > \"$start_file\"; "
+                                    "printf '{\"pid\":%s,\"starttime\":%s}\\n' "
+                                    "\"$(cat \"$pid_file\")\" \"$(cat \"$start_file\")\"; "
+                                    "exec sleep 300"
+                                ),
+                                "description": "PC07 long running cleanup probe",
+                                "yield_time_ms": 250,
                                 "timeout": 300,
-                                "yield_time_ms": 30_000,
                             },
                         }
                     ],
                 },
+                {
+                    "mode": "complete",
+                    "tool_calls": [
+                        {
+                            "id": "call_pc07_shell_identity_before_pause",
+                            "name": "shell",
+                            "arguments": {
+                                "command": pc07_identity_command,
+                                "description": "PC07 verify shell PID identity before pause",
+                                "yield_time_ms": 250,
+                                "timeout": 30,
+                            },
+                        }
+                    ],
+                },
+                {"mode": "timeout", "barrier": pc07_pause_barrier},
             ],
         )
-        interrupt_thread = _start_thread(first, "PC-07")
-        interrupted_turn = _start_turn(first, interrupt_thread, "interrupt me")
-        shell_started = _wait_tool_started(first, interrupted_turn, "shell")
-        interrupt_started = time.monotonic()
-        interrupt_result = first.request(
-            "turn/interrupt",
-            {"threadId": interrupt_thread, "turnId": interrupted_turn},
+        pc07_input_ack = first.send_programmatic(
+            pc07, "pc07-input", "pc07 start controllable shell"
         )
-        interrupted_terminal = first.wait_terminal(interrupted_turn, timeout=2.0)
-        interrupt_duration = time.monotonic() - interrupt_started
-        interrupted_payload = _event_turn(interrupted_terminal)
-        interrupted_read = first.request(
-            "turn/read",
-            {"threadId": interrupt_thread, "turnId": interrupted_turn},
+        pc07_page_with_tool, pc07_tool_rows = _wait_for_message_items(
+            first, pc07, "tool_result", minimum=2
         )
-        _ = first.request("server/status", {})
-        interrupted_events = _recorded_turn_notifications(events_path, interrupted_turn)
-        interrupted_terminal_count = sum(
-            event.get("method") == "turn/completed" for event in interrupted_events
+        pc07_provider_count = len(
+            _model_requests(_http_json("GET", f"{model_url}/control/requests"))
         )
-        _, shell_completed = _tool_lifecycle(interrupted_events, "shell")
-        persisted_shell = next(
+        _wait_barrier(model_url, pc07_pause_barrier)
+        _release_barrier(model_url, pc07_pause_barrier)
+        pc07_outputs_with_tool = _message_items(pc07_page_with_tool, "output")
+        pc07_tool_payloads = [
+            _execution_payload(item)
+            for item in pc07_tool_rows
+        ]
+        pc07_tool_result = next(
             (
                 item
-                for item in interrupted_payload.get("items", [])
-                if isinstance(item, dict) and item.get("id") == shell_started.get("id")
+                for item, payload in zip(pc07_tool_rows, pc07_tool_payloads)
+                if isinstance(payload, dict) and isinstance(payload.get("execution_id"), int)
             ),
             None,
         )
+        pc07_pre_identity_result = next(
+            (
+                item
+                for item, payload in zip(pc07_tool_rows, pc07_tool_payloads)
+                if isinstance(payload, dict)
+                and isinstance(payload.get("output"), str)
+                and '"alive":true' in payload["output"].replace(" ", "")
+            ),
+            None,
+        )
+        if pc07_tool_result is None or pc07_pre_identity_result is None:
+            raise GateFailure(
+                f"PC07 shell identity ToolResult 缺失：{pc07_tool_rows!r}"
+            )
+        pc07_tool_ref = pc07_tool_result.get("body", {}).get("call_ref", {})
+        try:
+            pc07_tool_payload = _execution_payload(pc07_tool_result)
+            pc07_execution_id = int(pc07_tool_payload["execution_id"])
+            pc07_shell_identity = _execution_last_json(pc07_tool_result)
+            pc07_pre_identity = _execution_last_json(pc07_pre_identity_result)
+        except (KeyError, TypeError, ValueError) as error:
+            raise GateFailure(
+                f"PC07 shell 未返回可核验 PID identity：{pc07_tool_rows!r}"
+            ) from error
+        if not (
+            isinstance(pc07_shell_identity, dict)
+            and isinstance(pc07_pre_identity, dict)
+            and pc07_shell_identity.get("pid") == pc07_pre_identity.get("pid")
+            and pc07_shell_identity.get("starttime")
+            == pc07_pre_identity.get("expected_starttime")
+            and pc07_pre_identity.get("expected_starttime")
+            == pc07_pre_identity.get("actual_starttime")
+            and pc07_pre_identity.get("alive") is True
+        ):
+            raise GateFailure(
+                f"PC07 pause 前 shell identity 未确认存活："
+                f"{pc07_shell_identity!r} / {pc07_pre_identity!r}"
+            )
+        pc07_tool_call: dict[str, Any] | None = None
+        for output in pc07_outputs_with_tool:
+            if output.get("id") != pc07_tool_ref.get("message_id"):
+                continue
+            parts = output.get("body", {}).get("parts", [])
+            if not isinstance(parts, list):
+                continue
+            part_index = pc07_tool_ref.get("part_index")
+            if (
+                type(part_index) is int
+                and 0 <= part_index < len(parts)
+                and isinstance(parts[part_index], dict)
+                and parts[part_index].get("kind") == "tool_call"
+                and parts[part_index].get("name") == "shell"
+            ):
+                pc07_tool_call = {
+                    "message_id": output.get("id"),
+                    "part_index": part_index,
+                    "part": parts[part_index],
+                }
+                break
+        if pc07_tool_call is None:
+            raise GateFailure(f"PC07 shell ToolCall 缺失：{pc07_tool_ref!r}")
 
-        _create_barrier(
-            model_url,
-            "interrupt-fresh",
-            {"mode": "complete", "content": "fresh survives"},
+        # 后续 provider 调用故意等待客户端断开，使 pause 发生在工具回执之后。
+        pc07_pause_ack = first.request_result(
+            "programmatic/message/pause",
+            {"session_id": pc07, "message_id": "pc07-pause"},
         )
-        fresh_turn = _start_turn(first, interrupt_thread, "fresh turn")
-        _wait_barrier(model_url, "interrupt-fresh")
-        stale_interrupt = first.request_raw(
-            "turn/interrupt",
-            {"threadId": interrupt_thread, "turnId": interrupted_turn},
+        pc07_paused_result = first.programmatic_result(pc07, "pc07-input")
+        pc07_cancel_deadline = time.monotonic() + SCENARIO_DEADLINE_S
+        while time.monotonic() < pc07_cancel_deadline:
+            pc07_after_pause_requests = _model_requests(
+                _http_json("GET", f"{model_url}/control/requests")
+            )
+            if any(
+                isinstance(request, dict)
+                and int(request.get("index", 0)) >= pc07_provider_count
+                and request.get("state") == "client_disconnected"
+                for request in pc07_after_pause_requests
+            ):
+                break
+            threading.Event().wait(0.05)
+        else:
+            raise GateFailure("PC07 pause 后 provider 请求未确认断开")
+        _http_json("PUT", f"{model_url}/control/barriers/pc07-new-input")
+        _http_json(
+            "PUT",
+            f"{model_url}/control/script",
+            [
+                {
+                    "mode": "complete",
+                    "tool_calls": [
+                        {
+                            "id": "call_pc07_after_cleanup",
+                            "name": "write_stdin",
+                            "arguments": {
+                                "execution_id": pc07_execution_id,
+                                "yield_time_ms": 250,
+                            },
+                        },
+                        {
+                            "id": "call_pc07_shell_identity_after_pause",
+                            "name": "shell",
+                            "arguments": {
+                                "command": pc07_identity_command,
+                                "description": "PC07 verify shell PID identity after pause",
+                                "yield_time_ms": 250,
+                                "timeout": 30,
+                            },
+                        },
+                    ],
+                },
+                {
+                    "mode": "complete",
+                    "content": "pc07 new input response",
+                    "barrier": "pc07-new-input",
+                },
+            ],
         )
-        fresh_before_release = first.request(
-            "turn/read",
-            {"threadId": interrupt_thread, "turnId": fresh_turn},
+        pc07_new_ack = first.send_programmatic(
+            pc07, "pc07-new-input", "pc07 new input after resume"
         )
-        _release_barrier(model_url, "interrupt-fresh")
-        fresh_terminal = first.wait_terminal(fresh_turn)
-        stale_error = stale_interrupt.get("error")
-        stale_result = stale_interrupt.get("result")
-        stale_safe = (
-            isinstance(stale_error, dict) and stale_error.get("code") == -32012
-        ) or (
-            isinstance(stale_result, dict)
-            and stale_result.get("id") == interrupted_turn
-            and stale_result.get("status") == "interrupted"
+        _wait_barrier(model_url, "pc07-new-input")
+        pc07_page_before_release = first.read_messages(pc07)
+        pc07_result_before_release = first.programmatic_result(pc07, "pc07-input")
+        pc07_stale_pause_ack = first.request_result(
+            "programmatic/message/pause",
+            {"session_id": pc07, "message_id": "pc07-pause"},
+        )
+        pc07_pre_release_tool_results = _message_items(
+            pc07_page_before_release, "tool_result"
+        )
+        pc07_post_identity_result: dict[str, Any] | None = None
+        for item in pc07_pre_release_tool_results:
+            try:
+                identity = _execution_last_json(item)
+            except GateFailure:
+                continue
+            if identity.get("alive") is False:
+                pc07_post_identity_result = item
+                break
+        pc07_write_stdin_result = next(
+            (
+                item
+                for item in pc07_pre_release_tool_results
+                if "未知 execution_id" in _message_text(item)
+            ),
+            None,
+        )
+        try:
+            if pc07_post_identity_result is None:
+                raise GateFailure("PC07 pause 后 shell identity ToolResult 缺失")
+            pc07_post_identity = _execution_last_json(pc07_post_identity_result)
+        except (GateFailure, KeyError, TypeError, ValueError) as error:
+            raise GateFailure(
+                f"PC07 pause 后 shell identity 未返回："
+                f"{pc07_pre_release_tool_results!r}"
+            ) from error
+        _release_barrier(model_url, "pc07-new-input")
+        pc07_result = first.programmatic_result(pc07, "pc07-input")
+        pc07_new_result = _wait_programmatic_result(first, pc07, "pc07-new-input")
+        pc07_page = first.read_messages(pc07)
+        pc07_controls = _message_items(pc07_page, "control")
+        pc07_inputs = _message_items(pc07_page, "input")
+        pc07_outputs = _message_items(pc07_page, "output")
+        pc07_tool_results = _message_items(pc07_page, "tool_result")
+        pc07_cleanup_tool_result = pc07_write_stdin_result
+        pc07_post_identity_ref = (
+            pc07_post_identity_result.get("body", {}).get("call_ref", {})
+            if pc07_post_identity_result is not None
+            else {}
+        )
+        pc07_post_identity_call = any(
+            output.get("id") == pc07_post_identity_ref.get("message_id")
+            and isinstance(output.get("body", {}).get("parts"), list)
+            and type(pc07_post_identity_ref.get("part_index")) is int
+            and 0 <= pc07_post_identity_ref["part_index"]
+            < len(output["body"]["parts"])
+            and isinstance(output["body"]["parts"][pc07_post_identity_ref["part_index"]], dict)
+            and output["body"]["parts"][pc07_post_identity_ref["part_index"]].get("kind")
+            == "tool_call"
+            and output["body"]["parts"][pc07_post_identity_ref["part_index"]].get("name")
+            == "shell"
+            for output in pc07_outputs
+        )
+        pc07_shell_gone = (
+            pc07_post_identity.get("pid") == pc07_shell_identity.get("pid")
+            and pc07_post_identity.get("expected_starttime")
+            == pc07_shell_identity.get("starttime")
+            and pc07_post_identity.get("actual_starttime") is None
+            and pc07_post_identity.get("alive") is False
+            and pc07_post_identity_call
+            and pc07_cleanup_tool_result is not None
+            and pc07_cleanup_tool_result.get("body", {}).get("outcome") == "error"
+            and "未知 execution_id"
+            in _message_text(pc07_cleanup_tool_result)
+        )
+        pc07_passed = (
+            pc07_input_ack.get("seq") == 0
+            and pc07_tool_call is not None
+            and pc07_tool_ref == {
+                "message_id": pc07_tool_call.get("message_id"),
+                "part_index": pc07_tool_call.get("part_index"),
+            }
+            and pc07_tool_result.get("body", {}).get("outcome") == "success"
+            and pc07_pause_ack.get("seq") == pc07_pre_identity_result.get("seq", -1) + 1
+            and pc07_paused_result.get("status") == "pause"
+            # Once a newer Input is appended, the old Input is open again;
+            # the durable result before that append remains the pause proof.
+            and pc07_result_before_release.get("status") == "open"
+            and pc07_page_before_release.get("items") is not None
+            and pc07_post_identity_result is not None
+            and pc07_shell_gone
+            and pc07_new_ack.get("seq") > pc07_pause_ack.get("seq", -1)
+            # Repeating the same pause identity is idempotent: it returns the
+            # original Control row and must not cancel the newer Input.
+            and pc07_stale_pause_ack == pc07_pause_ack
+            and pc07_new_result.get("status") == "complete"
+            and [item.get("id") for item in pc07_inputs]
+            == ["pc07-input", "pc07-new-input"]
+            and [item.get("body", {}).get("action") for item in pc07_controls]
+            == ["pause"]
+            and pc07_controls[0].get("body", {}).get("through_seq")
+            == pc07_pre_identity_result.get("seq")
+            and len(pc07_tool_results) == 4
+            and pc07_cleanup_tool_result is not None
+            and pc07_cleanup_tool_result.get("body", {}).get("call_ref", {}).get(
+                "part_index"
+            )
+            == next(
+                (
+                    index
+                    for output in pc07_outputs
+                    for index, part in enumerate(output.get("body", {}).get("parts", []))
+                    if isinstance(part, dict)
+                    and part.get("kind") == "tool_call"
+                    and part.get("name") == "write_stdin"
+                ),
+                None,
+            )
+            and any(
+                _message_text(output) == "pc07 new input response"
+                for output in pc07_outputs
+            )
         )
         checks.append(
             CheckResult(
                 "PC-07",
-                _terminal_status(interrupted_terminal) == "interrupted"
-                and interrupt_duration <= 2.0
-                and shell_completed.get("id") == shell_started.get("id")
-                and shell_completed.get("data", {}).get("status") == "interrupted"
-                and persisted_shell == shell_completed
-                and interrupted_terminal_count == 1
-                and interrupted_read.get("result") == interrupted_payload
-                and stale_safe
-                and fresh_before_release.get("result", {}).get("status")
-                == "in_progress"
-                and _terminal_status(fresh_terminal) == "completed",
+                pc07_passed,
                 {
-                    "interrupt": interrupt_result,
-                    "durationSeconds": interrupt_duration,
-                    "toolStarted": shell_started,
-                    "toolCompleted": shell_completed,
-                    "terminalEqualsRead": interrupted_read.get("result")
-                    == interrupted_payload,
-                    "terminalEventCount": interrupted_terminal_count,
-                    "staleError": stale_error,
-                    "staleResult": stale_result,
-                    "freshBeforeRelease": fresh_before_release,
+                    "inputAck": pc07_input_ack,
+                    "pauseAck": pc07_pause_ack,
+                    "newInputAck": pc07_new_ack,
+                    "stalePauseAck": pc07_stale_pause_ack,
+                    "pausedResult": pc07_paused_result,
+                    "resultBeforeNewInputRelease": pc07_result_before_release,
+                    "result": pc07_result,
+                    "newInputResult": pc07_new_result,
+                    "controls": pc07_controls,
+                    "toolCall": pc07_tool_call,
+                    "toolResult": pc07_tool_result,
+                    "prePauseShellIdentity": pc07_pre_identity,
+                    "postPauseShellIdentity": pc07_post_identity,
+                    "shellPid": pc07_shell_identity.get("pid"),
+                    "shellPidGone": pc07_post_identity.get("actual_starttime") is None,
+                    "shellGone": pc07_shell_gone,
+                    "messagePage": pc07_page,
                 },
             )
         )
 
-        # 4. 显式 detached turn 在连接断开后继续；重连后读取持久终态。
+        # 4. 连接断开只丢传输；重连后用 Input/result 读取同一持久前缀。
+        pc08 = "programmatic:pc08-reconnect"
         disconnecting = _connect_client(endpoint, events_path)
         clients.append(disconnecting)
-        _create_barrier(
-            model_url,
-            "disconnect-held",
-            {"mode": "complete", "content": "survived disconnect"},
+        disconnecting.admit_programmatic(pc08)
+        pc08_barrier = "pc08-disconnect-provider"
+        _http_json("PUT", f"{model_url}/control/barriers/{pc08_barrier}")
+        _http_json(
+            "PUT", f"{model_url}/control/script",
+            {"mode": "complete", "content": "pc08 survived disconnect", "barrier": pc08_barrier},
         )
-        recovery_thread = _start_thread(disconnecting, "PC-08")
-        recovery_turn = _start_turn(
-            disconnecting,
-            recovery_thread,
-            "disconnect me",
-            detached=True,
-        )
-        _wait_barrier(model_url, "disconnect-held")
+        pc08_ack = disconnecting.send_programmatic(pc08, "pc08-input", "pc08 disconnect")
+        _wait_barrier(model_url, pc08_barrier)
         disconnecting.close()
         clients.remove(disconnecting)
-        _release_barrier(model_url, "disconnect-held")
+        _release_barrier(model_url, pc08_barrier)
         resumed = _connect_client(endpoint, events_path)
         clients.append(resumed)
-        deadline = time.monotonic() + SCENARIO_DEADLINE_S
-        recovery_read: dict[str, Any] = {}
-        while time.monotonic() < deadline:
-            recovery_read = resumed.request(
-                "turn/read",
-                {"threadId": recovery_thread, "turnId": recovery_turn},
-            )
-            if recovery_read.get("result", {}).get("status") == "completed":
-                break
-            threading.Event().wait(0.02)
+        resumed_result = _wait_programmatic_result(resumed, pc08, "pc08-input")
+        resumed_page = resumed.read_messages(pc08)
+        pc08_inputs = [
+            item for item in resumed_page.get("items", [])
+            if isinstance(item, dict) and item.get("body", {}).get("kind") == "input"
+        ]
+        pc08_outputs = [
+            item for item in resumed_page.get("items", [])
+            if isinstance(item, dict) and item.get("body", {}).get("kind") == "output"
+        ]
         checks.append(
             CheckResult(
                 "PC-08",
-                recovery_read.get("result", {}).get("finalResponse")
-                == "survived disconnect",
-                recovery_read,
+                pc08_ack.get("seq") == 0
+                and resumed_result.get("status") == "complete"
+                and len(pc08_inputs) == 1
+                and pc08_inputs[0].get("id") == "pc08-input"
+                and len(pc08_outputs) == 1
+                and _message_text(pc08_outputs[0]) == "pc08 survived disconnect",
+                {"ack": pc08_ack, "result": resumed_result, "messagePage": resumed_page},
             )
         )
-        restart_state = {"threadId": recovery_thread, "turnId": recovery_turn}
+        restart_state = {"sessionId": pc08, "inputId": "pc08-input"}
 
-        # 5. 不读取事件的客户端只能影响自身，另一连接仍须在 deadline 内完成。
+        # 5. 慢读者先制造有界队列压力；压力持续时健康 Session 仍须完成。
+        pc09 = "programmatic:pc09-slow"
+        pc09_healthy = "programmatic:pc09-healthy"
+        first.admit_programmatic(pc09)
         slow = _connect_client(endpoint, events_path)
         clients.append(slow)
-        slow._socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024)
-        overflow_calls = [
-            {
-                "id": f"call_pc09_{index}",
-                "name": "tool_search",
-                "arguments": {"query": f"no-match-pc09-{index}-" + "x" * (1024)},
-            }
-            for index in range(80)
-        ]
+        slow._socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 256)
+        slow.follow_session(pc09, "pc09-slow-follow")
+        producer_count = 8
+        burst_count = 4
+        slow_content = "pc09 slow " + ("x" * (256 * 1024))
         _http_json(
             "PUT",
             f"{model_url}/control/script",
-            [
-                {
-                    "mode": "stream",
-                    "deltas": [],
-                    "tool_calls": [
-                        {
-                            "id": "call_pc09_seed",
-                            "name": "tool_search",
-                            "arguments": {"query": "no-match-pc09-seed"},
-                        }
-                    ],
-                },
-                {
-                    "mode": "stream",
-                    "deltas": [],
-                    "tool_calls": [
-                        {
-                            "id": "call_pc09_seed_2",
-                            "name": "shell",
-                            "arguments": {
-                                "command": "python -c 'print(\"x\" * 80000)'",
-                                "description": "生成可压缩的已闭合工具上下文",
-                                "timeout": 5,
-                                "yield_time_ms": 1000,
-                            },
-                        }
-                    ],
-                },
-                # 保留两个已闭合批次；默认 keep_recent_tokens=20k 需要从首个
-                # 批次切出可压缩前缀，不能只放一个很小的 seed。
-                {
-                    "mode": "stream",
-                    "deltas": [],
-                    "tool_calls": overflow_calls,
-                },
-                # 大 batch 闭合后下一次 business payload 过 compaction gate；
-                # 先放合法摘要，避免把业务响应消费到 summary 请求。
-                {"mode": "complete", "content": _PC09_COMPACTION_SUMMARY},
-                {"mode": "stream", "deltas": ["overflow complete"]},
-                {"mode": "complete", "content": "healthy after overflow"},
-            ],
+            ([{"mode": "complete", "content": slow_content} for _ in range(burst_count)]
+             + [{"mode": "complete", "content": "pc09 healthy response"}]
+             + [{"mode": "complete", "content": slow_content}
+                for _ in range(producer_count - burst_count)]),
         )
-        slow_thread = _start_thread(slow, "PC-09-slow")
-        slow_turn = _start_turn(slow, slow_thread, "overflow this connection")
-        slow_deadline = time.monotonic() + SCENARIO_DEADLINE_S
-        slow_read: dict[str, Any] = {}
-        while time.monotonic() < slow_deadline:
-            slow_read = second.request(
-                "turn/read", {"threadId": slow_thread, "turnId": slow_turn}
-            )
-            if slow_read.get("result", {}).get("status") == "completed":
-                break
-            threading.Event().wait(0.02)
-        healthy_thread = _start_thread(second, "PC-09-healthy")
-        healthy_turn = _start_turn(second, healthy_thread, "healthy connection")
-        healthy_terminal = second.wait_terminal(healthy_turn, timeout=5.0)
+        producer_errors: list[str] = []
+        producer_sent = 0
+        burst_ready = threading.Event()
+        continue_tail = threading.Event()
+        producer_stop = threading.Event()
+        producer_done = threading.Event()
+        producer_client: JsonRpcSocketClient | None = None
+        producer: threading.Thread | None = None
+        pressure_pending_bytes = 0
+        pressure_min_pending_bytes = 0
+        pressure_observed_at: float | None = None
+        healthy_started_at: float | None = None
+        healthy_completed_at: float | None = None
+        producer_tail_released_at: float | None = None
+        slow_eof_at: float | None = None
         slow_closed = False
-        close_deadline = time.monotonic() + SCENARIO_DEADLINE_S
-        slow._socket.settimeout(0.25)
-        while time.monotonic() < close_deadline:
-            try:
-                chunk = slow._socket.recv(256 * 1024)
-            except TimeoutError:
-                continue
-            if not chunk:
-                slow_closed = True
-                break
-        checks.append(
-            CheckResult(
-                "PC-09",
-                slow_read.get("result", {}).get("status") == "completed"
-                and _terminal_status(healthy_terminal) == "completed"
-                and _event_turn(healthy_terminal).get("finalResponse")
-                == "healthy after overflow",
-                {
-                    "slowConnectionClosed": slow_closed,
-                    "slowTurnStatus": slow_read.get("result", {}).get("status"),
-                    "overflowToolCalls": len(overflow_calls),
-                    "healthyTurn": _event_turn(healthy_terminal),
-                },
-            )
-        )
-        slow.close()
-        clients.remove(slow)
+        drained_bytes = 0
 
-        # 6. 可达 gate failure 发生在 tool started 后，owner 闭合 failed item。
+        def produce_slow_tail() -> None:
+            """Append a bounded tail and expose all producer failures to the gate."""
+
+            nonlocal producer_sent
+            try:
+                for index in range(producer_count):
+                    if producer_stop.is_set():
+                        return
+                    assert producer_client is not None
+                    producer_client.send_programmatic(
+                        pc09,
+                        f"pc09-input-{index}",
+                        f"pc09 slow input {index}",
+                    )
+                    result = _wait_programmatic_result(
+                        producer_client, pc09, f"pc09-input-{index}"
+                    )
+                    if result.get("status") != "complete":
+                        raise GateFailure(
+                            f"PC09 slow input {index} 未完成：{result!r}"
+                        )
+                    producer_sent = index + 1
+                    if producer_sent == burst_count:
+                        burst_ready.set()
+                        while not continue_tail.wait(0.05):
+                            if producer_stop.is_set():
+                                return
+            except BaseException as error:
+                if not producer_stop.is_set():
+                    producer_errors.append(f"{type(error).__name__}: {error}")
+            finally:
+                burst_ready.set()
+                producer_done.set()
+
+        try:
+            producer_client = _connect_client(endpoint, events_path)
+            clients.append(producer_client)
+            producer = threading.Thread(
+                target=produce_slow_tail, name="pc09-slow-producer", daemon=False
+            )
+            producer.start()
+            if not burst_ready.wait(SCENARIO_DEADLINE_S):
+                raise GateFailure("PC09 slow producer 未建立第一段压力")
+            slow_receive_buffer = slow._socket.getsockopt(
+                socket.SOL_SOCKET, socket.SO_RCVBUF
+            )
+            pressure_min_pending_bytes = max(64 * 1024, slow_receive_buffer * 2)
+            pressure_deadline = time.monotonic() + SCENARIO_DEADLINE_S
+            while time.monotonic() < pressure_deadline:
+                pressure_pending_bytes = _socket_pending_bytes(slow._socket)
+                if pressure_pending_bytes >= pressure_min_pending_bytes:
+                    break
+                if producer_done.is_set() and producer_sent < burst_count:
+                    raise GateFailure(
+                        f"PC09 slow producer 在 burst 内结束：{producer_sent}/{burst_count}"
+                    )
+                threading.Event().wait(0.05)
+            pressure_pending_bytes = _socket_pending_bytes(slow._socket)
+            pressure_observed_at = time.monotonic()
+            if pressure_pending_bytes < pressure_min_pending_bytes:
+                raise GateFailure(
+                    "PC09 慢订阅未达到可观测 socket backlog："
+                    f"{pressure_pending_bytes} < {pressure_min_pending_bytes}"
+                )
+            second.admit_programmatic(pc09_healthy)
+            healthy_started_at = time.monotonic()
+            second.send_programmatic(
+                pc09_healthy, "pc09-healthy-input", "pc09 healthy input"
+            )
+            pc09_healthy_result = _wait_programmatic_result(
+                second, pc09_healthy, "pc09-healthy-input"
+            )
+            healthy_completed_at = time.monotonic()
+            continue_tail.set()
+            producer_tail_released_at = time.monotonic()
+            if not producer_done.wait(SCENARIO_DEADLINE_S):
+                raise GateFailure("PC09 slow producer 未在 deadline 内完成")
+            assert producer is not None
+            producer.join(timeout=SCENARIO_DEADLINE_S)
+            if producer.is_alive():
+                raise GateFailure("PC09 slow producer join 超时")
+            slow_closed, drained_bytes = _drain_socket_until_eof(slow._socket)
+            slow_eof_at = time.monotonic()
+            checks.append(
+                CheckResult(
+                    "PC-09",
+                    not producer_errors
+                    and producer_sent == producer_count
+                    and pressure_pending_bytes >= pressure_min_pending_bytes
+                    and slow_closed
+                    and pc09_healthy_result.get("status") == "complete"
+                    and pressure_observed_at < healthy_completed_at
+                    and healthy_completed_at <= producer_tail_released_at
+                    and producer_tail_released_at <= slow_eof_at,
+                    {
+                        "slowConnectionClosed": slow_closed,
+                        "healthyResult": pc09_healthy_result,
+                        "producerSent": producer_sent,
+                        "producerCount": producer_count,
+                        "producerErrors": producer_errors,
+                        "producerJoined": not producer.is_alive(),
+                        "pressurePending": pressure_pending_bytes >= pressure_min_pending_bytes,
+                        "pressurePendingBytesBeforeHealthy": pressure_pending_bytes,
+                        "pressureMinimumPendingBytes": pressure_min_pending_bytes,
+                        "drainedBytesBeforeEof": drained_bytes,
+                        "healthyIsolation": pc09_healthy_result.get("status") == "complete",
+                        "healthyStartedAt": healthy_started_at,
+                        "healthyCompletedAt": healthy_completed_at,
+                        "pressureObservedAt": pressure_observed_at,
+                        "producerTailReleasedAt": producer_tail_released_at,
+                        "slowEofAt": slow_eof_at,
+                        "pressureObservedBeforeHealthy": pressure_observed_at < healthy_completed_at,
+                        "healthyCompletedBeforeTailRelease": healthy_completed_at <= producer_tail_released_at,
+                        "tailReleasedBeforeSlowEof": producer_tail_released_at <= slow_eof_at,
+                        "slowReceiveBuffer": slow_receive_buffer,
+                    },
+                )
+            )
+        finally:
+            continue_tail.set()
+            producer_stop.set()
+            if producer is not None and producer.is_alive() and producer_client is not None:
+                try:
+                    producer_client.close()
+                except OSError:
+                    pass
+            if producer is not None:
+                producer.join(timeout=SCENARIO_DEADLINE_S)
+                if producer.is_alive():
+                    raise GateFailure("PC09 slow producer cleanup join 超时")
+            if producer_client is not None:
+                producer_client.close()
+                if producer_client in clients:
+                    clients.remove(producer_client)
+            slow.close()
+            if slow in clients:
+                clients.remove(slow)
+
+        # 6. 真实 TOOLS BoundTool 在 started 后失败，日志必须保留 ToolResult。
+        pc10 = "programmatic:pc10-tool-failure"
+        second.admit_programmatic(pc10)
         _http_json(
-            "PUT",
-            f"{model_url}/control/script",
-            [
-                {
-                    "mode": "stream",
-                    "deltas": [],
-                    "tool_calls": [
-                        {
-                            "id": "call_pc10_open",
-                            "name": "pc10_failure_probe",
-                            "arguments": {"probe": True},
-                        }
-                    ],
-                },
-                {"mode": "complete", "content": "unreachable pc10 reply"},
-            ],
+            "PUT", f"{model_url}/control/script",
+            {
+                "mode": "stream",
+                "deltas": [],
+                "tool_calls": [
+                    {
+                        "id": "call_pc10_failure",
+                        "name": "pc10_failure_probe",
+                        "arguments": {"probe": True},
+                    }
+                ],
+            },
         )
-        failed_thread = _start_thread(second, "PC-10")
-        failed_turn = _start_turn(second, failed_thread, "pc10 fail after tool started")
-        failed_terminal = second.wait_terminal(failed_turn)
-        failed_read = second.request(
-            "turn/read", {"threadId": failed_thread, "turnId": failed_turn}
-        )
-        _ = second.request("server/status", {})
-        failed_payload = _event_turn(failed_terminal)
-        failed_events = _recorded_turn_notifications(events_path, failed_turn)
-        failed_terminal_count = sum(
-            event.get("method") == "turn/completed" for event in failed_events
-        )
-        failed_error = failed_payload.get("error")
-        pc10_started, pc10_completed = _tool_lifecycle(
-            failed_events, "pc10_failure_probe"
-        )
-        persisted_failed_item = next(
-            (
-                item
-                for item in failed_payload.get("items", [])
-                if isinstance(item, dict) and item.get("id") == pc10_started.get("id")
-            ),
-            None,
+        pc10_ack = second.send_programmatic(pc10, "pc10-input", "pc10 invoke failing tool")
+        pc10_result = _wait_programmatic_result(second, pc10, "pc10-input")
+        pc10_page = second.read_messages(pc10)
+        pc10_outputs = [
+            item for item in pc10_page.get("items", [])
+            if isinstance(item, dict) and item.get("body", {}).get("kind") == "output"
+        ]
+        pc10_tools = [
+            item for item in pc10_page.get("items", [])
+            if isinstance(item, dict) and item.get("body", {}).get("kind") == "tool_result"
+        ]
+        pc10_controls = [
+            item for item in pc10_page.get("items", [])
+            if isinstance(item, dict) and item.get("body", {}).get("kind") == "control"
+        ]
+        pc10_passed = (
+            pc10_ack.get("seq") == 0
+            and pc10_result.get("status") == "failure"
+            and len(pc10_outputs) == 1
+            and len(pc10_tools) == 1
+            and pc10_tools[0].get("body", {}).get("outcome") == "unknown"
+            and pc10_tools[0].get("body", {}).get("call_ref", {}).get("message_id")
+            == pc10_outputs[0].get("id")
+            and pc10_tools[0].get("body", {}).get("call_ref", {}).get("part_index")
+            == next(
+                (
+                    index
+                    for index, part in enumerate(
+                        pc10_outputs[0].get("body", {}).get("parts", [])
+                    )
+                    if isinstance(part, dict)
+                    and part.get("kind") == "tool_call"
+                    and part.get("name") == "pc10_failure_probe"
+                ),
+                None,
+            )
+            and any(
+                isinstance(part, dict)
+                and part.get("kind") == "tool_call"
+                and part.get("name") == "pc10_failure_probe"
+                and isinstance(part.get("binding_id"), str)
+                and bool(part.get("binding_id"))
+                for part in pc10_outputs[0].get("body", {}).get("parts", [])
+            )
+            and len(pc10_controls) == 1
+            and pc10_controls[0].get("body", {}).get("action") == "failure"
+            and "pc10 tool handler failure"
+            in str(pc10_controls[0].get("body", {}).get("reason", ""))
         )
         checks.append(
             CheckResult(
                 "PC-10",
-                failed_payload.get("status") == "failed"
-                and isinstance(failed_error, dict)
-                and failed_error.get("type") == "RuntimeError"
-                and failed_error.get("retryable") is False
-                and pc10_completed.get("id") == pc10_started.get("id")
-                and pc10_completed.get("data", {}).get("status") == "error"
-                and persisted_failed_item == pc10_completed
-                and failed_terminal_count == 1
-                and failed_read.get("result") == failed_payload,
+                pc10_passed,
                 {
-                    "terminal": failed_terminal,
-                    "read": failed_read,
-                    "terminalEventCount": failed_terminal_count,
-                    "toolStarted": pc10_started,
-                    "toolCompleted": pc10_completed,
-                    "failureSource": "v3 after_reasoning fixture",
+                    "ack": pc10_ack,
+                    "result": pc10_result,
+                    "outputs": pc10_outputs,
+                    "toolResults": pc10_tools,
+                    "controls": pc10_controls,
+                    "messagePage": pc10_page,
                 },
             )
         )
 
-        # 7. WebSocket channel adapter 保留领域投影、完整出站字段和 lane 语义。
+        # 7. 新 Message 合同下核对 Web/程序接口 parity、并发、撤销和恢复。
         from websockets.sync.client import connect as connect_websocket
 
         websocket_url = "ws://akashic-control-gate:2236/ws"
-        with connect_websocket(websocket_url, open_timeout=READINESS_DEADLINE_S) as web:
-            web.send(
-                json.dumps({"type": "session.create", "request_id": "pc16-create"})
-            )
-            created = json.loads(web.recv(timeout=SCENARIO_DEADLINE_S))
-            web_thread = str(created["session_id"])
+        database = Path("/sandbox/workspace/sessions.db")
 
-            fixtures = (
+        def output_projection(rows: list[dict[str, Any]]) -> dict[str, object]:
+            outputs = [
+                row for row in rows
+                if isinstance(row.get("body"), dict)
+                and row["body"].get("kind") == "output"
+            ]
+            final = next(
                 (
-                    "parity success",
-                    {
-                        "mode": "complete",
-                        "content": "<think>channel reasoning</think>parity result",
-                    },
+                    row for row in outputs
+                    if isinstance(row["body"].get("finish"), str)
+                    and row["body"]["finish"] != "continue"
                 ),
-                (
-                    "parity failure",
-                    [
-                        {"mode": "error", "status": 500},
-                        {"mode": "error", "status": 500},
-                    ],
-                ),
+                None,
             )
-            parity_evidence: list[dict[str, object]] = []
-            parity_passed = True
-            for index, (input_text, script) in enumerate(fixtures):
-                _http_json("PUT", f"{model_url}/control/script", script)
-                program_thread = _start_thread(first, f"PC-16-{index}")
-                program_turn = _start_turn(first, program_thread, input_text)
-                program_terminal = _event_turn(first.wait_terminal(program_turn))
+            text = ""
+            thinking: str | None = None
+            if isinstance(final, dict) and isinstance(final.get("body"), dict):
+                for part in final["body"].get("parts", []):
+                    if not isinstance(part, dict):
+                        continue
+                    if part.get("kind") == "text":
+                        text += str(part.get("value", ""))
+                    if part.get("kind") == "model.facts" and isinstance(
+                        part.get("value"), dict
+                    ):
+                        value = part["value"].get("thinking")
+                        if isinstance(value, str):
+                            thinking = value
+            return {
+                "outputCount": len(outputs),
+                "final": final,
+                "content": text,
+                "thinking": thinking,
+            }
 
+        def programmatic_projection(
+            page: dict[str, Any], result: dict[str, Any]
+        ) -> dict[str, object]:
+            rows = [item for item in page.get("items", []) if isinstance(item, dict)]
+            return {
+                "status": result.get("status"),
+                "endingMessageId": result.get("ending_message_id"),
+                "endingSeq": result.get("ending_seq"),
+                "messages": rows,
+                **output_projection(rows),
+            }
+
+        fixtures = (
+            (
+                "parity success",
+                {
+                    "mode": "complete",
+                    "content": "<think>channel reasoning</think>parity result",
+                },
+                "complete",
+            ),
+            (
+                "parity failure",
+                [
+                    {"mode": "error", "status": 500},
+                    {"mode": "error", "status": 500},
+                ],
+                "failure",
+            ),
+        )
+        parity_evidence: list[dict[str, object]] = []
+        parity_passed = True
+        for index, (input_text, script, expected_status) in enumerate(fixtures):
+            program_session = f"programmatic:pc16-parity-{index}"
+            program_input = f"pc16-program-{index}"
+            first.admit_programmatic(program_session)
+            _http_json("PUT", f"{model_url}/control/script", script)
+            program_ack = first.send_programmatic(
+                program_session, program_input, input_text
+            )
+            program_result = _wait_programmatic_result(
+                first, program_session, program_input
+            )
+            program_page = first.read_messages(program_session)
+            program_view = programmatic_projection(program_page, program_result)
+
+            with connect_websocket(
+                websocket_url, open_timeout=READINESS_DEADLINE_S
+            ) as web:
+                web.send(json.dumps({
+                    "type": "session.create",
+                    "request_id": f"pc16-create-{index}",
+                }))
+                web_session = str(
+                    json.loads(web.recv(timeout=SCENARIO_DEADLINE_S))["session_id"]
+                )
+                web.send(json.dumps({
+                    "type": "session.follow",
+                    "version": 2,
+                    "request_id": f"pc16-follow-{index}",
+                    "session_id": web_session,
+                    "after_seq": -1,
+                }))
+                following = json.loads(web.recv(timeout=SCENARIO_DEADLINE_S))
+                if (
+                    following.get("type") != "session.following"
+                    or following.get("session_id") != web_session
+                ):
+                    raise GateFailure(f"Web session.follow ACK 非法：{following!r}")
                 _http_json("PUT", f"{model_url}/control/script", script)
-                web.send(
-                    json.dumps(
-                        {
-                            "type": "message.send",
-                            "request_id": f"pc16-{index}",
-                            "session_id": web_thread,
-                            "text": input_text,
-                            "media": [],
-                        }
-                    )
+                web_request_id = f"pc16-web-{index}"
+                web.send(json.dumps({
+                    "type": "message.send",
+                    "request_id": web_request_id,
+                    "session_id": web_session,
+                    "text": input_text,
+                    "media": [],
+                }))
+                web_rows, web_status_frames = _receive_web_follow_rows(
+                    web,
+                    web_session,
+                    lambda rows, _statuses: (
+                        any(
+                            isinstance(row.get("body"), dict)
+                            and row["body"].get("kind") == "output"
+                            and row["body"].get("finish") != "continue"
+                            for row in rows
+                        )
+                        if expected_status == "complete"
+                        else any(
+                            isinstance(row.get("body"), dict)
+                            and row["body"].get("kind") == "control"
+                            and row["body"].get("action") == "failure"
+                            for row in rows
+                        )
+                    ),
                 )
-                final_frame = _receive_web_final(web)
-                channel_turn = _wait_database_turn(
-                    Path("/sandbox/workspace/sessions.db"), web_thread, input_text
+            web_raw_rows = _wait_message_log_rows(
+                database,
+                web_session,
+                minimum=len(web_rows),
+                required_ids={str(row["id"]) for row in web_rows},
+            )
+            web_wire_observable = _message_observable_projection(web_rows)
+            web_raw_observable = _message_observable_projection(web_raw_rows)
+            web_raw_matches_wire = (
+                len(web_raw_rows) == len(web_rows)
+                and web_raw_observable == web_wire_observable
+            )
+            web_view = output_projection(web_rows)
+            web_status = (
+                "complete"
+                if web_view["outputCount"] == 1
+                else "failure"
+                if any(
+                    isinstance(row.get("body"), dict)
+                    and row["body"].get("kind") == "control"
+                    and row["body"].get("action") == "failure"
+                    for row in web_rows
                 )
-                program_projection = _turn_projection(program_terminal)
-                channel_projection = _turn_projection(channel_turn)
-                frame_projection = {
-                    "content": final_frame.get("content"),
-                    "thinking": final_frame.get("thinking"),
-                    "media": final_frame.get("media"),
-                    "metadata": final_frame.get("metadata"),
-                    "duration_ms": final_frame.get("duration_ms"),
-                }
-                frame_fields_passed = (
-                    isinstance(frame_projection["thinking"], str)
-                    and isinstance(frame_projection["media"], list)
-                    and isinstance(frame_projection["metadata"], dict)
-                    and frame_projection["duration_ms"]
-                    == cast(dict[str, object], frame_projection["metadata"]).get(
-                        "turn_duration_ms"
-                    )
+                else "open"
+            )
+            wire_projection = {
+                "following": following,
+                "messages": web_rows,
+                "replyStatus": web_status_frames,
+            }
+            fixture_passed = (
+                program_ack.get("message_id") == program_input
+                and program_result.get("status") == expected_status
+                and web_status == expected_status
+                and web_raw_matches_wire
+                and any(
+                    isinstance(frame, dict)
+                    and frame.get("type") == "reply.status"
+                    and isinstance(frame.get("available"), bool)
+                    for frame in web_status_frames
                 )
-                if input_text == "parity success":
-                    frame_fields_passed = (
-                        frame_fields_passed
-                        and frame_projection["content"] == "parity result"
-                        and frame_projection["thinking"] == "channel reasoning"
-                    )
-                fixture_passed = (
-                    program_projection == channel_projection and frame_fields_passed
+            )
+            if expected_status == "complete":
+                fixture_passed = fixture_passed and (
+                    program_view["content"] == "parity result"
+                    and program_view["thinking"] == "channel reasoning"
+                    and web_view["content"] == "parity result"
+                    and web_view["thinking"] == "channel reasoning"
                 )
-                parity_passed = parity_passed and fixture_passed
-                parity_evidence.append(
-                    {
-                        "input": input_text,
-                        "passed": fixture_passed,
-                        "programmatic": program_projection,
-                        "channel": channel_projection,
-                        "channelFrame": frame_projection,
-                    }
+            else:
+                fixture_passed = fixture_passed and (
+                    web_view["outputCount"] == 0
                 )
+            parity_passed = parity_passed and fixture_passed
+            parity_evidence.append({
+                "input": input_text,
+                "sessionId": program_session,
+                "inputId": program_input,
+                "passed": fixture_passed,
+                "programmaticResult": program_result,
+                "programmatic": program_view,
+                "channel": {"status": web_status, "messages": web_rows, **web_view},
+                "channelDatabase": {
+                    "sessionId": web_session,
+                    "rawMessages": web_raw_rows,
+                    "observable": web_raw_observable,
+                    "matchesWire": web_raw_matches_wire,
+                },
+                "channelWire": wire_projection,
+            })
 
         lane_evidence: dict[str, object] = {}
-        database = Path("/sandbox/workspace/sessions.db")
         with (
-            connect_websocket(
-                websocket_url, open_timeout=READINESS_DEADLINE_S
-            ) as slow_web,
-            connect_websocket(
-                websocket_url, open_timeout=READINESS_DEADLINE_S
-            ) as fast_web,
+            connect_websocket(websocket_url, open_timeout=READINESS_DEADLINE_S) as slow_web,
+            connect_websocket(websocket_url, open_timeout=READINESS_DEADLINE_S) as fast_web,
         ):
-            slow_web.send(
-                json.dumps({"type": "session.create", "request_id": "pc16-slow"})
-            )
-            fast_web.send(
-                json.dumps({"type": "session.create", "request_id": "pc16-fast"})
-            )
-            slow_thread = str(
-                json.loads(slow_web.recv(timeout=SCENARIO_DEADLINE_S))["session_id"]
-            )
-            fast_thread = str(
-                json.loads(fast_web.recv(timeout=SCENARIO_DEADLINE_S))["session_id"]
-            )
+            slow_web.send(json.dumps({"type": "session.create", "request_id": "pc16-slow"}))
+            fast_web.send(json.dumps({"type": "session.create", "request_id": "pc16-fast"}))
+            slow_session = str(json.loads(slow_web.recv(timeout=SCENARIO_DEADLINE_S))["session_id"])
+            fast_session = str(json.loads(fast_web.recv(timeout=SCENARIO_DEADLINE_S))["session_id"])
+            for web, session_id, request_id in (
+                (slow_web, slow_session, "pc16-slow-follow"),
+                (fast_web, fast_session, "pc16-fast-follow"),
+            ):
+                web.send(json.dumps({
+                    "type": "session.follow",
+                    "version": 2,
+                    "request_id": request_id,
+                    "session_id": session_id,
+                    "after_seq": -1,
+                }))
+                following = json.loads(web.recv(timeout=SCENARIO_DEADLINE_S))
+                if (
+                    following.get("type") != "session.following"
+                    or following.get("session_id") != session_id
+                ):
+                    raise GateFailure(f"Web Session follow ACK 非法：{following!r}")
             _create_barrier(
                 model_url,
                 "pc16-channel-slow",
@@ -1785,199 +3294,495 @@ def _inside_failure_matrix(report_dir: Path) -> int:
                 f"{model_url}/control/script",
                 {"mode": "complete", "content": "fast complete"},
             )
-            slow_web.send(
-                json.dumps(
-                    {
-                        "type": "message.send",
-                        "request_id": "pc16-slow-turn",
-                        "session_id": slow_thread,
-                        "text": "slow lane",
-                        "media": [],
-                    }
-                )
-            )
+            slow_request_id = "pc16-slow-input"
+            slow_web.send(json.dumps({
+                "type": "message.send",
+                "request_id": slow_request_id,
+                "session_id": slow_session,
+                "text": "slow lane",
+                "media": [],
+            }))
             _wait_barrier(model_url, "pc16-channel-slow")
-            fast_web.send(
-                json.dumps(
-                    {
-                        "type": "message.send",
-                        "request_id": "pc16-fast-turn",
-                        "session_id": fast_thread,
-                        "text": "fast lane",
-                        "media": [],
-                    }
-                )
+            fast_request_id = "pc16-fast-input"
+            fast_web.send(json.dumps({
+                "type": "message.send",
+                "request_id": fast_request_id,
+                "session_id": fast_session,
+                "text": "fast lane",
+                "media": [],
+            }))
+            fast_rows, fast_statuses = _receive_web_follow_rows(
+                fast_web,
+                fast_session,
+                lambda rows, _statuses: output_projection(rows)["outputCount"] == 1,
             )
-            fast_completed = _wait_database_turn_status(
-                database, fast_thread, "fast lane", {"completed"}
-            )
-            fast_final = _receive_web_final(fast_web)
+            fast_completed = {
+                "status": "complete"
+                if output_projection(fast_rows)["outputCount"] == 1
+                else "open",
+                "messages": fast_rows,
+                "replyStatus": fast_statuses,
+            }
             _release_barrier(model_url, "pc16-channel-slow")
-            slow_final = _receive_web_final(slow_web)
-            lane_evidence["differentThreads"] = {
+            slow_rows, slow_statuses = _receive_web_follow_rows(
+                slow_web,
+                slow_session,
+                lambda rows, _statuses: output_projection(rows)["outputCount"] == 1,
+            )
+            lane_evidence["differentSessions"] = {
+                "slowSessionId": slow_session,
+                "fastSessionId": fast_session,
                 "fastCompletedBeforeRelease": fast_completed,
-                "slowFinal": slow_final.get("content"),
-                "fastFinal": fast_final.get("content"),
+                "fastFinal": output_projection(fast_rows)["content"],
+                "slowFinal": output_projection(slow_rows)["content"],
+                "fastRows": fast_rows,
+                "slowRows": slow_rows,
+                "slowReplyStatus": slow_statuses,
             }
 
-        with connect_websocket(
-            websocket_url, open_timeout=READINESS_DEADLINE_S
-        ) as lane_web:
-            lane_web.send(
-                json.dumps({"type": "session.create", "request_id": "pc16-lane"})
-            )
-            lane_thread = str(
-                json.loads(lane_web.recv(timeout=SCENARIO_DEADLINE_S))["session_id"]
-            )
-            _create_barrier(
-                model_url,
-                "pc16-strict-lane",
-                {"mode": "complete", "content": "order one final"},
-            )
-            _http_json(
-                "PUT",
-                f"{model_url}/control/script",
-                [
-                    {"mode": "complete", "content": "order two final"},
-                    {"mode": "complete", "content": "order three final"},
-                    {"mode": "complete", "content": "order four final"},
-                ],
-            )
-            lane_web.send(
-                json.dumps(
-                    {
-                        "type": "message.send",
-                        "request_id": "pc16-order-1",
-                        "session_id": lane_thread,
-                        "text": "order one",
-                        "media": [],
-                    }
+        def run_failure_recovery() -> dict[str, object]:
+            # Web failure 通过 session.follow 暴露 Control.failure，随后同 Session 新 Input 可以恢复。
+            with connect_websocket(
+                websocket_url, open_timeout=READINESS_DEADLINE_S
+            ) as recovery_web:
+                recovery_web.send(json.dumps({
+                    "type": "session.create",
+                    "request_id": "pc16-recovery",
+                }))
+                recovery_session = str(
+                    json.loads(recovery_web.recv(timeout=SCENARIO_DEADLINE_S))["session_id"]
+                )
+                recovery_web.send(json.dumps({
+                    "type": "session.follow",
+                    "version": 2,
+                    "request_id": "pc16-recovery-follow",
+                    "session_id": recovery_session,
+                    "after_seq": -1,
+                }))
+                following = json.loads(recovery_web.recv(timeout=SCENARIO_DEADLINE_S))
+                if (
+                    following.get("type") != "session.following"
+                    or following.get("session_id") != recovery_session
+                ):
+                    raise GateFailure(f"Web recovery follow ACK 非法：{following!r}")
+                _http_json(
+                    "PUT",
+                    f"{model_url}/control/script",
+                    {"mode": "error", "status": 500},
+                )
+                recovery_web.send(json.dumps({
+                    "type": "message.send",
+                    "request_id": "pc16-failure",
+                    "session_id": recovery_session,
+                    "text": "pc16 lane failure",
+                    "media": [],
+                }))
+                failed_rows, failed_statuses = _receive_web_follow_rows(
+                    recovery_web,
+                    recovery_session,
+                    lambda rows, _statuses: any(
+                        isinstance(row.get("body"), dict)
+                        and row["body"].get("kind") == "control"
+                        and row["body"].get("action") == "failure"
+                        for row in rows
+                    ),
+                )
+                _http_json(
+                    "PUT",
+                    f"{model_url}/control/script",
+                    {"mode": "complete", "content": "pc16 recovered"},
+                )
+                recovery_web.send(json.dumps({
+                    "type": "message.send",
+                    "request_id": "pc16-recovery-input",
+                    "session_id": recovery_session,
+                    "text": "pc16 lane recovery",
+                    "media": [],
+                }))
+                recovered_rows, recovered_statuses = _receive_web_follow_rows(
+                    recovery_web,
+                    recovery_session,
+                    lambda rows, _statuses: any(
+                        isinstance(row.get("body"), dict)
+                        and row["body"].get("kind") == "output"
+                        and row["body"].get("finish") == "complete"
+                        for row in rows
+                    ),
+                )
+            recovery_passed = (
+                any(
+                    isinstance(row.get("body"), dict)
+                    and row["body"].get("kind") == "input"
+                    and row.get("id") == "pc16-failure"
+                    for row in failed_rows
+                )
+                and any(
+                    isinstance(row.get("body"), dict)
+                    and row["body"].get("kind") == "control"
+                    and row["body"].get("action") == "failure"
+                    for row in failed_rows
+                )
+                and any(
+                    isinstance(row.get("body"), dict)
+                    and row["body"].get("kind") == "output"
+                    and row["body"].get("finish") == "complete"
+                    for row in recovered_rows
+                )
+                and _message_text(next(
+                    row for row in recovered_rows
+                    if isinstance(row.get("body"), dict)
+                    and row["body"].get("kind") == "output"
+                    and row["body"].get("finish") == "complete"
+                )) == "pc16 recovered"
+                and any(
+                    isinstance(frame, dict)
+                    and frame.get("type") == "reply.status"
+                    and isinstance(frame.get("available"), bool)
+                    for frame in (*failed_statuses, *recovered_statuses)
                 )
             )
-            _wait_barrier(model_url, "pc16-strict-lane")
-            for request_id, text in (
-                ("pc16-order-2", "order two"),
-                ("pc16-order-3", "order three"),
-                ("pc16-order-4", "order four"),
-            ):
-                lane_web.send(
-                    json.dumps(
-                        {
-                            "type": "message.send",
-                            "request_id": request_id,
-                            "session_id": lane_thread,
-                            "text": text,
-                            "media": [],
-                        }
-                    )
-                )
-            active_inputs = _wait_database_turn_inputs(
-                database, lane_thread, "order one", 1
-            )
-            _release_barrier(model_url, "pc16-strict-lane")
-            ordered_finals = [_receive_web_final(lane_web) for _ in range(4)]
-            ordered_turns = [
-                _wait_database_turn(database, lane_thread, f"order {name}")
-                for name in ("one", "two", "three", "four")
-            ]
-
-            _http_json(
-                "PUT",
-                f"{model_url}/control/script",
-                [{"mode": "error", "status": 500} for _ in range(4)],
-            )
-            lane_web.send(
-                json.dumps(
-                    {
-                        "type": "message.send",
-                        "request_id": "pc16-fail",
-                        "session_id": lane_thread,
-                        "text": "lane failure",
-                        "media": [],
-                    }
-                )
-            )
-            failed_final = _receive_web_final(lane_web)
-            failed_state = _wait_database_turn_status(
-                database, lane_thread, "lane failure", {"failed"}
-            )
-            failed_error = failed_state.get("error")
-            if not isinstance(failed_error, dict) or not isinstance(
-                failed_error.get("message"), str
-            ):
-                raise GateFailure(f"failed turn 缺少 error.message：{failed_state!r}")
-
-            _http_json(
-                "PUT",
-                f"{model_url}/control/script",
-                {"mode": "complete", "content": "recovered"},
-            )
-            lane_web.send(
-                json.dumps(
-                    {
-                        "type": "message.send",
-                        "request_id": "pc16-recover",
-                        "session_id": lane_thread,
-                        "text": "lane recovery",
-                        "media": [],
-                    }
-                )
-            )
-            recovered_final = _receive_web_final(lane_web)
-            recovered_state = _wait_database_turn_status(
-                database, lane_thread, "lane recovery", {"completed"}
-            )
-            lane_evidence["sameThread"] = {
-                "activeInputs": active_inputs,
-                "orderedTurns": [_turn_projection(turn) for turn in ordered_turns],
-                "finals": [
-                    *[frame.get("content") for frame in ordered_finals],
-                    failed_final.get("content"),
-                    recovered_final.get("content"),
-                ],
-                "statuses": [
-                    *[turn["status"] for turn in ordered_turns],
-                    failed_state["status"],
-                    recovered_state["status"],
-                ],
-                "failedError": failed_error["message"],
+            return {
+                "sessionId": recovery_session,
+                "failedRows": failed_rows,
+                "recoveredRows": recovered_rows,
+                "failedReplyStatus": failed_statuses,
+                "recoveredReplyStatus": recovered_statuses,
+                "passed": recovery_passed,
             }
 
-        different_threads = cast(dict[str, object], lane_evidence["differentThreads"])
-        same_thread = cast(dict[str, object], lane_evidence["sameThread"])
-        lane_passed = (
-            cast(
-                dict[str, object],
-                different_threads["fastCompletedBeforeRelease"],
-            )["status"]
-            == "completed"
-            and different_threads["slowFinal"] == "slow complete"
-            and different_threads["fastFinal"] == "fast complete"
-            and cast(dict[str, object], same_thread["activeInputs"])["userInputs"]
-            == ["order one"]
-            and same_thread["finals"]
-            == [
-                "order one final",
-                "order two final",
-                "order three final",
-                "order four final",
-                same_thread["failedError"],
-                "recovered",
-            ]
-            and same_thread["statuses"]
-            == [
-                "completed",
-                "completed",
-                "completed",
-                "completed",
-                "failed",
-                "completed",
-            ]
+
+        lane_evidence["failureRecovery"] = run_failure_recovery()
+
+        # 同 source 的四条 Input 全部先落日志；旧 provider 被取消后只提交一个新 Output。
+        pc16_source = "programmatic:pc16-source-head"
+        pc16_inputs = [
+            (f"pc16-input-{index}", f"pc16 input {index}")
+            for index in range(1, 5)
+        ]
+        first.admit_programmatic(pc16_source)
+        pc16_old_barrier = "pc16-old-provider"
+        pc16_shared_barrier = "pc16-shared-provider"
+        _create_barrier(
+            model_url,
+            pc16_old_barrier,
+            {"mode": "timeout"},
         )
+        _http_json("PUT", f"{model_url}/control/barriers/{pc16_shared_barrier}")
+        _http_json(
+            "PUT",
+            f"{model_url}/control/script",
+            [
+                {
+                    "mode": "complete",
+                    "content": "pc16 four input final",
+                    "barrier": pc16_shared_barrier,
+                }
+                for _ in range(4)
+            ],
+        )
+        first_ack = first.send_programmatic(pc16_source, *pc16_inputs[0])
+        _wait_barrier(model_url, pc16_old_barrier)
+        request_start = len(
+            _model_requests(_http_json("GET", f"{model_url}/control/requests"))
+        ) - 1
+        input_acks = [first_ack]
+        for message_id, text in pc16_inputs[1:]:
+            input_acks.append(first.send_programmatic(pc16_source, message_id, text))
+        before_release = first.read_messages(pc16_source)
+        before_rows = [
+            item for item in before_release.get("items", [])
+            if isinstance(item, dict)
+        ]
+        input_rows = [
+            item for item in before_rows
+            if isinstance(item.get("body"), dict)
+            and item["body"].get("kind") == "input"
+        ]
+        # 旧 provider 先独立进入 client_disconnected；共享 barrier 仍保持，
+        # 因而后续请求只能在所有 Input 落日志后被观察和释放。
+        _release_barrier(model_url, pc16_old_barrier)
+        all_texts = [text for _, text in pc16_inputs]
+        request_deadline = time.monotonic() + SCENARIO_DEADLINE_S
+        old_request: dict[str, Any] | None = None
+        new_request: dict[str, Any] | None = None
+        while time.monotonic() < request_deadline:
+            requests = _model_requests(
+                _http_json("GET", f"{model_url}/control/requests")
+            )
+            for request in requests[max(0, request_start):]:
+                payload = request.get("payload") if isinstance(request, dict) else None
+                prompt = (
+                    json.dumps(payload, ensure_ascii=False)
+                    if isinstance(payload, dict)
+                    else ""
+                )
+                if all(text in prompt for text in all_texts):
+                    new_request = request
+                elif all_texts[0] in prompt:
+                    old_request = request
+            if (
+                new_request is not None
+                and new_request.get("state") == "blocked"
+                and old_request is not None
+                and old_request.get("state") == "client_disconnected"
+            ):
+                break
+            threading.Event().wait(0.05)
+        pre_release_requests = {
+            "old": old_request,
+            "new": new_request,
+            "barrier": _http_json(
+                "GET", f"{model_url}/control/barriers/{pc16_shared_barrier}"
+            ),
+        }
+        _release_barrier(model_url, pc16_shared_barrier)
+        input_results = [
+            _wait_programmatic_result(first, pc16_source, message_id)
+            for message_id, _ in pc16_inputs
+        ]
+        post_release_requests = _model_requests(
+            _http_json("GET", f"{model_url}/control/requests")
+        )
+        for request in post_release_requests[max(0, request_start):]:
+            payload = request.get("payload") if isinstance(request, dict) else None
+            prompt = (
+                json.dumps(payload, ensure_ascii=False)
+                if isinstance(payload, dict)
+                else ""
+            )
+            if all(text in prompt for text in all_texts):
+                new_request = request
+            elif all_texts[0] in prompt:
+                old_request = request
+        source_page = first.read_messages(pc16_source)
+        source_rows = [
+            item for item in source_page.get("items", [])
+            if isinstance(item, dict)
+        ]
+        source_outputs = [
+            item for item in source_rows
+            if isinstance(item.get("body"), dict)
+            and item["body"].get("kind") == "output"
+        ]
+        final_output = source_outputs[0] if len(source_outputs) == 1 else None
+        input_body_exact = all(
+            item.get("id") == message_id
+            and item.get("session_id") == pc16_source
+            and item.get("source") == "programmatic"
+            and item.get("seq") == index
+            and isinstance(item.get("body"), dict)
+            and item["body"].get("kind") == "input"
+            and any(
+                isinstance(part, dict)
+                and part.get("kind") == "text"
+                and part.get("value") == text
+                for part in item["body"].get("parts", [])
+            )
+            for index, ((message_id, text), item) in enumerate(
+                zip(pc16_inputs, input_rows)
+            )
+        )
+        result_ids = {result.get("ending_message_id") for result in input_results}
+        result_seqs = {result.get("ending_seq") for result in input_results}
+        pre_release_passed = (
+            isinstance(pre_release_requests.get("old"), dict)
+            and isinstance(pre_release_requests.get("new"), dict)
+            and pre_release_requests["old"].get("state") == "client_disconnected"
+            and pre_release_requests["new"].get("state") == "blocked"
+        )
+        ending_refs_match = (
+            isinstance(final_output, dict)
+            and isinstance(final_output.get("id"), str)
+            and final_output.get("seq") == 4
+            and result_ids == {final_output["id"]}
+            and result_seqs == {final_output["seq"]}
+        )
+        same_source_passed = (
+            [ack.get("seq") for ack in input_acks] == [0, 1, 2, 3]
+            and len(input_rows) == 4
+            and input_body_exact
+            and len(source_rows) == 5
+            and len(source_outputs) == 1
+            and isinstance(final_output, dict)
+            and final_output.get("seq") == 4
+            and final_output.get("source") == "programmatic"
+            and final_output.get("body", {}).get("finish") == "complete"
+            and _message_text(final_output) == "pc16 four input final"
+            and all(result.get("status") == "complete" for result in input_results)
+            and ending_refs_match
+            and pre_release_passed
+            and new_request is not None
+            and old_request is not None
+            and old_request.get("state") == "client_disconnected"
+            and new_request.get("state") == "completed"
+        )
+        lane_evidence["sameSource"] = {
+            "acks": input_acks,
+            "inputsBeforeRelease": input_rows,
+            "results": input_results,
+            "messagePage": source_page,
+            "oldProvider": old_request,
+            "newProvider": new_request,
+            "preReleaseRequests": pre_release_requests,
+            "postReleaseRequests": post_release_requests[max(0, request_start):],
+            "preReleasePassed": pre_release_passed,
+            "endingReferencesMatch": ending_refs_match,
+            "passed": same_source_passed,
+        }
+        different_sessions = cast(dict[str, object], lane_evidence["differentSessions"])
+        same_source = cast(dict[str, object], lane_evidence["sameSource"])
+        failure_recovery = cast(dict[str, object], lane_evidence["failureRecovery"])
+        if input_results and source_outputs:
+            pc06_first_result = first.programmatic_result(pc06, "pc06-first")
+            pc07_current_result = first.programmatic_result(pc07, "pc07-input")
+            pc09_results = [
+                first.programmatic_result(pc09, f"pc09-input-{index}")
+                for index in range(producer_count)
+            ]
+            raw_messages = _wait_message_log_rows(
+                database,
+                pc16_source,
+                minimum=5,
+                required_ids={message_id for message_id, _ in pc16_inputs}
+                | {str(final_output["id"])},
+            )
+
+            def result_evidence(
+                session_id: str,
+                input_id: str,
+                result: dict[str, Any],
+                *,
+                lifecycle: str,
+                observations: list[dict[str, Any]] | None = None,
+            ) -> dict[str, object]:
+                status = result.get("status")
+                settled = status in {"complete", "pause", "failure"}
+                return {
+                    "sessionId": session_id,
+                    "inputId": input_id,
+                    "status": status,
+                    "endingMessageId": result.get("ending_message_id"),
+                    "endingSeq": result.get("ending_seq"),
+                    "lifecycle": lifecycle,
+                    "settled": settled,
+                    "result": result,
+                    "observations": observations or [result],
+                }
+
+            programmatic_results = [
+                result_evidence(pc05_a, "pc05-input-a", pc05_a_result, lifecycle="complete"),
+                result_evidence(pc05_b, "pc05-input-b", pc05_b_result, lifecycle="complete"),
+                result_evidence(
+                    pc06, "pc06-first", pc06_first_result,
+                    lifecycle="superseded_same_source",
+                ),
+                result_evidence(pc06, "pc06-second", pc06_result, lifecycle="complete"),
+                result_evidence(
+                    pc07, "pc07-input", pc07_current_result,
+                    lifecycle="pause_then_resumed",
+                    observations=[pc07_paused_result, pc07_current_result],
+                ),
+                result_evidence(pc07, "pc07-new-input", pc07_new_result, lifecycle="complete"),
+                result_evidence(pc08, "pc08-input", resumed_result, lifecycle="complete"),
+                *[
+                    result_evidence(
+                        pc09, f"pc09-input-{index}", result, lifecycle="complete"
+                    )
+                    for index, result in enumerate(pc09_results)
+                ],
+                result_evidence(
+                    pc09_healthy, "pc09-healthy-input", pc09_healthy_result,
+                    lifecycle="complete",
+                ),
+                result_evidence(pc10, "pc10-input", pc10_result, lifecycle="failure"),
+                *[
+                    result_evidence(
+                        str(item["sessionId"]),
+                        str(item["inputId"]),
+                        cast(dict[str, Any], item["programmaticResult"]),
+                        lifecycle=(
+                            "complete"
+                            if cast(dict[str, Any], item["programmaticResult"]).get("status")
+                            == "complete"
+                            else "failure"
+                        ),
+                    )
+                    for item in parity_evidence
+                    if isinstance(item.get("programmaticResult"), dict)
+                ],
+                *[
+                    result_evidence(
+                        pc16_source, message_id, result, lifecycle="complete"
+                    )
+                    for (message_id, _), result in zip(pc16_inputs, input_results)
+                ],
+            ]
+            restart_state = {
+                "sessionId": pc16_source,
+                "inputId": pc16_inputs[-1][0],
+                "inputText": pc16_inputs[-1][1],
+                "inputSeq": 3,
+                "endingMessageId": input_results[-1].get("ending_message_id"),
+                "endingSeq": input_results[-1].get("ending_seq"),
+                "rawMessages": raw_messages,
+                "wireMessages": source_rows,
+                "statusBefore": first.request("server/status", {}).get("result"),
+                "providerRequestCount": len(
+                    _model_requests(_http_json("GET", f"{model_url}/control/requests"))
+                ),
+                "programmaticResults": programmatic_results,
+            }
+            web_session_ids = {
+                str(item["channelDatabase"]["sessionId"])
+                for item in parity_evidence
+                if isinstance(item.get("channelDatabase"), dict)
+                and isinstance(item["channelDatabase"].get("sessionId"), str)
+            }
+            web_session_ids.update(
+                str(different_sessions[key])
+                for key in ("slowSessionId", "fastSessionId")
+                if isinstance(different_sessions.get(key), str)
+            )
+            if isinstance(failure_recovery.get("sessionId"), str):
+                web_session_ids.add(str(failure_recovery["sessionId"]))
+            programmatic_session_ids = {
+                str(item["sessionId"])
+                for item in programmatic_results
+                if isinstance(item, dict) and isinstance(item.get("sessionId"), str)
+            }
+            restart_state["relevantSessionIds"] = sorted(
+                programmatic_session_ids | web_session_ids
+            )
+
+        if restart_state:
+            restart_state["messageTerminalEvidence"] = {
+                "parity": [
+                    {
+                        "status": item["channel"]["status"],
+                        "settled": item["passed"],
+                    }
+                    for item in parity_evidence
+                ],
+                "differentSessions": {
+                    "fast": different_sessions["fastCompletedBeforeRelease"]["status"]
+                    == "complete",
+                    "slow": different_sessions["slowFinal"] == "slow complete",
+                },
+                "sameSource": same_source.get("passed") is True,
+                "failureRecovery": failure_recovery.get("passed") is True,
+            }
         checks.append(
             CheckResult(
                 "PC-16",
-                parity_passed and lane_passed,
+                parity_passed
+                and same_source.get("passed") is True
+                and failure_recovery.get("passed") is True
+                and cast(
+                    dict[str, object],
+                    different_sessions["fastCompletedBeforeRelease"],
+                )["status"] == "complete"
+                and different_sessions["fastFinal"] == "fast complete"
+                and different_sessions["slowFinal"] == "slow complete",
                 {
                     "projection": parity_evidence,
                     "lanes": lane_evidence,
@@ -1985,7 +3790,6 @@ def _inside_failure_matrix(report_dir: Path) -> int:
                 },
             )
         )
-
         # 8. 非法 JSON/params 返回稳定 error，随后新连接仍可 readiness。
         raw_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         raw_socket.connect(str(endpoint))
@@ -1995,7 +3799,7 @@ def _inside_failure_matrix(report_dir: Path) -> int:
         raw_reader.close()
         raw_socket.close()
         invalid_params = second.request_raw(
-            "thread/start", {"metadata": {}, "unexpected": True}
+            "programmatic/message/send", {"session_id": "programmatic:pc11-invalid"}
         )
         healthy = _connect_client(endpoint, events_path)
         clients.append(healthy)
@@ -2041,7 +3845,7 @@ def _inside_failure_matrix(report_dir: Path) -> int:
 
 
 def _inside_restart_check(report_dir: Path) -> int:
-    """重启后验证协议 readiness 与既有 turn 持久可读。"""
+    """重启后验证 Message 原文、结果 ACK 和 provider 请求均未改变。"""
 
     endpoint = Path("/sandbox/akashic.sock")
     _wait_socket(endpoint, READINESS_DEADLINE_S)
@@ -2050,21 +3854,140 @@ def _inside_restart_check(report_dir: Path) -> int:
         state = json.loads(
             (report_dir / "restart-state.json").read_text(encoding="utf-8")
         )
-        turn = client.request(
-            "turn/read",
-            {"threadId": state["threadId"], "turnId": state["turnId"]},
+        if not isinstance(state, dict):
+            raise GateFailure("restart-state 不是 object")
+        session_id = state.get("sessionId")
+        input_id = state.get("inputId")
+        input_text = state.get("inputText")
+        input_seq = state.get("inputSeq")
+        ending_id = state.get("endingMessageId")
+        ending_seq = state.get("endingSeq")
+        expected_messages = state.get("rawMessages")
+        expected_wire_messages = state.get("wireMessages")
+        before_status = state.get("statusBefore")
+        phase = state.get("restartPhase")
+        runtime = state.get("runtime")
+        phase_runtime = runtime.get(phase) if isinstance(runtime, dict) else None
+        if (
+            not isinstance(session_id, str)
+            or not isinstance(input_id, str)
+            or not isinstance(input_text, str)
+            or type(input_seq) is not int
+            or not isinstance(ending_id, str)
+            or type(ending_seq) is not int
+            or not isinstance(expected_messages, list)
+            or not isinstance(expected_wire_messages, list)
+            or not isinstance(before_status, dict)
+            or not isinstance(phase, str)
+            or not isinstance(phase_runtime, dict)
+        ):
+            raise GateFailure(f"restart-state 字段不完整：{state!r}")
+        status_response = client.request("server/status", {})
+        current_status = status_response.get("result")
+        if not isinstance(current_status, dict):
+            raise GateFailure(f"重启后 server/status 非 object：{status_response!r}")
+        ack = client.send_programmatic(session_id, input_id, input_text)
+        result = client.programmatic_result(session_id, input_id)
+        page = client.read_messages(session_id)
+        actual_messages = _wait_message_log_rows(
+            Path("/sandbox/workspace/sessions.db"),
+            session_id,
+            minimum=len(expected_messages),
+            required_ids={str(row["id"]) for row in expected_messages if isinstance(row, dict)},
+        )
+        model_url = os.environ.get("AKASHIC_MODEL_GATE_URL", "http://model-gate:8090")
+        provider_request_count = len(
+            _model_requests(_http_json("GET", f"{model_url}/control/requests"))
         )
     finally:
         client.close()
-    passed = turn.get("result", {}).get("status") == "completed"
-    result = CheckResult("PC-13", passed, turn)
+    runtime_before = phase_runtime.get("before")
+    runtime_after = phase_runtime.get("after")
+    boot_before = before_status.get("bootId")
+    boot_after = current_status.get("bootId")
+    runtime_changed = (
+        isinstance(runtime_before, dict)
+        and isinstance(runtime_after, dict)
+        and isinstance(runtime_before.get("cmdline"), str)
+        and runtime_before.get("cmdline") == runtime_after.get("cmdline")
+        and type(runtime_before.get("starttime")) is int
+        and type(runtime_after.get("starttime")) is int
+        and type(runtime_before.get("pid")) is int
+        and type(runtime_after.get("pid")) is int
+        and (
+            runtime_before.get("pid"), runtime_before.get("starttime")
+        ) != (
+            runtime_after.get("pid"), runtime_after.get("starttime")
+        )
+    )
+    wire_messages = _message_wire_projection(page)
+    wire_messages_before = _message_wire_projection({"items": expected_wire_messages})
+    input_row = next(
+        (
+            row for row in expected_messages
+            if isinstance(row, dict) and row.get("id") == input_id
+        ),
+        None,
+    )
+    passed = (
+        current_status.get("ready") is True
+        and current_status.get("protocolVersion") == PROTOCOL_VERSION
+        and isinstance(boot_before, str)
+        and isinstance(boot_after, str)
+        and boot_before != boot_after
+        and runtime_changed
+        and ack.get("version") == 2
+        and ack.get("session_id") == session_id
+        and ack.get("message_id") == input_id
+        and ack.get("seq") == input_seq
+        and result.get("status") == "complete"
+        and result.get("ending_message_id") == ending_id
+        and result.get("ending_seq") == ending_seq
+        and page.get("session_id") == session_id
+        and page.get("through_seq") == ending_seq
+        and actual_messages == expected_messages
+        and wire_messages == wire_messages_before
+        and provider_request_count == state.get("providerRequestCount")
+        and isinstance(input_row, dict)
+        and input_row.get("seq") == input_seq
+        and any(
+            isinstance(part, dict)
+            and part.get("kind") == "text"
+            and part.get("value") == input_text
+            for part in (
+                input_row.get("body", {}).get("parts", [])
+                if isinstance(input_row.get("body"), dict)
+                else []
+            )
+        )
+    )
+    evidence = {
+        "phase": phase,
+        "statusBefore": before_status,
+        "statusAfter": current_status,
+        "runtimeBefore": runtime_before,
+        "runtimeAfter": runtime_after,
+        "runtimeChanged": runtime_changed,
+        "ack": ack,
+        "result": result,
+        "messagePage": page,
+        "rawMessagesBefore": expected_messages,
+        "rawMessagesAfter": actual_messages,
+        "wireMessagesBefore": expected_wire_messages,
+        "wireMessagesAfter": page.get("items"),
+        "wireUnchanged": wire_messages == wire_messages_before,
+        "messagesUnchanged": actual_messages == expected_messages,
+        "providerRequestCountBefore": state.get("providerRequestCount"),
+        "providerRequestCountAfter": provider_request_count,
+    }
+    result = CheckResult("PC-13", passed, evidence)
     _write_json(report_dir / "restart-check.json", asdict(result))
     print(json.dumps(asdict(result), ensure_ascii=False))
     return 0 if passed else 1
 
 
 def _inside_soak(report_dir: Path) -> int:
-    """执行 10 次预热和 100 次混合 turn，并记录稳定终态。"""
+    """执行 programmatic Message soak，并核对每个结果的日志引用。"""
 
     report_dir.mkdir(parents=True, exist_ok=True)
     endpoint = Path("/sandbox/akashic.sock")
@@ -2074,115 +3997,318 @@ def _inside_soak(report_dir: Path) -> int:
     _configure_model_gate()
     _wait_socket(endpoint, READINESS_DEADLINE_S)
     client = _connect_client(endpoint, events_path)
-    counts = {"completed": 0, "failed": 0, "interrupted": 0, "reconnects": 0}
-    turn_ids: list[str] = []
+    session_id = "programmatic:g5-soak"
+    counts = {"complete": 0, "pause": 0, "failure": 0, "reconnects": 0}
+    records: list[dict[str, object]] = []
 
-    def run_complete(index: int, *, warmup: bool = False) -> None:
-        _http_json(
-            "PUT",
-            f"{model_url}/control/script",
-            {"mode": "complete", "content": f"soak-{index}"},
+    def wait_ack_barrier(path: Path) -> None:
+        deadline = time.monotonic() + READINESS_DEADLINE_S
+        while not path.exists():
+            if time.monotonic() >= deadline:
+                raise GateFailure(f"controller 未确认 soak milestone：{path.name}")
+            threading.Event().wait(0.02)
+
+    def run_message(
+        index: int,
+        *,
+        phase: str,
+        expected_status: str,
+        mode: str = "complete",
+    ) -> None:
+        message_id = f"g5-{phase}-{index:03d}"
+        text = f"soak {phase} {index}"
+        barrier_name = f"g5-pause-{index}"
+        if mode == "complete":
+            _http_json(
+                "PUT",
+                f"{model_url}/control/script",
+                {"mode": "complete", "content": f"reply {message_id}"},
+            )
+        elif mode == "failure":
+            _http_json(
+                "PUT",
+                f"{model_url}/control/script",
+                [
+                    {"mode": "error", "status": 500},
+                    {"mode": "error", "status": 500},
+                ],
+            )
+        elif mode == "pause":
+            _http_json("PUT", f"{model_url}/control/barriers/{barrier_name}")
+            _http_json(
+                "PUT",
+                f"{model_url}/control/script",
+                [
+                    {"mode": "timeout", "barrier": barrier_name},
+                ],
+            )
+        else:
+            raise GateFailure(f"未知 soak mode：{mode}")
+
+        ack = client.send_programmatic(session_id, message_id, text)
+        if ack.get("message_id") != message_id or not isinstance(ack.get("seq"), int):
+            raise GateFailure(f"soak Input ACK 异常：{ack!r}")
+        if mode == "pause":
+            _wait_barrier(model_url, barrier_name)
+            _release_barrier(model_url, barrier_name)
+            control_ack = client.request_result(
+                "programmatic/message/pause",
+                {
+                    "session_id": session_id,
+                    "message_id": f"g5-pause-control-{index:03d}",
+                },
+            )
+            if control_ack.get("seq") != ack["seq"] + 1:
+                raise GateFailure(f"soak pause Control ACK 序号异常：{control_ack!r}")
+        result = _wait_programmatic_result(client, session_id, message_id)
+        if result.get("status") != expected_status:
+            raise GateFailure(
+                f"soak {message_id} 结果状态异常：expected={expected_status!r} result={result!r}"
+            )
+        ending_seq = result.get("ending_seq")
+        if not isinstance(ending_seq, int) or ending_seq <= int(ack["seq"]):
+            raise GateFailure(f"soak {message_id} 结果缺少 terminal seq：{result!r}")
+        records.append(
+            {
+                "index": index,
+                "phase": phase,
+                "messageId": message_id,
+                "text": text,
+                "ack": ack,
+                "result": result,
+                "expectedStatus": expected_status,
+            }
         )
-        thread_id = _start_thread(client, "G5-warmup" if warmup else "G5")
-        turn_id = _start_turn(client, thread_id, f"soak complete {index}")
-        terminal = client.wait_terminal(turn_id)
-        if _terminal_status(terminal) != "completed":
-            raise GateFailure(f"soak complete turn 非 completed：{turn_id}")
-        counts["completed"] += 1
-        turn_ids.append(turn_id)
+        counts[expected_status] += 1
 
     try:
+        admission = client.admit_programmatic(session_id)
+        if (
+            admission.get("visibility") != "internal"
+            or admission.get("learning") != "excluded"
+        ):
+            raise GateFailure(f"G5 programmatic Session 准入异常：{admission!r}")
+
         # 1. 预热完成后等待 controller 采集资源基线。
         for index in range(10):
-            run_complete(index, warmup=True)
+            run_message(index, phase="warmup", expected_status="complete")
         _write_json(
             report_dir / "soak-progress.json",
             {"phase": "warmup", "completed": 10, "counts": counts},
         )
         start_barrier = report_dir / "soak-start"
-        deadline = time.monotonic() + READINESS_DEADLINE_S
-        while not start_barrier.exists():
-            if time.monotonic() >= deadline:
-                raise GateFailure("controller 未释放 soak-start barrier")
-            threading.Event().wait(0.02)
+        wait_ack_barrier(start_barrier)
 
-        # 2. 100 turns：10 reconnect、10 interrupt、10 provider failure。
+        # 2. 100 个独立 Input：80 complete、10 pause、10 provider failure。
         for index in range(100):
             if index % 10 == 0:
                 client.close()
                 client = _connect_client(endpoint, events_path)
                 counts["reconnects"] += 1
             if index < 10:
-                barrier = f"soak-interrupt-{index}"
-                _create_barrier(
-                    model_url,
-                    barrier,
-                    {"mode": "complete", "content": "must interrupt"},
-                )
-                thread_id = _start_thread(client, "G5-interrupt")
-                turn_id = _start_turn(client, thread_id, f"soak interrupt {index}")
-                _wait_barrier(model_url, barrier)
-                client.request(
-                    "turn/interrupt", {"threadId": thread_id, "turnId": turn_id}
-                )
-                terminal = client.wait_terminal(turn_id, timeout=2)
-                _release_barrier(model_url, barrier)
-                if _terminal_status(terminal) != "interrupted":
-                    raise GateFailure(f"soak interrupt turn 非 interrupted：{turn_id}")
-                counts["interrupted"] += 1
-                turn_ids.append(turn_id)
+                run_message(index, phase="pause", expected_status="pause", mode="pause")
             elif index < 20:
-                _http_json(
-                    "PUT",
-                    f"{model_url}/control/script",
-                    [
-                        {"mode": "error", "status": 500},
-                        {"mode": "error", "status": 500},
-                    ],
+                run_message(
+                    index, phase="failure", expected_status="failure", mode="failure"
                 )
-                thread_id = _start_thread(client, "G5-failure")
-                turn_id = _start_turn(client, thread_id, f"soak failure {index}")
-                terminal = client.wait_terminal(turn_id)
-                if _terminal_status(terminal) != "failed":
-                    raise GateFailure(f"soak failure turn 非 failed：{turn_id}")
-                counts["failed"] += 1
-                turn_ids.append(turn_id)
             else:
-                run_complete(index)
+                run_message(index, phase="complete", expected_status="complete")
             if (index + 1) % 10 == 0:
+                milestone = index + 1
                 _write_json(
                     report_dir / "soak-progress.json",
                     {
                         "phase": "run",
-                        "completed": index + 1,
+                        "completed": milestone,
                         "counts": counts,
                     },
                 )
+                wait_ack_barrier(report_dir / f"soak-ack-{milestone}")
     finally:
         client.close()
 
     expected = {
-        "completed": 90,
-        "failed": 10,
-        "interrupted": 10,
+        "complete": 90,
+        "pause": 10,
+        "failure": 10,
         "reconnects": 10,
     }
-    passed = counts == expected and len(set(turn_ids)) == 110
+    unique_inputs = len({str(item["messageId"]) for item in records})
+    passed = counts == expected and unique_inputs == 110 and len(records) == 110
     result = CheckResult(
         "G5-turns",
         passed,
-        {"counts": counts, "uniqueTurns": len(set(turn_ids)), "expected": expected},
+        {
+            "counts": counts,
+            "uniqueInputs": unique_inputs,
+            "records": len(records),
+            "expected": expected,
+        },
     )
+    # Controller 采样期间已关闭原连接；这里明确建立独立只读核验连接。
+    ledger_client = _connect_client(endpoint, events_path)
+    try:
+        pages: list[dict[str, Any]] = []
+        after_seq = -1
+        while True:
+            current_page = ledger_client.read_messages(
+                session_id, after_seq=after_seq, limit=200
+            )
+            pages.append(current_page)
+            if current_page.get("has_more") is not True:
+                break
+            next_after = current_page.get("next_after_seq")
+            if not isinstance(next_after, int) or next_after <= after_seq:
+                raise GateFailure(f"G5 Message 分页游标无进展：{current_page!r}")
+            after_seq = next_after
+    finally:
+        ledger_client.close()
+    rows = [
+        item
+        for page in pages
+        for item in page.get("items", [])
+        if isinstance(page, dict) and isinstance(page.get("items"), list)
+    ]
+    ledger_passed = isinstance(rows, list) and len(rows) == 220
+    ledger_evidence: dict[str, object] = {
+        "sessionId": session_id,
+        "messageCount": len(rows) if isinstance(rows, list) else None,
+        "records": records,
+    }
+    if ledger_passed:
+        by_id = {str(item.get("id")): item for item in rows if isinstance(item, dict)}
+        ledger_passed = len(by_id) == 220 and [
+            item.get("seq") for item in rows if isinstance(item, dict)
+        ] == list(range(220))
+        for record in records:
+            message_id = str(record["messageId"])
+            ack = cast(dict[str, object], record["ack"])
+            result_payload = cast(dict[str, object], record["result"])
+            input_row = by_id.get(message_id)
+            ending_id = result_payload.get("ending_message_id")
+            ending_row = by_id.get(str(ending_id)) if ending_id is not None else None
+            if not isinstance(input_row, dict) or not isinstance(ending_row, dict):
+                ledger_passed = False
+                break
+            body = input_row.get("body")
+            ending_body = ending_row.get("body")
+            ledger_passed = ledger_passed and (
+                input_row.get("seq") == ack.get("seq")
+                and _message_text(input_row) == str(record["text"])
+                and input_row.get("author") == "user"
+                and input_row.get("source") == "programmatic"
+                and isinstance(body, dict)
+                and body.get("kind") == "input"
+                and ending_row.get("seq") == result_payload.get("ending_seq")
+                and ending_row.get("source") == "programmatic"
+                and (
+                    (
+                        record["expectedStatus"] == "complete"
+                        and ending_row.get("author") == "assistant"
+                        and isinstance(ending_body, dict)
+                        and ending_body.get("kind") == "output"
+                        and ending_body.get("finish") == "complete"
+                    )
+                    or (
+                        record["expectedStatus"] in {"pause", "failure"}
+                        and ending_row.get("author") == "app"
+                        and isinstance(ending_body, dict)
+                        and ending_body.get("kind") == "control"
+                        and ending_body.get("action") == record["expectedStatus"]
+                    )
+                )
+            )
+    from datetime import datetime
+
+    from plugins.turn_projection.plugin import TurnProjection
+    from session.message import Message
+    from session.message_codec import decode_body
+
+    database = Path("/sandbox/workspace/sessions.db")
+    raw_rows: list[sqlite3.Row] = []
+    if not database.exists():
+        raise GateFailure(f"G5 raw Message ledger 不存在：{database}")
+    try:
+        with closing(
+            sqlite3.connect(f"file:{database}?mode=ro", uri=True)
+        ) as connection:
+            connection.row_factory = sqlite3.Row
+            raw_rows = connection.execute(
+                "SELECT id, session_key, seq, ts, author, source, body "
+                "FROM messages WHERE session_key = ? ORDER BY seq",
+                (session_id,),
+            ).fetchall()
+    except sqlite3.Error as error:
+        raise GateFailure(f"G5 raw Message ledger 只读读取失败：{error}") from error
+    try:
+        projected_messages = [
+            Message(
+                message_id=str(row["id"]),
+                session_id=str(row["session_key"]),
+                seq=int(row["seq"]),
+                recorded_at=datetime.fromisoformat(str(row["ts"])),
+                author=str(row["author"]),
+                source=str(row["source"]),
+                body=decode_body(str(row["body"])),
+            )
+            for row in raw_rows
+        ]
+    except (KeyError, TypeError, ValueError) as error:
+        raise GateFailure(
+            f"G5 raw Message 无法还原为 TurnProjection 输入：{error}"
+        ) from error
+    raw_ids = [str(row["id"]) for row in raw_rows]
+    raw_seqs = [int(row["seq"]) for row in raw_rows]
+    wire_ids = [str(item["id"]) for item in rows if isinstance(item, dict)]
+    ledger_evidence["rawDatabase"] = {
+        "path": str(database),
+        "messageCount": len(raw_rows),
+        "seqs": raw_seqs,
+        "idsDigest": hashlib.sha256("\n".join(raw_ids).encode()).hexdigest(),
+    }
+    ledger_evidence["wireIdsMatchRawIds"] = wire_ids == raw_ids
+    ledger_passed = (
+        ledger_passed
+        and len(raw_rows) == 220
+        and raw_seqs == list(range(220))
+        and wire_ids == raw_ids
+    )
+    projected = TurnProjection().project(projected_messages, "programmatic")
+    projection_open = [
+        {
+            "afterSeq": turn.after_seq,
+            "throughSeq": turn.through_seq,
+            "messageIds": list(turn.message_ids),
+            "status": turn.status,
+        }
+        for turn in projected
+        if turn.status == "open"
+    ]
+    ledger_evidence["projectionOpenTurns"] = projection_open
+    ledger_evidence["activeOpenTurns"] = projection_open
+    ledger_evidence["turnProjection"] = {
+        "turnCount": len(projected),
+        "activeOpenTurns": len(projection_open),
+    }
+    ledger_passed = ledger_passed and not projection_open
+    ledger_evidence["allTerminalReferences"] = ledger_passed
+    ledger_result = CheckResult("G5-ledger", ledger_passed, ledger_evidence)
+    _write_json(report_dir / "soak-ledger.json", ledger_evidence)
     _write_json(
         report_dir / "inside-gate.json",
         {
             "gate": "soak",
-            "status": "passed" if passed else "failed",
-            "checks": [asdict(result)],
+            "status": "passed" if passed and ledger_passed else "failed",
+            "checks": [asdict(result), asdict(ledger_result)],
         },
     )
-    print(json.dumps(asdict(result), ensure_ascii=False))
-    return 0 if passed else 1
+    print(
+        json.dumps(
+            {"turns": asdict(result), "ledger": asdict(ledger_result)},
+            ensure_ascii=False,
+        )
+    )
+    return 0 if passed and ledger_passed else 1
 
 
 def _write_json(path: Path, payload: object) -> None:
@@ -2199,10 +4325,16 @@ def _write_jsonl(path: Path, items: list[object]) -> None:
 
 
 def _snapshot_database(database: Path) -> dict[str, object]:
-    """读取控制面相关 SQLite 终态，缺失数据库时明确记录。"""
+    """读取控制面 SQLite 终态，并明确报告必需表是否存在。"""
 
     if not database.exists():
-        return {"exists": False, "path": str(database)}
+        return {
+            "exists": False,
+            "path": str(database),
+            "tableNames": [],
+            "missingRequiredTables": ["sessions", "messages"],
+            "tables": {},
+        }
     with sqlite3.connect(database) as connection:
         connection.row_factory = sqlite3.Row
         table_names = {
@@ -2212,12 +4344,159 @@ def _snapshot_database(database: Path) -> dict[str, object]:
             ).fetchall()
         }
         tables: dict[str, list[dict[str, object]]] = {}
-        for name in ("sessions", "turns", "operations"):
+        for name in ("sessions", "messages", "turns", "operations"):
             if name not in table_names:
                 continue
-            rows = connection.execute(f'SELECT * FROM "{name}"').fetchall()
+            order = " ORDER BY session_key, seq" if name == "messages" else ""
+            rows = connection.execute(f'SELECT * FROM "{name}"{order}').fetchall()
             tables[name] = [dict(row) for row in rows]
-    return {"exists": True, "path": str(database), "tables": tables}
+    required_tables = ("sessions", "messages")
+    return {
+        "exists": True,
+        "path": str(database),
+        "tableNames": sorted(table_names),
+        "missingRequiredTables": [
+            name for name in required_tables if name not in table_names
+        ],
+        "tables": tables,
+    }
+
+
+def _snapshot_message_rows(
+    snapshot: dict[str, object], session_ids: Sequence[str]
+) -> tuple[dict[str, list[dict[str, object]]], list[str]]:
+    """从数据库快照解码指定 Session 的完整 Message 行。"""
+
+    wanted = list(dict.fromkeys(session_ids))
+    rows_by_session = {session_id: [] for session_id in wanted}
+    errors: list[str] = []
+    tables = snapshot.get("tables")
+    messages = tables.get("messages") if isinstance(tables, dict) else None
+    if not isinstance(messages, list):
+        return rows_by_session, ["messages table snapshot missing"]
+    for index, raw_row in enumerate(messages):
+        if not isinstance(raw_row, dict):
+            errors.append(f"messages[{index}] is not an object")
+            continue
+        session_id = raw_row.get("session_key")
+        if session_id not in rows_by_session:
+            continue
+        required = ("id", "session_key", "seq", "ts", "author", "source", "body")
+        missing = [name for name in required if name not in raw_row]
+        if missing:
+            errors.append(
+                f"messages[{index}] missing columns for {session_id}: {missing}"
+            )
+            continue
+        raw_body = raw_row["body"]
+        if not isinstance(raw_body, str):
+            errors.append(f"messages[{index}] body is not text for {session_id}")
+            continue
+        try:
+            body = json.loads(raw_body)
+        except json.JSONDecodeError as error:
+            errors.append(f"messages[{index}] invalid body for {session_id}: {error}")
+            continue
+        rows_by_session[str(session_id)].append(
+            {
+                "id": raw_row["id"],
+                "session_id": raw_row["session_key"],
+                "seq": raw_row["seq"],
+                "timestamp": raw_row["ts"],
+                "author": raw_row["author"],
+                "source": raw_row["source"],
+                "body": body,
+            }
+        )
+    return rows_by_session, errors
+
+
+def _runtime_identity(
+    compose: list[str], repo: Path, env: dict[str, str]
+) -> dict[str, object]:
+    """读取进程树中真实 gateway 的 PID、启动时间和命令行。"""
+
+    deadline = time.monotonic() + READINESS_DEADLINE_S
+    while True:
+        try:
+            sample = _sample_resources(compose, repo, env, milestone=-1)
+            break
+        except GateFailure as error:
+            if time.monotonic() >= deadline:
+                raise
+            threading.Event().wait(0.05)
+    try:
+        pid = int(sample["gatewayPid"])
+        starttime = int(str(sample["gatewayStarttime"]))
+        cmdline = str(sample["gatewayCmdline"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise GateFailure(f"gateway runtime identity 字段非法：{sample!r}") from error
+    return {"pid": pid, "starttime": starttime, "cmdline": cmdline}
+
+
+def _gateway_status(
+    compose: list[str], repo: Path, env: dict[str, str]
+) -> dict[str, Any]:
+    """通过 gateway 自己的 UDS 证明现有 owner 仍然 ready。"""
+
+    script = (
+        "import json,socket; "
+        "connection=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); "
+        "connection.connect('/sandbox/akashic.sock'); "
+        "reader=connection.makefile('rb'); "
+        "connection.sendall((json.dumps({'jsonrpc':'2.0','id':1,'method':'initialize',"
+        "'params':{'protocolVersion':'2.0','clientInfo':{'name':'workspace-lock-check',"
+        "'version':'2.0'},'capabilities':{}}})+'\\n').encode()); "
+        "reader.readline(); "
+        "connection.sendall((json.dumps({'jsonrpc':'2.0','method':'initialized',"
+        "'params':{}})+'\\n').encode()); "
+        "connection.sendall((json.dumps({'jsonrpc':'2.0','id':2,'method':'server/status',"
+        "'params':{}})+'\\n').encode()); "
+        "print(reader.readline().decode().strip())"
+    )
+    completed = subprocess.run(
+        [
+            *compose,
+            "exec",
+            "-T",
+            "akashic-control-gate",
+            "python",
+            "-c",
+            script,
+        ],
+        cwd=repo,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if completed.returncode != 0:
+        return {
+            "ready": False,
+            "error": completed.stderr[-1000:],
+            "returncode": completed.returncode,
+        }
+    try:
+        frame = json.loads(completed.stdout.splitlines()[-1])
+    except (IndexError, json.JSONDecodeError) as error:
+        return {
+            "ready": False,
+            "error": f"status output invalid: {error}",
+            "stdout": completed.stdout[-1000:],
+        }
+    result = frame.get("result") if isinstance(frame, dict) else None
+    return result if isinstance(result, dict) else {"ready": False, "frame": frame}
+
+
+def _socket_unavailable(endpoint: Path) -> bool:
+    """证明停止后共享 UDS 没有可接受连接的进程。"""
+
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        return not endpoint.exists() or probe.connect_ex(str(endpoint)) != 0
+    finally:
+        probe.close()
 
 
 def _repository_digest(repo: Path) -> dict[str, str]:
@@ -2253,26 +4532,19 @@ def _write_config(
     *,
     context_window: int = 64_000,
     max_iterations: int = 2,
+    outbound_queue_size: int = 64,
 ) -> None:
     """渲染只连接 compose 私网 model-gate 的隔离配置。"""
 
-    config = f"""[agent]
-system_prompt = "Return the deterministic model-gate response."
-max_iterations = {max_iterations}
-
-[agent.plugins]
+    config = f"""[agent.plugins]
 disabled_builtin = ["subagent"]
-
-[agent.context]
-[agent.context.compaction]
-keep_recent_tokens = 20000
 
 [app_server]
 enabled = true
 listen = "/sandbox/akashic.sock"
 max_connections = 8
 ingress_queue_size = 32
-outbound_queue_size = 64
+outbound_queue_size = {outbound_queue_size}
 
 [channels.chat]
 enabled = true
@@ -2287,25 +4559,55 @@ bot_uin = ""
 
 """
     (sandbox / "config.toml").write_text(config, encoding="utf-8")
+    reply_config = sandbox / "workspace/plugin-data/reply-builtin/config.local.toml"
+    reply_config.parent.mkdir(parents=True, exist_ok=True)
+    reply_config.write_text(f"max_steps = {max_iterations}\n", encoding="utf-8")
+    compaction_config = sandbox / "workspace/plugin-data/compaction-builtin/config.local.toml"
+    compaction_config.parent.mkdir(parents=True, exist_ok=True)
+    compaction_config.write_text("keep_recent_tokens = 20000\n", encoding="utf-8")
 
 
 def _initialize_current_workspace(workspace: Path, source_root: Path) -> None:
-    """为已标记 current 的 Gate workspace 写入当前版本必需资产。"""
+    """在候选源码进程中调用 workspace 初始化 owner。"""
 
-    # 1. Gate fixture 必须使用候选源码中的版本化默认值。
-    template = source_root / "prompts/VEDA.md"
+    config_path = workspace.parent / "config.toml"
+    script = """
+import sys
+from pathlib import Path
+
+source_root = Path(sys.argv[1]).resolve()
+config_path = Path(sys.argv[2]).resolve()
+workspace = Path(sys.argv[3]).resolve()
+sys.path.insert(0, str(source_root))
+from bootstrap import init_workspace as init_module
+
+module_path = Path(init_module.__file__).resolve()
+if source_root not in module_path.parents:
+    raise RuntimeError(f"workspace init imported outside candidate source: {module_path}")
+init_module.init_workspace(config_path=config_path, workspace=workspace, force=False)
+"""
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(source_root)
     try:
-        payload = template.read_bytes()
-        content = payload.decode("utf-8")
-    except (OSError, UnicodeDecodeError) as exc:
-        raise GateFailure(f"无法读取 Gate Veda 模板: {template}") from exc
-    if not content.strip():
-        raise GateFailure(f"Gate Veda 模板为空: {template}")
-
-    # 2. current cursor 禁止依赖 migration 补齐当前格式资产。
-    target = workspace / "memory/VEDA.md"
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_bytes(payload)
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                script,
+                str(source_root),
+                str(config_path),
+                str(workspace),
+            ],
+            cwd=source_root,
+            env=environment,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except subprocess.CalledProcessError as error:
+        details = (error.stderr or error.stdout or "").strip()
+        raise GateFailure(f"候选 workspace 初始化失败: {details}") from error
 
 
 def _prepare_host_sandbox(
@@ -2313,6 +4615,7 @@ def _prepare_host_sandbox(
     source_root: Path,
     *,
     max_iterations: int = 2,
+    outbound_queue_size: int = 64,
 ) -> None:
     """创建 control gate 独占的运行目录和可写静态目录。"""
 
@@ -2343,48 +4646,53 @@ def _prepare_host_sandbox(
 
     # 2. 所有运行时写入均归外部 sandbox，不依赖仓库 ignored 目录。
     (sandbox / "workspace").mkdir(parents=True)
-    _initialize_current_workspace(sandbox / "workspace", sandbox / "app")
     (sandbox / "home").mkdir()
     (sandbox / "reports").mkdir()
     (sandbox / "static/dashboard").mkdir(parents=True)
     (sandbox / "static/chat").mkdir()
 
     # 3. 配置只引用同一 sandbox 内的路径。
-    _write_config(sandbox, max_iterations=max_iterations)
+    _write_config(
+        sandbox,
+        max_iterations=max_iterations,
+        outbound_queue_size=outbound_queue_size,
+    )
+    _initialize_current_workspace(sandbox / "workspace", sandbox / "app")
 
 
 def _install_control_failure_plugin(sandbox: Path) -> None:
-    """安装只为 PC10 构造 started 后 gate failure 的隔离插件。"""
+    """安装只为 PC10 构造真实 BoundTool handler failure 的隔离插件。"""
 
     plugin_base = sandbox / "home/.akashic-plugin/cache/gate/control_failure"
     cache = plugin_base / ".artifacts/1.0.0"
     manifest = sandbox / "home/.akashic-plugin/manifest.toml"
     cache.mkdir(parents=True, exist_ok=True)
     _ = (cache / "plugin.py").write_text(
-        "from agent.lifecycle.composition import AFTER_REASONING_PREPROCESS_EVENT\n"
-        "from agent.plugin_composition import TOOL_CATALOG, PluginToolDefinition\n"
+        "from contextlib import asynccontextmanager\n"
+        "from plugins.tools.api import BoundTool, Result\n"
+        "from plugins.tools.plugin import TOOLS\n"
         "api_version = 3\n"
         "name = 'control_failure'\n"
         "version = '1.0.0'\n"
-        "inject = (TOOL_CATALOG,)\n"
-        "async def pc10_failure_probe(context, arguments):\n"
-        "    raise RuntimeError('pc10 tool failure')\n"
-        "async def fail_after_started(event):\n"
-        "    calls = (call for group in event.tool_chain "
-        "for call in group.get('calls', ()))\n"
-        "    if not any(call.get('name') == 'pc10_failure_probe' "
-        "for call in calls): return\n"
-        "    raise RuntimeError('pc10 gate failure after tool started')\n"
+        "inject = (TOOLS,)\n"
+        "class FailureTool:\n"
+        "    idempotent = False\n"
+        "    async def prepare(self, arguments, source=None):\n"
+        "        return arguments\n"
+        "    async def invoke(self, key, arguments):\n"
+        "        raise RuntimeError('pc10 tool handler failure')\n"
+        "    async def query(self, key):\n"
+        "        return None\n"
+        "@asynccontextmanager\n"
+        "async def open(_state):\n"
+        "    yield FailureTool()\n"
         "async def apply(ctx, config):\n"
-        "    await ctx.require(TOOL_CATALOG).register(ctx, PluginToolDefinition(\n"
-        "        name='pc10_failure_probe',\n"
-        "        description='Fail after emitting the PC10 tool lifecycle.',\n"
-        "        parameters={'type': 'object', 'properties': {\n"
-        "            'probe': {'type': 'boolean'}}, 'required': ['probe'],\n"
-        "            'additionalProperties': False},\n"
-        "        handler_export='pc10_failure_probe', risk='read-only',\n"
-        "        always_on=True))\n"
-        "    await ctx.on(AFTER_REASONING_PREPROCESS_EVENT, fail_after_started)\n",
+        "    await ctx.require(TOOLS).register(\n"
+        "        ctx, name='pc10_failure_probe',\n"
+        "        description='Fail inside the PC10 tool handler.',\n"
+        "        parameters={'type': 'object', 'properties': {'probe': {'type': 'boolean'}},\n"
+        "                     'required': ['probe'], 'additionalProperties': False},\n"
+        "        open=open, risk='read-only', always_on=True, preloadable=True)\n",
         encoding="utf-8",
     )
     _ = (cache / "akashic.plugin.toml").write_text(
@@ -2397,10 +4705,7 @@ def _install_control_failure_plugin(sandbox: Path) -> None:
     )
     _ = (plugin_base / ".pointers.json").write_text(
         json.dumps(
-            {
-                "stable": ".artifacts/1.0.0",
-                "latest": ".artifacts/1.0.0",
-            },
+            {"stable": ".artifacts/1.0.0", "latest": ".artifacts/1.0.0"},
             sort_keys=True,
         ),
         encoding="utf-8",
@@ -2417,28 +4722,15 @@ def _seed_memory_context_fixture(
     repo: Path,
     env: dict[str, str],
 ) -> None:
-    """在 gateway 启动前用生产 SessionManager 写入分页测试会话。"""
+    """只完成生产迁移；历史消息由真实程序化 ingress 追加。"""
 
     script = """
 from pathlib import Path
-from session.manager import SessionManager
+from agent.migrations import migrate_installation
 
-manager = SessionManager(Path("/sandbox/workspace"))
-session = manager.get_or_create("programmatic:context-ledger")
-for index in range(4):
-    control_turn_id = f"memory-gate-seed-{index}"
-    session.add_message(
-        "user",
-        (f"seed user {index} " + "token " * 5000).strip(),
-        control_turn_id=control_turn_id,
-    )
-    session.add_message(
-        "assistant",
-        (f"seed assistant {index} " + "token " * 5000).strip(),
-        control_turn_id=control_turn_id,
-    )
-manager.save(session)
-manager.close()
+config = Path("/sandbox/config.toml")
+workspace = Path("/sandbox/workspace")
+migrate_installation(config, workspace)
 """
     seeded = subprocess.run(
         [
@@ -2476,12 +4768,13 @@ def _run_stdio_check(
             "method": "initialize",
             "params": {
                 "protocolVersion": PROTOCOL_VERSION,
-                "clientInfo": {"name": "docker-stdio-gate", "version": "1.0"},
+                "clientInfo": {"name": "docker-stdio-gate", "version": "2.0"},
                 "capabilities": {"reasoningEvents": False},
             },
         },
         {"jsonrpc": "2.0", "method": "initialized", "params": {}},
         {"jsonrpc": "2.0", "id": 2, "method": "server/status", "params": {}},
+        {"jsonrpc": "2.0", "id": 3, "method": "session/create", "params": {}},
     ]
     payload = "".join(json.dumps(item) + "\n" for item in messages)
     command = [
@@ -2533,10 +4826,24 @@ def _run_stdio_check(
             continue
         if isinstance(item, dict) and item.get("jsonrpc") == "2.0":
             stderr_protocol_frames.append(item)
+    responses = [
+        item for item in parsed
+        if isinstance(item, dict) and item.get("jsonrpc") == "2.0" and "id" in item
+    ]
+    initialize_result = next((item.get("result") for item in responses if item.get("id") == 1), None)
+    status_result = next((item.get("result") for item in responses if item.get("id") == 2), None)
+    session_result = next((item.get("result") for item in responses if item.get("id") == 3), None)
     passed = (
         completed.returncode == 0
         and not parse_error
-        and {1, 2} <= response_ids
+        and {1, 2, 3} <= response_ids
+        and isinstance(initialize_result, dict)
+        and initialize_result.get("protocolVersion") == "2.0"
+        and isinstance(status_result, dict)
+        and status_result.get("ready") is True
+        and status_result.get("protocolVersion") == "2.0"
+        and isinstance(session_result, dict)
+        and session_result.get("session_id", "").startswith("akashic:")
         and not stderr_protocol_frames
     )
     return CheckResult(
@@ -2546,6 +4853,9 @@ def _run_stdio_check(
             "returncode": completed.returncode,
             "frames": len(parsed),
             "responseIds": sorted(str(item) for item in response_ids),
+            "initialize": initialize_result,
+            "status": status_result,
+            "sessionCreate": session_result,
             "parseError": parse_error,
             "stderrProtocolFrames": stderr_protocol_frames,
         },
@@ -2607,13 +4917,21 @@ def _workspace_lock_check(
         timeout=READINESS_DEADLINE_S,
         check=False,
     )
-    (report_dir / "workspace-lock.stderr.log").write_bytes(completed.stderr)
+    stderr = completed.stderr.decode(errors="replace")
+    (report_dir / "workspace-lock.stderr.log").write_text(stderr, encoding="utf-8")
+    gateway_status = _gateway_status(compose, repo, env)
+    lock_reason = "workspace 已由其他 runtime 占用"
     return CheckResult(
         "PC-14",
-        completed.returncode != 0,
+        completed.returncode != 0
+        and lock_reason in stderr
+        and gateway_status.get("ready") is True,
         {
             "returncode": completed.returncode,
-            "stderrTail": completed.stderr.decode(errors="replace")[-2000:],
+            "lockReason": lock_reason,
+            "reasonMatched": lock_reason in stderr,
+            "stderrTail": stderr[-2000:],
+            "gatewayStatus": gateway_status,
         },
     )
 
@@ -2634,16 +4952,44 @@ def _non_terminal_turns(snapshot: dict[str, object]) -> list[dict[str, object]]:
 
 def _sample_resources(
     compose: list[str], repo: Path, env: dict[str, str], milestone: int
-) -> dict[str, int | float]:
-    """从真实 gateway PID 1 读取 RSS、fd 和线程数。"""
+) -> dict[str, object]:
+    """从进程树中定位真实 gateway，并读取其 RSS、fd 和线程数。"""
 
-    script = (
-        "import json, pathlib; "
-        "status=pathlib.Path('/proc/1/status').read_text(); "
-        "rss=next(int(line.split()[1]) for line in status.splitlines() if line.startswith('VmRSS:')); "
-        "print(json.dumps({'rssKiB':rss,'fdCount':len(list(pathlib.Path('/proc/1/fd').iterdir())),"
-        "'threadCount':len(list(pathlib.Path('/proc/1/task').iterdir()))}))"
-    )
+    script = """
+import json
+import pathlib
+
+def read(pid, name):
+    return pathlib.Path('/proc', str(pid), name).read_text()
+
+def children(pid):
+    return [int(value) for value in read(pid, 'task/' + str(pid) + '/children').split()]
+
+roots = [1, *children(1)]
+candidates = []
+seen = set()
+stack = list(roots)
+while stack:
+    pid = stack.pop()
+    if pid in seen:
+        continue
+    seen.add(pid)
+    cmd = read(pid, 'cmdline').replace(chr(0), ' ').strip()
+    if '/main.py' in cmd and ' gateway' in (' ' + cmd):
+        candidates.append((pid, cmd))
+    stack.extend(children(pid))
+if len(candidates) != 1:
+    raise RuntimeError('gateway identity ambiguous: roots=%r candidates=%r' % (roots, candidates))
+pid, cmd = candidates[0]
+status = read(pid, 'status')
+rss = next(int(line.split()[1]) for line in status.splitlines() if line.startswith('VmRSS:'))
+stat = read(pid, 'stat')
+starttime = stat.rsplit(')', 1)[1].split()[19]
+print(json.dumps({'pid': pid, 'cmdline': cmd, 'rssKiB': rss,
+                  'starttime': starttime,
+                  'fdCount': len(list(pathlib.Path('/proc', str(pid), 'fd').iterdir())),
+                  'threadCount': len(list(pathlib.Path('/proc', str(pid), 'task').iterdir()))}))
+"""
     completed = subprocess.run(
         [
             *compose,
@@ -2667,6 +5013,9 @@ def _sample_resources(
     return {
         "timestamp": time.time(),
         "milestone": milestone,
+        "gatewayPid": int(payload["pid"]),
+        "gatewayCmdline": str(payload["cmdline"]),
+        "gatewayStarttime": str(payload["starttime"]),
         "rssKiB": int(payload["rssKiB"]),
         "fdCount": int(payload["fdCount"]),
         "threadCount": int(payload["threadCount"]),
@@ -2680,7 +5029,7 @@ def _run_soak(
     sandbox: Path,
     report_dir: Path,
 ) -> list[CheckResult]:
-    """并行采样 100-turn soak 资源，并执行公开增量阈值。"""
+    """并行采样 Message soak 资源，并执行公开增量阈值。"""
 
     command = [
         *compose,
@@ -2700,7 +5049,7 @@ def _run_soak(
     ]
     process = subprocess.Popen(command, cwd=repo, env=env)
     progress_path = sandbox / "reports/soak-progress.json"
-    samples: list[dict[str, int | float]] = []
+    samples: list[dict[str, object]] = []
     sampled_milestones: set[int] = set()
     deadline = time.monotonic() + 600
     try:
@@ -2718,6 +5067,8 @@ def _run_soak(
                     sampled_milestones.add(sample_key)
                     if phase == "warmup":
                         (sandbox / "reports/soak-start").touch()
+                    else:
+                        (sandbox / f"reports/soak-ack-{milestone}").touch()
             threading.Event().wait(0.05)
         returncode = process.wait()
     finally:
@@ -2744,21 +5095,31 @@ def _run_soak(
     rss_delta = int(final["rssKiB"]) - int(baseline["rssKiB"])
     fd_delta = int(final["fdCount"]) - int(baseline["fdCount"])
     thread_delta = int(final["threadCount"]) - int(baseline["threadCount"])
-    snapshot = _snapshot_database(sandbox / "workspace/sessions.db")
-    non_terminal = _non_terminal_turns(snapshot)
+    gateway_identities = [
+        (int(sample["gatewayPid"]), str(sample["gatewayStarttime"]))
+        for sample in samples
+    ]
+    ledger = json.loads(
+        (sandbox / "reports/soak-ledger.json").read_text(encoding="utf-8")
+    )
+    all_terminal = ledger.get("allTerminalReferences") is True
     checks.append(
         CheckResult(
             "G5-resources",
             rss_delta <= 64 * 1024
             and fd_delta <= 8
             and thread_delta <= 3
-            and not non_terminal,
+            and all_terminal
+            and len(set(gateway_identities)) == 1,
             {
                 "samples": len(samples),
                 "rssDeltaKiB": rss_delta,
                 "fdDelta": fd_delta,
                 "threadDelta": thread_delta,
-                "nonTerminalTurns": non_terminal,
+                "gatewayIdentities": gateway_identities,
+                "gatewayCmdline": baseline["gatewayCmdline"],
+                "gatewayStarttime": baseline["gatewayStarttime"],
+                "allTerminalReferences": all_terminal,
             },
         )
     )
@@ -2776,7 +5137,8 @@ def _run_host(gate: str) -> int:
     _prepare_host_sandbox(
         sandbox,
         repo,
-        max_iterations=3 if gate == "failure-matrix" else 2,
+        max_iterations=4 if gate == "failure-matrix" else 2,
+        outbound_queue_size=4 if gate == "failure-matrix" else 64,
     )
     if gate == "failure-matrix":
         _install_control_failure_plugin(sandbox)
@@ -2832,6 +5194,36 @@ def _run_host(gate: str) -> int:
             raise GateFailure(f"inside {gate} failed: {inside.returncode}")
         if gate == "failure-matrix":
             checks.append(_workspace_lock_check(compose, repo, env, report_dir))
+        restart_state_path = sandbox / "reports/restart-state.json"
+        if gate == "failure-matrix":
+            restart_state = json.loads(restart_state_path.read_text(encoding="utf-8"))
+            restart_state["restartPhase"] = "graceful"
+            restart_state["runtime"] = {
+                "graceful": {
+                    "before": _runtime_identity(compose, repo, env),
+                }
+            }
+            relevant_session_ids = restart_state.get("relevantSessionIds")
+            if not isinstance(relevant_session_ids, list) or not all(
+                isinstance(session_id, str) and session_id
+                for session_id in relevant_session_ids
+            ):
+                raise GateFailure(
+                    f"restart-state 缺少 relevantSessionIds：{relevant_session_ids!r}"
+                )
+            pre_stop_snapshot = _snapshot_database(
+                sandbox / "workspace/sessions.db"
+            )
+            pre_stop_messages, pre_stop_message_errors = _snapshot_message_rows(
+                pre_stop_snapshot,
+                cast(list[str], relevant_session_ids),
+            )
+            restart_state["preStopMessages"] = pre_stop_messages
+            restart_state["preStopMessageErrors"] = pre_stop_message_errors
+            restart_state["preStopMissingRequiredTables"] = pre_stop_snapshot.get(
+                "missingRequiredTables"
+            )
+            _write_json(restart_state_path, restart_state)
         stop_started = time.monotonic()
         gateway_stop = subprocess.run(
             [*compose, "stop", "-t", "15", "akashic-control-gate"],
@@ -2846,14 +5238,89 @@ def _run_host(gate: str) -> int:
             checks.append(_run_stdio_check(compose, repo, env, report_dir))
         elif gate == "failure-matrix":
             stopped_snapshot = _snapshot_database(sandbox / "workspace/sessions.db")
-            non_terminal = _non_terminal_turns(stopped_snapshot)
+            restart_state = json.loads(restart_state_path.read_text(encoding="utf-8"))
+            programmatic_results = restart_state.get("programmaticResults")
+            terminal_evidence = restart_state.get("messageTerminalEvidence")
+            relevant_session_ids = restart_state.get("relevantSessionIds")
+            pre_stop_messages = restart_state.get("preStopMessages")
+            pre_stop_message_errors = restart_state.get("preStopMessageErrors")
+            pre_stop_missing_tables = restart_state.get("preStopMissingRequiredTables")
+            missing_tables = stopped_snapshot.get("missingRequiredTables")
+            post_stop_messages, post_stop_message_errors = _snapshot_message_rows(
+                stopped_snapshot,
+                cast(list[str], relevant_session_ids)
+                if isinstance(relevant_session_ids, list)
+                else [],
+            )
+            session_message_exact_match = (
+                isinstance(relevant_session_ids, list)
+                and bool(relevant_session_ids)
+                and all(isinstance(session_id, str) for session_id in relevant_session_ids)
+                and isinstance(pre_stop_messages, dict)
+                and pre_stop_missing_tables == []
+                and not pre_stop_message_errors
+                and not post_stop_message_errors
+                and pre_stop_messages == post_stop_messages
+            )
+            open_results = (
+                [
+                    item
+                    for item in programmatic_results
+                    if isinstance(item, dict) and item.get("settled") is not True
+                ]
+                if isinstance(programmatic_results, list)
+                else ["missing"]
+            )
+            different_sessions = (
+                terminal_evidence.get("differentSessions")
+                if isinstance(terminal_evidence, dict)
+                else None
+            )
+            no_running_work = (
+                isinstance(programmatic_results, list)
+                and bool(programmatic_results)
+                and not open_results
+                and isinstance(terminal_evidence, dict)
+                and isinstance(different_sessions, dict)
+                and all(value is True for value in different_sessions.values())
+                and terminal_evidence.get("sameSource") is True
+                and terminal_evidence.get("failureRecovery") is True
+            )
+            socket_unavailable = _socket_unavailable(sandbox / "akashic.sock")
             checks.append(
                 CheckResult(
                     "PC-12",
-                    stop_duration <= 15 and not non_terminal,
+                    stop_duration <= 15
+                    and stopped_snapshot.get("exists") is True
+                    and missing_tables == []
+                    and no_running_work
+                    and session_message_exact_match
+                    and socket_unavailable,
                     {
                         "durationSeconds": stop_duration,
-                        "nonTerminalTurns": non_terminal,
+                        "database": {
+                            "exists": stopped_snapshot.get("exists"),
+                            "tableNames": stopped_snapshot.get("tableNames"),
+                            "missingRequiredTables": missing_tables,
+                            "messageCount": len(
+                                stopped_snapshot.get("tables", {}).get("messages", [])
+                            )
+                            if isinstance(stopped_snapshot.get("tables"), dict)
+                            else None,
+                        },
+                        "sessionMessageParity": {
+                            "relevantSessionIds": relevant_session_ids,
+                            "preStopMessages": pre_stop_messages,
+                            "preStopMissingRequiredTables": pre_stop_missing_tables,
+                            "postStopMessages": post_stop_messages,
+                            "preStopErrors": pre_stop_message_errors,
+                            "postStopErrors": post_stop_message_errors,
+                            "exactMatch": session_message_exact_match,
+                        },
+                        "programmaticResults": programmatic_results,
+                        "openResults": open_results,
+                        "messageTerminalEvidence": terminal_evidence,
+                        "socketUnavailable": socket_unavailable,
                     },
                 )
             )
@@ -2865,6 +5332,11 @@ def _run_host(gate: str) -> int:
             )
             if restart.returncode != 0:
                 raise GateFailure(f"gateway restart failed: {restart.returncode}")
+            restart_state = json.loads(restart_state_path.read_text(encoding="utf-8"))
+            restart_state["runtime"]["graceful"]["after"] = _runtime_identity(
+                compose, repo, env
+            )
+            _write_json(restart_state_path, restart_state)
             restart_check = _run_inside(
                 compose,
                 repo,
@@ -2874,6 +5346,7 @@ def _run_host(gate: str) -> int:
             )
             restart_payload = sandbox / "reports/restart-check.json"
             if restart_payload.exists():
+                shutil.copy2(restart_payload, report_dir / "restart-check-graceful.json")
                 checks.append(CheckResult(**json.loads(restart_payload.read_text())))
             if restart_check.returncode != 0:
                 raise GateFailure(
@@ -2892,6 +5365,17 @@ def _run_host(gate: str) -> int:
                 env=env,
                 check=False,
             )
+            if restart_after_crash.returncode != 0:
+                raise GateFailure(
+                    f"gateway crash restart failed: {restart_after_crash.returncode}"
+                )
+            restart_state = json.loads(restart_state_path.read_text(encoding="utf-8"))
+            restart_state["restartPhase"] = "crash"
+            restart_state["runtime"]["crash"] = {
+                "before": restart_state["runtime"]["graceful"]["after"],
+                "after": _runtime_identity(compose, repo, env),
+            }
+            _write_json(restart_state_path, restart_state)
             crash_check = _run_inside(
                 compose,
                 repo,
@@ -2899,16 +5383,28 @@ def _run_host(gate: str) -> int:
                 gate=gate,
                 phase="restart-check",
             )
+            if restart_payload.exists():
+                shutil.copy2(restart_payload, report_dir / "restart-check-crash.json")
+            crash_payload = (
+                json.loads(restart_payload.read_text())
+                if restart_payload.exists()
+                else None
+            )
             checks.append(
                 CheckResult(
                     "PC-13-crash",
                     crash.returncode == 0
                     and restart_after_crash.returncode == 0
-                    and crash_check.returncode == 0,
+                    and crash_check.returncode == 0
+                    and isinstance(crash_payload, dict)
+                    and crash_payload.get("passed") is True,
                     {
                         "killReturncode": crash.returncode,
                         "restartReturncode": restart_after_crash.returncode,
                         "probeReturncode": crash_check.returncode,
+                        "restartCheck": (
+                            crash_payload
+                        ),
                     },
                 )
             )

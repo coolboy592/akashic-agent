@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import re
-from collections.abc import Callable, Mapping
+import secrets
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import MappingProxyType
@@ -96,6 +98,8 @@ class _RootBridge:
 class _RuntimeOwner:
     generation: CompositionRuntimeGeneration
     bridge: _RootBridge
+    borrowed: AsyncExitStack | None = None
+    lock: asyncio.Lock | None = None
 
 
 class CompositionGenerationHost:
@@ -107,8 +111,11 @@ class CompositionGenerationHost:
         workload_controller: WorkloadController | None = None,
         workspace_id: str | None = None,
         on_failure: Callable[[CompositionRuntimeFailure], None] | None = None,
+        command_resolver: Callable[[PluginGeneration, str, str], tuple[str, ...]] | None = None,
     ) -> None:
         self._on_failure = on_failure
+        self._command_resolver = command_resolver
+        self._scoped_closed = False
         self._bridges: dict[str, _RootBridge] = {}
         self._detached_observers: set[str] = set()
         self._owners: dict[str, _RuntimeOwner] = {}
@@ -137,6 +144,12 @@ class CompositionGenerationHost:
         )
         self._workload_controller = workload_controller
         self._workload_workspace_id = workspace_id
+
+    def start_scoped(self) -> None:
+        """同一 Manager 再次加载前，确认旧调用资源已清空再开放接纳。"""
+        if any(owner.borrowed is not None for owner in self._owners.values()):
+            raise RuntimeError("旧调用资源尚未清空，不能重新接纳")
+        self._scoped_closed = False
 
     async def cleanup_candidates(self) -> None:
         """Strongly remove candidate containers left by an earlier Core boot."""
@@ -177,6 +190,12 @@ class CompositionGenerationHost:
         if workload_bindings and self._workload_host is None:
             raise RuntimeError("插件声明了 Workload，但 Core 未配置 Controller")
         _assert_root_token(snapshot, root.instance_token)
+        if self._command_resolver is not None:
+            generation.static_runtime_commands = tuple(
+                (f"{kind}:{name}", self._command_resolver(generation, kind, name))
+                for kind, bindings in (("process", process_bindings), ("mcp", mcp_bindings))
+                for name in bindings
+            )
         bridge = _RootBridge(
             root_instance_token=root.instance_token,
             workload_bindings=workload_bindings,
@@ -281,6 +300,132 @@ class CompositionGenerationHost:
         self._owners[generation.generation_id] = _RuntimeOwner(runtime, bridge)
         return runtime
 
+    @asynccontextmanager
+    async def open_mcp(
+        self, snapshot: RuntimeSnapshot, name: str,
+        *, expected_catalog_digest: str | None = None, mode: RuntimeMode = "formal",
+    ) -> AsyncIterator[McpServerView]:
+        """只打开指定 MCP 与其资源依赖；不启动整个插件或发布 runtime。"""
+        # 1. 同步接纳不跨 await；关闭与 owner 登记在同一事件循环中排序。
+        if self._scoped_closed:
+            raise RuntimeError("调用资源已停止接纳")
+        registry = snapshot.mcp_server_registry
+        if registry is None:
+            raise RuntimeError("当前 scope 没有 MCP 声明")
+        binding = registry[name]
+        generation = snapshot.generations[binding.descriptor.owner]
+        root = snapshot.composition_root
+        if root is None:
+            raise RuntimeError("MCP scope 缺少 Root")
+        scope_id = "bound-" + secrets.token_hex(16)
+        bound_generation = replace(generation, generation_id=scope_id)
+        process_bindings = _owned_process_bindings(snapshot, generation.plugin_id)
+        process_bindings = {
+            endpoint.process: process_bindings[endpoint.process]
+            for endpoint in binding.descriptor.endpoint_env
+        }
+        names = {endpoint.workload for endpoint in binding.descriptor.workload_env}
+        declared_workloads = _owned_workload_bindings(snapshot, generation.plugin_id)
+        workload_bindings = {name: declared_workloads[name] for name in names}
+        if self._command_resolver is not None:
+            bound_generation.static_runtime_commands = tuple(
+                (f"{kind}:{target}", self._command_resolver(generation, kind, target))
+                for kind, targets in (
+                    ("process", process_bindings),
+                    ("mcp", {name: binding}),
+                )
+                for target in targets
+            )
+        borrowed = AsyncExitStack()
+        bridge = _RootBridge(root.instance_token, workload_bindings, process_bindings, {name: binding})
+        self._bridges[scope_id] = bridge
+        self._owners[scope_id] = _RuntimeOwner(
+            CompositionRuntimeGeneration(
+                generation.plugin_id, scope_id, mode, None, None, None
+            ),
+            bridge,
+            borrowed,
+            asyncio.Lock(),
+        )
+        owner = self._owners[scope_id]
+        assert owner.lock is not None
+        try:
+            async with owner.lock:
+                # 2. 正式调用只借相同桌面；验证只创建自己拥有的候选资源。
+                endpoints: dict[tuple[str, str], str] = {}
+                workloads = None
+                if workload_bindings:
+                    if self._workload_host is None:
+                        raise RuntimeError("MCP 依赖 Workload，但没有资源 owner")
+                    if mode == "candidate":
+                        workloads = await self._workload_host.start_generation(
+                            scope_id, generation.plugin_id, workload_bindings, mode="candidate",
+                        )
+                        owner.generation = replace(owner.generation, workloads=workloads)
+                        endpoints.update(workloads.endpoints)
+                    else:
+                        for workload_name in sorted(workload_bindings):
+                            urls = await borrowed.enter_async_context(
+                                self._workload_host.borrow(workload_bindings[workload_name].descriptor)
+                            )
+                            endpoints.update({(workload_name, port): url for port, url in urls.items()})
+                processes = None
+                if process_bindings:
+                    processes = await self._process_host.start_generation(
+                        scope_id,
+                        _materialized_process_definitions(
+                            bound_generation, process_bindings
+                        ),
+                        mode=mode,
+                        fixed_ports=False,
+                    )
+                    owner.generation = replace(owner.generation, processes=processes)
+                mcp = await self._mcp_host.start_generation(
+                    scope_id,
+                    McpServerRegistry(
+                        {name: binding}, root_instance_token=root.instance_token
+                    ),
+                    _materialized_mcp_commands(
+                        bound_generation, {name: binding}, scope_id=scope_id
+                    ),
+                    mode=mode,
+                    endpoint_ports=(
+                        {}
+                        if processes is None
+                        else {
+                            key: endpoint.port
+                            for key, endpoint in processes.endpoints.items()
+                        }
+                    ),
+                    workload_endpoints=endpoints,
+                    expected_catalog_digests=(
+                        None
+                        if expected_catalog_digest is None
+                        else {name: expected_catalog_digest}
+                    ),
+                )
+                self._owners[scope_id].generation = CompositionRuntimeGeneration(
+                    generation.plugin_id,
+                    scope_id,
+                    mode,
+                    workloads,
+                    processes,
+                    mcp,
+                )
+            yield mcp.server(name)
+        finally:
+            # 3. 先关闭子进程，再释放借阅；清理失败保留 owner 供既有 retry 使用。
+            closing = asyncio.create_task(self.stop(scope_id))
+            cancelled = False
+            while not closing.done():
+                try:
+                    await asyncio.shield(closing)
+                except asyncio.CancelledError:
+                    cancelled = True
+            closing.result()
+            if cancelled:
+                raise asyncio.CancelledError
+
     def attach_tools(
         self,
         registry: ToolRegistry | None,
@@ -310,6 +455,16 @@ class CompositionGenerationHost:
     async def stop(self, generation_id: str) -> None:
         """Stop consumers before providers and retain failed ownership."""
 
+        owner = self._owners.get(generation_id)
+        if owner is not None and owner.lock is not None:
+            async with owner.lock:
+                if self._owners.get(generation_id) is owner:
+                    await self._stop(generation_id)
+        else:
+            await self._stop(generation_id)
+
+    async def _stop(self, generation_id: str) -> None:
+        """调用 scope 由其 owner 锁保护，正式 generation 沿用既有排空协议。"""
         self._detached_observers.add(generation_id)
         _ = self._bridges.pop(generation_id, None)
         owner = self._owners.get(generation_id)
@@ -322,8 +477,51 @@ class CompositionGenerationHost:
             processes=processes,
             workloads=workloads,
         )
-        _ = self._owners.pop(generation_id, None)
+        finished = self._owners.pop(generation_id, None)
+        if finished is not None and finished.borrowed is not None:
+            await finished.borrowed.aclose()
         self._detached_observers.discard(generation_id)
+
+    def scoped(self, scope_id: str) -> bool:
+        """区分一次调用的资源 owner 与正式插件 generation。"""
+        owner = self._owners.get(scope_id)
+        return owner is not None and owner.borrowed is not None
+
+    def scoped_failures(self) -> tuple[CompositionRuntimeFailure, ...]:
+        """从实际 tombstone 计算待恢复调用，不保存第二份故障状态。"""
+        return tuple(
+            failure
+            for identity, owner in self._owners.items()
+            if owner.borrowed is not None
+            if (failure := self.failure(identity)) is not None
+        )
+
+    def retry_scoped_cleanup(self, scope_id: str) -> Awaitable[str]:
+        """在调用接纳时捕获实际 owner，重复清理者共用它的完成边界。"""
+        owner = self._owners.get(scope_id)
+        if owner is None or owner.borrowed is None:
+            raise ValueError("没有对应的调用资源 owner")
+        if self.failure(scope_id) is None:
+            raise ValueError("调用资源没有待恢复故障")
+        return self._close_scoped_owner(scope_id, owner)
+
+    async def _close_scoped_owner(self, scope_id: str, owner: _RuntimeOwner) -> str:
+        """同一调用的 shutdown 与重试只执行一次实际清理。"""
+        assert owner.lock is not None
+        async with owner.lock:
+            if self._owners.get(scope_id) is owner:
+                if self.failure(scope_id) is None:
+                    await self._stop(scope_id)
+                else:
+                    await self._retry_runtime(scope_id, recover_degraded=True)
+        return f"composition-runtime:{scope_id}:cleanup-complete"
+
+    async def close_scoped(self) -> None:
+        """同步关闭接纳后，先归还调用借用再允许正式 Workload 停止。"""
+        self._scoped_closed = True
+        for identity, owner in tuple(self._owners.items()):
+            if owner.borrowed is not None:
+                _ = await self._close_scoped_owner(identity, owner)
 
     def get(self, generation_id: str) -> CompositionRuntimeGeneration | None:
         owner = self._owners.get(generation_id)
@@ -405,6 +603,20 @@ class CompositionGenerationHost:
     ) -> None:
         """Retry both protocol hosts without invoking unloaded plugin code."""
 
+        owner = self._owners.get(generation_id)
+        if owner is not None and owner.lock is not None:
+            async with owner.lock:
+                if self._owners.get(generation_id) is owner:
+                    await self._retry_runtime(
+                        generation_id, recover_degraded=recover_degraded
+                    )
+        else:
+            await self._retry_runtime(generation_id, recover_degraded=recover_degraded)
+
+    async def _retry_runtime(
+        self, generation_id: str, *, recover_degraded: bool
+    ) -> None:
+        """在对应 owner 的关闭顺序内清理保留资源。"""
         if self.failure(generation_id) is None:
             raise RuntimeError(
                 f"v3 runtime generation 没有 retained failure: {generation_id}"
@@ -428,7 +640,9 @@ class CompositionGenerationHost:
                 await host.retry_generation_cleanup(generation_id)
         if self.failure(generation_id) is not None:
             raise RuntimeError(f"v3 runtime generation retry 未清空: {generation_id}")
-        _ = self._owners.pop(generation_id, None)
+        finished = self._owners.pop(generation_id, None)
+        if finished is not None and finished.borrowed is not None:
+            await finished.borrowed.aclose()
         _ = self._bridges.pop(generation_id, None)
         self._detached_observers.discard(generation_id)
 
@@ -771,8 +985,11 @@ def _materialized_process_definitions(
 def _materialized_mcp_commands(
     generation: PluginGeneration,
     bindings: Mapping[str, McpServerBinding],
+    *,
+    scope_id: str | None = None,
 ) -> dict[str, McpMaterializedCommand]:
     commands = dict(generation.static_runtime_commands)
+    materialized_scope = generation.generation_id if scope_id is None else scope_id
     return {
         name: McpMaterializedCommand(
             command=_runtime_command(
@@ -788,10 +1005,13 @@ def _materialized_mcp_commands(
                 )
             ),
             env=MappingProxyType(
-                _core_environment(
-                    binding.runtime_data_dir,
-                    binding.runtime_workspace,
-                )
+                {
+                    **_core_environment(
+                        binding.runtime_data_dir,
+                        binding.runtime_workspace,
+                    ),
+                    "AKASHIC_MCP_SCOPE_ID": materialized_scope,
+                }
             ),
         )
         for name, binding in bindings.items()

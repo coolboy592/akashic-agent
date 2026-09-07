@@ -13,6 +13,8 @@ from agent.plugin_composition import (
 from .litellm_catalog import LiteLlmCapabilityCatalog
 from .state import ModelsState
 from .store import ModelsStore
+from .projection import MODEL_CALLS, MODEL_CALL_HISTORY
+from agent.plugin_composition.models import MODEL_CALL_STATS
 
 api_version = 3
 name = "models"
@@ -56,8 +58,11 @@ async def apply(ctx: Context, config: object) -> None:
         label="model-auth-attempts",
     )
     _ = await ctx.provide(MODEL_DRIVERS, state.drivers)
-    _ = await ctx.provide(CHAT_MODELS, state.chat_models)
+    _ = await ctx.provide(CHAT_MODELS, state.chat_models, binding_contributors=state.chat_contributors)
     _ = await ctx.provide(EMBEDDINGS, state.embeddings)
     _ = await ctx.provide(MODEL_CATALOG, state.catalog)
     _ = await ctx.provide(MODEL_SETTINGS, state.settings)
+    _ = await ctx.provide(MODEL_CALLS, store.read_call)
+    _ = await ctx.provide(MODEL_CALL_HISTORY, store.read_calls)
+    _ = await ctx.provide(MODEL_CALL_STATS, store.read_call_stats)
     _ = await ctx.on(SNAPSHOT_SEALING, state.seal)
