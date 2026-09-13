@@ -51,6 +51,9 @@ plugins/**/.data/
 !/docs/
 /docs/*
 !/docs/INDEX.md
+!/docs/interview-guide.md
+!/docs/interview-guide-workbench/
+!/docs/interview-guide-workbench/**
 !/docs/WORKFLOW.md
 !/docs/projectneed.md
 !/docs/NOW.md

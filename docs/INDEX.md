@@ -73,6 +73,8 @@
 
 | 文件或目录 | 回答的问题 | 读取策略 |
 |---|---|---|
+| [面试准备与源码阅读](interview-guide.md) | 简历能力对应哪些 Agent 知识、源码路径和面试表达 | 面向 Agent 应用研发面试；按主题逐段阅读，留意待核实标记 |
+| [面试指导书工作台](interview-guide-workbench/00-workflow-and-state.md) | 分阶段编写规则、已验收章节和当前接手点是什么 | 继续编写指导书时先读唯一入口，再按其中路由读取对应事实包 |
 | [插件 V3 能力手册](design/plugin-v3-capabilities.md) | V3 当前有哪些原子能力、插件怎样使用 | 开发或审查 V3 插件时读取 |
 | [hua-home 插件运行事实](design/hua-home-plugin-runtime-source-of-truth.md) | 线上权威路径、固定查找方法、本地镜像边界和 exact fleet snapshot | 审计、同步或部署插件时先读取 |
 | [`WORKFLOW.md`](WORKFLOW.md) | 修改仓库文件时怎样从接手任务走到提交评审 | 每个修改任务读取 |
