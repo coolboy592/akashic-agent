@@ -1,16 +1,12 @@
 # 章节证据包：工具发现与上下文治理
 
-> 本包是研究起点，不是固定目录或封闭事实清单。写作与验收遵循 `../00-workflow-and-state.md`；旧稿结构不自动继承，相关事实可沿历史实现及相关插件补充。
+> 本包是章节事实底稿：数据、机制、踩坑、源码锚点与禁止推导。写作与验收以 `../00-README.md` 为准，通用主张边界见 `../01-fact-boundaries.md`；本包不是封闭事实清单。
 
-## 1. 章节任务
-
-解释工具数量和对话历史增长时，本项目怎样选择可见工具、组织请求、压缩历史并观察开销。讲清采用的方法和实现，不只讲集合或协议边界；全量 Schema 在小工具集下可能更简单，按需发现和模型摘要的额外成本也要解释。
-
-## 2. 对应简历
+## 1. 对应简历
 
 > 工具发现与上下文管理：统一注册本地与 MCP 工具，通过目录检索、当轮解锁及常用工具预加载按需暴露 Schema；分层编排稳定指令与动态记忆，按模型窗口水位压缩历史并保留完整交互单元，支持工具扩展与长对话执行，并记录输入 token、缓存命中率用于开销分析。
 
-## 3. 解释工具流程时需要区分的三个集合
+## 2. 解释工具流程时需要区分的三个集合
 
 1. **registered：** 宿主已经加载并能根据真实 identity 找到的工具。
 2. **visible：** 当前 provider 请求中实际携带 Schema、模型可以选择的工具。
@@ -20,7 +16,7 @@ registered 不等于 visible；visible 也不等于一定可以越过执行权�
 
 这是准确解释的依据，不要求题目或正文先背诵三个术语再进入技术内容。
 
-## 4. 工具按需暴露链路
+## 3. 工具按需暴露链路
 
 ```text
 统一注册本地/MCP 工具
@@ -43,7 +39,7 @@ registered 不等于 visible；visible 也不等于一定可以越过执行权�
 - `preloadable=False` 的工具不能因为近期使用而自动预加载。
 - 搜索是基于工具元数据/关键词的目录搜索，不要称为向量语义检索。
 
-## 5. 上下文组织与压缩链路
+## 4. 上下文组织与压缩链路
 
 ```text
 稳定指令
@@ -69,7 +65,7 @@ registered 不等于 visible；visible 也不等于一定可以越过执行权�
 - provider 仍报容量错误时，重试必须有上限，不能把所有错误都当成 context overflow。
 - 动态 Akasha 记忆放在稳定历史之后，以保留更长的稳定 Prompt 前缀。
 
-## 6. 关键取舍
+## 5. 关键取舍
 
 ### 全量 Schema vs 目录加当轮解锁
 
@@ -91,7 +87,7 @@ registered 不等于 visible；visible 也不等于一定可以越过执行权�
 
 固定条数便宜，却可能拆开 tool call/result；逻辑单元实现复杂，但保持 provider 协议和恢复语义。
 
-## 7. 踩坑候选
+## 6. 踩坑候选
 
 ### 搜索结果只有文字，没有可执行 Schema
 
@@ -122,7 +118,7 @@ registered 不等于 visible；visible 也不等于一定可以越过执行权�
 - 修复为调整 Prompt 分层顺序。
 - 提交：`403e6924`。
 
-## 8. 已有数据与边界
+## 7. 已有数据与边界
 
 局部微基准：
 
@@ -132,9 +128,17 @@ registered 不等于 visible；visible 也不等于一定可以越过执行权�
 
 可以说系统记录输入 token 与缓存命中信息用于开销分析；不能给出没有记录支持的端到端节省率或缓存提升比例。记录功能、运行统计、优化效果对比应分别说明。
 
-用户补充的 [observe](https://github.com/akashic-plugins/observe) 是必须考虑的相关实现入口。公开 README 描述了缓存效率视图、近期 KV Cache 命中率、主动/被动链路差异和 Turn 明细。历史插件版本、采集来源和计算口径尚需按对应基线核对；这里不是已经完成源码核验或取得具体命中率的声明。
+用户补充的 [observe](https://github.com/akashic-plugins/observe) 是必须考虑的相关实现入口。公开 README 描述了缓存效率视图、近期 KV Cache 命中率、主动/被动链路差异和 Turn 明细。
 
-## 9. 需核实的统计与实验方向
+### Observe 观测插件核对结论（2026-09-13 执行期核实）
+
+- 研究副本为 canonical main commit `8913be0e0cda9b7a71682b48f8b304ee334d628c`（manifest `2.0.0`、`api_version=3`）；历史 artifact `1.2.0` 对应 `4d85b9dc64ef0d8d96c5a635586ca17dd94b59cd`。
+- Observe `2.0.0` 依赖后续 Message runtime、`models.calls.v1`/`models.call-history.v1` 与 Turn projection，与 d565 基线不直接兼容，不能倒灌为基线实现；`1.2.0` 只作旧 lifecycle 的运行记录线索。
+- 命中率口径为 token 加权：`sum(cached_input_tokens)/sum(input_tokens)`，分组与时间桶内先求 token 总量再算比例，不是逐 Turn 比例平均；Turn 聚合只计成功且 usage 为 exact 的调用。
+- 口径风险：input 已知而 cached_input_tokens 缺失时，缺失 hit 可能按 0 计入分母，报表存在显示偏低的风险；`wake` 映射代表 Wake-derived 主动链路整体，不区分 content/drift/alert owner。
+- 4 个 terminal Turn 对账（input 合计 49,653、cache hit 合计 14,976）证明 usage 在多个存储间一致；对账不是对照实验，不能证明命中率提升。
+
+## 8. 需核实的统计与实验方向
 
 先查主仓库与 `observe` 已有记录，确定哪些只是尚未整理、哪些确需对比实验；不要再把缓存观测笼统列成待实现功能。
 
@@ -142,7 +146,7 @@ registered 不等于 visible；visible 也不等于一定可以越过执行权�
 - 有无压缩时的长对话完成率、摘要遗漏率和原文补搜次数。
 - Prompt 分层调整前后的可比缓存命中和成本；单次命中率或已有看板不能直接证明分层调整带来提升。
 
-## 10. 源码与文档锚点
+## 9. 源码与文档锚点
 
 - `agent/tools/registry.py`
 - `agent/tools/tool_search.py`
@@ -151,23 +155,12 @@ registered 不等于 visible；visible 也不等于一定可以越过执行权�
 - `plugins/compaction/engine.py`
 - `plugins/compaction/runtime.py`
 - `docs/refactor/clean-code-ledger.md`
-- [observe README](https://github.com/akashic-plugins/observe#readme)：缓存观测入口，历史版本及实现路径待本章执行时核对
+- [observe README](https://github.com/akashic-plugins/observe#readme)：缓存观测入口；版本核对结论见本包 §7
 - 提交：`981b51b1`、`2c3a8f28`、`31c129bd`、`064602b2`、`c3e83d59`、`e17cb95f`、`403e6924`
 
-## 11. 禁止推导
+## 10. 禁止推导
 
 - 不得把关键词目录搜索称为 embedding 语义搜索。
 - 不得说解锁永久修改全局权限。
 - 不得把记录 token/cache 指标写成已经取得节省效果。
 - 不得把 0.74 和 20,000 描述为适合所有模型的最优参数。
-
-## 12. 后续研究与解释重点
-
-以下用于指导执行端补足关键细节，不预填实现答案，也不是固定题目或段落配额：
-
-- 工具目录的可搜索信息、关键词匹配与真实 Schema 的关系；初始预加载、当轮解锁、容量不足和后续会话复用怎样共同工作。
-- 目录与搜索调用自身也消耗 token 和轮次。工具数量、Schema 长度、命中质量及复用情况怎样影响收益，小工具集全量暴露何时更合适；不能无数据保证节省。
-- 压缩触发依据、完整请求预算的组成、历史选择与近期保留；滑动窗口和模型摘要各解决什么，不将 token 水位简化为消息条数。
-- 摘要使用什么模型和提示词、是否利用旧摘要增量更新、输入输出预算怎样控制。当前材料尚不足以回答的实现细节，沿 compaction 及调用方读取，不凭一般经验补全。
-- 摘要遗漏任务约束或多次更新失真时，系统实际有哪些保留、回查和处理能力；未闭合的多工具批次怎样处理。工具协议完整、摘要语义正确、超窗口重试成功是不同问题。
-- 缓存观测从哪里取得使用量，怎样存储、汇总和展示；命中率按何种口径计算、主被动如何区分、缺失字段怎样处理。根据对应版本解释，不能因看板名称自行假定公式。
